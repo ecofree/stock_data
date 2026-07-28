@@ -1,0 +1,6 @@
+duckdb==1.5.4
+requests==2.32.2
+pandas==2.2.2
+akshare==1.18.64
+baostock==0.9.30
+pytest==9.1.1

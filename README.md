@@ -1,0 +1,314 @@
+# stock_data
+
+`stock_data` is an A-share short-term/theme/emotion-cycle trading assistant.
+It is designed for pre-market preparation, auction confirmation, intraday
+monitoring, close review, post-market journaling, backtest validation, and
+risk constraints.
+
+It does **not** place orders and should not be extended into automatic trading
+without a separate risk and compliance review.
+
+## Current Shape
+
+- Storage: DuckDB (`kpl_data.duckdb`)
+- Runtime: Python + DuckDB
+- Tests: pytest
+- Main upstream API: KPL/opening-market data
+- Reports: Markdown + static HTML under `reports/`
+- Workflow: one-command daily runner plus focused scripts
+
+The database currently contains hundreds of raw/derived tables and normalized
+views. For current counts, run:
+
+```powershell
+    D:\anaconda\python.exe scripts\audit_data_quality.py --db kpl_data.duckdb --schema schema.py --out reports\data_quality_latest.md
+```
+
+## Install And Test
+
+```powershell
+cd D:\accio\stock_data
+D:\anaconda\python.exe -m pip install -r requirements.txt
+D:\anaconda\python.exe -m pytest -q -p no:cacheprovider
+```
+
+`pytest.ini` sets `pythonpath = .`, so tests can be run from the project root
+without manually setting `PYTHONPATH`.
+
+The supported runtime range is Python 3.11 through 3.14. Use the lock file for
+reproducible production installs; `requirements.txt` delegates to it.
+
+## Daily Operator Workflow
+
+The integrated runner is phase-aware. By default `--phase auto` selects the
+current China-market window and skips fresh snapshots; it does not run the
+historical/backtest/news fan-out during trading hours:
+
+```powershell
+D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --trade-date <YYYY-MM-DD> --phase auto
+```
+
+Use the four profiles explicitly when operating the system:
+
+```powershell
+# 09:15-09:27: KPL market context/candidates plus KPL tick and independent
+# Tencent five-level auction-window snapshots
+D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --phase auction
+# 09:30-15:00: market context, full-market stock flow and full-sector flow only
+D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --phase intraday
+# 15:00-18:30: final snapshots, bounded finance gap-fill and close review
+D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --phase close
+# Off-hours/manual only: checkpointed 2026 history and after-close sources
+D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --phase history --history-start 20260101 --history-end 20260715 --history-max-days 5
+```
+
+The exact source/cadence matrix and current TTL decisions are written by:
+
+```powershell
+D:\anaconda\python.exe scripts\describe_collection_profiles.py --db kpl_data.duckdb --phase intraday
+```
+
+The legacy all-source plan is still available only as an explicit escape hatch:
+`--phase full` (or by calling `command_plan` without a phase in compatibility
+tests). It should not be used as the intraday scheduler.
+
+The integrated runner collects market and focused capital-flow data by
+default, takes an exclusive database lock, and writes an atomic run manifest
+below `reports/runs/<run-id>/run.json`. Intraday data gates block signals but
+do not stop the retry watcher. At the close, failed data gates remain
+non-actionable while the runner continues far enough to publish the review,
+dashboard and exact gap reports; the final close task still exits nonzero and
+is recorded as `completed_blocked`. Use `--skip-collect` only for an
+offline/research rerun of data already captured.
+
+Before any signal run, verify same-date readiness. A nonzero exit means the
+requested stage is not actionable:
+
+```powershell
+D:\anaconda\python.exe scripts\check_data_readiness.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage close
+```
+
+During the trading session, refresh bounded intraday capital-flow evidence
+before regenerating signals and reports:
+
+```powershell
+D:\anaconda\python.exe scripts\collect_capital_flow_focus.py --db kpl_data.duckdb --date <YYYY-MM-DD> --max-stocks 8 --max-sectors 6 --strict
+D:\anaconda\python.exe scripts\generate_signals.py --db kpl_data.duckdb --date <YYYY-MM-DD>
+D:\anaconda\python.exe scripts\generate_operator_reports.py --db kpl_data.duckdb
+D:\anaconda\python.exe scripts\generate_web_dashboard.py --db kpl_data.duckdb --out reports\trading_dashboard_latest.html
+```
+
+The focused collector writes `reports/capital_flow_freshness_latest.md` and
+separately reports individual-stock and sector-flow coverage. Sector volume is
+not accepted as a replacement for directional sector capital flow. It uses a
+short request timeout, a total collection budget, and a circuit breaker so a
+network outage cannot hold the daily pipeline indefinitely. Historical
+integrated reruns must use `--skip-collect` because some endpoints expose only
+the current snapshot.
+
+To audit already stored evidence without making network calls:
+
+```powershell
+D:\anaconda\python.exe scripts\check_capital_flow_health.py --db kpl_data.duckdb --date <YYYY-MM-DD> --report-only
+```
+
+Important generated reports:
+
+- `reports/operator_report_latest.md`
+- `reports/trading_dashboard_latest.html`
+- `reports/daily_review_latest.md`
+- `reports/daily_review_statistics_latest.md`
+- `reports/stage_backtest_latest.md`
+- `reports/strategy_backtest_latest.md`
+- `reports/real_data_backfill_latest.md`
+- `reports/empty_table_catalog_latest.md`
+- `reports/data_readiness_latest.md`
+- `reports/capital_flow_freshness_latest.md`
+
+## Manual Trading Loop
+
+The daily loop converts signals into manual workflow records:
+
+- `watchlist`: pre-market candidates and thesis
+- `trade_plan`: manual plan, position cap, entry/stop conditions
+- `risk_snapshot`: market-state position limits
+- `portfolio_snapshot`: current/manual position snapshot
+- `trade_journal`: stage decisions and review tags
+- `operator_trade_outcome`: imported real execution/skipped/cancelled outcomes
+
+These records are review aids only. They are not orders.
+
+Import reviewed operator outcomes after the close:
+
+```powershell
+D:\anaconda\python.exe scripts\import_operator_trade_outcomes.py --db kpl_data.duckdb --csv path\to\operator_outcomes.csv
+D:\anaconda\python.exe scripts\run_operator_backtest.py --db kpl_data.duckdb
+D:\anaconda\python.exe scripts\generate_daily_review.py --db kpl_data.duckdb
+```
+
+The CSV should include at least `trade_date`, `stock_code`, and
+`execution_status`. Common review columns are `entry_price`, `exit_price`,
+`position_pct`, `outcome_tag`, `mistake_tag`, and `review_note`.
+
+## Signal Layers
+
+Key normalized evidence views:
+
+- `v_market_state_inputs`
+- `v_theme_mainline_evidence`
+- `v_intraday_capital_flow_evidence`
+- `v_intraday_strength_evidence`
+- `v_research_event_evidence`
+- `v_lhb_review_evidence`
+
+Candidate stages:
+
+- `premarket_pool`
+- `auction_confirmation`
+- `intraday_strength`
+- `close_decision`
+
+Run them only in their real decision windows:
+
+```powershell
+# Before 09:15; consumes the previous completed session only.
+D:\anaconda\python.exe scripts\generate_stage_signals.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage premarket_pool
+# 09:15-09:30; requires real per-stock auction evidence.
+D:\anaconda\python.exe scripts\generate_stage_signals.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage auction_confirmation
+# 09:30-11:30 or 13:00-14:50; requires real per-stock intraday evidence.
+D:\anaconda\python.exe scripts\generate_stage_signals.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage intraday_strength
+# From 14:50; requires a valid same-date close/reference price per stock.
+D:\anaconda\python.exe scripts\generate_stage_signals.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage close_decision
+```
+
+Every stage-v2 signal preserves the source trade date, as-of cutoff, run id,
+readiness snapshot, feature version, and individual-stock actionability. Missing
+or fallback evidence is retained as `blocked_data_quality` and cannot enter the
+operator plan. Close-stage proxy backtests use next-session open-to-close;
+intraday signals without a captured executable price are excluded.
+
+## Backfill And Coverage
+
+Historical coverage is tracked by:
+
+```powershell
+D:\anaconda\python.exe scripts\report_real_data_backfill.py --db kpl_data.duckdb
+```
+
+Optional TuShare relay basic-data supplement:
+
+```powershell
+$env:TUSHARE_FAST_RELAY_TOKEN = "<your-token>"
+$env:TUSHARE_RELAY_MIN_INTERVAL_SECONDS = "0.6"
+D:\anaconda\python.exe scripts\collect_tushare_basic_data.py --db kpl_data.duckdb --start-date 20250101 --end-date <YYYYMMDD> --max-stocks 20 --sync-core
+```
+
+This collects bounded `trade_cal`, `stock_basic`, `daily`,
+`daily_basic`, `adj_factor`, and `index_daily` samples into `tushare_*`
+staging tables. `--sync-core` copies only the requested code/date scope into
+the existing `kline` and `index_kline` tables for backtest coverage. TuShare
+relay data is a base-data supplement, not an automatic trading signal.
+
+For slow, recoverable history growth, prefer the incremental backfill runner:
+
+```powershell
+D:\anaconda\python.exe scripts\backfill_tushare_incremental.py --db kpl_data.duckdb --start-date 20260701 --end-date <YYYYMMDD> --max-stocks 10 --index-codes SH000001,SZ399001,SZ399006 --run-limit 5 --sync-core
+```
+
+It writes `tushare_gap_status`, creates resumable `tushare_backfill_task`
+records, runs only pending tasks, keeps completed tasks done across reruns, and
+generates `reports/tushare_gap_latest.md`. Stock and index universes are kept
+separate; always pass `--index-codes` when requesting `index_daily`. Increase
+`--run-limit`, widen the date range, or rotate `--stock-codes` gradually to
+expand history without forcing a full rescan.
+
+Generate the historical return/risk/valuation report:
+
+```powershell
+D:\anaconda\python.exe scripts\analyze_tushare_history.py --db kpl_data.duckdb --start-date 20250101 --end-date <YYYYMMDD> --stock-codes <comma-separated-codes> --out reports\tushare_history_analysis_latest.md
+```
+
+The report includes interval return, annualized volatility, maximum drawdown,
+win rate, latest PE/PB, adjustment-factor coverage, industry grouping, and
+three-index comparison. It explicitly flags that the sample is not a random
+全市场 sample and does not constitute an investment recommendation.
+
+Empty tables are classified by:
+
+```powershell
+D:\anaconda\python.exe scripts\build_empty_table_catalog.py --db kpl_data.duckdb
+```
+
+Missing auction ticks must remain explicit gaps. Do not synthesize raw market
+data. The independent Tencent source is stored as
+`auction_quote_snapshot` and is explicitly labelled as a five-level order-book
+snapshot, not an exchange transaction tick. Its server date and 09:15-09:27
+timestamp must both pass before it can satisfy auction evidence.
+
+Before repairing a production database, make and verify a separate backup.
+The remediation utility is intentionally explicit:
+
+```powershell
+D:\anaconda\python.exe scripts\repair_critical_integrity.py --db kpl_data.duckdb --dry-run
+```
+
+## Extension Rules
+
+### Optional QLib environment and Eastmoney recovery
+
+QLib is installed only in the project-local `.venv-qlib`; verify it before shadow training:
+
+```powershell
+cd D:\accio\stock_data
+.\.venv-qlib\Scripts\python.exe scripts\check_qlib_env.py
+```
+
+The live Eastmoney clist collector uses a persisted circuit breaker and bounded front-door rotation. When the upstream route resets connections, it keeps the last auditable partial snapshot and resumes missing pages after the cooldown; it never relabels historical data as today's intraday flow. See `docs\qlib_optional_env.md` and `docs\eastmoney_clist_recovery.md`.
+
+### Production data gates
+
+The scheduler now fails closed when the requested trade date is missing, a
+snapshot is older than the phase freshness window, a fallback-only market
+state is being used, or full-market flow coverage is below 99.5%. Check the
+same gates manually with:
+
+```powershell
+D:\anaconda\python.exe scripts\check_data_readiness.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage intraday --max-age-seconds 600
+D:\anaconda\python.exe scripts\check_capital_flow_health.py --db kpl_data.duckdb --date <YYYY-MM-DD> --max-age-seconds 600 --min-coverage-pct 99.5
+D:\anaconda\python.exe scripts\audit_p0_p3_acceptance.py --db kpl_data.duckdb --date <YYYY-MM-DD> --max-age-seconds 600
+D:\anaconda\python.exe scripts\audit_p0_five_day_observation.py --db kpl_data.duckdb --as-of <YYYY-MM-DD>
+```
+
+The rolling P0 observer is stricter than a green unit test. It requires five
+consecutive exchange-calendar sessions with completed (not degraded)
+auction/intraday/close manifests, at least 99.5% stock and sector flow
+coverage, all five TuShare close datasets, a complete weekly THS 374+
+concept/member snapshot, and committed review/dashboard artifacts. The close
+runner writes both a latest report and a dated report automatically.
+
+The daily review publishes individual-stock main-net inflow/outflow Top 50,
+THS concept inflow/outflow Top 10, Eastmoney industry inflow/outflow Top 10,
+THS concepts with their limit-up constituents, and research-only candidate
+picks. Multi-source stock rows are deduplicated before market-wide flow ranks
+are calculated.
+
+Register unattended tasks from an elevated PowerShell. The installer verifies
+the SYSTEM principal after registration and refuses a partial non-elevated
+install:
+
+```powershell
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File D:\accio\stock_data\scripts\install_stock_data_task.ps1 -RegisterAll -Register
+```
+
+`is_executable` means stock-level evidence is complete; a candidate is
+counted as execution-ready only when `risk_approved` is also true. Blocked,
+skipped, or price-missing operator outcomes are excluded from realized-return
+statistics. Production backtests use the T+1 path; the compatibility flag is
+reserved for legacy unit fixtures.
+
+- Prefer adapters over copying external projects into this repo.
+- Keep qlib in shadow mode until predictions have enough validated samples.
+- Use second-source market data for long K-line history if KPL cannot provide
+  enough depth.
+- Import real operator outcomes before judging operator backtest quality.
+- Do not store API keys in reports or commit environment files with secrets.

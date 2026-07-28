@@ -1,0 +1,374 @@
+"""Daily manual operator workflow loop.
+
+This module turns generated signals into auditable manual workflow records.
+It does not create orders and does not imply automatic execution.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+from trade_system.operator_risk import TradePlanInput, evaluate_trade_plan
+from trade_system.quality import table_columns, table_exists
+from trade_system.readiness import assess_trade_date_readiness
+from trade_system.risk import init_trading_tables
+
+
+def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
+    cur = con.execute(sql, params or [])
+    columns = [desc[0] for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def _loads(value: Any) -> dict:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def _latest_regime(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict:
+    rows = _fetch_dicts(
+        con,
+        """
+        SELECT trade_date, regime, regime_score, suggested_position_pct, evidence_json
+        FROM market_regime_snapshot
+        WHERE trade_date = ?
+        ORDER BY generated_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        [trade_date],
+    )
+    if not rows:
+        return {
+            "trade_date": trade_date,
+            "regime": "unknown",
+            "regime_score": 0,
+            "suggested_position_pct": 0,
+            "evidence": {},
+        }
+    row = rows[0]
+    row["evidence"] = _loads(row.get("evidence_json"))
+    return row
+
+
+def _risk_state(regime: dict) -> str:
+    suggested = int(regime.get("suggested_position_pct") or 0)
+    acute = float((regime.get("evidence") or {}).get("acute_drop_risk_score") or 0)
+    if suggested <= 15 or acute >= 60:
+        return "defensive"
+    if suggested <= 30 or acute >= 45:
+        return "cautious"
+    return "normal"
+
+
+def _max_single_position(regime: dict) -> float:
+    state = _risk_state(regime)
+    suggested = float(regime.get("suggested_position_pct") or 0)
+    if state == "defensive":
+        return min(5.0, max(0.0, suggested))
+    if state == "cautious":
+        return min(8.0, max(3.0, suggested / 3.0))
+    return min(10.0, max(5.0, suggested / 4.0))
+
+
+def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int) -> list[dict]:
+    actionable_filter = ""
+    if "is_actionable" in table_columns(con, "stock_candidate_score"):
+        actionable_filter += "\n          AND coalesce(stock_candidate_score.is_actionable, false) = true"
+    stage_columns = table_columns(con, "stock_candidate_stage_signal") if table_exists(con, "stock_candidate_stage_signal") else set()
+    stage_gate = "is_executable" if "is_executable" in stage_columns else "is_actionable"
+    if table_exists(con, "stock_candidate_stage_signal") and stage_gate in stage_columns:
+        actionable_filter = f"""
+          AND EXISTS (
+              SELECT 1
+              FROM stock_candidate_stage_signal s
+              WHERE s.trade_date = stock_candidate_score.trade_date
+                AND s.stock_code = stock_candidate_score.stock_code
+                AND coalesce(s.{stage_gate}, false) = true
+          )
+        """
+    rows = _fetch_dicts(
+        con,
+        f"""
+        SELECT trade_date, stock_code, stock_name, score, source, sector_code, evidence_json
+        FROM stock_candidate_score
+        WHERE trade_date = ?
+        {actionable_filter}
+        ORDER BY score DESC NULLS LAST, stock_code
+        LIMIT {int(limit)}
+        """,
+        [trade_date],
+    )
+    if rows or not table_exists(con, "stock_candidate_stage_signal"):
+        return rows
+    # Intraday runs can have a fully evidence-gated stage pool before the
+    # legacy close-stage score table is produced.  Promote those rows into the
+    # manual workflow without inventing a score or an order: the existing
+    # risk/regime gate still decides whether a plan is blocked or reviewable.
+    stage_actionable_filter = (
+        f"AND coalesce({stage_gate}, false) = true"
+        if stage_gate in stage_columns
+        else ""
+    )
+    stage_rows = _fetch_dicts(
+        con,
+        f"""
+        WITH ranked AS (
+            SELECT trade_date, stock_code, stock_name, score, evidence_json,
+                   row_number() OVER (
+                       PARTITION BY stock_code
+                       ORDER BY CASE stage
+                           WHEN 'close_decision' THEN 1
+                           WHEN 'intraday_strength' THEN 2
+                           WHEN 'auction_confirmation' THEN 3
+                           ELSE 4 END,
+                           score DESC NULLS LAST
+                   ) AS rn
+            FROM stock_candidate_stage_signal
+            WHERE CAST(trade_date AS VARCHAR) = ?
+              {stage_actionable_filter}
+        )
+        SELECT trade_date, stock_code, stock_name, score,
+               'stage_signal' AS source, NULL AS sector_code, evidence_json
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY score DESC NULLS LAST, stock_code
+        LIMIT ?
+        """,
+        [trade_date, int(limit)],
+    )
+    return stage_rows
+
+
+def _stage_rows(con: duckdb.DuckDBPyConnection, trade_date: str, stock_codes: list[str]) -> list[dict]:
+    if not stock_codes:
+        return []
+    placeholders = ", ".join(["?"] * len(stock_codes))
+    stage_columns = table_columns(con, "stock_candidate_stage_signal")
+    stage_gate = "is_executable" if "is_executable" in stage_columns else "is_actionable"
+    actionable_filter = (
+        f"AND coalesce({stage_gate}, false) = true"
+        if stage_gate in stage_columns
+        else ""
+    )
+    return _fetch_dicts(
+        con,
+        f"""
+        SELECT trade_date, stage, stock_code, stock_name, score, decision, evidence_json
+        FROM stock_candidate_stage_signal
+        WHERE trade_date = ? AND stock_code IN ({placeholders})
+          {actionable_filter}
+        ORDER BY stock_code, stage
+        """,
+        [trade_date] + stock_codes,
+    )
+
+
+def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 20) -> dict[str, int]:
+    init_trading_tables(db_path)
+    con = duckdb.connect(str(db_path))
+    try:
+        for table in ("watchlist", "trade_plan", "portfolio_snapshot", "risk_snapshot"):
+            con.execute(f"DELETE FROM {table} WHERE trade_date = ?", [trade_date])
+        con.execute(
+            "DELETE FROM trade_journal WHERE trade_date = ? AND coalesce(action, '') != 'operator_outcome'",
+            [trade_date],
+        )
+
+        regime = _latest_regime(con, trade_date)
+        risk_state = _risk_state(regime)
+        suggested = float(regime.get("suggested_position_pct") or 0)
+        stage_columns_for_gate = (
+            table_columns(con, "stock_candidate_stage_signal")
+            if table_exists(con, "stock_candidate_stage_signal")
+            else set()
+        )
+        has_operational_checkpoint = (
+            table_exists(con, "intraday_stock_flow_batch")
+            or table_exists(con, "intraday_sector_flow_batch")
+            or "is_executable" in stage_columns_for_gate
+        )
+        data_readiness = (
+            assess_trade_date_readiness(
+                con, trade_date, "close", max_age_seconds=21600
+            )
+            if has_operational_checkpoint
+            else {"ready": True, "status": "legacy_test_or_manual_context"}
+        )
+        data_blocked = (
+            suggested <= 0
+            or str(regime.get("regime") or "") in {"数据缺失", "unknown"}
+            or not data_readiness.get("ready", False)
+        )
+        max_single = _max_single_position(regime)
+        max_sector = min(max(0.0, suggested), 20.0)
+        risk_evidence = {
+            "regime": regime.get("regime"),
+            "regime_score": regime.get("regime_score"),
+            "suggested_position_pct": int(regime.get("suggested_position_pct") or 0),
+            "acute_drop_risk_score": (regime.get("evidence") or {}).get("acute_drop_risk_score"),
+            "data_readiness": data_readiness,
+            "note": "manual planning guardrail; no automatic order execution",
+        }
+        con.execute(
+            """
+            INSERT INTO risk_snapshot (
+                trade_date, total_position_pct, max_single_position_pct, max_sector_position_pct,
+                daily_loss_limit_pct, current_drawdown_pct, risk_state, evidence_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [trade_date, 0.0, max_single, max_sector, 2.0 if risk_state == "defensive" else 3.0, 0.0, risk_state, json.dumps(risk_evidence, ensure_ascii=False)],
+        )
+
+        candidates = _candidate_rows(con, trade_date, limit)
+        watchlist_count = 0
+        trade_plan_count = 0
+        current_total_position_pct = 0.0
+        sector_positions: dict[str, float] = {}
+        for priority, row in enumerate(candidates, start=1):
+            evidence = _loads(row.get("evidence_json"))
+            risk_points = evidence.get("risk_points") or []
+            thesis = evidence.get("entry_reason") or f"candidate_score={float(row.get('score') or 0):.2f}"
+            invalidation = evidence.get("invalidation") or "Invalidate if score/fallback/risk evidence deteriorates."
+            planned_position = 0.0 if data_blocked else max_single
+            sector_code = str(row.get("sector_code") or "")
+            risk_flags_for_plan = list(risk_points if risk_state == "defensive" and float(row.get("score") or 0) < 70 else ())
+            if sector_code and sector_positions.get(sector_code, 0.0) + planned_position > max_sector:
+                risk_flags_for_plan.append("sector_position_limit_exceeded")
+            con.execute(
+                """
+                INSERT INTO watchlist (
+                    trade_date, stock_code, stock_name, sector_code, thesis, invalidation, priority, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    trade_date,
+                    row.get("stock_code"),
+                    row.get("stock_name"),
+                    row.get("sector_code"),
+                    thesis,
+                    invalidation,
+                    priority,
+                    "blocked_data_quality" if data_blocked else "active",
+                ],
+            )
+            watchlist_count += 1
+
+            decision = evaluate_trade_plan(
+                TradePlanInput(
+                    stock_code=row.get("stock_code") or "",
+                    score=float(row.get("score") or 0),
+                    market_regime=str(regime.get("regime") or "unknown"),
+                    planned_position_pct=planned_position,
+                    current_total_position_pct=current_total_position_pct,
+                    risk_flags=tuple(risk_flags_for_plan),
+                )
+            )
+            if decision.allowed:
+                current_total_position_pct += planned_position
+                if sector_code:
+                    sector_positions[sector_code] = sector_positions.get(sector_code, 0.0) + planned_position
+            con.execute(
+                """
+                INSERT INTO trade_plan (
+                    trade_date, stock_code, stock_name, setup_type, entry_condition, stop_condition,
+                    target_condition, max_position_pct, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    trade_date,
+                    row.get("stock_code"),
+                    row.get("stock_name"),
+                    "manual_shortline_plan",
+                    f"Only consider after auction/intraday evidence confirms; risk_gate={decision.reason}",
+                    invalidation,
+                    "Review at close; no automatic execution.",
+                     planned_position,
+                    (
+                        "blocked_data_quality"
+                        if data_blocked
+                        else "planned" if decision.allowed else "review_required"
+                    ),
+                ],
+            )
+            if table_exists(con, "stock_candidate_stage_signal"):
+                stage_columns = table_columns(con, "stock_candidate_stage_signal")
+                if {"risk_approved", "is_executable"}.issubset(stage_columns):
+                    con.execute(
+                        """
+                        UPDATE stock_candidate_stage_signal
+                        SET risk_approved=?, is_executable=(coalesce(data_complete,false)
+                            AND coalesce(signal_triggered,false)
+                            AND coalesce(tradable,false) AND ?)
+                        WHERE trade_date=? AND stock_code=?
+                        """,
+                        [bool(decision.allowed), bool(decision.allowed), trade_date, row.get("stock_code")],
+                    )
+            trade_plan_count += 1
+
+        con.execute(
+            "UPDATE risk_snapshot SET total_position_pct=? WHERE trade_date=?",
+            [current_total_position_pct, trade_date],
+        )
+
+        con.execute(
+            """
+            INSERT INTO portfolio_snapshot (
+                trade_date, snapshot_time, stock_code, stock_name, position_pct, cost_price,
+                last_price, pnl_pct, sector_code
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [trade_date, "close", "CASH", "No automatic position", 0.0, None, None, 0.0, None],
+        )
+
+        stage_rows = _stage_rows(con, trade_date, [row.get("stock_code") for row in candidates])
+        journal_count = 0
+        stage_time = {
+            "premarket_pool": "pre_market",
+            "auction_confirmation": "auction",
+            "intraday_strength": "intraday",
+            "close_decision": "close",
+        }
+        for row in stage_rows:
+            con.execute(
+                """
+                INSERT INTO trade_journal (
+                    trade_date, stock_code, stock_name, action, action_time, price,
+                    position_pct, reason, mistake_tag
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    trade_date,
+                    row.get("stock_code"),
+                    row.get("stock_name"),
+                    row.get("stage"),
+                    stage_time.get(row.get("stage"), "review"),
+                    None,
+                    0.0,
+                    f"decision={row.get('decision')} score={float(row.get('score') or 0):.2f}",
+                    "pending_review",
+                ],
+            )
+            journal_count += 1
+
+        return {
+            "watchlist": watchlist_count,
+            "trade_plan": trade_plan_count,
+            "risk_snapshot": 1,
+            "portfolio_snapshot": 1,
+            "trade_journal": journal_count,
+        }
+    finally:
+        con.close()

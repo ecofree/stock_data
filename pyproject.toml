@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-data-trading-assistant"
+version = "0.1.0"
+description = "Manual A-share trading data, evidence, risk, and review assistant"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "duckdb==1.5.4",
+  "requests>=2.31,<3",
+  "pandas>=2.2,<3",
+  "akshare>=1.18.64",
+  "baostock>=0.9.30",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["trade_system*"]
