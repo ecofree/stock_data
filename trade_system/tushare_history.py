@@ -160,6 +160,12 @@ class TushareHistoryCollector:
             ).fetchone()[0] or 0)
             if count == 5000:
                 return False
+            # A success checkpoint with zero stored rows means an empty relay
+            # response was recorded as success (observed 2026-08-10 on
+            # daily/daily_basic).  Treat it as not-done so the next run
+            # re-fetches the date instead of permanently skipping it.
+            if count == 0:
+                return False
         return True
 
     def _next_attempt(self, dataset: str, trade_date: str) -> int:
@@ -212,6 +218,13 @@ class TushareHistoryCollector:
             raise TushareRelayError(f"{api} returned no rows for requested date {target}")
         # Never relabel a previous-session response as the requested date.
         rows = dated_rows
+        # A relay that answers with an empty item list is a successful HTTP
+        # response, not a market snapshot.  Without this guard an empty day
+        # is recorded as a success checkpoint after DELETE+INSERT of zero
+        # rows (observed 2026-08-10: daily/daily_basic marked success with 0
+        # rows while adj_factor for the same date landed 5,553 rows).
+        if isinstance(self.client, TushareRelayClient) and not rows:
+            raise TushareRelayError(f"empty {api} response for requested date {target}")
         if isinstance(self.client, TushareRelayClient) and 0 < len(rows) < 1000:
             time.sleep(1)
             retry = self.client.query_rows(api, params, fields)
