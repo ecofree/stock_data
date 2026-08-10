@@ -40,6 +40,7 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "evaluate_qlib_shadow",
         "generate_operator_reports",
         "generate_daily_review",
+        "generate_daily_review_web",
         "audit_p0_p3_acceptance",
         "audit_p3_candidates",
         "report_real_data_backfill",

@@ -257,10 +257,13 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
             # result remains visible and can be manually retried, but must not
             # trigger a full 374+ concept crawl at every daily close.
             ttl = task.cadence_seconds
-        elif status in {"partial", "failed", "empty", "stale", "error"}:
+        elif status in {"partial", "failed", "empty", "stale", "error", "running"}:
             # Slow weekly sources are normally fetched once per week, but a
             # failed refresh should retry at the next daily close instead of
-            # remaining broken for another 3.5 days.
+            # remaining broken for another 3.5 days.  ``running`` is included
+            # because an interrupted crawl (killed process) leaves a running
+            # checkpoint behind; without this it would be treated as fresh
+            # for the full TTL and never retried (observed 2026-08-10 THS).
             ttl = max(60, min(ttl // 2, 86400))
         age = max(0.0, (current.replace(tzinfo=None) - fetched).total_seconds())
         if age < ttl:

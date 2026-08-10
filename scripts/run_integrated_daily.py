@@ -110,6 +110,7 @@ REVIEW_CHAIN_STEPS = {
     "run_daily_review_statistics",
     "generate_operator_reports",
     "generate_daily_review",
+    "generate_daily_review_web",
     "audit_p0_p3_acceptance",
     "audit_p3_candidates",
     "report_real_data_backfill",
@@ -557,6 +558,11 @@ def command_plan(
         (
             "generate_daily_review",
             [py, "scripts/generate_daily_review.py", "--db", db_path, "--trade-date", selected_date, "--out", report("daily_review_latest.md")],
+            False,
+        ),
+        (
+            "generate_daily_review_web",
+            [py, "scripts/generate_daily_review_web.py", "--db", db_path, "--trade-date", selected_date, "--out", report("daily_review_latest.html")],
             False,
         ),
         (
