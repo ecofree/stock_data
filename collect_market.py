@@ -256,6 +256,27 @@ def collect_market_rise_fall(client: KPLClient, store: DuckDBStore, date: str) -
                         f"{stale_count} consecutive runs; market state is relying on the "
                         "Eastmoney-derived fallback. Check the KPL upstream feed."
                     )
+                    # Surface the alert in alert_events so the dashboard,
+                    # daily review and trading terminal show it, not just the
+                    # collector log (previously the only trace).
+                    try:
+                        store.conn.execute(
+                            "CREATE TABLE IF NOT EXISTS alert_events ("
+                            "trade_date VARCHAR, severity VARCHAR, category VARCHAR, "
+                            "message VARCHAR, evidence_json VARCHAR, generated_at TIMESTAMP "
+                            "DEFAULT current_timestamp)"
+                        )
+                        store.conn.execute(
+                            "INSERT INTO alert_events (trade_date, severity, category, message) "
+                            "VALUES (?, 'warning', 'kpl_stale', ?)",
+                            [
+                                str(date)[:10],
+                                f"KPL market/rise-fall stale for {stale_count} consecutive runs; "
+                                "market state relies on the Eastmoney-derived fallback",
+                            ],
+                        )
+                    except Exception as exc:
+                        logger.warning(f"alert_events insert failed: {exc}")
             logger.info(f"Inserted {len(rows)} rows into market_rise_fall")
             return len(rows)
     except Exception as e:

@@ -119,11 +119,19 @@ class RunManifest:
         self.data["steps"].append({"name": name, "status": status, "command": command, **extra})
         self.write()
 
-    def finish(self, status: str, error: str | None = None) -> None:
+    def finish(
+        self,
+        status: str,
+        error: str | None = None,
+        *,
+        warnings: list[str] | None = None,
+    ) -> None:
         self.data["status"] = status
         self.data["completed_at"] = datetime.now().isoformat(timespec="seconds")
         if error:
             self.data["error"] = error
+        if warnings:
+            self.data["warnings"] = list(warnings)
         self.write()
 
     def write(self) -> None:

@@ -1,6 +1,65 @@
 import duckdb
+from datetime import datetime
 
 from trade_system.capital_flow_health import assess_capital_flow_health
+
+
+def test_capital_flow_historical_as_of_rejects_future_writes(tmp_path):
+    db_path = tmp_path / "future-flow.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE multi_source_stock_flow("
+        "source_date DATE,stock_code VARCHAR,main_net DOUBLE,fetched_at TIMESTAMP)"
+    )
+    con.execute(
+        "CREATE TABLE multi_source_sector_flow("
+        "source_date DATE,sector_code VARCHAR,main_net DOUBLE,fetched_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO multi_source_stock_flow VALUES "
+        "('2026-07-31','000001',100,'2026-08-01 09:00:00')"
+    )
+    con.execute(
+        "INSERT INTO multi_source_sector_flow VALUES "
+        "('2026-07-31','BK1',100,'2026-08-01 09:00:00')"
+    )
+    con.close()
+
+    result = assess_capital_flow_health(
+        db_path,
+        "2026-07-31",
+        1,
+        1,
+        max_age_seconds=7200,
+        now=datetime.fromisoformat("2026-07-31T17:45:00"),
+    )
+
+    assert result["ready"] is False
+    assert result["stock_flow"]["observed_codes"] == 0
+    assert result["sector_flow"]["observed_codes"] == 0
+
+
+def test_capital_flow_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
+    db_path = tmp_path / "aware.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE multi_source_stock_flow("
+        "source_date DATE, stock_code VARCHAR, main_net DOUBLE, fetched_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO multi_source_stock_flow VALUES "
+        "('2026-07-31','000001',100,'2026-07-31 17:45:00')"
+    )
+    con.close()
+    result = assess_capital_flow_health(
+        db_path,
+        "2026-07-31",
+        expected_stock_codes=1,
+        min_coverage_pct=99.5,
+        max_age_seconds=1200,
+        now=datetime.fromisoformat("2026-07-31T18:00:00+08:00"),
+    )
+    assert result["stock_flow"]["ready"] is True
 
 
 def test_capital_flow_health_requires_real_sector_capital(tmp_path):

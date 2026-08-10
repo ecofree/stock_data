@@ -196,7 +196,15 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
         data = client.get("/auction/tick", {"code": code, "date": date})
         if not data:
             continue
-        ticks = data if isinstance(data, list) else data.get("data", data.get("ticks", []))
+        # The endpoint nests ticks under "auction_ticks"; earlier parser
+        # revisions looked at "data"/"ticks" and silently stored nothing
+        # (auction_tick frozen at 2026-07-14 despite a healthy endpoint).
+        if isinstance(data, dict):
+            ticks = data.get("auction_ticks") or data.get("data") or data.get("ticks") or []
+        elif isinstance(data, list):
+            ticks = data
+        else:
+            ticks = []
         rows = []
         for tk in ticks:
             if isinstance(tk, dict):
@@ -210,7 +218,8 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
                 rows.append((date, code, str(tk[0]), tk[1], tk[2]))
         if rows:
             n = store.insert_rows("auction_tick", rows,
-                ["date", "stock_code", "time", "price", "volume"])
+                ["date", "stock_code", "time", "price", "volume"],
+                replace_on=["date", "stock_code", "time"])
             total += n
     if total:
         store.log_collect("auction_tick", "/auction/tick", total, "ok")
@@ -220,19 +229,27 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
 def collect_auction_bidding_anomaly(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
     if not stock_codes:
         return 0
-    data = client.get("/auction/bidding-anomaly", {"code": stock_codes[0], "date": date})
-    rows = _parse_bidding_anomalies(data, date)
-    if not rows:
+    total = 0
+    last_data = None
+    # The endpoint must be queried per stock; iterate all codes instead of
+    # only the first (the original single-code bug silently dropped the rest).
+    for code in stock_codes:
+        data = client.get("/auction/bidding-anomaly", {"code": code, "date": date})
         if data:
-            store.insert_raw("/auction/bidding-anomaly", data)
-        return 0
-    total = store.insert_rows(
-        "auction_bidding_anomaly",
-        rows,
-        ["date", "stock_code", "anomaly_type", "anomaly_value"],
-        replace_on=["date", "stock_code", "anomaly_type"],
-    )
-    store.log_collect("auction_bidding_anomaly", "/auction/bidding-anomaly", total, "ok")
+            last_data = data
+        rows = _parse_bidding_anomalies(data, date)
+        if not rows:
+            continue
+        total += store.insert_rows(
+            "auction_bidding_anomaly",
+            rows,
+            ["date", "stock_code", "anomaly_type", "anomaly_value"],
+            replace_on=["date", "stock_code", "anomaly_type"],
+        )
+    if total:
+        store.log_collect("auction_bidding_anomaly", "/auction/bidding-anomaly", total, "ok")
+    elif last_data:
+        store.insert_raw("/auction/bidding-anomaly", last_data)
     return total
 
 

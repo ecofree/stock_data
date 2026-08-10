@@ -16,6 +16,7 @@ TARGETS = {
     "multi_source_sector_flow": "板块资金流",
     "multi_source_kline": "行情K线",
     "multi_source_quote": "实时估值/快照",
+    "executable_quote_snapshot": "候选可执行报价快照",
     "multi_source_observation": "原始观测日志",
 }
 
@@ -50,13 +51,27 @@ def audit_multisource(db_path: str | Path, as_of: str | None = None) -> dict:
             }
 
         if "ths_concept_member_checkpoint" in tables:
+            # Checkpoints are append-only.  Current completeness must not use
+            # all-history counts, so retain both views explicitly.
             cp = con.execute(
                 "SELECT count(*), sum(CASE WHEN status='success' THEN 1 ELSE 0 END), "
                 "sum(CASE WHEN status<>'success' THEN 1 ELSE 0 END), max(trade_date) "
                 "FROM ths_concept_member_checkpoint"
             ).fetchone()
-            checkpoint = {"rows": int(cp[0] or 0), "success": int(cp[1] or 0),
-                          "partial": int(cp[2] or 0), "latest": str(cp[3]) if cp[3] else None}
+            latest_cp = con.execute(
+                "SELECT max(trade_date) FROM ths_concept_member_checkpoint "
+                "WHERE trade_date<=CAST(? AS DATE)", [requested]
+            ).fetchone()[0]
+            current_cp = con.execute(
+                "SELECT count(*), sum(CASE WHEN status='success' THEN 1 ELSE 0 END), "
+                "sum(CASE WHEN status<>'success' THEN 1 ELSE 0 END) "
+                "FROM ths_concept_member_checkpoint WHERE trade_date=CAST(? AS DATE)",
+                [latest_cp],
+            ).fetchone() if latest_cp else (0, 0, 0)
+            checkpoint = {"rows": int(current_cp[0] or 0), "success": int(current_cp[1] or 0),
+                          "partial": int(current_cp[2] or 0), "latest": str(latest_cp) if latest_cp else None,
+                          "history_rows": int(cp[0] or 0), "history_success": int(cp[1] or 0),
+                          "history_partial": int(cp[2] or 0), "current_snapshot": True}
             result["concept_checkpoint"] = checkpoint
             if checkpoint["partial"] and "ths_concept_stock_history" in result["tables"]:
                 result["tables"]["ths_concept_stock_history"]["status"] = "partial"
@@ -93,6 +108,63 @@ def audit_multisource(db_path: str | Path, as_of: str | None = None) -> dict:
                     "GROUP BY stage,status ORDER BY stage,status"
                 ).fetchall()
             ]
+        # THS concept counts follow the same current snapshot as the
+        # pagination checkpoint; cumulative rows are audit-only.
+        if "ths_concept_daily" in tables:
+            latest_concept = con.execute(
+                "SELECT max(trade_date) FROM ths_concept_daily "
+                "WHERE trade_date<=CAST(? AS DATE)", [requested]
+            ).fetchone()[0]
+            if latest_concept:
+                raw_concept_count = con.execute(
+                    "SELECT count(DISTINCT concept_code) FROM ths_concept_daily WHERE trade_date=?",
+                    [latest_concept],
+                ).fetchone()[0]
+                raw_member_count = con.execute(
+                    "SELECT count(*) FROM ths_concept_stock_history WHERE trade_date=?",
+                    [latest_concept],
+                ).fetchone()[0] if "ths_concept_stock_history" in tables else 0
+                # The raw THS tables intentionally retain partial/stale
+                # recovery rows for audit.  Default consumers must use the
+                # quality-gated views, otherwise a stale cached board appears
+                # complete in this report even though signals correctly omit
+                # it.  Fall back to raw counts for legacy/test databases that
+                # predate the canonical views.
+                canonical_concepts = (
+                    "v_default_concept_daily"
+                    if "v_default_concept_daily" in tables else "ths_concept_daily"
+                )
+                canonical_members = (
+                    "v_default_concept_stock_history"
+                    if "v_default_concept_stock_history" in tables else "ths_concept_stock_history"
+                )
+                concept_count = con.execute(
+                    f"SELECT count(DISTINCT concept_code) FROM {canonical_concepts} WHERE trade_date=?",
+                    [latest_concept],
+                ).fetchone()[0]
+                member_count = con.execute(
+                    f"SELECT count(*) FROM {canonical_members} WHERE trade_date=?",
+                    [latest_concept],
+                ).fetchone()[0] if canonical_members in tables else 0
+                result["concept_snapshot"] = {
+                    "trade_date": str(latest_concept),
+                    "concepts": int(concept_count or 0),
+                    "members": int(member_count or 0),
+                    "raw_concepts": int(raw_concept_count or 0),
+                    "raw_members": int(raw_member_count or 0),
+                    "status": "partial" if (result.get("concept_checkpoint") or {}).get("partial") else "available",
+                }
+                result["tables"]["ths_concept_daily"].update(
+                    current_rows=int(concept_count or 0),
+                    current_status=result["concept_snapshot"]["status"],
+                )
+                if "ths_concept_stock_history" in result["tables"]:
+                    result["tables"]["ths_concept_stock_history"].update(
+                        current_rows=int(member_count or 0),
+                        current_status=result["concept_snapshot"]["status"],
+                    )
+            else:
+                result["concept_snapshot"] = {"trade_date": None, "concepts": 0, "members": 0, "status": "missing"}
         return result
     finally:
         con.close()
@@ -103,10 +175,27 @@ def render_multisource_readiness(result: dict) -> str:
              "| 数据域 | 状态 | 行数 | 最新日期 | 距 as_of 天数 | provider |", "|---|---|---:|---|---:|---|"]
     for table, item in result["tables"].items():
         age = item.get('age_days') if item.get('age_days') is not None else '-'
-        lines.append(f"| {item['label']} | {item['status']} | {item.get('rows', 0)} | {item.get('latest') or '-'} | {age} | {', '.join(item.get('providers', [])) or '-'} |")
+        display_rows = item.get('current_rows', item.get('rows', 0))
+        display_status = item.get('current_status', item['status'])
+        lines.append(f"| {item['label']} | {display_status} | {display_rows} | {item.get('latest') or '-'} | {age} | {', '.join(item.get('providers', [])) or '-'} |")
+    legacy_quote = result["tables"].get("multi_source_quote") or {}
+    executable_quote = result["tables"].get("executable_quote_snapshot") or {}
+    if legacy_quote.get("status") in {"stale", "empty", "missing"} and executable_quote.get("status") == "available":
+        lines.extend([
+            "",
+            "- `multi_source_quote` 是历史补充表，当前可执行报价以 `executable_quote_snapshot` 为准；两者不应混作同一口径。",
+        ])
     if any(item.get("status") == "unverified" for item in result["tables"].values()):
         lines.extend(["", "- 当前默认概念源为 THS：热榜接口不回显历史有效日期，`unverified` 记录只能作为抓取日快照参考，不可直接用于历史回测。",
                       "- KPL 表保留为兼容/备选源，不再作为默认概念源。"])
+    snapshot = result.get("concept_snapshot") or {}
+    if snapshot:
+        lines.extend([
+            "", "## THS current snapshot", "",
+            f"- Current snapshot: `{snapshot.get('trade_date') or '-'}`; concepts=`{snapshot.get('concepts', 0)}`, members=`{snapshot.get('members', 0)}`, status=`{snapshot.get('status', 'missing')}`.",
+            f"- Raw snapshot retained for audit: concepts=`{snapshot.get('raw_concepts', snapshot.get('concepts', 0))}`, members=`{snapshot.get('raw_members', snapshot.get('members', 0))}`; default views exclude partial/stale boards.",
+            "- Historical cumulative counts are audit-only and are not used as current completeness evidence.",
+        ])
     cp = result.get("concept_checkpoint") or {}
     if cp.get("partial"):
         lines.append(f"- THS 成分分页 checkpoint: `{cp.get('success', 0)}/{cp.get('rows', 0)} success`, partial={cp.get('partial', 0)}; anti-bot/empty pages are not complete.")

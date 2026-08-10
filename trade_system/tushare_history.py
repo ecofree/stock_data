@@ -89,7 +89,7 @@ def _pages(client: TushareRelayClient, api: str, params: dict[str, Any], fields:
 
 class TushareHistoryCollector:
     def __init__(self, db_path: str | Path, *, client: TushareRelayClient | None = None,
-                 request_timeout: int = 12, retries: int = 1,
+                 request_timeout: int = 20, retries: int = 3,
                  batch_limit: int = 5000, moneyflow_page_size: int = 1000,
                  budget_seconds: float = 300.0):
         self.db_path = str(db_path)
@@ -161,6 +161,14 @@ class TushareHistoryCollector:
             if count == 5000:
                 return False
         return True
+
+    def _next_attempt(self, dataset: str, trade_date: str) -> int:
+        row = self.store.conn.execute(
+            "SELECT attempts FROM history_fetch_checkpoint "
+            "WHERE dataset=? AND trade_date=? AND page_no=0",
+            [dataset, _iso(trade_date)],
+        ).fetchone()
+        return int((row[0] if row else 0) or 0) + 1
 
     def _bulk_replace(self, table: str, rows: list[tuple], columns: list[str], replace_on: list[str]) -> int:
         """Write a batch with one temp-table load and set-based delete/insert."""
@@ -648,15 +656,19 @@ class TushareHistoryCollector:
             raise
 
     def run(self, start_date: str, end_date: str, *, datasets: Iterable[str],
-            max_days: int | None = None, force: bool = False) -> dict[str, Any]:
+            max_days: int | None = None, force: bool = False,
+            retry_passes: int = 0, retry_delay_seconds: float = 0.0) -> dict[str, Any]:
         datasets = list(dict.fromkeys(datasets))
         dates = self.ensure_calendar(start_date, end_date)
         if max_days is not None:
             dates = dates[: max(0, int(max_days))]
-        results: list[dict[str, Any]] = []
+        results_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         if "stock_basic" in datasets and self._budget_left():
-            results.append({"dataset": "stock_basic", "trade_date": CHECKPOINT_DATE,
-                            "status": "success" if self.collect_stock_basic(force=force) else "empty"})
+            results_by_key[("stock_basic", CHECKPOINT_DATE)] = {
+                "dataset": "stock_basic",
+                "trade_date": CHECKPOINT_DATE,
+                "status": "success" if self.collect_stock_basic(force=force) else "empty",
+            }
         handlers = {
             "daily": self._collect_daily,
             "daily_basic": self._collect_daily_basic,
@@ -664,34 +676,69 @@ class TushareHistoryCollector:
             "moneyflow": self._collect_moneyflow,
             "industry_flow": self._collect_industry_flow,
         }
-        for trade_date in dates:
-            for dataset in datasets:
-                if dataset == "stock_basic" or dataset not in handlers:
-                    continue
-                if not self._budget_left():
-                    results.append({"dataset": dataset, "trade_date": trade_date, "status": "budget_exhausted"})
-                    continue
-                if self._is_done(dataset, trade_date, force):
-                    results.append({"dataset": dataset, "trade_date": trade_date, "status": "skipped"})
-                    continue
-                self._checkpoint(dataset, trade_date, "running", attempts=1)
-                try:
-                    rows = handlers[dataset](trade_date)
-                    if dataset == "moneyflow":
-                        rows = self.sync_stock_flow(trade_date)
-                    elif dataset == "industry_flow":
-                        rows = self.sync_sector_flow(trade_date)
-                    self._checkpoint(dataset, trade_date, "success", rows=rows, attempts=1)
-                    results.append({"dataset": dataset, "trade_date": trade_date, "status": "success", "rows": rows})
-                except Exception as exc:
-                    # The handlers publish inside a transaction.  Preserve the
-                    # last verified date on a network/validation failure and
-                    # make the checkpoint carry the error instead of deleting
-                    # good data from the production tables.
-                    self._checkpoint(dataset, trade_date, "error", attempts=1, error=str(exc))
-                    results.append({"dataset": dataset, "trade_date": trade_date, "status": "error", "error": str(exc)[:240]})
+        retry_keys: set[tuple[str, str]] | None = None
+        for pass_no in range(max(0, int(retry_passes)) + 1):
+            failed_keys: set[tuple[str, str]] = set()
+            for trade_date in dates:
+                for dataset in datasets:
+                    if dataset == "stock_basic" or dataset not in handlers:
+                        continue
+                    key = (dataset, _iso(trade_date))
+                    if retry_keys is not None and key not in retry_keys:
+                        continue
+                    if not self._budget_left():
+                        results_by_key[key] = {
+                            "dataset": dataset,
+                            "trade_date": trade_date,
+                            "status": "budget_exhausted",
+                        }
+                        continue
+                    if self._is_done(dataset, trade_date, force):
+                        results_by_key.setdefault(key, {
+                            "dataset": dataset,
+                            "trade_date": trade_date,
+                            "status": "skipped",
+                        })
+                        continue
+                    attempt = self._next_attempt(dataset, trade_date)
+                    self._checkpoint(dataset, trade_date, "running", attempts=attempt)
+                    try:
+                        rows = handlers[dataset](trade_date)
+                        if dataset == "moneyflow":
+                            rows = self.sync_stock_flow(trade_date)
+                        elif dataset == "industry_flow":
+                            rows = self.sync_sector_flow(trade_date)
+                        self._checkpoint(dataset, trade_date, "success", rows=rows, attempts=attempt)
+                        results_by_key[key] = {
+                            "dataset": dataset,
+                            "trade_date": trade_date,
+                            "status": "success",
+                            "rows": rows,
+                        }
+                    except Exception as exc:
+                        # The handlers publish inside a transaction.  Preserve the
+                        # last verified date on a network/validation failure and
+                        # make the checkpoint carry the error instead of deleting
+                        # good data from the production tables.
+                        self._checkpoint(dataset, trade_date, "error", attempts=attempt, error=str(exc))
+                        results_by_key[key] = {
+                            "dataset": dataset,
+                            "trade_date": trade_date,
+                            "status": "error",
+                            "error": str(exc)[:240],
+                        }
+                        failed_keys.add(key)
+            if not failed_keys or pass_no >= max(0, int(retry_passes)):
+                break
+            retry_keys = failed_keys
+            delay = max(0.0, float(retry_delay_seconds)) * (pass_no + 1)
+            remaining = self.budget_seconds - (time.monotonic() - self.started)
+            if remaining <= 1.0:
+                break
+            if delay:
+                time.sleep(min(delay, max(0.0, remaining - 1.0)))
         return {"start_date": _iso(start_date), "end_date": _iso(end_date), "dates": dates,
-                "datasets": datasets, "results": results,
+                "datasets": datasets, "results": list(results_by_key.values()),
                 "elapsed_seconds": round(time.monotonic() - self.started, 3)}
 
 

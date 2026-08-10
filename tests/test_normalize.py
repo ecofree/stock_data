@@ -1,3 +1,5 @@
+import datetime
+
 import duckdb
 
 from trade_system.normalize import build_normalized_views
@@ -52,5 +54,34 @@ def test_market_fallback_flag_survives_normalized_views(tmp_path):
         assert con.execute(
             "SELECT is_fallback FROM v_market_state_inputs"
         ).fetchone()[0] is True
+    finally:
+        con.close()
+
+
+def test_verified_secondary_market_state_keeps_freshness_and_is_not_fallback(
+    tmp_path,
+):
+    db_path = tmp_path / "secondary-market.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE daily_summary("
+        "date DATE,limit_up_count INTEGER,limit_down_count INTEGER,"
+        "rise_count INTEGER,fall_count INTEGER,consecutive_count INTEGER,"
+        "raw_json VARCHAR,fetched_at TIMESTAMP,source_kind VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO daily_summary VALUES "
+        "('2026-07-31',100,2,4000,1200,NULL,'{}',"
+        "'2026-07-31 13:00:00','secondary_verified')"
+    )
+    con.close()
+
+    build_normalized_views(str(db_path))
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT is_fallback,fetched_at FROM v_market_state_inputs"
+        ).fetchone() == (False, datetime.datetime(2026, 7, 31, 13, 0))
     finally:
         con.close()

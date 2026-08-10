@@ -8,6 +8,11 @@ import duckdb
 
 from trade_system.quality import table_columns
 
+try:
+    from base import connect_duckdb
+except Exception:  # pragma: no cover - test isolation without project root
+    connect_duckdb = None  # type: ignore
+
 
 DATA_CHAINS = [
     {
@@ -23,9 +28,11 @@ DATA_CHAINS = [
         "why": "验证板块强度是否有资金推动。",
     },
     {
+        # Prefer the normalized / TuShare path; physical KPL ``kline`` often
+        # stalls while v_kline_daily is current.
         "chain": "基础K线",
-        "required": ["v_kline_daily", "tushare_daily", "kline"],
-        "fallback": ["advanced_gujia_kline", "advanced_dadan_kline"],
+        "required": ["v_kline_daily", "tushare_daily"],
+        "fallback": ["kline", "advanced_gujia_kline", "advanced_dadan_kline"],
         "why": "用于回测、趋势过滤、候选股风险确认。",
     },
     {
@@ -75,7 +82,10 @@ def _object_row_counts(
     for name in names:
         try:
             columns = set(table_columns(con, name))
-            date_column = next((column for column in ("trade_date", "date") if column in columns), None)
+            date_column = next(
+                (column for column in ("trade_date", "date", "source_date") if column in columns),
+                None,
+            )
             if date_column:
                 latest = con.execute(
                     f'SELECT max(CAST("{date_column}" AS VARCHAR)) FROM "{name}"'
@@ -97,7 +107,10 @@ def _object_row_counts(
 
 
 def assess_data_chains(db_path: str | Path, trade_date: str | None = None) -> list[dict]:
-    con = duckdb.connect(str(db_path), read_only=True)
+    if connect_duckdb is not None:
+        con = connect_duckdb(str(db_path), read_only=True)
+    else:
+        con = duckdb.connect(str(db_path), read_only=True)
     try:
         existing = _table_or_view_names(con)
         row_counts, latest_dates = _object_row_counts(con, existing, trade_date)
@@ -111,8 +124,31 @@ def assess_data_chains(db_path: str | Path, trade_date: str | None = None) -> li
         required_existing_empty = [
             name for name in chain["required"] if name in existing and row_counts.get(name, 0) == 0
         ]
-        if required_present:
+        # Same-date stale: relation has history but zero rows for trade_date.
+        if trade_date and not required_present and not fallback_present:
+            any_history = any(
+                latest_dates.get(name)
+                for name in chain["required"] + chain["fallback"]
+            )
+            if any_history:
+                status = "stale"
+            else:
+                status = "missing"
+        elif required_present:
             status = "available"
+            # If caller asked for a trade date and only older dates exist on
+            # required sources, mark stale even when total row counts are >0
+            # (when trade_date filter already applied, required_present is empty).
+            if trade_date:
+                same_day = [
+                    name
+                    for name in required_present
+                    if (latest_dates.get(name) or "")[:10] >= str(trade_date)[:10]
+                    or row_counts.get(name, 0) > 0
+                ]
+                # row_counts already scoped to trade_date when provided.
+                if not same_day and not any(row_counts.get(n, 0) > 0 for n in required_present):
+                    status = "stale"
         elif fallback_present:
             status = "fallback"
         elif trade_date and any(latest_dates.get(name) for name in chain["required"] + chain["fallback"]):

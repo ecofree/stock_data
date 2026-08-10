@@ -91,10 +91,30 @@ def _response_matches_trade_date(data, date: str) -> bool:
 
 def collect_l2_stock_intraday(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
     total = 0
+    empty_streak = 0
     for code in stock_codes:
+        # Endpoint already cooling: do not walk the rest of the universe.
+        cooldown_until = getattr(client, "_cooldown_until", {}).get("/l2/stock-intraday")
+        if cooldown_until and cooldown_until > __import__("time").time():
+            logger.info(
+                "L2 stock-intraday in cooldown after empty streak; "
+                "stopping early (%s codes remaining)",
+                max(0, len(stock_codes) - stock_codes.index(code)),
+            )
+            break
         data = client.get("/l2/stock-intraday", {"code": code, "date": date})
         if not data or not _response_matches_trade_date(data, date):
+            empty_streak += 1
+            # Two consecutive empties → let the caller fall back (trends2)
+            # instead of burning the host budget on a dead route.
+            if empty_streak >= 2:
+                logger.info(
+                    "L2 stock-intraday empty for %s consecutive codes; early stop",
+                    empty_streak,
+                )
+                break
             continue
+        empty_streak = 0
         intraday = data if isinstance(data, list) else data.get("data", data.get("intraday", []))
         rows = []
         for pt in intraday:
@@ -120,6 +140,10 @@ def collect_l2_stock_intraday(client: KPLClient, store: DuckDBStore, date: str, 
             n = store.insert_rows("l2_stock_intraday", rows,
                 ["date", "stock_code", "time", "price", "avg_price", "volume", "turnover", "main_fund_net"])
             total += n
+        else:
+            empty_streak += 1
+            if empty_streak >= 2:
+                break
     if total:
         store.log_collect("l2_stock_intraday", "/l2/stock-intraday", total, "ok")
     return total

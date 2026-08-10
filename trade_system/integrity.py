@@ -25,6 +25,11 @@ DEDUPE_SPECS = (
     ("trade_plan", ("trade_date", "stock_code"), "created_at"),
     ("risk_snapshot", ("trade_date",), "created_at"),
     ("portfolio_snapshot", ("trade_date", "snapshot_time", "stock_code"), "created_at"),
+    (
+        "ths_concept_stock_history",
+        ("trade_date", "concept_code", "stock_code"),
+        "fetched_at",
+    ),
 )
 
 UNIQUE_INDEX_SPECS = (
@@ -45,6 +50,11 @@ UNIQUE_INDEX_SPECS = (
         "uq_portfolio_snapshot_business",
         "portfolio_snapshot",
         ("trade_date", "snapshot_time", "stock_code"),
+    ),
+    (
+        "uq_ths_concept_member_business",
+        "ths_concept_stock_history",
+        ("trade_date", "concept_code", "stock_code"),
     ),
 )
 
@@ -72,6 +82,137 @@ def normalize_kline_periods(db_path: str | Path) -> dict[str, int]:
     return changed
 
 
+def normalize_ths_member_codes(
+    db_path: str | Path,
+    *,
+    dry_run: bool = False,
+) -> dict[str, int | str]:
+    """Normalize THS member codes before the common business-key dedupe.
+
+    Historical snapshots mixed bare codes with ``.SZ/.SH/.BJ`` suffixes.  Rows
+    that collapse onto the same normalized key are archived and removed in one
+    transaction before the surviving codes are updated.  Current collectors
+    already write bare codes, so subsequent close runs are a cheap no-op.
+    """
+    con = duckdb.connect(str(db_path), read_only=dry_run)
+    try:
+        if not table_exists(con, "ths_concept_stock_history"):
+            return {
+                "status": "missing_table",
+                "suffixed_rows": 0,
+                "duplicate_groups": 0,
+                "removed_rows": 0,
+                "normalized_rows": 0,
+            }
+        required = {"trade_date", "concept_code", "stock_code"}
+        if not required <= set(table_columns(con, "ths_concept_stock_history")):
+            return {
+                "status": "missing_columns",
+                "suffixed_rows": 0,
+                "duplicate_groups": 0,
+                "removed_rows": 0,
+                "normalized_rows": 0,
+            }
+
+        suffix_sql = (
+            "regexp_replace(trim(CAST(stock_code AS VARCHAR)), "
+            "'(?i)[.][A-Z]+$', '')"
+        )
+        suffixed_rows = int(
+            con.execute(
+                "SELECT count(*) FROM ths_concept_stock_history "
+                "WHERE regexp_matches(trim(CAST(stock_code AS VARCHAR)), "
+                "'(?i)^[0-9]{6}[.][A-Z]+$')"
+            ).fetchone()[0]
+        )
+        duplicate_groups = int(
+            con.execute(
+                "SELECT count(*) FROM ("
+                "SELECT trade_date, concept_code, "
+                f"{suffix_sql} AS normalized_code, count(*) AS n "
+                "FROM ths_concept_stock_history "
+                "GROUP BY 1,2,3 HAVING count(*) > 1)"
+            ).fetchone()[0]
+        )
+        if dry_run or (suffixed_rows == 0 and duplicate_groups == 0):
+            return {
+                "status": "dry_run" if dry_run else "ok",
+                "suffixed_rows": suffixed_rows,
+                "duplicate_groups": duplicate_groups,
+                "removed_rows": 0,
+                "normalized_rows": 0,
+            }
+
+        columns = set(table_columns(con, "ths_concept_stock_history"))
+        order_sql = (
+            "fetched_at DESC NULLS LAST, rowid DESC"
+            if "fetched_at" in columns
+            else "rowid DESC"
+        )
+        con.execute("BEGIN")
+        try:
+            con.execute("DROP TABLE IF EXISTS _ths_member_normalize_rank")
+            con.execute(
+                "CREATE TEMP TABLE _ths_member_normalize_rank AS "
+                "SELECT rowid AS source_rowid, "
+                f"{suffix_sql} AS normalized_code, "
+                "row_number() OVER ("
+                "PARTITION BY trade_date, concept_code, "
+                f"{suffix_sql} ORDER BY {order_sql}) AS rn "
+                "FROM ths_concept_stock_history"
+            )
+            removed_rows = int(
+                con.execute(
+                    "SELECT count(*) FROM _ths_member_normalize_rank WHERE rn > 1"
+                ).fetchone()[0]
+            )
+            if removed_rows:
+                con.execute(
+                    "CREATE TABLE IF NOT EXISTS "
+                    "_dedupe_archive_ths_concept_stock_history AS "
+                    "SELECT *, current_timestamp AS archived_at "
+                    "FROM ths_concept_stock_history WHERE false"
+                )
+                con.execute(
+                    "INSERT INTO _dedupe_archive_ths_concept_stock_history "
+                    "SELECT h.*, current_timestamp AS archived_at "
+                    "FROM ths_concept_stock_history h "
+                    "JOIN _ths_member_normalize_rank r "
+                    "ON h.rowid=r.source_rowid WHERE r.rn > 1"
+                )
+                con.execute(
+                    "DELETE FROM ths_concept_stock_history WHERE rowid IN ("
+                    "SELECT source_rowid FROM _ths_member_normalize_rank WHERE rn > 1)"
+                )
+            con.execute(
+                "UPDATE ths_concept_stock_history "
+                f"SET stock_code={suffix_sql} "
+                "WHERE regexp_matches(trim(CAST(stock_code AS VARCHAR)), "
+                "'(?i)^[0-9]{6}[.][A-Z]+$')"
+            )
+            if table_exists(con, "ths_concept_daily"):
+                con.execute(
+                    "UPDATE ths_concept_daily SET stock_count=("
+                    "SELECT count(DISTINCT h.stock_code) "
+                    "FROM ths_concept_stock_history h "
+                    "WHERE h.trade_date=ths_concept_daily.trade_date "
+                    "AND h.concept_code=ths_concept_daily.concept_code)"
+                )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        return {
+            "status": "ok",
+            "suffixed_rows": suffixed_rows,
+            "duplicate_groups": duplicate_groups,
+            "removed_rows": removed_rows,
+            "normalized_rows": suffixed_rows - removed_rows,
+        }
+    finally:
+        con.close()
+
+
 def ensure_unique_indexes(db_path: str | Path) -> list[str]:
     con = duckdb.connect(str(db_path))
     created: list[str] = []
@@ -94,6 +235,7 @@ def ensure_unique_indexes(db_path: str | Path) -> list[str]:
 
 def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dict:
     normalized = {} if dry_run else normalize_kline_periods(db_path)
+    ths_member_codes = normalize_ths_member_codes(db_path, dry_run=dry_run)
     repairs = []
     for table, keys, order_column in DEDUPE_SPECS:
         result = dedupe_table(
@@ -140,6 +282,7 @@ def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dic
     return {
         "dry_run": dry_run,
         "normalized_ktype_rows": normalized,
+        "ths_member_codes": ths_member_codes,
         "repairs": repairs,
         "plan_rows_blocked": plan_rows_blocked,
         "unique_indexes": indexes,

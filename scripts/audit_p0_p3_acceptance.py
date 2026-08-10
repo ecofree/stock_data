@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import subprocess
@@ -23,6 +24,14 @@ def _count(con: duckdb.DuckDBPyConnection, sql: str, params: list | None = None)
         return 0
 
 
+def _normalize_trade_date(value: str) -> str:
+    """Accept both CLI YYYYMMDD and storage YYYY-MM-DD forms."""
+    raw = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(raw) == 8:
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return str(value)[:10]
+
+
 def _fetchone(con: duckdb.DuckDBPyConnection, sql: str, params: list | None = None):
     try:
         return con.execute(sql, params or []).fetchone()
@@ -36,7 +45,9 @@ def audit(
     reports_dir: str | Path = "reports",
     *,
     max_age_seconds: int = 600,
+    now: datetime | None = None,
 ) -> dict:
+    trade_date = _normalize_trade_date(trade_date)
     root = Path(reports_dir)
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -91,6 +102,9 @@ def audit(
         scheduler = {name: None for name in ("StockData-Auction", "StockData-Intraday", "StockData-DailyClose")}
     report = {
         "trade_date": trade_date,
+        # Keep historical audits unambiguous: when omitted, freshness is
+        # evaluated at runtime; when supplied, this is the exact audit clock.
+        "as_of": now.isoformat() if now is not None else None,
         "p0": {
             "stock_batch": dict(zip(("expected_rows", "fetched_rows", "coverage_pct", "status", "updated_at"), stock_batch or (0, 0, 0, "missing", None))),
             "sector_batch": dict(zip(("expected_rows", "fetched_rows", "coverage_pct", "status", "updated_at"), sector_batch or (0, 0, 0, "missing", None))),
@@ -129,12 +143,14 @@ def audit(
         trade_date,
         min_coverage_pct=99.5,
         max_age_seconds=max_age_seconds,
+        now=now,
     )
     data_readiness = assess_trade_date_readiness(
         db_path,
         trade_date,
         "intraday",
         max_age_seconds=max_age_seconds,
+        now=now,
     )
     report["p0"]["flow_health"] = flow_health
     report["p0"]["data_readiness"] = data_readiness
@@ -152,7 +168,8 @@ def audit(
 
 
 def render(report: dict) -> str:
-    lines = ["# P0-P3 Acceptance", "", f"- Trade date: `{report['trade_date']}`", f"- Manual-use ready: `{str(report['ready_for_manual_use']).lower()}`", "", "```json", json.dumps(report, ensure_ascii=False, indent=2, default=str), "```", ""]
+    as_of = report.get("as_of") or "runtime clock"
+    lines = ["# P0-P3 Acceptance", "", f"- Trade date: `{report['trade_date']}`", f"- As of: `{as_of}`", f"- Manual-use ready: `{str(report['ready_for_manual_use']).lower()}`", "", "```json", json.dumps(report, ensure_ascii=False, indent=2, default=str), "```", ""]
     return "\n".join(lines)
 
 
@@ -162,9 +179,20 @@ def main() -> int:
     parser.add_argument("--date", required=True)
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument("--max-age-seconds", type=int, default=600)
+    parser.add_argument(
+        "--as-of",
+        default="",
+        help="Evaluate freshness at this ISO timestamp for audited recovery runs.",
+    )
     parser.add_argument("--out", default="reports/p0_p3_acceptance_latest.md")
     args = parser.parse_args()
-    result = audit(args.db, args.date, args.reports_dir, max_age_seconds=args.max_age_seconds)
+    result = audit(
+        args.db,
+        args.date,
+        args.reports_dir,
+        max_age_seconds=args.max_age_seconds,
+        now=datetime.fromisoformat(args.as_of) if args.as_of else None,
+    )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(result), encoding="utf-8")

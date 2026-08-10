@@ -169,6 +169,31 @@ def import_operator_trade_outcomes(
             if _text(row.get("trade_date")) and _text(row.get("stock_code"))
         ]
 
+    # The exported template deliberately contains review placeholders.  Do
+    # not let an untouched template create fake performance rows or move a
+    # plan to ``review_required`` while the operator has supplied no result.
+    # Validation happens before opening the write connection, so a mixed CSV
+    # cannot partially import before the first unreviewed row is discovered.
+    unreviewed = [
+        f"{row['trade_date']}:{row['stock_code']}"
+        for row in rows
+        if row["execution_status"] == "review_required"
+        or (
+            row["execution_status"] == "executed"
+            and (
+                row["outcome_tag"].lower() in {"", "unclassified", "review_required"}
+                or row["mistake_tag"].lower() in {"", "unreviewed", "review_required"}
+            )
+        )
+    ]
+    if unreviewed:
+        sample = ", ".join(unreviewed[:5])
+        suffix = "..." if len(unreviewed) > 5 else ""
+        raise ValueError(
+            "operator outcome CSV still contains unreviewed rows; "
+            f"fill execution_status/outcome_tag/mistake_tag before import: {sample}{suffix}"
+        )
+
     con = duckdb.connect(str(db_path))
     try:
         rows_imported = 0

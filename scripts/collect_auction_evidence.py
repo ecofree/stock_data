@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from base import DuckDBStore, KPLClient
-from collect_misc import collect_auction_bidding_anomaly, collect_auction_tick
+from collect_misc import collect_auction_tick
 from config import API_KEY, TODAY
 from schema import init_schema
 from trade_system.api_health import require_api_key
@@ -258,7 +258,13 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
         store = DuckDBStore(db_path)
         init_schema(store.conn)
         tick_rows = collect_auction_tick(client, store, trade_date, codes)
-        anomaly_rows = collect_auction_bidding_anomaly(client, store, trade_date, codes)
+        # Anomaly collection moved to the close phase
+        # (scripts/collect_auction_anomaly_daily.py): the KPL endpoint ignores
+        # the requested date and always returns the latest trading day, so
+        # inside the 08:25-09:35 window its payload carries the previous day's
+        # date and semantic validation rejects every call.  Querying it here
+        # only burned the morning API budget.
+        anomaly_rows = 0
         quote_rows = _collect_tencent_auction_quotes(store.conn, trade_date, codes)
         store.close()
         result.update({

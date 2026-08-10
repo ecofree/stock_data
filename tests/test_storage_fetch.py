@@ -1,5 +1,6 @@
 from base import DuckDBStore
 from fetch_all import should_collect_finance
+import pytest
 
 
 def test_insert_rows_can_replace_existing_key_rows(tmp_path):
@@ -20,6 +21,27 @@ def test_insert_rows_can_replace_existing_key_rows(tmp_path):
     rows = store.fetchall("SELECT date, rise_count FROM market_mood")
     store.close()
     assert rows == [("2026-07-06", "2")]
+
+
+def test_insert_rows_failure_does_not_report_or_persist_partial_batch(tmp_path):
+    db_path = tmp_path / "atomic.duckdb"
+    store = DuckDBStore(str(db_path))
+    store.execute("CREATE TABLE guarded(value INTEGER CHECK(value > 0))")
+    with pytest.raises(Exception):
+        store.insert_rows("guarded", [(1,), (-1,)], ["value"])
+    assert store.fetchall("SELECT * FROM guarded") == []
+    store.close()
+
+
+def test_insert_rows_respects_caller_transaction(tmp_path):
+    db_path = tmp_path / "nested.duckdb"
+    store = DuckDBStore(str(db_path))
+    store.execute("CREATE TABLE nested(value INTEGER)")
+    store.execute("BEGIN TRANSACTION")
+    store.insert_rows("nested", [(1,), (2,)], ["value"])
+    store.execute("COMMIT")
+    assert store.fetchall("SELECT value FROM nested ORDER BY value") == [(1,), (2,)]
+    store.close()
 
 
 def test_should_collect_finance_requires_collector_and_flag():

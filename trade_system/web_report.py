@@ -11,7 +11,14 @@ import duckdb
 
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.data_chain import assess_data_chains
+from trade_system.flow_ranking import sector_flow_rank_sql, stock_flow_rank_sql
 from trade_system.quality import table_exists
+from trade_system.readiness import assess_trade_date_readiness
+
+try:
+    from base import connect_duckdb
+except Exception:  # pragma: no cover
+    connect_duckdb = None  # type: ignore
 
 
 COUNT_RELATIONS = [
@@ -85,6 +92,71 @@ def _safe_count(con: duckdb.DuckDBPyConnection, relation_name: str) -> int:
         return int(con.execute(f'SELECT count(*) FROM "{relation_name}"').fetchone()[0])
     except Exception:
         return 0
+
+
+def _safe_same_date_count(
+    con: duckdb.DuckDBPyConnection,
+    relation_name: str,
+    trade_date: str | None,
+) -> dict[str, Any]:
+    """Return total + same-date row counts and the latest date for a relation."""
+    total = _safe_count(con, relation_name)
+    result: dict[str, Any] = {
+        "relation": relation_name,
+        "total": total,
+        "same_date": None,
+        "latest": "",
+    }
+    if not trade_date or total <= 0:
+        # still try latest
+        try:
+            cols = {
+                row[1]
+                for row in con.execute(f'PRAGMA table_info("{relation_name}")').fetchall()
+            }
+        except Exception:
+            cols = set()
+        date_col = next(
+            (c for c in ("trade_date", "date", "source_date") if c in cols), None
+        )
+        if date_col:
+            try:
+                latest = con.execute(
+                    f'SELECT max(CAST("{date_col}" AS VARCHAR)) FROM "{relation_name}"'
+                ).fetchone()[0]
+                result["latest"] = str(latest)[:10] if latest else ""
+            except Exception:
+                pass
+        return result
+    try:
+        cols = {
+            row[1]
+            for row in con.execute(f'PRAGMA table_info("{relation_name}")').fetchall()
+        }
+    except Exception:
+        # views may not support pragma table_info the same way
+        cols = set()
+        try:
+            sample = con.execute(f'SELECT * FROM "{relation_name}" LIMIT 0')
+            cols = {d[0] for d in sample.description}
+        except Exception:
+            return result
+    date_col = next((c for c in ("trade_date", "date", "source_date") if c in cols), None)
+    if not date_col:
+        return result
+    try:
+        same = con.execute(
+            f'SELECT count(*) FROM "{relation_name}" WHERE CAST("{date_col}" AS VARCHAR)=?',
+            [str(trade_date)[:10]],
+        ).fetchone()[0]
+        latest = con.execute(
+            f'SELECT max(CAST("{date_col}" AS VARCHAR)) FROM "{relation_name}"'
+        ).fetchone()[0]
+        result["same_date"] = int(same or 0)
+        result["latest"] = str(latest)[:10] if latest else ""
+    except Exception:
+        pass
+    return result
 
 
 def _source_rows(con: duckdb.DuckDBPyConnection, view_name: str) -> list[dict]:
@@ -244,8 +316,24 @@ def _latest_rows(con: duckdb.DuckDBPyConnection, table_name: str, order_column: 
         return []
 
 
-def _operator_candidates(con: duckdb.DuckDBPyConnection, limit: int = 30) -> list[dict]:
+def _operator_candidates(
+    con: duckdb.DuckDBPyConnection,
+    limit: int = 30,
+    trade_date: str | None = None,
+) -> list[dict]:
     try:
+        if trade_date:
+            return _fetch_dicts(
+                con,
+                f"""
+                SELECT trade_date, stage, stock_code, stock_name, score, decision, data_origin
+                FROM v_operator_candidates
+                WHERE CAST(trade_date AS VARCHAR)=?
+                ORDER BY score DESC NULLS LAST, stock_code
+                LIMIT {int(limit)}
+                """,
+                [str(trade_date)[:10]],
+            )
         return _fetch_dicts(
             con,
             f"""
@@ -259,8 +347,23 @@ def _operator_candidates(con: duckdb.DuckDBPyConnection, limit: int = 30) -> lis
         return []
 
 
-def _operator_origin_stats(con: duckdb.DuckDBPyConnection) -> list[dict]:
+def _operator_origin_stats(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: str | None = None,
+) -> list[dict]:
     try:
+        if trade_date:
+            return _fetch_dicts(
+                con,
+                """
+                SELECT data_origin, count(*) AS count
+                FROM v_operator_candidates
+                WHERE CAST(trade_date AS VARCHAR)=?
+                GROUP BY 1
+                ORDER BY 1
+                """,
+                [str(trade_date)[:10]],
+            )
         return _fetch_dicts(
             con,
             """
@@ -274,8 +377,24 @@ def _operator_origin_stats(con: duckdb.DuckDBPyConnection) -> list[dict]:
         return []
 
 
-def _strategy_candidates(con: duckdb.DuckDBPyConnection, limit: int = 30) -> list[dict]:
+def _strategy_candidates(
+    con: duckdb.DuckDBPyConnection,
+    limit: int = 30,
+    trade_date: str | None = None,
+) -> list[dict]:
     try:
+        if trade_date:
+            return _fetch_dicts(
+                con,
+                f"""
+                SELECT trade_date, stage, symbol, stock_name, score, selected_reason, risk_points, invalid_conditions
+                FROM strategy_scan_result
+                WHERE CAST(trade_date AS VARCHAR)=?
+                ORDER BY score DESC NULLS LAST, symbol
+                LIMIT {int(limit)}
+                """,
+                [str(trade_date)[:10]],
+            )
         return _fetch_dicts(
             con,
             f"""
@@ -289,13 +408,31 @@ def _strategy_candidates(con: duckdb.DuckDBPyConnection, limit: int = 30) -> lis
         return []
 
 
-def _research_context(con: duckdb.DuckDBPyConnection, limit: int = 20) -> list[dict]:
+def _research_context(
+    con: duckdb.DuckDBPyConnection,
+    limit: int = 20,
+    trade_date: str | None = None,
+) -> list[dict]:
     try:
+        if trade_date:
+            return _fetch_dicts(
+                con,
+                f"""
+                SELECT context_type, context_date, symbol, sector, title, summary, ref_id
+                FROM v_operator_research_context
+                WHERE CAST(context_date AS VARCHAR)=?
+                  AND coalesce(title, '') NOT LIKE '%interview count 0%'
+                ORDER BY context_type, title
+                LIMIT {int(limit)}
+                """,
+                [str(trade_date)[:10]],
+            )
         return _fetch_dicts(
             con,
             f"""
             SELECT context_type, context_date, symbol, sector, title, summary, ref_id
             FROM v_operator_research_context
+            WHERE coalesce(title, '') NOT LIKE '%interview count 0%'
             ORDER BY context_date DESC NULLS LAST, context_type, title
             LIMIT {int(limit)}
             """,
@@ -348,10 +485,27 @@ def _latest_relation_date(con: duckdb.DuckDBPyConnection, relation: str, date_co
         return ""
 
 
-def _capital_flow_snapshot(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-    """Return a compact, source-aware snapshot for the operator dashboard."""
+def _capital_flow_snapshot(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: str | None = None,
+) -> dict[str, Any]:
+    """Return a compact, source-aware snapshot for the operator dashboard.
+
+    Rankings use one canonical row per code (provider priority) and exclude
+    mega/index membership baskets that drown out tradeable themes.
+    """
     stock = []
     sector = []
+    # Resolve the effective flow date: prefer the requested trade date.
+    effective_date = str(trade_date)[:10] if trade_date else ""
+    if not effective_date and table_exists(con, "multi_source_stock_flow"):
+        try:
+            effective_date = str(
+                con.execute("SELECT max(source_date) FROM multi_source_stock_flow").fetchone()[0] or ""
+            )[:10]
+        except Exception:
+            effective_date = ""
+
     for relation, date_column, code_column in (
         ("multi_source_stock_flow", "source_date", "stock_code"),
         ("advanced_zjmm_min", "date", "stock_code"),
@@ -359,12 +513,25 @@ def _capital_flow_snapshot(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         if not table_exists(con, relation):
             continue
         try:
-            row = con.execute(
-                f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
-                f"FROM {relation} WHERE {date_column}=(SELECT max({date_column}) FROM {relation})"
-            ).fetchone()
-            stock.append({"relation": relation, "latest": str(row[0])[:10] if row[0] else "",
-                          "rows": int(row[1] or 0), "codes": int(row[2] or 0)})
+            if effective_date:
+                row = con.execute(
+                    f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
+                    f"FROM {relation} WHERE CAST({date_column} AS VARCHAR)=?",
+                    [effective_date],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
+                    f"FROM {relation} WHERE {date_column}=(SELECT max({date_column}) FROM {relation})"
+                ).fetchone()
+            stock.append(
+                {
+                    "relation": relation,
+                    "latest": str(row[0])[:10] if row[0] else "",
+                    "rows": int(row[1] or 0),
+                    "codes": int(row[2] or 0),
+                }
+            )
         except Exception:
             continue
     for relation, date_column, code_column in (
@@ -374,67 +541,80 @@ def _capital_flow_snapshot(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         if not table_exists(con, relation):
             continue
         try:
-            row = con.execute(
-                f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
-                f"FROM {relation} WHERE {date_column}=(SELECT max({date_column}) FROM {relation})"
-            ).fetchone()
-            sector.append({"relation": relation, "latest": str(row[0])[:10] if row[0] else "",
-                           "rows": int(row[1] or 0), "codes": int(row[2] or 0)})
+            if effective_date:
+                row = con.execute(
+                    f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
+                    f"FROM {relation} WHERE CAST({date_column} AS VARCHAR)=?",
+                    [effective_date],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    f"SELECT max({date_column}), count(*), count(DISTINCT {code_column}) "
+                    f"FROM {relation} WHERE {date_column}=(SELECT max({date_column}) FROM {relation})"
+                ).fetchone()
+            sector.append(
+                {
+                    "relation": relation,
+                    "latest": str(row[0])[:10] if row[0] else "",
+                    "rows": int(row[1] or 0),
+                    "codes": int(row[2] or 0),
+                }
+            )
         except Exception:
             continue
 
-    stock_top = []
-    stock_bottom = []
-    if table_exists(con, "multi_source_stock_flow"):
+    stock_top: list[dict] = []
+    stock_bottom: list[dict] = []
+    if table_exists(con, "multi_source_stock_flow") and effective_date:
         try:
+            ranked = stock_flow_rank_sql()
             stock_top = _fetch_dicts(
                 con,
-                """
+                f"""
                 SELECT source_date, stock_code, main_net, provider, fetched_at, is_stale
-                FROM multi_source_stock_flow
-                WHERE source_date=(SELECT max(source_date) FROM multi_source_stock_flow)
+                FROM ({ranked})
                 ORDER BY main_net DESC NULLS LAST
                 LIMIT 20
                 """,
+                [effective_date],
             )
             stock_bottom = _fetch_dicts(
                 con,
-                """
+                f"""
                 SELECT source_date, stock_code, main_net, provider, fetched_at, is_stale
-                FROM multi_source_stock_flow
-                WHERE source_date=(SELECT max(source_date) FROM multi_source_stock_flow)
+                FROM ({ranked})
                 ORDER BY main_net ASC NULLS LAST
                 LIMIT 20
                 """,
+                [effective_date],
             )
         except Exception:
             stock_top = []
             stock_bottom = []
-    sector_top = []
-    sector_bottom = []
-    if table_exists(con, "multi_source_sector_flow"):
+    sector_top: list[dict] = []
+    sector_bottom: list[dict] = []
+    if table_exists(con, "multi_source_sector_flow") and effective_date:
         try:
+            ranked = sector_flow_rank_sql(exclude_mega=True)
             sector_top = _fetch_dicts(
                 con,
-                """
+                f"""
                 SELECT source_date, sector_code, sector_name, main_net, provider, fetched_at, is_stale
-                FROM multi_source_sector_flow
-                WHERE source_date=(SELECT max(source_date) FROM multi_source_sector_flow)
-                  AND sector_type IN ('ths_concept','ths_concept_derived')
+                FROM ({ranked})
                 ORDER BY main_net DESC NULLS LAST
                 LIMIT 20
                 """,
+                [effective_date],
             )
             sector_bottom = _fetch_dicts(
                 con,
-                """
+                f"""
                 SELECT source_date, sector_code, sector_name, main_net, provider, fetched_at, is_stale
-                FROM multi_source_sector_flow
-                WHERE source_date=(SELECT max(source_date) FROM multi_source_sector_flow)
-                  AND sector_type IN ('ths_concept','ths_concept_derived')
+                FROM ({ranked})
                 ORDER BY main_net ASC NULLS LAST
                 LIMIT 20
                 """,
+                [effective_date],
             )
         except Exception:
             sector_top = []
@@ -442,74 +622,169 @@ def _capital_flow_snapshot(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     batch = {}
     if table_exists(con, "intraday_stock_flow_batch"):
         try:
-            row = con.execute(
-                "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
-                "FROM intraday_stock_flow_batch ORDER BY trade_date DESC LIMIT 1"
-            ).fetchone()
+            if effective_date:
+                row = con.execute(
+                    "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
+                    "FROM intraday_stock_flow_batch WHERE CAST(trade_date AS VARCHAR)=? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    [effective_date],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
+                    "FROM intraday_stock_flow_batch ORDER BY trade_date DESC LIMIT 1"
+                ).fetchone()
             if row:
-                batch = {"trade_date": str(row[0])[:10], "provider": row[1],
-                         "expected_rows": int(row[2] or 0), "fetched_rows": int(row[3] or 0),
-                         "coverage_pct": float(row[4] or 0), "status": row[5],
-                         "updated_at": str(row[6]) if row[6] else "", "last_error": row[7] or ""}
+                batch = {
+                    "trade_date": str(row[0])[:10],
+                    "provider": row[1],
+                    "expected_rows": int(row[2] or 0),
+                    "fetched_rows": int(row[3] or 0),
+                    "coverage_pct": float(row[4] or 0),
+                    "status": row[5],
+                    "updated_at": str(row[6]) if row[6] else "",
+                    "last_error": row[7] or "",
+                }
         except Exception:
             batch = {}
     sector_batch = {}
     if table_exists(con, "intraday_sector_flow_batch"):
         try:
-            row = con.execute(
-                "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
-                "FROM intraday_sector_flow_batch ORDER BY trade_date DESC LIMIT 1"
-            ).fetchone()
+            if effective_date:
+                row = con.execute(
+                    "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
+                    "FROM intraday_sector_flow_batch WHERE CAST(trade_date AS VARCHAR)=? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    [effective_date],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at,last_error "
+                    "FROM intraday_sector_flow_batch ORDER BY trade_date DESC LIMIT 1"
+                ).fetchone()
             if row:
-                sector_batch = {"trade_date": str(row[0])[:10], "provider": row[1],
-                                "expected_rows": int(row[2] or 0), "fetched_rows": int(row[3] or 0),
-                                "coverage_pct": float(row[4] or 0), "status": row[5],
-                                "updated_at": str(row[6]) if row[6] else "", "last_error": row[7] or ""}
+                sector_batch = {
+                    "trade_date": str(row[0])[:10],
+                    "provider": row[1],
+                    "expected_rows": int(row[2] or 0),
+                    "fetched_rows": int(row[3] or 0),
+                    "coverage_pct": float(row[4] or 0),
+                    "status": row[5],
+                    "updated_at": str(row[6]) if row[6] else "",
+                    "last_error": row[7] or "",
+                }
         except Exception:
             sector_batch = {}
     candidate_pool = {}
     if table_exists(con, "realtime_candidate_pool_snapshot"):
         try:
-            row = con.execute(
-                "SELECT trade_date,source,row_count,stock_count,status,fetched_at,error "
-                "FROM realtime_candidate_pool_snapshot ORDER BY trade_date DESC LIMIT 1"
-            ).fetchone()
+            if effective_date:
+                row = con.execute(
+                    "SELECT trade_date,source,row_count,stock_count,status,fetched_at,error "
+                    "FROM realtime_candidate_pool_snapshot WHERE CAST(trade_date AS VARCHAR)=? "
+                    "ORDER BY fetched_at DESC LIMIT 1",
+                    [effective_date],
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT trade_date,source,row_count,stock_count,status,fetched_at,error "
+                    "FROM realtime_candidate_pool_snapshot ORDER BY trade_date DESC LIMIT 1"
+                ).fetchone()
             if row:
-                candidate_pool = {"trade_date": str(row[0])[:10], "source": row[1],
-                                  "row_count": int(row[2] or 0), "stock_count": int(row[3] or 0),
-                                  "status": row[4], "fetched_at": str(row[5]) if row[5] else "",
-                                  "error": row[6] or ""}
+                candidate_pool = {
+                    "trade_date": str(row[0])[:10],
+                    "source": row[1],
+                    "row_count": int(row[2] or 0),
+                    "stock_count": int(row[3] or 0),
+                    "status": row[4],
+                    "fetched_at": str(row[5]) if row[5] else "",
+                    "error": row[6] or "",
+                }
         except Exception:
             candidate_pool = {}
-    return {"stock": stock, "sector": sector, "stock_top": stock_top, "stock_bottom": stock_bottom,
-            "sector_top": sector_top, "sector_bottom": sector_bottom,
-            "batch": batch, "sector_batch": sector_batch, "candidate_pool": candidate_pool}
+    return {
+        "stock": stock,
+        "sector": sector,
+        "stock_top": stock_top,
+        "stock_bottom": stock_bottom,
+        "sector_top": sector_top,
+        "sector_bottom": sector_bottom,
+        "batch": batch,
+        "sector_batch": sector_batch,
+        "candidate_pool": candidate_pool,
+        "effective_date": effective_date,
+    }
 
 
 def _concept_status(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-    result = {"concepts": 0, "members": 0, "verified": 0, "partial": 0, "latest": "", "top_partial": []}
+    # The production page is a current-snapshot view.  Counting every THS
+    # snapshot ever stored here made the dashboard show 1,859 concepts and
+    # 326k member rows for a 375-concept / 63k-member current snapshot.
+    result = {
+        "concepts": 0,
+        "members": 0,
+        "verified": 0,
+        "partial": 0,
+        "latest": "",
+        "snapshot_status": "missing",
+        "history_concepts": 0,
+        "history_members": 0,
+        "top_partial": [],
+    }
     if table_exists(con, "ths_concept_daily"):
         row = con.execute(
             "SELECT count(*), sum(CASE WHEN date_verified THEN 1 ELSE 0 END), max(trade_date) "
             "FROM ths_concept_daily"
         ).fetchone()
-        result.update({"concepts": int(row[0] or 0), "verified": int(row[1] or 0),
-                       "latest": str(row[2])[:10] if row[2] else ""})
+        latest = str(row[2])[:10] if row[2] else ""
+        result["latest"] = latest
+        result["history_concepts"] = int(row[0] or 0)
+        if latest:
+            current = con.execute(
+                "SELECT count(*), sum(CASE WHEN date_verified THEN 1 ELSE 0 END) "
+                "FROM ths_concept_daily WHERE trade_date=CAST(? AS DATE)",
+                [latest],
+            ).fetchone()
+            result["concepts"] = int(current[0] or 0)
+            result["verified"] = int(current[1] or 0)
     if table_exists(con, "ths_concept_stock_history"):
-        result["members"] = int(con.execute("SELECT count(*) FROM ths_concept_stock_history").fetchone()[0])
-    if table_exists(con, "ths_concept_member_checkpoint"):
-        result["partial"] = int(con.execute(
-            "SELECT count(*) FROM ths_concept_member_checkpoint WHERE status <> 'success'"
-        ).fetchone()[0])
+        result["history_members"] = int(
+            con.execute("SELECT count(*) FROM ths_concept_stock_history").fetchone()[0]
+        )
+        if result["latest"]:
+            result["members"] = int(
+                con.execute(
+                    "SELECT count(*) FROM ths_concept_stock_history "
+                    "WHERE trade_date=CAST(? AS DATE)",
+                    [result["latest"]],
+                ).fetchone()[0]
+            )
+    if table_exists(con, "ths_concept_member_checkpoint") and result["latest"]:
+        result["verified"] = int(
+            con.execute(
+                "SELECT count(*) FROM ths_concept_member_checkpoint "
+                "WHERE trade_date=CAST(? AS DATE) AND status='success'",
+                [result["latest"]],
+            ).fetchone()[0]
+        )
+        result["partial"] = int(
+            con.execute(
+                "SELECT count(*) FROM ths_concept_member_checkpoint "
+                "WHERE trade_date=CAST(? AS DATE) AND status <> 'success'",
+                [result["latest"]],
+            ).fetchone()[0]
+        )
+        result["snapshot_status"] = "success" if result["partial"] == 0 else "partial"
         result["top_partial"] = _fetch_dicts(
             con,
             """
             SELECT concept_code, concept_name, status, pages_expected, pages_fetched, member_rows, last_error
             FROM ths_concept_member_checkpoint
-            WHERE status <> 'success'
+            WHERE trade_date=CAST(? AS DATE) AND status <> 'success'
             ORDER BY updated_at DESC
             LIMIT 10
             """,
+            [result["latest"]],
         )
     return result
 
@@ -549,10 +824,26 @@ def _qlib_status(con: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     return result
 
 
-def _auction_evidence_rows(con: duckdb.DuckDBPyConnection, limit: int = 20) -> list[dict]:
+def _auction_evidence_rows(
+    con: duckdb.DuckDBPyConnection,
+    limit: int = 20,
+    trade_date: str | None = None,
+) -> list[dict]:
     if not table_exists(con, "auction_evidence_snapshot"):
         return []
     try:
+        if trade_date:
+            return _fetch_dicts(
+                con,
+                f"""
+                SELECT trade_date, stock_code, source_table, confirmation, auction_strength, is_fallback, missing_reason
+                FROM auction_evidence_snapshot
+                WHERE CAST(trade_date AS VARCHAR)=?
+                ORDER BY is_fallback, auction_strength DESC NULLS LAST
+                LIMIT {int(limit)}
+                """,
+                [str(trade_date)[:10]],
+            )
         return _fetch_dicts(
             con,
             f"""
@@ -604,24 +895,51 @@ def _execution_status(con, trade_date: str) -> dict:
     A delayed-only snapshot can be fully present (analytics-ready) yet support no
     executable candidate; surface that explicitly instead of implying a green
     'ready to trade' state.
+
+    ``actionable`` = stage evidence complete for the decision (incl. close keep/reduce).
+    ``executable`` = same-session entry is allowed (``is_executable``). Close
+    ``signal_close`` rows are actionable for review but never executable.
     """
     total = 0
     actionable = 0
+    executable = 0
+    block_reasons: list = []
     try:
         if table_exists(con, "stock_candidate_stage_signal"):
             row = con.execute(
-                "SELECT count(*), sum(CASE WHEN coalesce(is_actionable,false) THEN 1 ELSE 0 END) "
+                "SELECT count(*), "
+                "sum(CASE WHEN coalesce(is_actionable,false) THEN 1 ELSE 0 END), "
+                "sum(CASE WHEN coalesce(is_executable,false) THEN 1 ELSE 0 END) "
                 "FROM stock_candidate_stage_signal WHERE CAST(trade_date AS VARCHAR)=?",
                 [str(trade_date)[:10]],
             ).fetchone()
             total = int(row[0] or 0)
             actionable = int(row[1] or 0)
+            executable = int(row[2] or 0)
+            # Prefer entry-block reasons when present; fall back to row_block/decision.
+            reason_rows = con.execute(
+                "SELECT coalesce("
+                "json_extract_string(evidence_json, '$.entry_block_reason'), "
+                "json_extract_string(evidence_json, '$.row_block_reason'), "
+                "decision) AS reason, "
+                "count(*) AS n FROM stock_candidate_stage_signal "
+                "WHERE CAST(trade_date AS VARCHAR)=? "
+                "AND coalesce(is_executable,false)=false "
+                "GROUP BY 1 ORDER BY n DESC LIMIT 6",
+                [str(trade_date)[:10]],
+            ).fetchall()
+            block_reasons = [
+                {"reason": str(r[0] or "unknown"), "count": int(r[1] or 0)}
+                for r in reason_rows
+            ]
     except Exception:
         pass
     return {
         "candidate_total": total,
         "actionable_candidates": actionable,
-        "execution_ready": actionable > 0,
+        "executable_candidates": executable,
+        "execution_ready": executable > 0,
+        "block_reasons": block_reasons,
     }
 
 
@@ -630,42 +948,87 @@ def load_dashboard_context(
     reports_dir: str | Path = "reports",
     trade_date: str | None = None,
 ) -> dict:
-    con = duckdb.connect(str(db_path), read_only=True)
+    if connect_duckdb is not None:
+        con = connect_duckdb(str(db_path), read_only=True)
+    else:
+        con = duckdb.connect(str(db_path), read_only=True)
     try:
         market = _latest_market(con, trade_date)
-        counts = {name: _safe_count(con, name) for name in COUNT_RELATIONS}
+        effective_trade_date = trade_date or str(market.get("trade_date") or "")
+        # Prefer same-date metrics so total historical bloat cannot look "healthy".
+        count_details = {
+            name: _safe_same_date_count(con, name, effective_trade_date or None)
+            for name in COUNT_RELATIONS
+        }
+        counts = {
+            name: (
+                detail["same_date"]
+                if detail.get("same_date") is not None
+                else detail.get("total", 0)
+            )
+            for name, detail in count_details.items()
+        }
         sources = {name: _source_rows(con, name) for name in SOURCE_VIEWS}
         sectors = _latest_rows(con, "sector_rotation_score", "score", 10)
-        candidates = _latest_rows(con, "stock_candidate_score", "score", 20)
-        operator_candidates = _operator_candidates(con)
-        operator_origin_stats = _operator_origin_stats(con)
-        strategy_candidates = _strategy_candidates(con)
-        research_context = _research_context(con)
+        # Lock candidates to the page trade date when available.
+        if effective_trade_date and table_exists(con, "stock_candidate_score"):
+            try:
+                candidates = _fetch_dicts(
+                    con,
+                    """
+                    SELECT *
+                    FROM stock_candidate_score
+                    WHERE CAST(trade_date AS VARCHAR)=?
+                    ORDER BY score DESC NULLS LAST
+                    LIMIT 20
+                    """,
+                    [str(effective_trade_date)[:10]],
+                )
+            except Exception:
+                candidates = _latest_rows(con, "stock_candidate_score", "score", 20)
+        else:
+            candidates = _latest_rows(con, "stock_candidate_score", "score", 20)
+        operator_candidates = _operator_candidates(con, trade_date=effective_trade_date or None)
+        operator_origin_stats = _operator_origin_stats(con, trade_date=effective_trade_date or None)
+        strategy_candidates = _strategy_candidates(con, trade_date=effective_trade_date or None)
+        research_context = _research_context(con, trade_date=effective_trade_date or None)
         strategy_backtest = _strategy_backtest_rows(con)
         qlib_shadow = _qlib_shadow_rows(con)
-        capital_flow = _capital_flow_snapshot(con)
+        capital_flow = _capital_flow_snapshot(con, trade_date=effective_trade_date or None)
         concept_status = _concept_status(con)
         outcome_status = _outcome_status(con)
         qlib_status = _qlib_status(con)
-        auction_evidence = _auction_evidence_rows(con)
+        auction_evidence = _auction_evidence_rows(con, trade_date=effective_trade_date or None)
         alerts = _latest_rows(con, "alert_events", "generated_at", 10)
         stage_stats = _stage_stats(db_path, con)
         api_utilization = _api_utilization(con)
-        execution = _execution_status(con, trade_date or str(market.get("trade_date") or ""))
+        execution = _execution_status(con, effective_trade_date)
+        try:
+            readiness = assess_trade_date_readiness(con, effective_trade_date, stage="postmarket")
+        except Exception as exc:
+            readiness = {
+                "analytics_ready": False, "execution_ready": False,
+                "missing_groups": [f"readiness_error:{type(exc).__name__}"],
+                "actionable_candidates": 0, "tradable_candidates": 0,
+                "risk_approved_candidates": 0, "executable_candidates": 0,
+            }
     finally:
         con.close()
 
-    effective_trade_date = trade_date or str(market.get("trade_date") or "")
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "trade_date": effective_trade_date,
         "requested_trade_date": trade_date,
         "market_state_date": str(market.get("trade_date") or ""),
-        "date_consistent": bool(not trade_date or str(market.get("trade_date") or "") == trade_date),
+        "date_consistent": bool(
+            not trade_date or str(market.get("trade_date") or "") == trade_date
+        ),
         "market": market,
         "execution": execution,
-        "data_chains": assess_data_chains(db_path),
+        "readiness": readiness,
+        "data_chains": assess_data_chains(db_path, trade_date=effective_trade_date or None),
         "counts": counts,
+        "count_details": count_details,
         "sources": sources,
         "stage_stats": stage_stats,
         "sectors": sectors,
@@ -693,7 +1056,25 @@ def _fmt(value: Any) -> str:
         return ""
     if isinstance(value, float):
         return f"{value:.2f}"
+    if isinstance(value, bool):
+        return "是" if value else "否"
     return escape(str(value))
+
+
+def _bool_pill(value: Any) -> str:
+    truthy = value in (True, "true", "True", 1, "1", "是")
+    if value in (False, "false", "False", 0, "0", "否"):
+        truthy = False
+    elif value in (None, ""):
+        return "<span class='pill muted'>—</span>"
+    label = "是" if truthy else "否"
+    cls = "warn" if truthy else "ok"
+    # Fallback evidence is a warning; real/non-fallback is ok.
+    if isinstance(value, bool) or str(value).lower() in {"true", "false"}:
+        # For is_fallback: True=warn, False=ok
+        cls = "warn" if truthy else "ok"
+        label = "fallback" if truthy else "real"
+    return f"<span class='pill {cls}'>{escape(label)}</span>"
 
 
 def _status_class(status: str) -> str:
@@ -701,16 +1082,26 @@ def _status_class(status: str) -> str:
         "available": "ok",
         "fallback": "warn",
         "missing": "bad",
+        "stale": "warn",
     }.get(status, "muted")
 
 
 def render_dashboard_html(context: dict) -> str:
     market = context.get("market", {})
     execution = context.get("execution", {})
+    readiness = context.get("readiness", {})
     exec_ready = bool(execution.get("execution_ready"))
     exec_class = "ok" if exec_ready else "bad"
     exec_label = "是" if exec_ready else "否"
     exec_actionable = execution.get("actionable_candidates", 0)
+    exec_executable = execution.get("executable_candidates", 0)
+    exec_block_reasons = execution.get("block_reasons") or []
+    readiness_class = "ok" if readiness.get("analytics_ready") else "bad"
+    readiness_label = "READY" if readiness.get("analytics_ready") else "BLOCKED"
+    readiness_missing = ", ".join(readiness.get("missing_groups") or []) or "none"
+    exec_block_note = "; ".join(
+        f"{item.get('reason')}×{item.get('count')}" for item in exec_block_reasons
+    )
     requested_date = context.get("requested_trade_date")
     date_warning = ""
     if requested_date and not context.get("date_consistent", False):
@@ -729,10 +1120,26 @@ def render_dashboard_html(context: dict) -> str:
             f"<td>{_fmt(present)}</td><td>{_fmt(missing)}</td></tr>"
         )
 
-    count_cards = "\n".join(
-        f"<div class='metric'><span>{escape(name)}</span><strong>{count}</strong></div>"
-        for name, count in context.get("counts", {}).items()
-    )
+    count_details = context.get("count_details") or {}
+    if count_details:
+        count_cards = "\n".join(
+            (
+                f"<div class='metric'><span>{escape(name)}"
+                f"{(' · ' + escape(str(detail.get('latest')))) if detail.get('latest') else ''}"
+                f"</span><strong>"
+                f"{detail.get('same_date') if detail.get('same_date') is not None else detail.get('total', 0)}"
+                f"</strong>"
+                f"<span class='muted'>同日"
+                f"{'' if detail.get('same_date') is None else ''}"
+                f" / 全量 {detail.get('total', 0)}</span></div>"
+            )
+            for name, detail in count_details.items()
+        )
+    else:
+        count_cards = "\n".join(
+            f"<div class='metric'><span>{escape(name)}</span><strong>{count}</strong></div>"
+            for name, count in context.get("counts", {}).items()
+        )
     api = context.get("api_utilization", {})
     api_cards = "\n".join(
         [
@@ -787,7 +1194,12 @@ def render_dashboard_html(context: dict) -> str:
     concept = context.get("concept_status", {})
     concept_cards = "\n".join(
         f"<div class='metric'><span>{escape(label)}</span><strong>{_fmt(concept.get(key, 0))}</strong></div>"
-        for label, key in (("THS 概念", "concepts"), ("成分股关系", "members"), ("已验证概念", "verified"), ("分页未完成", "partial"))
+        for label, key in (
+            ("THS 当期概念", "concepts"),
+            ("当期成分关系", "members"),
+            ("成分完整概念", "verified"),
+            ("分页未完成", "partial"),
+        )
     )
     outcomes = context.get("outcome_status", {})
     outcome_cards = "\n".join(
@@ -863,11 +1275,17 @@ def render_dashboard_html(context: dict) -> str:
     gap_items = "\n".join(f"<li>{_fmt(item)}</li>" for item in context.get("gaps", []))
     strategy_candidates = context.get("strategy_candidates", [])
 
+    page_trade_date = str(context.get("trade_date") or "")[:10]
+
     def stage_candidate_rows(stage_names: set[str], limit: int = 8) -> str:
         rows = [
             item
             for item in strategy_candidates
             if str(item.get("stage") or "") in stage_names
+            and (
+                not page_trade_date
+                or str(item.get("trade_date") or "")[:10] == page_trade_date
+            )
         ][:limit]
         if not rows:
             return "<tr><td colspan='6' class='muted'>暂无候选或样本不足</td></tr>"
@@ -898,7 +1316,7 @@ def render_dashboard_html(context: dict) -> str:
     auction_evidence_rows = "\n".join(
         f"<tr><td>{_fmt(item.get('trade_date'))}</td><td>{_fmt(item.get('stock_code') or 'MARKET')}</td>"
         f"<td>{_fmt(item.get('source_table'))}</td><td>{_fmt(item.get('confirmation'))}</td>"
-        f"<td>{_fmt(item.get('auction_strength'))}</td><td>{_fmt(item.get('is_fallback'))}</td>"
+        f"<td>{_fmt(item.get('auction_strength'))}</td><td>{_bool_pill(item.get('is_fallback'))}</td>"
         f"<td>{_fmt(item.get('missing_reason'))}</td></tr>"
         for item in context.get("auction_evidence", [])[:12]
     ) or "<tr><td colspan='7' class='muted'>暂无竞价证据；检查 auction_tick / auction_bidding_anomaly / advanced_morning_bidding_summary</td></tr>"
@@ -977,8 +1395,15 @@ def render_dashboard_html(context: dict) -> str:
         <div class="metric"><span>建议仓位上限</span><strong>{_fmt(market.get('suggested_position_pct'))}%</strong></div>
         <div class="metric"><span>情绪分</span><strong>{_fmt(market.get('regime_score'))}</strong></div>
         <div class="metric"><span>告警数量</span><strong>{len(context.get('alerts', []))}</strong></div>
-        <div class="metric {exec_class}"><span>执行就绪</span><strong>{exec_label}</strong></div>
-        <div class="metric"><span>可执行候选</span><strong>{exec_actionable}</strong></div>
+        <div class="metric {exec_class}"><span>入场执行就绪</span><strong>{exec_label}</strong></div>
+        <div class="metric"><span>可执行候选</span><strong>{_fmt(exec_executable)}</strong></div>
+        <div class="metric"><span>分析可用候选</span><strong>{_fmt(exec_actionable)}</strong></div>
+      </div>
+      {f'<p class="muted">入场阻断原因：{escape(exec_block_note)}</p>' if exec_block_note and not exec_ready else ''}
+      <p class="muted">说明：入场执行就绪看 is_executable；分析可用候选含 close keep/reduce。盘中 delayed 资金流仅供分析；close 的 signal_close 是复盘价，不等于可入场。</p>
+      <div class="summary">
+        <div class="metric {readiness_class}"><span>Analytics gate</span><strong>{readiness_label}</strong></div>
+        <div class="metric"><span>Missing groups</span><strong>{escape(readiness_missing)}</strong></div>
       </div>
     </section>
     <section>
@@ -1045,7 +1470,7 @@ def render_dashboard_html(context: dict) -> str:
     <section id="concept-status" data-screen-label="concept-status">
       <h2>THS 概念完整性</h2>
       <div class="summary">{concept_cards}</div>
-      <p class="muted">快照日期：{_fmt(concept.get('latest'))}；历史回测必须过滤 date_verified=false。</p>
+      <p class="muted">快照日期：{_fmt(concept.get('latest'))}；状态：{_fmt(concept.get('snapshot_status'))}；历史累计数据不计入当期口径，历史回测必须过滤 date_verified=false。</p>
       <table><thead><tr><th>概念</th><th>状态</th><th>分页</th><th>成分数</th><th>错误</th></tr></thead><tbody>{partial_rows}</tbody></table>
     </section>
     <section id="review-status" data-screen-label="review-status">

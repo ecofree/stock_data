@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -24,6 +25,11 @@ def main() -> int:
     parser.add_argument("--min-coverage-pct", type=float, default=99.5)
     parser.add_argument("--collected-after", default=None)
     parser.add_argument("--max-age-seconds", type=int, default=None)
+    parser.add_argument(
+        "--as-of",
+        default="",
+        help="Evaluate freshness at this ISO timestamp; used for audited historical recovery runs.",
+    )
     args = parser.parse_args()
 
     result = assess_capital_flow_health(
@@ -34,6 +40,7 @@ def main() -> int:
         collected_after=args.collected_after,
         min_coverage_pct=args.min_coverage_pct,
         max_age_seconds=args.max_age_seconds,
+        now=datetime.fromisoformat(args.as_of) if args.as_of else None,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

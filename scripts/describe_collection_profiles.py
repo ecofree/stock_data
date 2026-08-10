@@ -23,7 +23,7 @@ def main() -> int:
     if args.phase:
         lines = [text.rstrip(), "", f"## Current freshness ({args.phase}, {args.date})", "", "| task | due | reason |", "|---|---|---|"]
         for task in phase_tasks(args.phase):
-            due, reason = task_due(args.db, args.date, task.name)
+            due, reason = task_due(args.db, args.date, task.name, phase=args.phase)
             lines.append(f"| {task.name} | {'yes' if due else 'no'} | {reason} |")
         text = "\n".join(lines) + "\n"
     out = Path(args.out)

@@ -23,6 +23,7 @@ def main() -> int:
     compact = {
         "dry_run": result["dry_run"],
         "normalized_ktype_rows": result["normalized_ktype_rows"],
+        "ths_member_codes": result["ths_member_codes"],
         "removed_rows": {
             item["table"]: item.get("would_remove_rows", 0)
             for item in result["repairs"]

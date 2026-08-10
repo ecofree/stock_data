@@ -9,6 +9,7 @@ import duckdb
 
 from base import connect_duckdb
 from trade_system.quality import table_columns, table_exists
+from trade_system.time_utils import as_local_naive
 
 
 STOCK_FLOW_RELATIONS = (
@@ -38,6 +39,8 @@ def _relation_health(
     max_age_seconds: int | None = None,
     now: datetime | None = None,
 ) -> dict:
+    collected_after = as_local_naive(collected_after)
+    now = as_local_naive(now)
     if not table_exists(con, relation):
         return {
             "relation": relation,
@@ -88,20 +91,24 @@ def _relation_health(
     if relation == "multi_source_stock_flow" and "main_net" in columns:
         valid_flow = '"main_net" IS NOT NULL'
     date_filter = f'"{date_column}" = CAST(? AS DATE) AND {valid_flow}'
+    date_params: list[object] = [trade_date]
+    if now is not None and timestamp_column:
+        date_filter += f' AND "{timestamp_column}" <= ?'
+        date_params.append(now)
     rows, codes, latest, latest_source_time = con.execute(
         f"""
         SELECT count(*), {code_expr}, {timestamp_expr}, {source_time_expr}
         FROM "{relation}"
         WHERE {date_filter}
         """,
-        [trade_date],
+        date_params,
     ).fetchone()
     recent_rows = int(rows or 0)
     recent_codes = int(codes or 0)
     if collected_after is not None or max_age_seconds is not None:
         if timestamp_column:
             freshness_filters = []
-            freshness_params = [trade_date]
+            freshness_params = list(date_params)
             if collected_after is not None:
                 freshness_filters.append(f'"{timestamp_column}" >= ?')
                 freshness_params.append(collected_after)
@@ -128,7 +135,7 @@ def _relation_health(
     freshness_age_seconds = None
     if latest is not None:
         try:
-            observed_at = latest if isinstance(latest, datetime) else datetime.fromisoformat(str(latest))
+            observed_at = as_local_naive(latest)
             freshness_age_seconds = max(0.0, ((now or datetime.now()) - observed_at).total_seconds())
         except (TypeError, ValueError):
             freshness_age_seconds = None
@@ -170,7 +177,10 @@ def assess_capital_flow_health(
     now: datetime | None = None,
 ) -> dict:
     if isinstance(collected_after, str):
-        collected_after = datetime.fromisoformat(collected_after)
+        collected_after = as_local_naive(collected_after)
+    else:
+        collected_after = as_local_naive(collected_after)
+    now = as_local_naive(now)
     con = connect_duckdb(str(db_path), read_only=True)
     try:
         # Full-market collectors persist their expected universe in a durable
@@ -269,12 +279,67 @@ def assess_capital_flow_health(
                 "WHERE trade_date=CAST(? AS DATE) AND taxonomy='ths_concept'",
                 [trade_date],
             ).fetchone()
-            if stale_row and str(stale_row[0] or "").lower() == "stale_members":
+            if stale_row and str(stale_row[0] or "").lower() in {"stale_members", "partial_members"}:
                 sector_taxonomy_stale = True
-                sector_taxonomy_note = str(stale_row[1] or "ths concept membership is stale")
+                sector_taxonomy_note = str(stale_row[1] or "ths concept membership is stale or partial")
         con.close()
     except Exception:
         sector_taxonomy_stale = False
+    # P1-2: surface independent-source reconciliation.  Coverage alone can pass while
+    # accuracy rests on a single (delayed) Eastmoney source; the reconciliation status
+    # and whether an independent provider (TuShare moneyflow) exists for the date must
+    # be visible rather than silently passing.
+    recon_status = "not_run"
+    recon_reference_rows = 0
+    independent_source_present = False
+    independent_status = "not_run"
+    independent_overlap_pct = None
+    independent_correlation = None
+    independent_sign_agreement_pct = None
+    try:
+        con = connect_duckdb(str(db_path), read_only=True)
+        if table_exists(con, "intraday_stock_flow_reconciliation"):
+            recon_row = con.execute(
+                "SELECT status, reference_rows FROM intraday_stock_flow_reconciliation "
+                "WHERE trade_date=CAST(? AS DATE)",
+                [trade_date],
+            ).fetchone()
+            if recon_row:
+                recon_status = str(recon_row[0] or "not_run")
+                recon_reference_rows = int(recon_row[1] or 0)
+        if table_exists(con, "multi_source_stock_flow"):
+            independent_source_present = bool(con.execute(
+                "SELECT count(*) FROM multi_source_stock_flow "
+                "WHERE source_date=CAST(? AS DATE) AND provider='tushare'",
+                [trade_date],
+            ).fetchone()[0])
+        if table_exists(con, "intraday_stock_flow_independent_reconciliation"):
+            independent_row = con.execute(
+                "SELECT status, overlap_reference_pct, correlation_main_net, sign_agreement_pct "
+                "FROM intraday_stock_flow_independent_reconciliation "
+                "WHERE trade_date=CAST(? AS DATE)",
+                [trade_date],
+            ).fetchone()
+            if independent_row:
+                independent_status = str(independent_row[0] or "not_run")
+                independent_overlap_pct = float(independent_row[1]) if independent_row[1] is not None else None
+                independent_correlation = float(independent_row[2]) if independent_row[2] is not None else None
+                independent_sign_agreement_pct = float(independent_row[3]) if independent_row[3] is not None else None
+        con.close()
+    except Exception:
+        pass
+    # A primary/reference comparison from the same Eastmoney family is useful
+    # for transport consistency, but it is not independent accuracy evidence.
+    # Keep that result visible and fail the independent gate until TuShare (or
+    # another genuinely independent provider) has rows for this date.
+    same_vendor_reconciliation_ready = (
+        recon_status.lower() == "pass" and recon_reference_rows > 0
+    )
+    independent_reconciliation_ready = (
+        same_vendor_reconciliation_ready
+        and independent_source_present
+        and independent_status.lower() == "pass"
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "trade_date": trade_date,
@@ -299,6 +364,17 @@ def assess_capital_flow_health(
             "relations": sector_relations,
             "taxonomy_stale": sector_taxonomy_stale,
             "taxonomy_stale_note": sector_taxonomy_note,
+        },
+        "reconciliation": {
+            "status": recon_status,
+            "reference_rows": recon_reference_rows,
+            "independent_source_present": independent_source_present,
+            "same_vendor_reconciliation_ready": same_vendor_reconciliation_ready,
+            "independent_reconciliation_ready": independent_reconciliation_ready,
+            "independent_status": independent_status,
+            "independent_overlap_pct": independent_overlap_pct,
+            "independent_correlation_main_net": independent_correlation,
+            "independent_sign_agreement_pct": independent_sign_agreement_pct,
         },
     }
 
@@ -342,5 +418,34 @@ def render_capital_flow_health_markdown(result: dict) -> str:
             f"- WARNING: THS concept membership stale -- "
             f"`{result['sector_flow'].get('taxonomy_stale_note', '')}` "
             "(concept taxonomy is not certified ready)"
+        )
+    recon = result.get("reconciliation", {})
+    lines.extend([
+        "",
+        "## Independent reconciliation",
+        "",
+        f"- Reconciliation status: `{recon.get('status', 'not_run')}`",
+        f"- Reference rows: `{recon.get('reference_rows', 0)}`",
+        f"- Independent (TuShare) source present: "
+        f"`{str(recon.get('independent_source_present', False)).lower()}`",
+        f"- Independent persisted status: `{recon.get('independent_status', 'not_run')}`",
+        f"- Independent overlap: `{recon.get('independent_overlap_pct')}`%",
+        f"- Independent main-net correlation: `{recon.get('independent_correlation_main_net')}`",
+        f"- Independent sign agreement: `{recon.get('independent_sign_agreement_pct')}`%",
+        f"- Independent reconciliation ready: "
+        f"`{str(recon.get('independent_reconciliation_ready', False)).lower()}`",
+        f"- Same-vendor reconciliation ready: "
+        f"`{str(recon.get('same_vendor_reconciliation_ready', False)).lower()}`",
+    ])
+    if not recon.get("independent_reconciliation_ready"):
+        lines.append(
+            "- WARNING: no passing independent reconciliation for this date "
+            "(reference run absent/not_run or 0 reference rows); coverage passed on the "
+            "primary source only -- accuracy is not independently verified."
+        )
+    if not recon.get("independent_source_present"):
+        lines.append(
+            "- WARNING: independent provider (TuShare moneyflow) has no rows for this "
+            "date; flow accuracy relies on a single (Eastmoney) source."
         )
     return "\n".join(lines)

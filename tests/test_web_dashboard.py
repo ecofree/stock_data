@@ -59,6 +59,7 @@ def test_load_dashboard_context_reads_database_counts_sources_and_reports(tmp_pa
     assert context["concept_status"]["concepts"] == 0
     assert context["outcome_status"]["outcomes"] == 0
     assert context["qlib_status"]["signal_impact"] == "disabled"
+    assert "readiness" in context
 
 
 def test_dashboard_context_includes_operator_candidate_origin(tmp_path):

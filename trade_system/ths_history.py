@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -34,6 +35,37 @@ THS_CONCEPT_CATALOG_URL = "https://q.10jqka.com.cn/gn/"
 # explicitly unverified so they cannot leak into backtests.
 THS_REQUEST_INTERVAL_SECONDS = 0.35
 _THS_LAST_REQUEST_AT: float | None = None
+# A browser-authenticated session may be supplied explicitly for a repair or
+# operator-run crawl.  Scheduled runs do not invent credentials: when this is
+# absent, only the public anti-bot cookie is generated and blocked/partial
+# pages remain fail-closed.
+_THS_COOKIE: str | None = os.getenv("THS_COOKIE", "").strip() or None
+
+
+def _ths_request_cookie() -> str:
+    """Return the short-lived THS anti-bot cookie used by its AJAX pager.
+
+    THS serves the first detail page without a cookie but returns a login/401
+    response for the actual ``/ajax/1/`` constituent requests unless the
+    JavaScript ``v`` cookie is present.  AkShare already ships the same small
+    ``ths.js`` cookie generator; reuse it when available and keep a graceful
+    no-cookie fallback for minimal installations/tests.
+    """
+    global _THS_COOKIE
+    if _THS_COOKIE:
+        return _THS_COOKIE
+    try:
+        from py_mini_racer import MiniRacer
+        import akshare.stock_feature.stock_board_concept_ths as ak_ths
+
+        context = MiniRacer()
+        context.eval(ak_ths._get_file_content_ths("ths.js"))
+        value = str(context.call("v") or "").strip()
+        if value:
+            _THS_COOKIE = f"v={value};"
+    except Exception:
+        _THS_COOKIE = ""
+    return _THS_COOKIE or ""
 
 
 class _THSCatalog(list):
@@ -57,6 +89,9 @@ def _ths_html(url: str, referer: str = THS_CONCEPT_CATALOG_URL) -> str:
             request = urllib.request.Request(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
                 "Referer": referer,
+                "Cookie": _ths_request_cookie(),
+                "X-Requested-With": "XMLHttpRequest" if "/ajax/1/" in url else "",
+                "Accept": "text/html, */*; q=0.01",
             })
             _THS_LAST_REQUEST_AT = time.monotonic()
             with urllib.request.urlopen(request, timeout=20) as response:
@@ -65,7 +100,8 @@ def _ths_html(url: str, referer: str = THS_CONCEPT_CATALOG_URL) -> str:
             last_error = exc
             if attempt < 2:
                 time.sleep(1.0 * (attempt + 1))
-    raise RuntimeError(f"THS page request failed after 3 attempts: {url}") from last_error
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
+    raise RuntimeError(f"THS page request failed after 3 attempts: {url}; {detail}") from last_error
 
 
 def _ths_catalog() -> list[tuple[str, str]]:
@@ -166,9 +202,11 @@ class _THSMembersResult(tuple):
     """
 
     def __new__(cls, members: list[dict[str, str]], expected_pages: int,
-                fetched_pages: int, provider: str = "ths_concept_board"):
+                fetched_pages: int, provider: str = "ths_concept_board",
+                advertised_count: int | None = None):
         obj = super().__new__(cls, (members, expected_pages, fetched_pages))
         obj.provider = provider
+        obj.advertised_count = advertised_count
         return obj
 
 
@@ -251,7 +289,12 @@ def _ths_index_members(index_code: str) -> tuple[list[dict[str, str]], int]:
     # trust the full response's advertised count when it is internally
     # consistent, while still rejecting a genuinely truncated payload.
     advertised = response_counts[-1] if response_counts else total
-    if len(deduped) < advertised:
+    gap = advertised - len(deduped)
+    # THS occasionally leaves a stale ``subcodeCount`` (+1) while the actual
+    # blockrank payload is complete.  Treat that bounded mismatch as a valid
+    # snapshot and preserve both counts in the collector raw metadata.  Larger
+    # gaps remain hard failures; accepting them would publish truncated boards.
+    if gap > 1:
         raise RuntimeError(
             f"THS blockrank member coverage incomplete: index={index_code} "
             f"rows={len(deduped)}/{advertised}"
@@ -285,7 +328,7 @@ def _ths_detail_members_with_meta(code: str, max_pages: int = 0) -> tuple[list[d
             if index_members and advertised_count >= len(index_members):
                 logical_pages = expected_pages
                 return _THSMembersResult(index_members, logical_pages, logical_pages,
-                                         "ths_index_blockrank")
+                                         "ths_index_blockrank", advertised_count)
         except Exception:
             # Preserve the guarded HTML fallback and its exact partial-page
             # checkpoint if the internal endpoint is unavailable.
@@ -293,7 +336,13 @@ def _ths_detail_members_with_meta(code: str, max_pages: int = 0) -> tuple[list[d
     members = _parse_ths_members(first_html)
     fetched_pages = 1
     for page in range(2, target_pages + 1):
-        url = f"https://q.10jqka.com.cn/gn/detail/code/{code}/page/{page}/"
+        # The visible page links are JavaScript-only.  The real endpoint is
+        # the AJAX route emitted by THS ``mpager``; requesting the pretty URL
+        # is what caused the recurring 5-page partial checkpoints.
+        url = (
+            "https://q.10jqka.com.cn/gn/detail/field/199112/order/desc/"
+            f"page/{page}/ajax/1/code/{code}"
+        )
         html = _ths_html(url, first_url)
         page_members = _parse_ths_members(html)
         if "m-pager-table" not in html.lower() or not page_members:
@@ -307,7 +356,7 @@ def _ths_detail_members_with_meta(code: str, max_pages: int = 0) -> tuple[list[d
     for member in members:
         deduped[member["code"]] = member
     return _THSMembersResult(list(deduped.values()), expected_pages, fetched_pages,
-                             "ths_concept_board")
+                             "ths_concept_board", len(deduped))
 
 
 def _ths_detail_members(code: str, max_pages: int = 0) -> list[dict[str, str]]:
@@ -385,6 +434,10 @@ def _stock_code(value: Any) -> str:
     code = str(value or "").strip().upper()
     if code.startswith(("SH", "SZ", "BJ")):
         code = code[2:]
+    # TuShare con_code arrives exchange-suffixed (e.g. 000001.SZ); strip the suffix so
+    # every writer stores the bare 6-digit code and web/TuShare merges dedup (P1-1).
+    if "." in code:
+        code = code.split(".", 1)[0]
     return code
 
 
@@ -495,7 +548,8 @@ class THSConceptHistoryCollector:
 
     def _member_checkpoint(self, trade_date: str, concept_code: str, concept_name: str,
                            status: str, *, pages_expected: int = 0, pages_fetched: int = 0,
-                           member_rows: int = 0, attempts: int = 0, error: str = "") -> None:
+                           member_rows: int = 0, attempts: int = 0, error: str = "",
+                           provider: str | None = None) -> None:
         self.store.conn.execute(
             "INSERT INTO ths_concept_member_checkpoint "
             "(trade_date,concept_code,concept_name,status,pages_expected,pages_fetched,member_rows,attempts,last_error,updated_at,provider,crawler_version,catalog_hash) "
@@ -505,9 +559,51 @@ class THSConceptHistoryCollector:
             "member_rows=excluded.member_rows,attempts=excluded.attempts,last_error=excluded.last_error,updated_at=excluded.updated_at, "
             "provider=excluded.provider,crawler_version=excluded.crawler_version,catalog_hash=excluded.catalog_hash",
             [_iso(trade_date), concept_code, concept_name, status, int(pages_expected), int(pages_fetched),
-             int(member_rows), int(attempts), error[:500], self.member_source, self.crawler_version, self.catalog_hash],
+            int(member_rows), int(attempts), error[:500], provider or self.member_source,
+            self.crawler_version, self.catalog_hash],
         )
         self.store.conn.commit()
+
+    def _cached_complete_members(self, requested_date: str, concept_code: str,
+                                 max_age_days: int = 14) -> tuple[list[dict[str, str]], str] | None:
+        """Return a complete prior weekly snapshot when live THS is blocked.
+
+        The source date is retained in the caller's raw metadata and the
+        resulting checkpoint is ``success_stale``.  That keeps the mapping
+        usable for review while preventing the P0 gate from treating it as a
+        same-day verified membership fetch.
+        """
+        try:
+            candidate = self.store.conn.execute(
+                """
+                SELECT h.trade_date, count(*) AS rows, max(c.member_rows) AS expected
+                FROM ths_concept_stock_history h
+                JOIN ths_concept_member_checkpoint c
+                  ON c.trade_date=h.trade_date AND c.concept_code=h.concept_code
+                WHERE h.trade_date < CAST(? AS DATE) AND h.concept_code=?
+                  AND c.status='success'
+                GROUP BY h.trade_date
+                HAVING count(*)=max(c.member_rows) AND count(*)>0
+                ORDER BY h.trade_date DESC
+                LIMIT 1
+                """,
+                [requested_date, concept_code],
+            ).fetchone()
+            if not candidate:
+                return None
+            source_date = str(candidate[0])[:10]
+            age = (date.fromisoformat(requested_date) - date.fromisoformat(source_date)).days
+            if age < 0 or age > max_age_days:
+                return None
+            rows = self.store.conn.execute(
+                "SELECT stock_code,stock_name FROM ths_concept_stock_history "
+                "WHERE trade_date=? AND concept_code=? ORDER BY concept_rank,stock_code",
+                [source_date, concept_code],
+            ).fetchall()
+            members = [{"code": str(row[0]), "name": str(row[1] or "")} for row in rows]
+            return (members, source_date) if members else None
+        except Exception:
+            return None
 
     def _member_checkpoint_row(self, trade_date: str, concept_code: str):
         return self.store.conn.execute(
@@ -545,6 +641,7 @@ class THSConceptHistoryCollector:
         failed_codes: list[str] = []
         partial_codes: list[str] = []
         empty_codes: list[str] = []
+        stale_codes: list[str] = []
         # The project default is the actual THS concept webpage.  TuShare is
         # retained as an explicit opt-in provider, never as a silent
         # replacement for the requested web crawl.
@@ -606,6 +703,9 @@ class THSConceptHistoryCollector:
             error = ""
             provider = "ths_concept_board"
             supplement_reason = ""
+            source_snapshot_date = ""
+            stale_fallback = False
+            advertised_member_count: int | None = None
             try:
                 ts_row = tushare_map.get(concept_id) if tushare_client else None
                 if ts_row:
@@ -619,6 +719,7 @@ class THSConceptHistoryCollector:
                     details = _ths_detail_members_with_meta(concept_id, self.max_member_pages)
                     members, expected_pages, fetched_pages = details
                     provider = getattr(details, "provider", provider)
+                    advertised_member_count = getattr(details, "advertised_count", None)
             except Exception as exc:
                 error = str(exc)
                 if not tushare_client and tushare_error:
@@ -650,6 +751,23 @@ class THSConceptHistoryCollector:
                     except Exception as exc:
                         supplement_reason = f"supplement_error={type(exc).__name__}:{exc}"
 
+            # If the authenticated/live sources are unavailable, keep a
+            # recent complete weekly mapping usable for review, but mark it
+            # explicitly stale.  It is never counted as a same-day success by
+            # the snapshot/P0 gates and its source date is preserved in raw.
+            if (not members or error or (expected_pages and fetched_pages < expected_pages)):
+                cached = self._cached_complete_members(requested_date, concept_code)
+                if cached:
+                    members, source_snapshot_date = cached
+                    expected_pages = fetched_pages = 1
+                    provider = "ths_cached_weekly"
+                    stale_fallback = True
+                    supplement_reason = (
+                        f"cached_source_date={source_snapshot_date}; "
+                        f"live_error={error[:180]}"
+                    )
+                    error = ""
+
             # Remove stale rows for this board before writing this attempt.
             self.store.conn.execute(
                 "DELETE FROM ths_concept_daily WHERE trade_date=? AND concept_code=?",
@@ -665,6 +783,9 @@ class THSConceptHistoryCollector:
                    "ths_concept_id": concept_id,
                    "pages_expected": expected_pages, "pages_fetched": fetched_pages,
                    "provider": provider, "supplement_reason": supplement_reason,
+                   "advertised_member_count": advertised_member_count,
+                   "stale_fallback": stale_fallback,
+                   "source_snapshot_date": source_snapshot_date,
                    "tushare_ths_index_error": tushare_error,
                    "error": error}
             concept_row = (requested_date, concept_code, concept_name, concept_rank, len(members),
@@ -696,11 +817,15 @@ class THSConceptHistoryCollector:
                 status = "partial"
                 error = f"THS page coverage incomplete: fetched={fetched_pages}/{expected_pages}"
                 partial_codes.append(concept_id)
+            elif provider == "ths_cached_weekly":
+                status = "success_stale"
+                stale_codes.append(concept_id)
             else:
                 status = "success"
             self._member_checkpoint(requested_date, concept_code, concept_name, status,
                                     pages_expected=expected_pages, pages_fetched=fetched_pages,
-                                    member_rows=len(members), attempts=attempts, error=error)
+                                    member_rows=len(members), attempts=attempts, error=error,
+                                    provider=provider)
             if concept_rank == 1 or concept_rank % 10 == 0 or concept_rank == len(catalog):
                 print(
                     f"THS web crawl {concept_rank}/{len(catalog)} "
@@ -736,6 +861,7 @@ class THSConceptHistoryCollector:
                 "date_verified": verified, "source": DEFAULT_CONCEPT_SOURCE, "mode": "full",
                 "catalog_count": len(catalog), "failed_concepts": failed_total,
                 "partial_member_concepts": partial_total, "missing_member_concepts": zero_member,
+                "stale_member_concepts": len(stale_codes),
                 "checkpoint_total": int(checkpoint_total or 0),
                 "checkpoint_success": int(checkpoint_success or 0)}
 
@@ -905,7 +1031,7 @@ class THSConceptHistoryCollector:
         """Skip a new daily crawl when a complete THS snapshot exists this week.
 
         A partially started requested date is deliberately resumed instead of
-        being hidden by an older weekly snapshot.  This keeps the 374-board
+        being hidden by an older weekly snapshot.  This keeps the full catalogue
         crawl resumable while preventing normal intraday/after-close loops
         from hitting THS every day.
         """
@@ -968,9 +1094,10 @@ def render_report(db_path: str | Path, result: dict[str, Any], out_path: str | P
             "(SELECT max(trade_date) FROM ths_concept_daily), "
             "(SELECT count(*) FROM ths_concept_daily WHERE trade_date=(SELECT max(trade_date) FROM ths_concept_daily) AND stock_count=0)"
         ).fetchone()
-        checkpoint_total, checkpoint_success, checkpoint_partial, checkpoint_errors, checkpoint_empty = con.execute(
+        checkpoint_total, checkpoint_success, checkpoint_partial, checkpoint_stale, checkpoint_errors, checkpoint_empty = con.execute(
             "SELECT count(*), sum(CASE WHEN status='success' THEN 1 ELSE 0 END), "
-            "sum(CASE WHEN status='partial' THEN 1 ELSE 0 END), sum(CASE WHEN status='error' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN status='partial' THEN 1 ELSE 0 END), sum(CASE WHEN status='success_stale' THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN status='error' THEN 1 ELSE 0 END), "
             "sum(CASE WHEN status='empty' THEN 1 ELSE 0 END) "
             "FROM ths_concept_member_checkpoint WHERE trade_date=(SELECT max(trade_date) FROM ths_concept_member_checkpoint)"
         ).fetchone()
@@ -999,6 +1126,7 @@ def render_report(db_path: str | Path, result: dict[str, Any], out_path: str | P
         f"- zero_member_concepts: `{zero_member_concepts}`",
         f"- member_checkpoints: `{int(checkpoint_success or 0)}/{int(checkpoint_total or 0)} success`",
         f"- partial_member_concepts: `{result.get('snapshot', {}).get('partial_member_concepts', int(checkpoint_partial or 0))}`",
+        f"- stale_member_concepts: `{result.get('snapshot', {}).get('stale_member_concepts', int(checkpoint_stale or 0))}` (usable cache, not same-day success)",
         f"- empty_member_concepts: `{int(checkpoint_empty or 0)}`",
         f"- member_checkpoint_errors: `{int(checkpoint_errors or 0)}`",
         "- member_rows_by_provider: " + ", ".join(f"`{source}`={count}" for source, count in source_counts),
@@ -1009,7 +1137,7 @@ def render_report(db_path: str | Path, result: dict[str, Any], out_path: str | P
         f"| ths_concept_stock_history | {member_count} | {latest or '-'} | {verified_members} |",
         "", "## 已记录问题", "",
         f"- 同花顺概念板块页面当前可解析完整概念目录（本次 {result.get('snapshot', {}).get('catalog_count', 0)} 个）；已优先使用网页/内部 blockrank 成分接口，失败板块才记录为部分或错误。",
-        "- THS 374 概念及成分股按自然周更新；日常盘中/盘后任务只读取最近一次完整快照，不重复抓取。",
+        f"- THS 全量概念及成分股按自然周更新（本次目录 {result.get('snapshot', {}).get('catalog_count', 0)} 个）；日常盘中/盘后任务只读取最近一次完整快照，不重复抓取。",
         "- 同花顺概念板块页面没有历史日期参数，只能保存抓取日快照；`date_verified=0` 是预期保护，不是已补齐的 2026 历史。",
     ]
     lines.append("- Completeness rule: max_member_pages=0 discovers all THS pages; any failed, empty, or bounded board remains partial.")

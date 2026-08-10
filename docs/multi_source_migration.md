@@ -49,7 +49,7 @@ python scripts/collect_multisource.py --offline --types stock_flow,sector_flow  
 
 不要把 `SOURCE_PLAN` 中的所有接口一次性调用。`scripts/run_staged_multisource.py` 将接口按交易时段分组，默认单线程、单任务串行执行；每个任务在开始时写入 `running` 检查点，获取后立即写入 `multi_source_observation` 及对应的资金流/K 线表，再把任务更新为 `success`、`stale` 或 `failed`。进程中断后，已完成任务会跳过，未完成任务可继续；达到预算后剩余任务标记为 `budget_exhausted`，下次运行会重试。
 
-THS 概念目录及成分股是低频维表：完整 374 概念抓取按自然周执行。周内已有完整检查点时返回 `skipped`，盘中/盘后任务只读取最近快照；只有首次缺失、部分失败或显式 `--force` 才会续传网页。
+THS 概念目录及成分股是低频维表：按当前 THS 全量目录（当前约 375 个概念）按自然周执行。周内已有完整检查点时返回 `skipped`，盘中/盘后任务只读取最近快照；只有首次缺失、部分失败或显式 `--force` 才会续传网页。
 
 阶段顺序固定为：
 

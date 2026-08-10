@@ -75,10 +75,12 @@ if ($RegisterAll) {
     # Auction tick data is only meaningful from 09:15.  Starting at 08:30
     # produced repeated empty KPL calls and increased block risk.  Drain at
     # 09:27 so the 09:30 intraday task cannot lose its only trigger to the
-    # single-instance pipeline lock.
-    Register-Phase "StockData-Auction" "auction" "09:15" 300 "09:27"
+    # single-instance pipeline lock.  120s interval gives ~6 auction
+    # snapshots per stock (300s produced only the first and last snap,
+    # too sparse to draw the indicative-price curve).
+    Register-Phase "StockData-Auction" "auction" "09:15" 120 "09:27"
     Register-Phase "StockData-Intraday" "intraday" "09:30" 300 "15:05"
     Register-Phase "StockData-DailyClose" "close" "17:30" 0 "18:30"
 } else {
-    Register-Phase $TaskName $Phase $At $(if ($Phase -eq "auction") { 300 } elseif ($Phase -eq "intraday") { 300 } else { 0 }) $(if ($Phase -eq "auction") { "09:27" } elseif ($Phase -eq "intraday") { "15:05" } else { "18:30" })
+    Register-Phase $TaskName $Phase $At $(if ($Phase -eq "auction") { 120 } elseif ($Phase -eq "intraday") { 300 } else { 0 }) $(if ($Phase -eq "auction") { "09:27" } elseif ($Phase -eq "intraday") { "15:05" } else { "18:30" })
 }

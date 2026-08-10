@@ -67,6 +67,9 @@ DEFAULT_DUPLICATE_KEYS = {
 NORMALIZED_DUPLICATE_SQL = {
     "kline": '"date", "stock_code", upper(coalesce(nullif(trim(cast("ktype" as varchar)), \'\'), \'UNKNOWN\'))',
     "index_kline": '"date", "index_code", upper(coalesce(nullif(trim(cast("ktype" as varchar)), \'\'), \'UNKNOWN\'))',
+    # P1-1: THS member codes mix bare (000001) and suffixed (000001.SZ) formats;
+    # compare on the de-suffixed code so the duplicate audit catches mixed-format dupes.
+    "ths_concept_stock_history": '"trade_date", "concept_code", regexp_replace(CAST(stock_code AS VARCHAR), \'[.].*$\', \'\')',
 }
 
 

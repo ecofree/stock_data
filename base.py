@@ -385,42 +385,88 @@ class DuckDBStore:
         return self.conn.execute(sql).fetchall()
 
     def insert_rows(self, table_name, rows, columns, replace_on=None):
-        """Insert rows into a table, creating it if needed."""
+        """Atomically publish a validated batch into ``table_name``.
+
+        Rows are staged before one final publish statement.  Transaction
+        ownership stays with the caller, so the helper is safe both in
+        autocommit mode and inside an outer transaction.
+        """
         if not rows:
             return 0
 
         self._ensure_table(table_name, columns)
 
-        placeholders = ", ".join(["?"] * len(columns))
-        col_str = ", ".join(columns)
-        sql = f"INSERT INTO {table_name} ({col_str}) VALUES ({placeholders})"
-        replace_indexes = []
-        if replace_on:
-            replace_indexes = [columns.index(col) for col in replace_on]
-            where = " AND ".join(f"{col} = ?" for col in replace_on)
-            delete_sql = f"DELETE FROM {table_name} WHERE {where}"
+        missing_replace_columns = [
+            col for col in (replace_on or []) if col not in columns
+        ]
+        if missing_replace_columns:
+            raise ValueError(
+                f"replace_on columns missing from batch schema: {missing_replace_columns}"
+            )
+        for index, row in enumerate(rows):
+            if len(row) != len(columns):
+                raise ValueError(
+                    f"{table_name}[{index}] has {len(row)} values; "
+                    f"expected {len(columns)}"
+                )
 
-        inserted = 0
-        for i, row in enumerate(rows):
+        def _ident(value):
+            return '"' + str(value).replace('"', '""') + '"'
+
+        target = _ident(table_name)
+        quoted_columns = [_ident(col) for col in columns]
+        projection = ", ".join(quoted_columns)
+        temp = _ident(f"_insert_batch_{time.time_ns()}")
+        staged_projection = ", ".join(f"source.{col}" for col in quoted_columns)
+        try:
+            self.conn.execute(
+                f"CREATE TEMP TABLE {temp} AS "
+                f"SELECT {projection}, CAST(NULL AS BIGINT) AS _batch_seq "
+                f"FROM {target} LIMIT 0"
+            )
+            placeholders = ", ".join(["?"] * (len(columns) + 1))
+            self.conn.executemany(
+                f"INSERT INTO {temp} ({projection}, _batch_seq) "
+                f"VALUES ({placeholders})",
+                [(*row, index) for index, row in enumerate(rows)],
+            )
+            if replace_on:
+                partition = ", ".join(_ident(col) for col in replace_on)
+                source_sql = (
+                    f"(SELECT {projection} FROM {temp} "
+                    f"QUALIFY row_number() OVER (PARTITION BY {partition} "
+                    f"ORDER BY _batch_seq DESC)=1)"
+                )
+                match = " AND ".join(
+                    f"target.{_ident(col)} IS NOT DISTINCT FROM "
+                    f"source.{_ident(col)}"
+                    for col in replace_on
+                )
+                updates = ", ".join(
+                    f"{col}=source.{col}" for col in quoted_columns
+                )
+                values = ", ".join(f"source.{col}" for col in quoted_columns)
+                self.conn.execute(
+                    f"MERGE INTO {target} AS target USING {source_sql} AS source "
+                    f"ON {match} "
+                    f"WHEN MATCHED THEN UPDATE SET {updates} "
+                    f"WHEN NOT MATCHED THEN INSERT ({projection}) VALUES ({values})"
+                )
+            else:
+                self.conn.execute(
+                    f"INSERT INTO {target} ({projection}) "
+                    f"SELECT {staged_projection} FROM {temp} AS source "
+                    "ORDER BY source._batch_seq"
+                )
+        except Exception as exc:
+            logger.warning(f"Atomic batch insert failed for {table_name}: {exc}")
+            raise
+        finally:
             try:
-                if replace_indexes:
-                    self.conn.execute(delete_sql, [row[idx] for idx in replace_indexes])
-                self.conn.execute(sql, list(row))
-                inserted += 1
-            except Exception as e:
-                if i == 0:
-                    # Log first error loudly so we can see the schema mismatch
-                    logger.warning(f"Insert error {table_name}[0] ({len(row)} cols vs {len(columns)} schema): {e}")
-                    logger.warning(f"  row: {list(row)[:6]}...")
-                    logger.warning(f"  schema: {columns}")
-                else:
-                    logger.debug(f"Insert error {table_name}[{i}]: {e}")
-                # On first error, try to auto-migrate: add missing columns
-                if i == 0 and ("does not exist" in str(e) or "no column" in str(e).lower()):
-                    logger.info(f"  Attempting auto-migration for {table_name}...")
-                    # Fall back to JSON-style storage
-                    self._ensure_json_table(table_name, columns)
-        return inserted
+                self.conn.execute(f"DROP TABLE IF EXISTS {temp}")
+            except Exception:
+                pass
+        return len(rows)
 
     def insert_json(self, table_name, records, extra_cols=None):
         """Insert list of dicts, storing as JSON with optional extra columns."""

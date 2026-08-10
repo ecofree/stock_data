@@ -1,9 +1,8 @@
 import csv
-import json
 
 import duckdb
 
-from trade_system.backfill import import_professional_csvs, repair_kline_from_raw_json
+from trade_system.backfill import import_professional_csvs
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.normalize import build_normalized_views
 from trade_system.signals import generate_signals
@@ -215,54 +214,3 @@ def test_stage_candidate_backtest_returns_stage_statistics(tmp_path):
     assert result["return_sample_count"] == 3
     assert result["independent_sample_count"] == 1
     assert result["excluded_count"] == 1
-
-
-def test_repair_kline_from_raw_json_expands_embedded_history(tmp_path):
-    db_path = tmp_path / "sample.duckdb"
-    raw = {
-        "data": [
-            {
-                "date": "20260703",
-                "open": 9.5,
-                "high": 10.0,
-                "low": 9.4,
-                "close": 9.8,
-                "volume": 100000,
-                "amount": 980000,
-                "change_pct": 3.0,
-            },
-            {
-                "date": "20260706",
-                "open": 9.8,
-                "high": 10.5,
-                "low": 9.7,
-                "close": 10.4,
-                "volume": 120000,
-                "amount": 1200000,
-                "change_pct": 6.12,
-            },
-        ]
-    }
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE kline("
-        "date DATE, stock_code VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
-        "volume BIGINT, turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, fetched_at TIMESTAMP, raw_json VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO kline VALUES "
-        "('2026-07-06', '000001', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2026-07-06 15:00:00', ?)",
-        [json.dumps(raw)],
-    )
-    con.close()
-
-    result = repair_kline_from_raw_json(str(db_path))
-    build_normalized_views(str(db_path))
-
-    con = duckdb.connect(str(db_path))
-    structured = con.execute(
-        "SELECT trade_date, stock_code, close FROM v_kline_daily WHERE stock_code='000001' ORDER BY trade_date"
-    ).fetchall()
-    con.close()
-    assert result["inserted_rows"] == 2
-    assert structured == [("2026-07-03", "000001", 9.8), ("2026-07-06", "000001", 10.4)]

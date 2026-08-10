@@ -2,12 +2,62 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
 from base import connect_duckdb
+
+
+def reap_stale_pipeline_tasks(
+    db_path: str | Path,
+    *,
+    max_age_seconds: int = 6 * 60 * 60,
+) -> int:
+    """Close abandoned ``running`` audit rows without touching live work.
+
+    A process can be terminated after it writes its start marker but before it
+    records a terminal status.  Those rows must not make the next audit look
+    perpetually active.  The threshold is deliberately conservative so a
+    genuinely long-running collector is left alone; callers can override it
+    in tests or for a known batch window.
+    """
+    cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
+    con = connect_duckdb(str(db_path))
+    try:
+        pending = con.execute(
+            """
+            SELECT count(*)
+            FROM pipeline_task_audit
+            WHERE status='running'
+              AND started_at IS NOT NULL
+              AND started_at < ?
+            """,
+            [cutoff],
+        ).fetchone()[0]
+        con.execute(
+            """
+            UPDATE pipeline_task_audit
+            SET status='aborted',
+                return_code=-1,
+                finished_at=COALESCE(finished_at, current_timestamp),
+                duration_seconds=COALESCE(
+                    duration_seconds,
+                    epoch(COALESCE(finished_at, current_timestamp) - started_at)
+                ),
+                reason='stale_running_reaped_after_seconds',
+                updated_at=current_timestamp
+            WHERE status='running'
+              AND started_at IS NOT NULL
+              AND started_at < ?
+            """,
+            [cutoff],
+        )
+        con.commit()
+        return int(pending or 0)
+    finally:
+        con.close()
 
 
 def ensure_pipeline_task_audit(db_path: str | Path) -> None:
@@ -34,6 +84,10 @@ def ensure_pipeline_task_audit(db_path: str | Path) -> None:
         con.commit()
     finally:
         con.close()
+    # Run after the schema exists and outside the create transaction.  This
+    # keeps recovery safe when called by every task wrapper while avoiding a
+    # nested connection during table creation.
+    reap_stale_pipeline_tasks(db_path)
 
 
 def record_pipeline_task(

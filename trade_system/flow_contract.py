@@ -123,6 +123,12 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
 
 def ensure_stock_flow_contract(con) -> None:
     """Upgrade old DuckDB files in place; no rows are removed."""
+    existing = {
+        row[1]
+        for row in con.execute(
+            "PRAGMA table_info('multi_source_stock_flow')"
+        ).fetchall()
+    }
     for column, kind in (
         ("net_total", "DOUBLE"),
         ("amount_unit", "VARCHAR"),
@@ -131,54 +137,7 @@ def ensure_stock_flow_contract(con) -> None:
         ("origin_provider", "VARCHAR"),
         ("field_mapping_version", "VARCHAR"),
     ):
-        con.execute(f"ALTER TABLE multi_source_stock_flow ADD COLUMN IF NOT EXISTS {column} {kind}")
-
-
-def migrate_existing_stock_flow(con) -> dict[str, int]:
-    """Backfill provenance and correct legacy TuShare ``main_net`` values.
-
-    The original raw JSON remains unchanged.  TuShare rows with both large and
-    super-large buckets are recalculated as main-order net; the old headline
-    value is retained as ``net_total``.
-    """
-    ensure_stock_flow_contract(con)
-    con.execute("""
-        UPDATE multi_source_stock_flow
-        SET amount_unit = coalesce(nullif(amount_unit, ''), 'yuan'),
-            origin_provider = coalesce(nullif(origin_provider, ''),
-                coalesce(json_extract_string(raw_json, '$._src'), provider, 'unknown')),
-            source_api = coalesce(nullif(source_api, ''),
-                coalesce(json_extract_string(raw_json, '$.source_api'),
-                         json_extract_string(raw_json, '$.source'), provider, 'unknown')),
-            field_mapping_version = coalesce(nullif(field_mapping_version, ''), 'legacy_v1')
-    """)
-    legacy_tushare = con.execute("""
-        SELECT count(*) FROM multi_source_stock_flow
-        WHERE provider='tushare' AND flow_definition IS NULL
-    """).fetchone()[0]
-    con.execute("""
-        UPDATE multi_source_stock_flow
-        SET net_total = coalesce(net_total, main_net),
-            main_net = CASE
-                WHEN super_net IS NOT NULL OR large_net IS NOT NULL
-                THEN coalesce(super_net, 0) + coalesce(large_net, 0)
-                ELSE main_net
-            END,
-            flow_definition = CASE
-                WHEN super_net IS NOT NULL OR large_net IS NOT NULL THEN 'main_orders_net'
-                ELSE 'total_net_only'
-            END,
-            source_api = coalesce(nullif(source_api, ''), 'moneyflow'),
-            field_mapping_version = 'stock_flow_v2'
-        WHERE provider='tushare'
-    """)
-    con.execute("""
-        UPDATE multi_source_stock_flow
-        SET flow_definition = coalesce(nullif(flow_definition, ''),
-            CASE WHEN provider IN ('eastmoney', 'eastmoney_market', 'kpl')
-                 THEN 'main_orders_net' ELSE 'provider_main_net' END),
-            field_mapping_version = coalesce(nullif(field_mapping_version, ''), 'stock_flow_v2')
-        WHERE provider <> 'tushare'
-    """)
-    con.commit()
-    return {"legacy_tushare_rows": int(legacy_tushare)}
+        if column not in existing:
+            con.execute(
+                f"ALTER TABLE multi_source_stock_flow ADD COLUMN {column} {kind}"
+            )

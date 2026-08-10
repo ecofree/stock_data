@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date as system_date, datetime as system_datetime
+
 import duckdb
 import requests
 
@@ -233,6 +235,90 @@ def test_market_flow_persists_beijing_exchange_coverage(tmp_path, monkeypatch):
             "SELECT expected_rows,fetched_rows,status "
             "FROM intraday_stock_flow_exchange_coverage WHERE exchange='BJ'"
         ).fetchone() == (1, 1, "success")
+    finally:
+        con.close()
+
+
+def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
+    tmp_path, monkeypatch
+):
+    trade_date = system_date.today().isoformat()
+
+    class _AfterCloseDateTime:
+        @classmethod
+        def now(cls):
+            return system_datetime.combine(
+                system_date.today(), system_datetime.strptime("17:45", "%H:%M").time()
+            )
+
+    def fake_live(trade_date, *, page_size, max_pages, pause_seconds, on_page, start_page):
+        rows = [
+            {
+                "f12": code, "f14": "Test", "f2": 10.0, "f3": 2.0,
+                "f62": 100.0, "f66": 50.0, "f72": 40.0,
+                "f78": 10.0, "f84": 0.0,
+            }
+            for code in ("000001", "600000")
+        ]
+        on_page(
+            1, rows, 1,
+            {"count": 2, "source": "eastmoney_intraday_clist", "status": "live"},
+        )
+        return [], {
+            "pages": 1, "expected_rows": 2, "rows": 2,
+            "source": "eastmoney_intraday_clist",
+        }
+
+    def fake_reference(trade_date, *, page_size, pause_seconds):
+        return [
+            {
+                "code": code,
+                "date": trade_date,
+                "main_net": 100.0,
+                "super_net": 50.0,
+                "large_net": 40.0,
+                "mid_net": 10.0,
+                "small_net": 0.0,
+            }
+            for code in ("000001", "600000")
+        ], {"source": "eastmoney_market"}
+
+    monkeypatch.setattr(
+        "scripts.collect_intraday_stock_flow_market.datetime",
+        _AfterCloseDateTime,
+    )
+    monkeypatch.setattr(
+        "scripts.collect_intraday_stock_flow_market.get_fund_flow_market_realtime",
+        fake_live,
+    )
+    monkeypatch.setattr(
+        "scripts.collect_intraday_stock_flow_market.get_fund_flow_market",
+        fake_reference,
+    )
+    db = tmp_path / "after-close-reconciliation.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)")
+    con.execute(
+        "INSERT INTO tushare_stock_basic VALUES "
+        "('000001','000001.SZ'),('600000','600000.SH')"
+    )
+    con.close()
+
+    result = collect_market_stock_flow(db, trade_date, pause_seconds=0)
+
+    assert result["status"] == "success", result.get("error")
+    assert result["reconciliation"]["status"] == "pass"
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        assert con.execute(
+            "SELECT status FROM intraday_stock_flow_batch WHERE trade_date=?",
+            [trade_date],
+        ).fetchone()[0] == "success"
+        assert con.execute(
+            "SELECT count(*) FROM multi_source_stock_flow "
+            "WHERE source_date=? AND provider='eastmoney_market'",
+            [trade_date],
+        ).fetchone()[0] == 0
     finally:
         con.close()
 

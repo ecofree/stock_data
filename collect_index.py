@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date as date_type
 
 from base import DuckDBStore, KPLClient
 
@@ -169,6 +170,87 @@ def collect_index_kline(client: KPLClient, store: DuckDBStore, date: str, index_
     if total:
         store.log_collect("index_kline", "/index/zhishu-kline", total, "ok")
     return total
+
+
+INDEX_NAMES = {
+    "SH000001": "上证指数",
+    "SZ399001": "深证成指",
+    "SZ399006": "创业板指",
+    "SH000688": "科创50",
+}
+
+
+def sync_index_list_from_kline(
+    store: DuckDBStore,
+    trade_date: str,
+    index_codes: list[str] | None = None,
+) -> int:
+    """Publish the requested-date index snapshot from persisted real K-lines."""
+    requested = date_type.fromisoformat(str(trade_date)[:10])
+    code_filter = ""
+    params: list[object] = [requested, requested]
+    if index_codes:
+        placeholders = ",".join("?" for _ in index_codes)
+        code_filter = f" AND index_code IN ({placeholders})"
+        params.extend(index_codes)
+    rows = store.fetchall(
+        f"""
+        WITH history AS (
+            SELECT
+                CAST(date AS DATE) AS trade_date,
+                index_code,
+                close,
+                volume,
+                turnover,
+                change_pct,
+                lag(close) OVER (
+                    PARTITION BY index_code ORDER BY CAST(date AS DATE)
+                ) AS previous_close
+            FROM index_kline
+            WHERE upper(coalesce(nullif(trim(ktype), ''), 'D'))='D'
+              AND CAST(date AS DATE) <= ?
+        )
+        SELECT trade_date, index_code, close, volume, turnover, change_pct,
+               previous_close
+        FROM history
+        WHERE trade_date = ?{code_filter}
+        """,
+        params,
+    )
+    payload = []
+    for row_date, code, close, volume, turnover, change_pct, previous_close in rows:
+        change_amount = None
+        if close is not None and previous_close is not None:
+            change_amount = float(close) - float(previous_close)
+        payload.append(
+            (
+                row_date,
+                code,
+                INDEX_NAMES.get(str(code), str(code)),
+                close,
+                change_pct,
+                change_amount,
+                turnover or 0,
+                volume or 0,
+            )
+        )
+    if not payload:
+        return 0
+    return store.insert_rows(
+        "index_list",
+        payload,
+        [
+            "date",
+            "index_code",
+            "index_name",
+            "price",
+            "change_pct",
+            "change_amt",
+            "turnover",
+            "volume",
+        ],
+        replace_on=["date", "index_code"],
+    )
 
 
 def collect_all_index(client: KPLClient, store: DuckDBStore, date: str) -> dict:

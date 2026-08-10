@@ -26,12 +26,19 @@ def main() -> int:
     parser.add_argument("--db", default=str(project_root / "kpl_data.duckdb"))
     parser.add_argument("--trade-date", default="", help="Defaults to latest stock_candidate_score trade_date.")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument(
+        "--stage",
+        choices=("auction", "intraday", "close"),
+        default="close",
+    )
     args = parser.parse_args()
 
     trade_date = args.trade_date or _latest_signal_date(args.db)
     if not trade_date:
         raise SystemExit("No trade_date supplied and stock_candidate_score is empty.")
-    result = run_daily_operator_loop(args.db, trade_date, args.limit)
+    result = run_daily_operator_loop(
+        args.db, trade_date, args.limit, stage=args.stage
+    )
     print(f"trade_date={trade_date}")
     for key, value in result.items():
         print(f"{key}={value}")

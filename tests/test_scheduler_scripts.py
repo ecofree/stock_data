@@ -40,4 +40,4 @@ def test_scheduler_installer_requires_elevation_and_system_principal():
     assert 'New-ScheduledTaskPrincipal -UserId "SYSTEM"' in installer
     assert "Get-ScheduledTask -TaskName $name" in installer
     assert "principal verification failed" in installer
-    assert '"StockData-Auction" "auction" "09:15" 300 "09:27"' in installer
+    assert '"StockData-Auction" "auction" "09:15" 120 "09:27"' in installer

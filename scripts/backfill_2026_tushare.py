@@ -22,8 +22,20 @@ def main() -> int:
                         help="Comma-separated: stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow")
     parser.add_argument("--max-days", type=int, default=0, help="Limit this invocation; 0 means all open dates.")
     parser.add_argument("--budget-seconds", type=float, default=300.0)
-    parser.add_argument("--request-timeout", type=int, default=12)
-    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--request-timeout", type=int, default=20)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--retry-passes",
+        type=int,
+        default=1,
+        help="Retry only failed date/dataset checkpoints after the first pass.",
+    )
+    parser.add_argument(
+        "--retry-delay-seconds",
+        type=float,
+        default=15.0,
+        help="Backoff before each failed-checkpoint retry pass.",
+    )
     parser.add_argument("--batch-limit", type=int, default=5000)
     parser.add_argument("--moneyflow-page-size", type=int, default=1000)
     parser.add_argument("--force", action="store_true", help="Re-fetch successful checkpoints.")
@@ -44,6 +56,8 @@ def main() -> int:
             datasets=datasets,
             max_days=args.max_days or None,
             force=args.force,
+            retry_passes=args.retry_passes,
+            retry_delay_seconds=args.retry_delay_seconds,
         )
     report = render_report(args.db, result, args.report)
     summary = {}

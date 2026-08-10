@@ -108,7 +108,7 @@ def test_premarket_signal_uses_previous_trade_date_context(tmp_path):
 
     evidence = json.loads(row[4])
     assert result["actionable"] == 1
-    assert row[:4] == ("2026-07-08", row[1], True, "stage_v2_asof")
+    assert row[:4] == ("2026-07-08", row[1], True, "stage_v3_score_recal")
     assert str(row[1]) == "2026-07-09 08:30:00"
     assert evidence["source_trade_date"] == "2026-07-08"
     assert evidence["input_cutoff_enforced"] is True

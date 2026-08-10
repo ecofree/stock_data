@@ -233,7 +233,9 @@ def collect_advanced_fengk_best(client: KPLClient, store: DuckDBStore, date: str
 
 
 def collect_advanced_on_the_lhb(client: KPLClient, store: DuckDBStore, date: str) -> int:
-    data = client.get("/advanced/on-the-lhb")
+    # Pass the trade date: without it the request is ambiguous and the row
+    # would be stamped with whatever the endpoint returned (or the run date).
+    data = client.get("/advanced/on-the-lhb", {"date": date})
     if not data:
         return 0
     stocks = data.get("data", data.get("stocks", []))

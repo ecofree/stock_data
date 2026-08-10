@@ -207,6 +207,23 @@ def test_tushare_ohlc_can_sync_to_core_kline_tables(tmp_path):
 
     result = sync_tushare_ohlc_to_core_tables(db_path)
 
+    # Production adds business-key unique indexes.  Re-running the same close
+    # recovery must update/merge in place rather than DELETE+INSERT and collide
+    # with DuckDB's unique-index constraint inside one transaction.
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            "CREATE UNIQUE INDEX uq_test_kline_business "
+            "ON kline(date,stock_code,ktype)"
+        )
+        con.execute(
+            "CREATE UNIQUE INDEX uq_test_index_kline_business "
+            "ON index_kline(date,index_code,ktype)"
+        )
+    finally:
+        con.close()
+    rerun = sync_tushare_ohlc_to_core_tables(db_path)
+
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         stock_row = con.execute(
@@ -219,6 +236,7 @@ def test_tushare_ohlc_can_sync_to_core_kline_tables(tmp_path):
         con.close()
 
     assert result == {"kline": 1, "index_kline": 1}
+    assert rerun == result
     assert stock_row == ("2026-07-09", "000001", 10.5, "D")
     assert index_row == ("2026-07-09", "SH000001", 3010.0, "D")
 
@@ -264,6 +282,46 @@ def test_tushare_ohlc_sync_can_be_scoped_by_code_and_date(tmp_path):
     assert result == {"kline": 1, "index_kline": 1}
     assert stock_rows == [("000001", "2026-07-09", 11.8)]
     assert index_rows == [("SZ399001", "2026-07-09", 9040.0)]
+
+
+def test_tushare_ohlc_sync_keeps_existing_core_rows_when_source_is_empty(tmp_path):
+    store, db_path = _store(tmp_path)
+    store.insert_rows(
+        "kline",
+        [("2026-07-09", "000001", 10, 11, 9.5, 10.5, 1000, 1200, 2.1, "D")],
+        [
+            "date", "stock_code", "open", "high", "low", "close",
+            "volume", "turnover", "change_pct", "ktype",
+        ],
+    )
+    store.insert_rows(
+        "index_kline",
+        [("2026-07-09", "SH000001", 3000, 3020, 2990, 3010, 10000, 20000, 0.5, "D")],
+        [
+            "date", "index_code", "open", "high", "low", "close",
+            "volume", "turnover", "change_pct", "ktype",
+        ],
+    )
+    store.close()
+
+    result = sync_tushare_ohlc_to_core_tables(
+        db_path, start_date="20260709", end_date="20260709"
+    )
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        stock_rows = con.execute(
+            "SELECT stock_code, close, ktype FROM kline"
+        ).fetchall()
+        index_rows = con.execute(
+            "SELECT index_code, close, ktype FROM index_kline"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert result == {"kline": 0, "index_kline": 0}
+    assert stock_rows == [("000001", 10.5, "D")]
+    assert index_rows == [("SH000001", 3010.0, "D")]
 
 
 def test_data_catalog_lists_tushare_relay_basic_data_source():

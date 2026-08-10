@@ -1,6 +1,54 @@
 import duckdb
+from datetime import datetime
 
 from trade_system.readiness import assess_trade_date_readiness
+
+
+def test_historical_as_of_rejects_rows_written_after_the_audit_time(tmp_path):
+    db_path = tmp_path / "future-row.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE multi_source_stock_flow("
+        "source_date DATE,stock_code VARCHAR,main_net DOUBLE,fetched_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO multi_source_stock_flow VALUES "
+        "('2026-07-31','000001',100,'2026-08-01 09:00:00')"
+    )
+    con.close()
+
+    result = assess_trade_date_readiness(
+        db_path,
+        "2026-07-31",
+        "intraday",
+        required_groups=["stock_capital_flow"],
+        max_age_seconds=7200,
+        now=datetime.fromisoformat("2026-07-31T17:45:00"),
+    )
+
+    assert result["ready"] is False
+    assert result["missing_groups"] == ["stock_capital_flow"]
+
+
+def test_readiness_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
+    db_path = tmp_path / "aware.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE daily_summary(date DATE, limit_up_count INTEGER, fetched_at TIMESTAMP, source_kind VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO daily_summary VALUES ('2026-07-31', 10, '2026-07-31 17:45:00', 'real')"
+    )
+    con.close()
+    result = assess_trade_date_readiness(
+        db_path,
+        "2026-07-31",
+        required_groups=("market_state",),
+        max_age_seconds=1200,
+        now=datetime.fromisoformat("2026-07-31T18:00:00+08:00"),
+    )
+    assert result["ready"] is True
+    assert result["as_of"] == "2026-07-31 18:00:00"
 
 
 def test_close_readiness_requires_same_date_capital_flows(tmp_path):

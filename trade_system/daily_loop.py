@@ -78,19 +78,73 @@ def _max_single_position(regime: dict) -> float:
     return min(10.0, max(5.0, suggested / 4.0))
 
 
-def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int) -> list[dict]:
+def _candidate_rows(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: str,
+    limit: int,
+    signal_stage: str | None = None,
+) -> list[dict]:
+    score_columns = table_columns(con, "stock_candidate_score")
     actionable_filter = ""
-    if "is_actionable" in table_columns(con, "stock_candidate_score"):
+    if "is_actionable" in score_columns:
         actionable_filter += "\n          AND coalesce(stock_candidate_score.is_actionable, false) = true"
     stage_columns = table_columns(con, "stock_candidate_stage_signal") if table_exists(con, "stock_candidate_stage_signal") else set()
-    stage_gate = "is_executable" if "is_executable" in stage_columns else "is_actionable"
+    if signal_stage and "is_actionable" in stage_columns:
+        execution_filters = ["coalesce(s.is_actionable,false)=true"]
+        if signal_stage in {"auction_confirmation", "intraday_strength"}:
+            if "data_complete" in stage_columns:
+                execution_filters.append("coalesce(s.data_complete,false)=true")
+            if "signal_triggered" in stage_columns:
+                execution_filters.append("coalesce(s.signal_triggered,false)=true")
+            if "tradable" in stage_columns:
+                execution_filters.append("coalesce(s.tradable,false)=true")
+        sector_expr = (
+            """
+                (
+                    SELECT c.sector_code
+                    FROM stock_candidate_score c
+                    WHERE c.trade_date=s.trade_date
+                      AND c.stock_code=s.stock_code
+                    LIMIT 1
+                )
+            """
+            if "sector_code" in score_columns
+            else "CAST(NULL AS VARCHAR)"
+        )
+        return _fetch_dicts(
+            con,
+            f"""
+            SELECT
+                s.trade_date,
+                s.stock_code,
+                s.stock_name,
+                s.score,
+                'stage_signal' AS source,
+                {sector_expr} AS sector_code,
+                s.evidence_json
+            FROM stock_candidate_stage_signal s
+            WHERE CAST(s.trade_date AS VARCHAR)=?
+              AND s.stage=?
+              AND {" AND ".join(execution_filters)}
+            ORDER BY s.score DESC NULLS LAST, s.stock_code
+            LIMIT ?
+            """,
+            [trade_date, signal_stage, int(limit)],
+        )
+    stage_gate = "is_actionable"
+    stage_params: list[Any] = []
+    stage_filter = ""
     if table_exists(con, "stock_candidate_stage_signal") and stage_gate in stage_columns:
+        if signal_stage and "stage" in stage_columns:
+            stage_filter = "AND s.stage = ?"
+            stage_params.append(signal_stage)
         actionable_filter = f"""
           AND EXISTS (
               SELECT 1
               FROM stock_candidate_stage_signal s
               WHERE s.trade_date = stock_candidate_score.trade_date
                 AND s.stock_code = stock_candidate_score.stock_code
+                {stage_filter}
                 AND coalesce(s.{stage_gate}, false) = true
           )
         """
@@ -104,7 +158,7 @@ def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int)
         ORDER BY score DESC NULLS LAST, stock_code
         LIMIT {int(limit)}
         """,
-        [trade_date],
+        [trade_date, *stage_params],
     )
     if rows or not table_exists(con, "stock_candidate_stage_signal"):
         return rows
@@ -117,6 +171,12 @@ def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int)
         if stage_gate in stage_columns
         else ""
     )
+    fallback_stage_filter = ""
+    fallback_params: list[Any] = [trade_date]
+    if signal_stage and "stage" in stage_columns:
+        fallback_stage_filter = "AND stage = ?"
+        fallback_params.append(signal_stage)
+    fallback_params.append(int(limit))
     stage_rows = _fetch_dicts(
         con,
         f"""
@@ -133,6 +193,7 @@ def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int)
                    ) AS rn
             FROM stock_candidate_stage_signal
             WHERE CAST(trade_date AS VARCHAR) = ?
+              {fallback_stage_filter}
               {stage_actionable_filter}
         )
         SELECT trade_date, stock_code, stock_name, score,
@@ -142,12 +203,17 @@ def _candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str, limit: int)
         ORDER BY score DESC NULLS LAST, stock_code
         LIMIT ?
         """,
-        [trade_date, int(limit)],
+        fallback_params,
     )
     return stage_rows
 
 
-def _stage_rows(con: duckdb.DuckDBPyConnection, trade_date: str, stock_codes: list[str]) -> list[dict]:
+def _stage_rows(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: str,
+    stock_codes: list[str],
+    signal_stage: str | None = None,
+) -> list[dict]:
     if not stock_codes:
         return []
     placeholders = ", ".join(["?"] * len(stock_codes))
@@ -158,20 +224,39 @@ def _stage_rows(con: duckdb.DuckDBPyConnection, trade_date: str, stock_codes: li
         if stage_gate in stage_columns
         else ""
     )
+    stage_filter = ""
+    stage_params: list[Any] = []
+    if signal_stage and "stage" in stage_columns:
+        stage_filter = "AND stage = ?"
+        stage_params.append(signal_stage)
     return _fetch_dicts(
         con,
         f"""
         SELECT trade_date, stage, stock_code, stock_name, score, decision, evidence_json
         FROM stock_candidate_stage_signal
         WHERE trade_date = ? AND stock_code IN ({placeholders})
+          {stage_filter}
           {actionable_filter}
         ORDER BY stock_code, stage
         """,
-        [trade_date] + stock_codes,
+        [trade_date] + stock_codes + stage_params,
     )
 
 
-def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 20) -> dict[str, int]:
+def run_daily_operator_loop(
+    db_path: str | Path,
+    trade_date: str,
+    limit: int = 20,
+    stage: str = "close",
+) -> dict[str, int]:
+    stage = str(stage or "close").lower()
+    if stage not in {"auction", "intraday", "close"}:
+        raise ValueError(f"unsupported operator stage: {stage}")
+    signal_stage = {
+        "auction": "auction_confirmation",
+        "intraday": "intraday_strength",
+        "close": "close_decision",
+    }[stage]
     init_trading_tables(db_path)
     con = duckdb.connect(str(db_path))
     try:
@@ -197,7 +282,14 @@ def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 2
         )
         data_readiness = (
             assess_trade_date_readiness(
-                con, trade_date, "close", max_age_seconds=21600
+                con,
+                trade_date,
+                stage,
+                max_age_seconds={
+                    "auction": 300,
+                    "intraday": 600,
+                    "close": 7200,
+                }[stage],
             )
             if has_operational_checkpoint
             else {"ready": True, "status": "legacy_test_or_manual_context"}
@@ -228,7 +320,25 @@ def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 2
             [trade_date, 0.0, max_single, max_sector, 2.0 if risk_state == "defensive" else 3.0, 0.0, risk_state, json.dumps(risk_evidence, ensure_ascii=False)],
         )
 
-        candidates = _candidate_rows(con, trade_date, limit)
+        if (
+            stage in {"auction", "intraday"}
+            and {"risk_approved", "is_executable"}.issubset(
+                stage_columns_for_gate
+            )
+        ):
+            # Every risk pass is a complete recalculation for the active
+            # stage.  Clear approvals first so a candidate that no longer
+            # triggers cannot retain an executable flag from an earlier run.
+            con.execute(
+                "UPDATE stock_candidate_stage_signal "
+                "SET risk_approved=false,is_executable=false "
+                "WHERE CAST(trade_date AS VARCHAR)=? AND stage=?",
+                [trade_date, signal_stage],
+            )
+
+        candidates = _candidate_rows(
+            con, trade_date, limit, signal_stage=signal_stage
+        )
         watchlist_count = 0
         trade_plan_count = 0
         current_total_position_pct = 0.0
@@ -301,18 +411,32 @@ def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 2
                     ),
                 ],
             )
-            if table_exists(con, "stock_candidate_stage_signal"):
+            if (
+                stage in {"auction", "intraday"}
+                and table_exists(con, "stock_candidate_stage_signal")
+            ):
                 stage_columns = table_columns(con, "stock_candidate_stage_signal")
                 if {"risk_approved", "is_executable"}.issubset(stage_columns):
                     con.execute(
                         """
                         UPDATE stock_candidate_stage_signal
-                        SET risk_approved=?, is_executable=(coalesce(data_complete,false)
+                        SET risk_approved=?, is_executable=(
+                            coalesce(data_complete,false)
                             AND coalesce(signal_triggered,false)
-                            AND coalesce(tradable,false) AND ?)
-                        WHERE trade_date=? AND stock_code=?
+                            AND coalesce(tradable,false)
+                            AND ?
+                            AND stage=?
+                        )
+                        WHERE trade_date=? AND stock_code=? AND stage=?
                         """,
-                        [bool(decision.allowed), bool(decision.allowed), trade_date, row.get("stock_code")],
+                        [
+                            bool(decision.allowed),
+                            bool(decision.allowed),
+                            signal_stage,
+                            trade_date,
+                            row.get("stock_code"),
+                            signal_stage,
+                        ],
                     )
             trade_plan_count += 1
 
@@ -329,10 +453,15 @@ def run_daily_operator_loop(db_path: str | Path, trade_date: str, limit: int = 2
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [trade_date, "close", "CASH", "No automatic position", 0.0, None, None, 0.0, None],
+            [trade_date, stage, "CASH", "No automatic position", 0.0, None, None, 0.0, None],
         )
 
-        stage_rows = _stage_rows(con, trade_date, [row.get("stock_code") for row in candidates])
+        stage_rows = _stage_rows(
+            con,
+            trade_date,
+            [row.get("stock_code") for row in candidates],
+            signal_stage=signal_stage,
+        )
         journal_count = 0
         stage_time = {
             "premarket_pool": "pre_market",

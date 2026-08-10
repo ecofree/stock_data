@@ -64,6 +64,25 @@ class BrokenCalendarTushare:
         raise RuntimeError("relay unavailable")
 
 
+class TransientDailyTushare:
+    def __init__(self):
+        self.daily_attempts = 0
+
+    def query_rows(self, api, params=None, fields=""):
+        if api == "trade_cal":
+            return [{"exchange": "SSE", "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
+        if api == "daily":
+            self.daily_attempts += 1
+            if self.daily_attempts == 1:
+                raise RuntimeError("temporary relay reset")
+            return [{
+                "ts_code": "000001.SZ", "trade_date": "20260710", "open": 10,
+                "high": 11, "low": 9, "close": 10.5, "vol": 100,
+                "amount": 1000, "pct_chg": 1,
+            }]
+        return []
+
+
 def test_tushare_calendar_accepts_verified_closed_day_without_weekday_fallback(tmp_path):
     db = tmp_path / "closed-calendar.duckdb"
     with TushareHistoryCollector(db, client=ClosedDayTushare()) as collector:
@@ -79,6 +98,30 @@ def test_tushare_calendar_failure_is_fail_closed(tmp_path):
             assert "trade_cal fetch failed" in str(exc)
         else:
             raise AssertionError("calendar relay failure must not synthesize a weekday")
+
+
+def test_tushare_failed_checkpoint_gets_one_bounded_outer_retry(tmp_path):
+    db = tmp_path / "transient.duckdb"
+    client = TransientDailyTushare()
+    with TushareHistoryCollector(db, client=client, budget_seconds=30) as collector:
+        result = collector.run(
+            "20260710",
+            "20260710",
+            datasets=["daily"],
+            retry_passes=1,
+            retry_delay_seconds=0,
+        )
+        assert result["results"] == [{
+            "dataset": "daily",
+            "trade_date": "2026-07-10",
+            "status": "success",
+            "rows": 1,
+        }]
+        assert client.daily_attempts == 2
+        assert collector.store.conn.execute(
+            "SELECT status,attempts,rows_written FROM history_fetch_checkpoint "
+            "WHERE dataset='daily' AND trade_date='2026-07-10'"
+        ).fetchone() == ("success", 2, 1)
 
 
 def test_tushare_industry_zero_close_rows_are_kept_raw_but_not_normalized(tmp_path):

@@ -2,35 +2,50 @@ import json
 
 import duckdb
 
-from trade_system.backfill import derive_index_kline_from_daily_summary
+from base import DuckDBStore
+from collect_index import sync_index_list_from_kline
 
 
-def test_derive_index_kline_from_daily_summary_populates_fallback_index_rows(tmp_path):
+def test_sync_index_list_from_real_kline_publishes_requested_date_only(tmp_path):
     db_path = tmp_path / "index.duckdb"
     con = duckdb.connect(str(db_path))
-    con.execute("CREATE TABLE daily_summary(date DATE, raw_json VARCHAR)")
     con.execute(
-        """
-        INSERT INTO daily_summary VALUES
-        ('2026-07-06', '{"上证指数":4041.24,"涨跌幅":"-0.06%","成交额":1432112821099}')
-        """
+        "CREATE TABLE index_kline("
+        "date DATE,index_code VARCHAR,close DOUBLE,volume BIGINT,turnover BIGINT,"
+        "change_pct DOUBLE,ktype VARCHAR)"
+    )
+    con.execute(
+        "CREATE TABLE index_list("
+        "date DATE,index_code VARCHAR,index_name VARCHAR,price DOUBLE,"
+        "change_pct DOUBLE,change_amt DOUBLE,turnover BIGINT,volume BIGINT)"
+    )
+    con.execute(
+        "INSERT INTO index_kline VALUES "
+        "('2026-07-05','SH000001',4000,100,1000,-1,'D'),"
+        "('2026-07-06','SH000001',4041.24,120,1432,1.03,'D')"
     )
     con.close()
 
-    result = derive_index_kline_from_daily_summary(db_path)
-    result_again = derive_index_kline_from_daily_summary(db_path)
+    store = DuckDBStore(db_path)
+    try:
+        result = sync_index_list_from_kline(store, "2026-07-06", ["SH000001"])
+        result_again = sync_index_list_from_kline(
+            store, "2026-07-06", ["SH000001"]
+        )
+    finally:
+        store.close()
 
-    assert result["source_rows"] == 1
-    assert result["inserted_rows"] == 1
-    assert result_again["inserted_rows"] == 1
+    assert result == 1
+    assert result_again == 1
     con = duckdb.connect(str(db_path))
     try:
         rows = con.execute(
-            "SELECT CAST(date AS VARCHAR), index_code, close, change_pct, turnover, ktype FROM index_kline"
+            "SELECT CAST(date AS VARCHAR),index_code,index_name,price,"
+            "round(change_amt,2) FROM index_list"
         ).fetchall()
     finally:
         con.close()
-    assert rows == [("2026-07-06", "SH000001", 4041.24, -0.06, 1432112821099, "D")]
+    assert rows == [("2026-07-06", "SH000001", "上证指数", 4041.24, 41.24)]
 
 from trade_system.data_chain import assess_data_chains
 from trade_system.normalize import build_normalized_views

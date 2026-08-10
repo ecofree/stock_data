@@ -710,28 +710,79 @@ def init_schema(db: duckdb.DuckDBPyConnection):
         db.execute(
             f"ALTER TABLE ths_concept_member_checkpoint ADD COLUMN IF NOT EXISTS {_column} {_type}"
         )
-    # Source-aware default relations: THS wins for a date; KPL is retained as
-    # a per-date compatibility fallback only when THS has no snapshot.
+    # Source-aware, quality-gated default relations.  THS wins for a date, but
+    # only concepts whose member pagination checkpoint is ``success`` are
+    # exposed.  A ``success_stale`` cache is useful for recovery/audit, never
+    # as a current canonical input.  KPL remains a compatibility fallback only
+    # when there is no quality-gated THS snapshot for that date.
     db.execute("""
         CREATE OR REPLACE VIEW v_default_concept_daily AS
         SELECT trade_date, concept_code, concept_name, rank, stock_count, source, raw_json, date_verified
-        FROM ths_concept_daily
+        FROM ths_concept_daily t
+        WHERE EXISTS (
+            SELECT 1
+            FROM ths_concept_member_checkpoint c
+            WHERE c.trade_date = t.trade_date
+              AND c.concept_code = t.concept_code
+              AND c.status = 'success'
+        )
+          AND coalesce(
+                CASE WHEN json_valid(t.raw_json)
+                     THEN json_extract_string(t.raw_json, '$.stale_fallback')
+                     ELSE 'false' END,
+                'false'
+              ) <> 'true'
         UNION ALL
         SELECT k.trade_date, k.concept_code, k.concept_name, k.rank, k.stock_count, k.source, k.raw_json, k.date_verified
         FROM kpl_concept_daily k
         WHERE NOT EXISTS (
-            SELECT 1 FROM ths_concept_daily t WHERE t.trade_date = k.trade_date
+            SELECT 1
+            FROM ths_concept_daily t
+            JOIN ths_concept_member_checkpoint c
+              ON c.trade_date = t.trade_date AND c.concept_code = t.concept_code
+            WHERE t.trade_date = k.trade_date
+              AND c.status = 'success'
+              AND coalesce(
+                    CASE WHEN json_valid(t.raw_json)
+                         THEN json_extract_string(t.raw_json, '$.stale_fallback')
+                         ELSE 'false' END,
+                    'false'
+                  ) <> 'true'
         )
     """)
     db.execute("""
         CREATE OR REPLACE VIEW v_default_concept_stock_history AS
         SELECT trade_date, concept_code, concept_name, stock_code, stock_name, concept_rank, source, raw_json, date_verified
-        FROM ths_concept_stock_history
+        FROM ths_concept_stock_history h
+        WHERE EXISTS (
+            SELECT 1
+            FROM ths_concept_member_checkpoint c
+            WHERE c.trade_date = h.trade_date
+              AND c.concept_code = h.concept_code
+              AND c.status = 'success'
+        )
+          AND coalesce(
+                CASE WHEN json_valid(h.raw_json)
+                     THEN json_extract_string(h.raw_json, '$.stale_fallback')
+                     ELSE 'false' END,
+                'false'
+              ) <> 'true'
         UNION ALL
         SELECT k.trade_date, k.concept_code, k.concept_name, k.stock_code, k.stock_name, k.concept_rank, k.source, k.raw_json, k.date_verified
         FROM kpl_concept_stock_history k
         WHERE NOT EXISTS (
-            SELECT 1 FROM ths_concept_stock_history t WHERE t.trade_date = k.trade_date
+            SELECT 1
+            FROM ths_concept_daily t
+            JOIN ths_concept_member_checkpoint c
+              ON c.trade_date = t.trade_date AND c.concept_code = t.concept_code
+            WHERE t.trade_date = k.trade_date
+              AND c.status = 'success'
+              AND coalesce(
+                    CASE WHEN json_valid(t.raw_json)
+                         THEN json_extract_string(t.raw_json, '$.stale_fallback')
+                         ELSE 'false' END,
+                    'false'
+                  ) <> 'true'
         )
     """)
 

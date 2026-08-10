@@ -16,6 +16,7 @@ from typing import Iterable
 import duckdb
 
 from trade_system.quality import table_columns, table_exists
+from trade_system.time_utils import as_local_naive
 
 
 def _normalize_trade_date(value: str) -> str:
@@ -129,6 +130,7 @@ def relation_freshness(
     max_age_seconds: int | None = None,
     now: datetime | None = None,
 ) -> dict:
+    now = as_local_naive(now) or datetime.now()
     if not table_exists(con, relation):
         return {
             "relation": relation,
@@ -188,13 +190,21 @@ def relation_freshness(
     # value remains available through ``net_total`` for separate analysis.
     if relation == "multi_source_stock_flow" and "main_net" in columns:
         valid_flow = '"main_net" IS NOT NULL'
+    as_of_filter = (
+        f' AND "{timestamp_column}" <= ?'
+        if now is not None and timestamp_column
+        else ""
+    )
+    base_params: list[object] = [trade_date]
+    if as_of_filter:
+        base_params.append(now)
     rows, real_rows, fallback_rows, latest_timestamp = con.execute(
         f"""
         SELECT count(*), {real_expr}, {fallback_expr}, {timestamp_expr}
         FROM "{relation}"
-        WHERE CAST("{date_column}" AS VARCHAR) = ? AND {valid_flow}
+        WHERE CAST("{date_column}" AS VARCHAR) = ? AND {valid_flow}{as_of_filter}
         """,
-        [trade_date],
+        base_params,
     ).fetchone()
     latest_date = con.execute(
         f'SELECT max(CAST("{date_column}" AS VARCHAR)) FROM "{relation}"'
@@ -205,7 +215,7 @@ def relation_freshness(
         try:
             observed_at = latest_timestamp
             if isinstance(observed_at, str):
-                observed_at = datetime.fromisoformat(observed_at)
+                observed_at = as_local_naive(observed_at)
             cutoff = (now or datetime.now()) - timedelta(seconds=max(0, int(max_age_seconds)))
             rows, real_rows, fallback_rows = con.execute(
                 f"""
@@ -214,8 +224,9 @@ def relation_freshness(
                 WHERE CAST("{date_column}" AS VARCHAR) = ?
                   AND {valid_flow}
                   AND "{timestamp_column}" >= ?
+                  AND "{timestamp_column}" <= ?
                 """,
-                [trade_date, cutoff],
+                [trade_date, cutoff, now or datetime.now()],
             ).fetchone()
         except (TypeError, ValueError):
             pass
@@ -225,7 +236,7 @@ def relation_freshness(
         try:
             observed_at = latest_timestamp
             if isinstance(observed_at, str):
-                observed_at = datetime.fromisoformat(observed_at)
+                observed_at = as_local_naive(observed_at)
             reference_now = now or datetime.now()
             freshness_age_seconds = max(0.0, (reference_now - observed_at).total_seconds())
         except (TypeError, ValueError):
@@ -240,11 +251,15 @@ def relation_freshness(
     # by the explicit fallback path.
     if rows and "source_kind" in columns:
         source_kind = con.execute(
-            f'SELECT source_kind FROM "{relation}" WHERE CAST("{date_column}" AS VARCHAR)=? '
+            f'SELECT source_kind FROM "{relation}" WHERE CAST("{date_column}" AS VARCHAR)=?{as_of_filter} '
             f'ORDER BY {timestamp_column or date_column} DESC NULLS LAST LIMIT 1',
-            [trade_date],
+            base_params,
         ).fetchone()
-        if source_kind and str(source_kind[0] or "").lower() == "fallback":
+        if source_kind and str(source_kind[0] or "").lower() in {
+            "fallback",
+            "derived",
+            "derived_current",
+        }:
             real_rows = 0
             status = "fallback_only"
     batch_meta = None
@@ -348,6 +363,11 @@ def assess_trade_date_readiness(
     now: datetime | None = None,
 ) -> dict:
     trade_date = _normalize_trade_date(trade_date)
+    # Freeze one local reference time for the whole assessment.  Besides
+    # avoiding tiny timestamp drift between relations, exposing this value in
+    # the report prevents an old trade date from being mistaken for current
+    # readiness when an operator reviews a weekend or historical audit.
+    now = as_local_naive(now) or datetime.now()
     selected_groups = tuple(required_groups or STAGE_REQUIREMENTS.get(stage, STAGE_REQUIREMENTS["close"]))
     owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
     con = duckdb.connect(str(db_path), read_only=True) if owns_connection else db_path
@@ -452,9 +472,20 @@ def assess_trade_date_readiness(
                 ).fetchone()
                 batch_status = str(batch[0] or "") if batch else ""
                 batch_coverage = float(batch[1] or 0) if batch else 0.0
+                # Live sessions often land 99.0–99.5% with a few suspended names
+                # and status ``partial``.  That is still usable for analytics and
+                # candidate evidence; only fail clearly incomplete runs.
                 batch_complete = (
                     batch_status == "success"
-                    or (batch_status == "success_with_unavailable" and batch_coverage >= 99.5)
+                    or (
+                        batch_status
+                        in {
+                            "success_with_unavailable",
+                            "partial",
+                            "success_with_optional_gap",
+                        }
+                        and batch_coverage >= 99.5
+                    )
                 )
                 if batch and (not batch_complete or batch_coverage < 80.0):
                     group_results[-1]["ready"] = False
@@ -498,42 +529,83 @@ def assess_trade_date_readiness(
         if owns_connection:
             con.close()
     missing = [item["group"] for item in group_results if not item["ready"]]
-    # P0#3: distinguish data-readiness (analytics) from execution-readiness.  Data can
-    # be fully present yet only from a delayed provider that cannot back a real order;
-    # operators must not see a green "actionable" signal in that case.  Count the
-    # executable candidates already persisted for this date on an independent
-    # read-only connection (the assessment connection is closed in the finally above).
-    actionable_candidates = 0
-    try:
-        if isinstance(db_path, duckdb.DuckDBPyConnection):
-            actionable_candidates = int(db_path.execute(
-                "SELECT count(*) FROM stock_candidate_stage_signal "
-                "WHERE CAST(trade_date AS VARCHAR)=? AND coalesce(is_actionable,false)=true",
-                [trade_date],
-            ).fetchone()[0] or 0)
-        else:
-            _con = duckdb.connect(str(db_path), read_only=True)
-            try:
-                actionable_candidates = int(_con.execute(
-                    "SELECT count(*) FROM stock_candidate_stage_signal "
-                    "WHERE CAST(trade_date AS VARCHAR)=? AND coalesce(is_actionable,false)=true",
-                    [trade_date],
-                ).fetchone()[0] or 0)
-            finally:
-                _con.close()
-    except Exception:
-        actionable_candidates = 0
+    # Candidate counts must describe this phase only.  Mixing prior intraday
+    # rows into close readiness made a review-only close look entry-ready.
+    stage_signal = {
+        "premarket": "premarket_pool",
+        "auction": "auction_confirmation",
+        "intraday": "intraday_strength",
+        "close": "close_decision",
+        "postmarket": "close_decision",
+    }.get(stage)
+
+    def _candidate_counts(connection: duckdb.DuckDBPyConnection) -> tuple[int, int, int, int]:
+        if not table_exists(connection, "stock_candidate_stage_signal"):
+            return 0, 0, 0, 0
+        columns = set(table_columns(connection, "stock_candidate_stage_signal"))
+        actionable_expr = (
+            "sum(CASE WHEN coalesce(is_actionable,false) THEN 1 ELSE 0 END)"
+            if "is_actionable" in columns
+            else "0"
+        )
+        tradable_expr = (
+            "sum(CASE WHEN coalesce(tradable,false) THEN 1 ELSE 0 END)"
+            if "tradable" in columns
+            else "0"
+        )
+        risk_expr = (
+            "sum(CASE WHEN coalesce(risk_approved,false) THEN 1 ELSE 0 END)"
+            if "risk_approved" in columns
+            else "0"
+        )
+        executable_expr = (
+            "sum(CASE WHEN coalesce(is_executable,false) THEN 1 ELSE 0 END)"
+            if "is_executable" in columns
+            else "0"
+        )
+        filters = ["CAST(trade_date AS VARCHAR)=?"]
+        params: list[str] = [trade_date]
+        if stage_signal and "stage" in columns:
+            filters.append("stage=?")
+            params.append(stage_signal)
+        row = connection.execute(
+            "SELECT "
+            f"{actionable_expr}, {tradable_expr}, {risk_expr}, {executable_expr} "
+            "FROM stock_candidate_stage_signal WHERE " + " AND ".join(filters),
+            params,
+        ).fetchone()
+        return tuple(int((value or 0)) for value in (row or (0, 0, 0, 0)))
+
+    if isinstance(db_path, duckdb.DuckDBPyConnection):
+        candidate_counts = _candidate_counts(db_path)
+    else:
+        _con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            candidate_counts = _candidate_counts(_con)
+        finally:
+            _con.close()
+    (
+        actionable_candidates,
+        tradable_candidates,
+        risk_approved_candidates,
+        executable_candidates,
+    ) = candidate_counts
     analytics_ready = not missing
     return {
         "trade_date": trade_date,
         "stage": stage,
+        "as_of": now.isoformat(sep=" ", timespec="seconds"),
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
         # ``ready`` stays the data-readiness gate (drives pipeline exit codes); the
         # analytics/execution split below is the operator-facing clarification.
         "ready": analytics_ready,
         "analytics_ready": analytics_ready,
-        "execution_ready": actionable_candidates > 0,
+        # Entry-ready only when same-session executable evidence exists.
+        "execution_ready": executable_candidates > 0,
         "actionable_candidates": actionable_candidates,
+        "tradable_candidates": tradable_candidates,
+        "risk_approved_candidates": risk_approved_candidates,
+        "executable_candidates": executable_candidates,
         "missing_groups": missing,
         "groups": group_results,
     }
@@ -543,20 +615,28 @@ def render_readiness_markdown(result: dict) -> str:
     analytics_ready = result.get("analytics_ready", result["ready"])
     execution_ready = result.get("execution_ready", False)
     actionable_candidates = result.get("actionable_candidates", 0)
+    tradable_candidates = result.get("tradable_candidates", 0)
+    risk_approved_candidates = result.get("risk_approved_candidates", 0)
+    executable_candidates = result.get("executable_candidates", 0)
     lines = [
         "# Trade Date Readiness",
         "",
         f"- Trade date: `{result['trade_date']}`",
         f"- Stage: `{result['stage']}`",
+        f"- As of: `{result.get('as_of') or 'runtime clock'}`",
         f"- Analytics ready: `{str(analytics_ready).lower()}`",
         f"- Execution ready: `{str(execution_ready).lower()}`",
         f"- Actionable candidates: `{actionable_candidates}`",
+        f"- Tradable candidates: `{tradable_candidates}`",
+        f"- Risk-approved candidates: `{risk_approved_candidates}`",
+        f"- Executable candidates: `{executable_candidates}`",
         f"- Missing groups: `{', '.join(result['missing_groups']) or 'none'}`",
     ]
     if analytics_ready and not execution_ready:
         lines.append(
-            "- WARNING: data is present but no candidate is executable "
-            "(e.g. only delayed providers); treat as analysis-only, NOT execution-ready."
+            "- WARNING: data is present but no candidate is entry-executable "
+            "(e.g. delayed providers or close signal_close review-only); "
+            "treat as analysis-only, NOT entry-ready."
         )
     lines.extend([
         "",

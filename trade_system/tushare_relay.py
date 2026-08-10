@@ -236,7 +236,15 @@ class TushareRelayClient:
                 last_error = type(exc).__name__
                 if attempt >= self.retries:
                     break
-                time.sleep(1)
+                # Rate-limit responses (relay app code=-1 "次数超限" or HTTP
+                # 429) only clear once the one-minute window rolls over, so a
+                # one-second retry just burns another attempt.  Scale the
+                # backoff with the attempt count, capped near the window size.
+                text = str(exc)
+                if "超限" in text or "429" in text:
+                    time.sleep(min(65.0, 15.0 * attempt))
+                else:
+                    time.sleep(1)
         raise TushareRelayError(f"relay request failed after {self.retries} attempts: {last_error}")
 
     def query_rows(self, api_name: str, params: dict[str, Any] | None = None, fields: str = "") -> list[dict[str, Any]]:
@@ -543,78 +551,175 @@ def sync_tushare_ohlc_to_core_tables(
         index_count = store.conn.execute(
             f"SELECT count(*) FROM tushare_index_daily WHERE {index_where}", index_params
         ).fetchone()[0]
-        delete_filters = []
-        delete_params: list[Any] = []
-        if stock_codes_normalized:
-            delete_filters.append(
-                "stock_code IN (" + ",".join("?" for _ in stock_codes_normalized) + ")"
-            )
-            delete_params.extend(stock_codes_normalized)
-        if start_date:
-            delete_filters.append("date >= CAST(? AS DATE)")
-            delete_params.append(_iso_date(start_date))
-        if end_date:
-            delete_filters.append("date <= CAST(? AS DATE)")
-            delete_params.append(_iso_date(end_date))
-        if delete_filters:
-            store.conn.execute(
-                f"DELETE FROM kline WHERE {' AND '.join(delete_filters)}", delete_params
-            )
-            store.conn.commit()
-        store.conn.execute(
-            f"""
-            INSERT INTO kline
-                (date, stock_code, open, high, low, close, volume, turnover, change_pct, ktype)
-            SELECT date, stock_code, open, high, low, close,
-                   CAST(volume AS BIGINT), CAST(turnover AS BIGINT), change_pct, 'D'
-            FROM (
-                SELECT *, row_number() OVER (
-                    PARTITION BY date, stock_code ORDER BY fetched_at DESC NULLS LAST
-                ) AS _rn
-                FROM tushare_daily
-                WHERE {stock_where}
-            ) latest
-            WHERE _rn = 1
-            """,
-            stock_params,
-        )
-        store.conn.commit()
-        delete_filters = []
-        delete_params = []
-        if index_codes_normalized:
-            delete_filters.append(
-                "index_code IN (" + ",".join("?" for _ in index_codes_normalized) + ")"
-            )
-            delete_params.extend(index_codes_normalized)
-        if start_date:
-            delete_filters.append("CAST(date AS DATE) >= CAST(? AS DATE)")
-            delete_params.append(_iso_date(start_date))
-        if end_date:
-            delete_filters.append("CAST(date AS DATE) <= CAST(? AS DATE)")
-            delete_params.append(_iso_date(end_date))
-        if delete_filters:
-            store.conn.execute(
-                f"DELETE FROM index_kline WHERE {' AND '.join(delete_filters)}", delete_params
-            )
-            store.conn.commit()
-        store.conn.execute(
-            f"""
-            INSERT INTO index_kline
-                (date, index_code, open, high, low, close, volume, turnover, change_pct, ktype)
-            SELECT CAST(date AS VARCHAR), index_code, open, high, low, close,
-                   CAST(volume AS BIGINT), CAST(turnover AS BIGINT), change_pct, 'D'
-            FROM (
-                SELECT *, row_number() OVER (
-                    PARTITION BY date, index_code ORDER BY fetched_at DESC NULLS LAST
-                ) AS _rn
-                FROM tushare_index_daily
-                WHERE {index_where}
-            ) latest
-            WHERE _rn = 1
-            """,
-            index_params,
-        )
-        store.conn.commit()
+        # Publish only keys present in the verified source batch.  Empty or
+        # partial relay responses must never erase an existing core row.
+        if stock_count or index_count:
+            store.conn.execute("BEGIN TRANSACTION")
+            try:
+                if stock_count:
+                    store.conn.execute(
+                        f"""
+                        MERGE INTO kline AS target
+                        USING (
+                            SELECT *, row_number() OVER (
+                                PARTITION BY date, stock_code ORDER BY fetched_at DESC NULLS LAST
+                            ) AS _rn
+                            FROM tushare_daily
+                            WHERE {stock_where}
+                        ) AS source
+                        ON target.date=source.date
+                           AND target.stock_code=source.stock_code
+                           AND target.ktype='D'
+                        WHEN MATCHED AND source._rn=1 THEN UPDATE SET
+                            open=source.open,
+                            high=source.high,
+                            low=source.low,
+                            close=source.close,
+                            volume=CAST(source.volume AS BIGINT),
+                            turnover=CAST(source.turnover AS BIGINT),
+                            change_pct=source.change_pct
+                        WHEN NOT MATCHED AND source._rn=1 THEN INSERT
+                            (date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype)
+                        VALUES
+                            (source.date,source.stock_code,source.open,source.high,source.low,source.close,
+                             CAST(source.volume AS BIGINT),CAST(source.turnover AS BIGINT),source.change_pct,'D')
+                        """,
+                        stock_params,
+                    )
+                if index_count:
+                    store.conn.execute(
+                        f"""
+                        MERGE INTO index_kline AS target
+                        USING (
+                            SELECT *, row_number() OVER (
+                                PARTITION BY date, index_code ORDER BY fetched_at DESC NULLS LAST
+                            ) AS _rn
+                            FROM tushare_index_daily
+                            WHERE {index_where}
+                        ) AS source
+                        ON CAST(target.date AS VARCHAR)=CAST(source.date AS VARCHAR)
+                           AND target.index_code=source.index_code
+                           AND target.ktype='D'
+                        WHEN MATCHED AND source._rn=1 THEN UPDATE SET
+                            open=source.open,
+                            high=source.high,
+                            low=source.low,
+                            close=source.close,
+                            volume=CAST(source.volume AS BIGINT),
+                            turnover=CAST(source.turnover AS BIGINT),
+                            change_pct=source.change_pct
+                        WHEN NOT MATCHED AND source._rn=1 THEN INSERT
+                            (date,index_code,open,high,low,close,volume,turnover,change_pct,ktype)
+                        VALUES
+                            (CAST(source.date AS VARCHAR),source.index_code,source.open,source.high,source.low,
+                             source.close,CAST(source.volume AS BIGINT),CAST(source.turnover AS BIGINT),
+                             source.change_pct,'D')
+                        """,
+                        index_params,
+                    )
+                # Keep the source-aware K-line layer aligned with the
+                # verified TuShare staging tables.  The production views use
+                # ``tushare_daily`` directly, but stale rows in
+                # ``multi_source_kline`` made the multi-source audit report a
+                # false K-line outage and left the fallback graph split across
+                # two authorities.  This is a local MERGE only; it does not
+                # trigger another network request.
+                source_tables = {
+                    row[0] for row in store.conn.execute("SHOW TABLES").fetchall()
+                }
+                if "multi_source_kline" in source_tables:
+                    if stock_count:
+                        store.conn.execute(
+                            f"""
+                            MERGE INTO multi_source_kline AS target
+                            USING (
+                                SELECT source_date, asset_type, asset_code, open, high, low,
+                                       close, volume, amount, change_pct, provider, fetched_at,
+                                       is_stale, raw_json
+                                FROM (
+                                    SELECT date AS source_date, 'stock' AS asset_type,
+                                           stock_code AS asset_code, open, high, low, close,
+                                           volume, turnover AS amount, change_pct,
+                                           'tushare' AS provider, fetched_at,
+                                           FALSE AS is_stale, NULL::VARCHAR AS raw_json,
+                                           row_number() OVER (
+                                               PARTITION BY date, stock_code
+                                               ORDER BY fetched_at DESC NULLS LAST
+                                           ) AS _rn
+                                    FROM tushare_daily
+                                    WHERE {stock_where}
+                                ) ranked
+                                WHERE _rn=1
+                            ) AS source
+                            ON target.source_date=source.source_date
+                               AND target.asset_type=source.asset_type
+                               AND target.asset_code=source.asset_code
+                               AND target.provider=source.provider
+                            WHEN MATCHED THEN UPDATE SET
+                                open=source.open, high=source.high, low=source.low,
+                                close=source.close, volume=source.volume, amount=source.amount,
+                                change_pct=source.change_pct, fetched_at=source.fetched_at,
+                                is_stale=FALSE, raw_json=source.raw_json
+                            WHEN NOT MATCHED THEN INSERT (
+                                source_date, asset_type, asset_code, open, high, low, close,
+                                volume, amount, change_pct, provider, fetched_at, is_stale, raw_json
+                            ) VALUES (
+                                source.source_date, source.asset_type, source.asset_code,
+                                source.open, source.high, source.low, source.close,
+                                source.volume, source.amount, source.change_pct, source.provider,
+                                source.fetched_at, source.is_stale, source.raw_json
+                            )
+                            """,
+                            stock_params,
+                        )
+                    if index_count:
+                        store.conn.execute(
+                            f"""
+                            MERGE INTO multi_source_kline AS target
+                            USING (
+                                SELECT source_date, asset_type, asset_code, open, high, low,
+                                       close, volume, amount, change_pct, provider, fetched_at,
+                                       is_stale, raw_json
+                                FROM (
+                                    SELECT date AS source_date, 'index' AS asset_type,
+                                           index_code AS asset_code, open, high, low, close,
+                                           volume, turnover AS amount, change_pct,
+                                           'tushare' AS provider, fetched_at,
+                                           FALSE AS is_stale, NULL::VARCHAR AS raw_json,
+                                           row_number() OVER (
+                                               PARTITION BY date, index_code
+                                               ORDER BY fetched_at DESC NULLS LAST
+                                           ) AS _rn
+                                    FROM tushare_index_daily
+                                    WHERE {index_where}
+                                ) ranked
+                                WHERE _rn=1
+                            ) AS source
+                            ON target.source_date=source.source_date
+                               AND target.asset_type=source.asset_type
+                               AND target.asset_code=source.asset_code
+                               AND target.provider=source.provider
+                            WHEN MATCHED THEN UPDATE SET
+                                open=source.open, high=source.high, low=source.low,
+                                close=source.close, volume=source.volume, amount=source.amount,
+                                change_pct=source.change_pct, fetched_at=source.fetched_at,
+                                is_stale=FALSE, raw_json=source.raw_json
+                            WHEN NOT MATCHED THEN INSERT (
+                                source_date, asset_type, asset_code, open, high, low, close,
+                                volume, amount, change_pct, provider, fetched_at, is_stale, raw_json
+                            ) VALUES (
+                                source.source_date, source.asset_type, source.asset_code,
+                                source.open, source.high, source.low, source.close,
+                                source.volume, source.amount, source.change_pct, source.provider,
+                                source.fetched_at, source.is_stale, source.raw_json
+                            )
+                            """,
+                            index_params,
+                        )
+                store.conn.execute("COMMIT")
+            except Exception:
+                store.conn.execute("ROLLBACK")
+                raise
         return {"kline": int(stock_count or 0), "index_kline": int(index_count or 0)}
     finally:
         store.close()

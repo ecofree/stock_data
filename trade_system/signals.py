@@ -431,7 +431,7 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
         """,
         [trade_date],
     )
-    if not rows and table_exists(con, "ths_concept_stock_history"):
+    if not rows and table_exists(con, "v_default_concept_stock_history"):
         # A same-day limit-up feed may be unavailable during the session. Use
         # the THS snapshot only to keep a research candidate pool visible;
         # readiness remains blocked because this is not a real limit-up pool.
@@ -439,13 +439,15 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
             con,
             """
             WITH ranked_members AS (
-                SELECT h.trade_date, h.stock_code, h.stock_name,
+                SELECT h.trade_date,
+                       regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                       max(h.stock_name) AS stock_name,
                        min(h.concept_rank) AS concept_rank,
                        count(DISTINCT h.concept_code) AS concept_hits
-                FROM ths_concept_stock_history h
+                FROM v_default_concept_stock_history h
                 WHERE h.trade_date = ?
-                GROUP BY h.trade_date, h.stock_code, h.stock_name
-                ORDER BY concept_hits DESC, concept_rank NULLS LAST, h.stock_code
+                GROUP BY h.trade_date, regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
+                ORDER BY concept_hits DESC, concept_rank NULLS LAST, stock_code
                 LIMIT 100
             ), prior_kline AS (
                 SELECT stock_code, source_table, is_fallback, change_pct, close

@@ -28,6 +28,7 @@ from trade_system.stock_data_sources import _from_em_sector_flow_page
 from trade_system import resilient_sources
 from trade_system.capital_flow_health import assess_capital_flow_health, render_capital_flow_health_markdown
 from trade_system.host_limiter import shared_host_limiter
+from trade_system.quality import table_exists
 
 
 SECTOR_COVERAGE_SUCCESS_PCT = 99.5
@@ -81,8 +82,8 @@ def _expected_sector_taxonomies(con: duckdb.DuckDBPyConnection, trade_date: str)
     out = {"em_industry": 0, "tushare_dc_sector": 0, "ths_concept": 0}
     try:
         out["ths_concept"] = int(con.execute(
-            "SELECT count(DISTINCT concept_code) FROM ths_concept_daily "
-            "WHERE trade_date=(SELECT max(trade_date) FROM ths_concept_daily WHERE trade_date<=CAST(? AS DATE))",
+            "SELECT count(DISTINCT concept_code) FROM v_default_concept_daily "
+            "WHERE trade_date=(SELECT max(trade_date) FROM v_default_concept_daily WHERE trade_date<=CAST(? AS DATE))",
             [trade_date],
         ).fetchone()[0] or 0)
     except Exception:
@@ -101,8 +102,17 @@ def _ths_membership_snapshot(con: duckdb.DuckDBPyConnection, trade_date: str):
     """Return (snapshot_date, age_days) for the THS concept membership in effect on
     trade_date, or (None, None) when no membership snapshot exists at or before it."""
     try:
+        # Prefer the canonical quality-gated view.  Small legacy/test databases
+        # may predate that view, in which case the raw table is the only
+        # available relation; production schema initialization always creates
+        # the view, so stale/partial rows cannot silently re-enter there.
+        relation = (
+            "v_default_concept_stock_history"
+            if table_exists(con, "v_default_concept_stock_history")
+            else "ths_concept_stock_history"
+        )
         row = con.execute(
-            "SELECT max(trade_date) FROM ths_concept_stock_history "
+            f"SELECT max(trade_date) FROM {relation} "
             "WHERE trade_date<=CAST(? AS DATE)",
             [trade_date],
         ).fetchone()
@@ -143,9 +153,9 @@ def _aggregate_ths_stock_flow(con: duckdb.DuckDBPyConnection, trade_date: str) -
             ), concept_members AS (
                 SELECT DISTINCT concept_code, concept_name, trade_date AS snapshot_date,
                        regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code
-                FROM ths_concept_stock_history
+                FROM v_default_concept_stock_history
                 WHERE trade_date=(
-                    SELECT max(trade_date) FROM ths_concept_stock_history
+                    SELECT max(trade_date) FROM v_default_concept_stock_history
                     WHERE trade_date<=CAST(? AS DATE)
                 )
             )
@@ -492,6 +502,26 @@ def collect_full_sector_flow(
 
             ths_snap, ths_age = _ths_membership_snapshot(con, trade_date)
             ths_members_stale = ths_age is not None and ths_age > THS_MEMBERSHIP_MAX_AGE_DAYS
+            ths_members_partial = False
+            ths_members_partial_count = 0
+            if table_exists(con, "ths_concept_member_checkpoint") and ths_snap:
+                try:
+                    # success_stale is a COMPLETE prior weekly snapshot reused
+                    # when live THS is blocked; only its source date is old.
+                    # It must not degrade the taxonomy to partial_members --
+                    # that single page was the cause of the 8/3-8/10 intraday
+                    # sector-flow runs all failing (30 consecutive degraded
+                    # steps) while every taxonomy was actually 100% fetched.
+                    partial_row = con.execute(
+                        "SELECT count(*) FROM ths_concept_member_checkpoint "
+                        "WHERE trade_date=CAST(? AS DATE) "
+                        "AND status IN ('error','partial','empty','running')",
+                        [ths_snap],
+                    ).fetchone()
+                    ths_members_partial_count = int(partial_row[0] or 0)
+                    ths_members_partial = ths_members_partial_count > 0
+                except Exception:
+                    ths_members_partial = False
 
             taxonomy_providers = {
                 "em_industry": "eastmoney_sector_full",
@@ -526,6 +556,9 @@ def collect_full_sector_flow(
                         f"ths membership snapshot {ths_snap} is {ths_age}d old "
                         f"(> {THS_MEMBERSHIP_MAX_AGE_DAYS}d)"
                     )
+                elif taxonomy == "ths_concept" and ths_members_partial:
+                    tax_status = "partial_members"
+                    tax_error = f"{ths_members_partial_count} THS member pages are partial/error"
                 else:
                     tax_error = "unverified denominator" if unverified else ""
                 taxonomy_rows[taxonomy] = (expected, observed, tax_coverage, tax_status)

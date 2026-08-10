@@ -97,7 +97,8 @@ def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
         order_col = _timestamp_column(con, "daily_summary")
         fetched_expr = order_col if order_col != "current_timestamp" else "current_timestamp"
         summary_fallback = (
-            "lower(coalesce(source_kind,''))='fallback'"
+            "lower(coalesce(source_kind,'')) IN "
+            "('fallback','derived','derived_current')"
             if "source_kind" in set(table_columns(con, "daily_summary"))
             else "false"
         )
@@ -798,6 +799,7 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
         ("acute_drop_risk_score", "DOUBLE"),
         ("source_table", "VARCHAR"),
         ("is_fallback", "BOOLEAN"),
+        ("fetched_at", "TIMESTAMP"),
     ]
     if not _relation_has_rows(con, "v_market_daily"):
         con.execute(_empty_view_sql("v_market_state_inputs", cols))
@@ -871,7 +873,8 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
                 2
             ) AS acute_drop_risk_score,
             m.market_daily_source || '+market_rise_fall+market_emotion_money' AS source_table,
-            m.is_fallback
+            m.is_fallback,
+            m.fetched_at
         FROM v_market_daily m
         LEFT JOIN ({rise_fall}) r ON m.trade_date = CAST(r.date AS VARCHAR)
         LEFT JOIN ({emotion}) e ON m.trade_date = CAST(e.date AS VARCHAR)
@@ -1498,15 +1501,23 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(_empty_view_sql("v_theme_mainline_evidence", cols))
         return
 
-    component_source = "ths_concept_stock_history" if _table_has_columns(
-        con, "ths_concept_stock_history", ["trade_date", "concept_code", "stock_code"]
-    ) else "sector_all_stocks"
-    if component_source == "ths_concept_stock_history":
+    # Operational features must consume the quality-gated default relation.
+    # The raw THS table intentionally retains stale/partial snapshots for
+    # audit and recovery, so reading it directly would leak those rows into
+    # normalized strategy evidence.
+    component_source = (
+        "v_default_concept_stock_history"
+        if _table_has_columns(con, "v_default_concept_stock_history", ["trade_date", "concept_code", "stock_code"])
+        else "ths_concept_stock_history"
+        if _table_has_columns(con, "ths_concept_stock_history", ["trade_date", "concept_code", "stock_code"])
+        else "sector_all_stocks"
+    )
+    if component_source in {"v_default_concept_stock_history", "ths_concept_stock_history"}:
         component_sql = """
             SELECT
                 CAST(trade_date AS VARCHAR) AS trade_date,
                 concept_code AS sector_code,
-                count(DISTINCT stock_code) AS component_count
+                count(DISTINCT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')) AS component_count
             FROM ths_concept_stock_history
             GROUP BY trade_date, concept_code
         """

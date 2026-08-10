@@ -1,11 +1,10 @@
-"""Derive same-session market context from the persisted stock-flow snapshot.
+"""Build same-session market context from the persisted stock-flow snapshot.
 
-KPL is the preferred market-context provider, but it can be unavailable while
-the Eastmoney full-market stock-flow collector is healthy.  A same-date batch
-that meets the project's 99.5% full-market contract is classified as
-``derived_current`` rather than fallback: it is a measured breadth snapshot,
-not guessed data.  Lower coverage remains an explicit fallback.  Neither form
-suppresses later KPL retries or overwrites a same-date KPL snapshot.
+KPL is the preferred market-context provider, but its breadth endpoint can
+remain on the previous session during trading.  A fresh, same-date Eastmoney
+full-market batch that passes the 99.5% coverage contract is classified as
+``secondary_verified``.  Lower coverage remains an explicit fallback.  Neither
+form suppresses later KPL retries or overwrites a same-date KPL snapshot.
 """
 
 from __future__ import annotations
@@ -69,7 +68,13 @@ def _limit_pct(con: duckdb.DuckDBPyConnection, stock_code: str) -> float:
     return 10.0
 
 
-def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
+def derive_market_context(
+    db_path: str | Path,
+    trade_date: str,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    reference_now = now or datetime.now()
     con = connect_duckdb(str(db_path))
     try:
         init_schema(con)
@@ -94,7 +99,8 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
         try:
             batch = con.execute(
                 """
-                SELECT coverage_pct,status,provider,updated_at
+                SELECT coverage_pct,status,provider,updated_at,
+                       expected_rows,fetched_rows
                 FROM intraday_stock_flow_batch
                 WHERE CAST(trade_date AS VARCHAR)=?
                 """,
@@ -104,12 +110,36 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
             batch = None
         batch_coverage = float(batch[0] or 0) if batch else 0.0
         batch_status = str(batch[1] or "") if batch else ""
+        batch_provider = str(batch[2] or "") if batch else ""
+        batch_updated_at = batch[3] if batch else None
+        if isinstance(batch_updated_at, str):
+            try:
+                batch_updated_at = datetime.fromisoformat(batch_updated_at)
+            except ValueError:
+                batch_updated_at = None
+        batch_age_seconds = (
+            max(0.0, (reference_now - batch_updated_at).total_seconds())
+            if isinstance(batch_updated_at, datetime)
+            else None
+        )
+        expected_rows = int(batch[4] or 0) if batch else 0
+        fetched_rows = int(batch[5] or 0) if batch else 0
+        coverage_codes = len({str(row[0]) for row in rows})
         verified_current = bool(
             batch
             and batch_coverage >= 99.5
             and batch_status in {"success", "success_with_unavailable"}
+            and batch_provider.startswith("eastmoney_intraday_clist")
+            and batch_age_seconds is not None
+            and batch_age_seconds <= 900
+            and batch_updated_at.date().isoformat() == trade_date
+            and expected_rows > 0
+            and fetched_rows > 0
+            and coverage_codes >= min(
+                fetched_rows, int(expected_rows * 0.995)
+            )
         )
-        source_kind = "derived_current" if verified_current else "fallback"
+        source_kind = "secondary_verified" if verified_current else "fallback"
 
         changes = []
         turnovers = []
@@ -146,7 +176,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 limit_up += 1
             if change <= -rule + 0.15:
                 limit_down += 1
-        coverage = len({str(row[0]) for row in rows})
+        coverage = coverage_codes
         payload = {
             "source": "derived_from_multi_source_stock_flow",
             "source_kind": source_kind,
@@ -155,7 +185,8 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
             "coverage_codes": coverage,
             "batch_coverage_pct": batch_coverage,
             "batch_status": batch_status,
-            "batch_provider": str(batch[2] or "") if batch else "",
+            "batch_provider": batch_provider,
+            "batch_age_seconds": batch_age_seconds,
             "rise_count": rise,
             "fall_count": fall,
             "flat_count": flat,
@@ -164,7 +195,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
             "turnover_sum": sum(turnovers) if turnovers else None,
             "providers": providers,
             "limit_rules": limit_rules,
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "generated_at": reference_now.isoformat(timespec="seconds"),
         }
         raw_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         written = 0
@@ -172,7 +203,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
         # Never overwrite a same-date KPL/real provider snapshot.  A prior
         # fallback may be promoted after a later retry reaches 99.5%.
         mood_source = _same_date_source_kind(con, "market_mood", trade_date)
-        if mood_source in {"fallback", "derived_current"}:
+        if mood_source in {"fallback", "derived_current", "secondary_verified"}:
             con.execute(
                 """
                 UPDATE market_mood SET
@@ -185,7 +216,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                     rise, fall, limit_up, limit_down,
                     int(sum(turnovers)) if turnovers else None,
                     (rise / fall) if fall else None,
-                    source_kind, datetime.now(), raw_json, source_kind, trade_date,
+                    source_kind, reference_now, raw_json, source_kind, trade_date,
                 ],
             )
             written += 1
@@ -200,7 +231,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 "prev_float": None,
                 "rise_fall_ratio": (rise / fall) if fall else None,
                 "market_color": source_kind,
-                "fetched_at": datetime.now(),
+                "fetched_at": reference_now,
                 "raw_json": raw_json,
                 "source_kind": source_kind,
             }
@@ -213,7 +244,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
             written += 1
 
         rise_fall_source = _same_date_source_kind(con, "market_rise_fall", trade_date)
-        if rise_fall_source in {"fallback", "derived_current"}:
+        if rise_fall_source in {"fallback", "derived_current", "secondary_verified"}:
             con.execute(
                 """
                 UPDATE market_rise_fall SET
@@ -223,7 +254,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 WHERE CAST(date AS VARCHAR)=?
                 """,
                 [
-                    limit_up, limit_down, flat, raw_json, datetime.now(),
+                    limit_up, limit_down, flat, raw_json, reference_now,
                     source_kind, trade_date,
                 ],
             )
@@ -237,12 +268,12 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 [trade_date, limit_up, limit_down, None, None, None, flat,
-                 raw_json, datetime.now(), source_kind],
+                 raw_json, reference_now, source_kind],
             )
             written += 1
 
         summary_source = _same_date_source_kind(con, "daily_summary", trade_date)
-        if summary_source in {"fallback", "derived_current"}:
+        if summary_source in {"fallback", "derived_current", "secondary_verified"}:
             con.execute(
                 """
                 UPDATE daily_summary SET
@@ -251,7 +282,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 WHERE CAST(date AS VARCHAR)=?
                 """,
                 [
-                    limit_up, limit_down, rise, fall, raw_json, datetime.now(),
+                    limit_up, limit_down, rise, fall, raw_json, reference_now,
                     source_kind, trade_date,
                 ],
             )
@@ -266,7 +297,7 @@ def derive_market_context(db_path: str | Path, trade_date: str) -> dict:
                 """,
                 [
                     trade_date, limit_up, limit_down, rise, fall, None,
-                    raw_json, datetime.now(), source_kind,
+                    raw_json, reference_now, source_kind,
                 ],
             )
             written += 1
@@ -295,7 +326,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Derive market context from same-date stock flow.")
     parser.add_argument("--db", default="kpl_data.duckdb")
     parser.add_argument("--date", required=True)
-    parser.add_argument("--out", default="reports/market_context_fallback_latest.json")
+    parser.add_argument("--out", default="reports/market_context_latest.json")
     args = parser.parse_args()
     result = derive_market_context(args.db, args.date)
     out = Path(args.out)
@@ -303,7 +334,7 @@ def main() -> int:
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(" ".join(f"{key}={value}" for key, value in result.items()), f"report={out}")
     return 0 if result["status"] in {
-        "fallback_written", "derived_current_written", "same_date_snapshot_exists",
+        "fallback_written", "secondary_verified_written", "same_date_snapshot_exists",
     } else 2
 
 

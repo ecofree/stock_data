@@ -243,6 +243,90 @@ def test_self_heal_purges_raw_json_via_column_rebuild(tmp_path):
         store.close()
 
 
+def test_capital_flow_health_surfaces_reconciliation(tmp_path):
+    """P1-2: the health report must surface independent reconciliation status rather
+    than silently passing on coverage alone."""
+    import duckdb
+    from trade_system.capital_flow_health import (
+        assess_capital_flow_health,
+        render_capital_flow_health_markdown,
+    )
+
+    db = tmp_path / "recon.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE intraday_stock_flow_reconciliation "
+        "(trade_date DATE PRIMARY KEY, status VARCHAR, reference_rows INTEGER)")
+    con.execute(
+        "INSERT INTO intraday_stock_flow_reconciliation VALUES ('2026-07-28','not_run',0)")
+    con.execute(
+        "CREATE TABLE multi_source_stock_flow "
+        "(source_date DATE, stock_code VARCHAR, provider VARCHAR, main_net DOUBLE)")
+    con.commit()
+    con.close()
+
+    result = assess_capital_flow_health(str(db), "2026-07-28")
+    assert result["reconciliation"]["status"] == "not_run"
+    assert result["reconciliation"]["independent_reconciliation_ready"] is False
+    assert result["reconciliation"]["independent_source_present"] is False
+    md = render_capital_flow_health_markdown(result)
+    assert "Independent reconciliation" in md
+    assert "WARNING" in md  # degradation surfaced, not hidden
+
+
+def test_stock_code_strips_exchange_suffix():
+    """P1-1: member codes must be normalized to the bare 6-digit form regardless of
+    exchange prefix or TuShare-style suffix."""
+    from trade_system.ths_history import _stock_code
+    assert _stock_code("000001.SZ") == "000001"
+    assert _stock_code("603839.SH") == "603839"
+    assert _stock_code("300898") == "300898"
+    assert _stock_code("SH600519") == "600519"
+    assert _stock_code("bj830799") == "830799"
+
+
+def test_intraday_liquidity_gate_requires_complete_sell_side_quote():
+    """An executable intraday candidate must have a positive live ask and size."""
+    from trade_system.stage_signals import _row_evidence_actionable
+
+    base_evidence = {
+        "is_fallback": False,
+        "stock_flow_close": 10.0,
+        "stock_flow_main_net": 1234.0,
+        "source_provider": "eastmoney_intraday_clist",  # live, not delayed
+    }
+    # Missing sell-side depth is analytics-only, never executable.
+    ok, reason = _row_evidence_actionable(
+        "intraday_strength", {"stage_evidence": dict(base_evidence)}, strict_tradability=True)
+    assert ok is False and reason == "missing_sell_side_liquidity"
+
+    # ask_price present but ask_volume missing -> incomplete -> blocked.
+    ok2, reason2 = _row_evidence_actionable(
+        "intraday_strength", {"stage_evidence": {**base_evidence, "ask_price": 10.1}},
+        strict_tradability=True)
+    assert ok2 is False and reason2 == "missing_sell_side_liquidity"
+
+    ok3, reason3 = _row_evidence_actionable(
+        "intraday_strength",
+        {
+            "stage_evidence": {
+                **base_evidence,
+                "ask_price": 10.1,
+                "ask_volume": 5000,
+            }
+        },
+        strict_tradability=True,
+    )
+    assert ok3 is True and reason3 is None
+
+    # Delayed provider still blocks regardless of ask data.
+    ok4, reason4 = _row_evidence_actionable(
+        "intraday_strength",
+        {"stage_evidence": {**base_evidence, "source_provider": "eastmoney_intraday_clist_delay"}},
+        strict_tradability=True)
+    assert ok4 is False and reason4 == "delayed_provider_not_executable"
+
+
 def test_readiness_splits_analytics_and_execution(tmp_path):
     """P0#3: readiness must report analytics_ready (data present) separately from
     execution_ready (an executable candidate exists) and actionable_candidates, so a
@@ -257,10 +341,11 @@ def test_readiness_splits_analytics_and_execution(tmp_path):
     con.execute(
         "CREATE TABLE IF NOT EXISTS stock_candidate_stage_signal ("
         "trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, stock_name VARCHAR, "
-        "score DOUBLE, decision VARCHAR, is_actionable BOOLEAN)")
+        "score DOUBLE, decision VARCHAR, is_actionable BOOLEAN, "
+        "is_executable BOOLEAN)")
     con.execute(
         "INSERT INTO stock_candidate_stage_signal VALUES "
-        "('2026-07-28','intraday_strength','600519','x',50,'blocked_data_quality',false)")
+        "('2026-07-28','intraday_strength','600519','x',50,'blocked_data_quality',false,false)")
     con.commit()
     con.close()
 
@@ -274,7 +359,7 @@ def test_readiness_splits_analytics_and_execution(tmp_path):
     con = duckdb.connect(str(db))
     con.execute(
         "INSERT INTO stock_candidate_stage_signal VALUES "
-        "('2026-07-28','intraday_strength','000001','y',80,'confirm',true)")
+        "('2026-07-28','intraday_strength','000001','y',80,'confirm',true,true)")
     con.commit()
     con.close()
     result2 = assess_trade_date_readiness(str(db), "2026-07-28", stage="intraday")

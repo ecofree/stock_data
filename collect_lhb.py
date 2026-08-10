@@ -26,7 +26,8 @@ def collect_lhb_list(client: KPLClient, store: DuckDBStore, date: str) -> int:
     if rows:
         n = store.insert_rows("lhb_list", rows,
             ["date", "stock_code", "stock_name", "change_pct", "turnover",
-             "reason", "buy_amount", "sell_amount", "net_amount"])
+             "reason", "buy_amount", "sell_amount", "net_amount"],
+            replace_on=["date", "stock_code"])
         store.log_collect("lhb_list", "/lhb/list", n, "ok")
         return n
     store.insert_raw("/lhb/list", data)
@@ -39,26 +40,42 @@ def collect_lhb_detail(client: KPLClient, store: DuckDBStore, date: str, stock_c
         data = client.get("/lhb/detail", {"code": code, "date": date})
         if not data:
             continue
-        # Parse buy/sell seats
         rows = []
-        for side_key, is_buy in [("buy", True), ("sell", False),
-                                  ("买入席位", True), ("卖出席位", False)]:
-            seats = data.get(side_key, [])
-            if isinstance(seats, list):
-                for seat in seats:
-                    if isinstance(seat, dict):
-                        rows.append((
-                            date, code,
-                            seat.get("broker_name", seat.get("营业部", "")),
-                            seat.get("buy_amount", seat.get("买入额", 0)),
-                            seat.get("sell_amount", seat.get("卖出额", 0)),
-                            seat.get("net_amount", seat.get("净额", 0)),
-                            is_buy,
-                        ))
+        # Current payload shape: one entry per brokerage seat under
+        # "businesses" carrying both buy and sell amounts.
+        businesses = data.get("businesses", [])
+        if isinstance(businesses, list) and businesses:
+            for seat in businesses:
+                if isinstance(seat, dict):
+                    buy = seat.get("buy", 0) or 0
+                    sell = seat.get("sell", 0) or 0
+                    net = seat.get("net", buy - sell)
+                    rows.append((
+                        date, code,
+                        seat.get("name", seat.get("broker_name", "")),
+                        buy, sell, net, (net or 0) >= 0,
+                    ))
+        else:
+            # Legacy payload shape: separate buy/sell seat lists.
+            for side_key, is_buy in [("buy", True), ("sell", False),
+                                      ("买入席位", True), ("卖出席位", False)]:
+                seats = data.get(side_key, [])
+                if isinstance(seats, list):
+                    for seat in seats:
+                        if isinstance(seat, dict):
+                            rows.append((
+                                date, code,
+                                seat.get("broker_name", seat.get("营业部", "")),
+                                seat.get("buy_amount", seat.get("买入额", 0)),
+                                seat.get("sell_amount", seat.get("卖出额", 0)),
+                                seat.get("net_amount", seat.get("净额", 0)),
+                                is_buy,
+                            ))
         if rows:
             n = store.insert_rows("lhb_detail", rows,
                 ["date", "stock_code", "broker_name", "buy_amount",
-                 "sell_amount", "net_amount", "is_buy"])
+                 "sell_amount", "net_amount", "is_buy"],
+                replace_on=["date", "stock_code", "broker_name"])
             total += n
     if total:
         store.log_collect("lhb_detail", "/lhb/detail", total, "ok")

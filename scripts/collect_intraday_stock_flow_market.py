@@ -521,13 +521,64 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 [trade_date, source_provider],
             ).fetchall()
         }) if expected_universe else []
+    # Publish the primary full-market checkpoint before the optional after-close
+    # reconciliation.  Reconciliation used to run first, so an OOM/fatal DuckDB
+    # error while writing the reference snapshot left an otherwise complete
+    # 99.5%+ primary batch permanently stuck at ``running``.
+    con.execute(
+        "UPDATE intraday_stock_flow_batch SET expected_rows=?,source_rows=?,unavailable_rows=?,fetched_rows=?,"
+        "expected_pages=?,fetched_pages=?,coverage_pct=?,status=?,last_error=?,provider=?,updated_at=current_timestamp "
+        "WHERE trade_date=?",
+        [expected_rows, expected_rows, max(0, expected_rows - fetched_rows), fetched_rows,
+         expected_pages, fetched_pages, coverage, status, error, source_provider, trade_date],
+    )
+    exchange_coverage = _write_exchange_coverage(
+        con, trade_date, source_provider, universe_by_exchange
+    ) if universe_by_exchange else {}
+    con.commit()
+
+    # Controlled checkpoint while no reconciliation write is pending.  After a
+    # full-market batch the WAL crosses DuckDB's auto-checkpoint threshold, so
+    # the first subsequent write (historically the reconciliation INSERT)
+    # triggered an implicit checkpoint that OOM'd and invalidated the
+    # connection mid-reconciliation (2026-07-29), crashing the close chain.
+    # Isolating the checkpoint here makes that pressure survivable: the
+    # primary batch is already durable, so on failure we skip the optional
+    # reconciliation instead of taking down the run.
+    checkpoint_ok = True
+    checkpoint_error = ""
+    try:
+        con.execute("CHECKPOINT")
+    except Exception as exc:
+        checkpoint_ok = False
+        checkpoint_error = f"checkpoint failed: {str(exc)[:300]}"
+
     reconciliation = {
         "status": "not_run", "reference_provider": "eastmoney_market",
         "reference_rows": 0, "overlap_rows": 0, "primary_only_rows": 0,
         "reference_only_rows": 0, "overlap_reference_pct": 0.0,
     }
+    if not checkpoint_ok:
+        reconciliation["status"] = "skipped"
+        reconciliation["error"] = checkpoint_error
+        # `con` is invalidated after a fatal checkpoint error; record the skip
+        # on a fresh connection so the health dashboard shows why recon is
+        # absent, then leave the invalidated connection untouched.
+        try:
+            _skip_con = duckdb.connect(str(db_path))
+            _skip_con.execute(
+                "INSERT INTO intraday_stock_flow_reconciliation "
+                "(trade_date, primary_provider, primary_rows, status, last_error, updated_at) "
+                "VALUES (?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
+                "status=excluded.status, last_error=excluded.last_error, updated_at=excluded.updated_at",
+                [trade_date, source_provider, fetched_rows, "skipped", checkpoint_error],
+            )
+            _skip_con.commit()
+            _skip_con.close()
+        except Exception:
+            pass
     is_after_close = datetime.now().hour > 15 or (datetime.now().hour == 15 and datetime.now().minute >= 5)
-    if (status.startswith("success") and trade_date == date.today().isoformat()
+    if (checkpoint_ok and status.startswith("success") and trade_date == date.today().isoformat()
             and crosscheck_after_close and is_after_close and max_pages is None):
         try:
             reference_rows, reference_meta = get_fund_flow_market(
@@ -540,12 +591,10 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                     row for row in reference_rows
                     if str(row.get("code") or "") in expected_universe
                 ]
-            multi_store.store(
-                "stock_flow", None, reference_rows,
-                {"source": reference_provider, "status": "live", "trade_date": trade_date,
-                 "purpose": "after_close_reconciliation"},
-                asset_type="stock", trade_date=trade_date,
-            )
+            # The reference sweep is validation evidence, not another execution
+            # snapshot.  Persisting all ~5,000 reference rows duplicated the
+            # market table and caused multi-gigabyte checkpoint pressure.  The
+            # durable reconciliation summary below is sufficient for the gate.
             primary_codes = {
                 str(row[0]) for row in con.execute(
                     "SELECT DISTINCT stock_code FROM multi_source_stock_flow "
@@ -585,29 +634,30 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         except Exception as exc:
             reconciliation["status"] = "error"
             reconciliation["error"] = str(exc)[:500]
-            con.execute(
-                "INSERT INTO intraday_stock_flow_reconciliation "
-                "(trade_date,primary_provider,primary_rows,reference_provider,status,last_error,updated_at) "
-                "VALUES (?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
-                "primary_provider=excluded.primary_provider,primary_rows=excluded.primary_rows,"
-                "reference_provider=excluded.reference_provider,status=excluded.status,"
-                "last_error=excluded.last_error,updated_at=excluded.updated_at",
-                [trade_date, source_provider, fetched_rows, "eastmoney_market", "error", str(exc)[:500]],
-            )
-            con.commit()
+            # A DuckDB FatalException invalidates the connection.  Do not let an
+            # optional reconciliation error mask the already committed primary
+            # batch or crash the collector while trying to record the error.
+            try:
+                con.execute(
+                    "INSERT INTO intraday_stock_flow_reconciliation "
+                    "(trade_date,primary_provider,primary_rows,reference_provider,status,last_error,updated_at) "
+                    "VALUES (?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
+                    "primary_provider=excluded.primary_provider,primary_rows=excluded.primary_rows,"
+                    "reference_provider=excluded.reference_provider,status=excluded.status,"
+                    "last_error=excluded.last_error,updated_at=excluded.updated_at",
+                    [trade_date, source_provider, fetched_rows, "eastmoney_market", "error", str(exc)[:500]],
+                )
+                con.commit()
+            except Exception:
+                pass
 
-    con.execute(
-        "UPDATE intraday_stock_flow_batch SET expected_rows=?,source_rows=?,unavailable_rows=?,fetched_rows=?,"
-        "expected_pages=?,fetched_pages=?,coverage_pct=?,status=?,last_error=?,provider=?,updated_at=current_timestamp "
-        "WHERE trade_date=?",
-        [expected_rows, expected_rows, max(0, expected_rows - fetched_rows), fetched_rows,
-         expected_pages, fetched_pages, coverage, status, error, source_provider, trade_date],
-    )
-    exchange_coverage = _write_exchange_coverage(
-        con, trade_date, source_provider, universe_by_exchange
-    ) if universe_by_exchange else {}
-    con.commit()
-    multi_store.close()
+    # A fatal checkpoint error above invalidates the shared connection; do not
+    # let MultiSourceStore's close (which may flush/checkpoint) crash the run
+    # after the primary batch is already durable.
+    try:
+        multi_store.close()
+    except Exception:
+        pass
     return {
         "trade_date": trade_date, "run_id": run_id, "provider": source_provider, "status": status,
         "expected_rows": expected_rows, "fetched_rows": fetched_rows,

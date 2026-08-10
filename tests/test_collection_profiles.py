@@ -17,18 +17,22 @@ def test_intraday_plan_excludes_after_close_fanout():
     steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase="intraday")
     names = [name for name, _, _ in steps]
     assert names == [
-        "migrate_stock_flow_contract",
         "collect_market_context",
         "collect_realtime_limit_pool",
         "collect_intraday_stock_flow_market",
+        "collect_l2_focus",
         "collect_intraday_sector_flow_full",
-        "derive_market_context_fallback",
+        "derive_market_context",
         "build_normalized_views",
+        "collect_executable_quotes",
         "audit_multisource_readiness",
         "check_capital_flow_health",
-        "check_data_readiness",
+        "generate_signals",
         "generate_intraday_stage_signals",
+        "run_daily_operator_loop",
+        "check_data_readiness",
         "generate_web_dashboard",
+        "generate_trading_terminal",
     ]
     assert "collect_finance_gapfill" not in names
     assert "evaluate_qlib_shadow" not in names
@@ -68,15 +72,15 @@ def test_close_priority_plan_keeps_incremental_tushare_and_weekly_ths():
     names = [name for name, _, _ in steps]
 
     assert names[:10] == [
-        "migrate_stock_flow_contract",
         "collect_market_context",
         "sync_tushare_close",
+        "sync_tushare_ohlc_core",
         "refresh_ths_weekly",
         "collect_realtime_limit_pool",
         "collect_kpl_stock_flow_focus",
         "collect_intraday_stock_flow_market",
         "collect_intraday_sector_flow_full",
-        "derive_market_context_fallback",
+        "derive_market_context",
         "collect_finance_gapfill",
     ]
 
@@ -142,7 +146,13 @@ def test_ths_weekly_gate_uses_latest_attempt_status(tmp_path):
         db,
         "2026-07-16",
         "refresh_ths_weekly",
-        now=datetime(2026, 7, 19, 10, 0),
+        now=datetime(2026, 7, 17, 10, 0),
+    )[0] is False
+    assert task_due(
+        db,
+        "2026-07-16",
+        "refresh_ths_weekly",
+        now=datetime(2026, 7, 23, 10, 0),
     )[0] is True
 
 
@@ -188,3 +198,27 @@ def test_market_context_fallback_never_suppresses_real_retry(tmp_path):
         "collect_market_context",
         now=datetime(2026, 7, 15, 11, 0),
     )[0] is False
+
+
+def test_task_due_is_phase_aware_for_shared_tasks(tmp_path):
+    """Audit P2 #2: a shared task name must use the active phase's cadence.  A
+    ~2000s-old market-context snapshot is fresh under the close 3600s TTL but due
+    under the auction 300s TTL (a phase-blind first-match would always use 300s)."""
+    from datetime import timedelta
+
+    db = tmp_path / "phase-aware.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE daily_summary (date DATE, source_kind VARCHAR, fetched_at TIMESTAMP)")
+    fetched = datetime(2026, 7, 15, 17, 0, 0)
+    con.execute(
+        "INSERT INTO daily_summary VALUES (DATE '2026-07-15', 'real', ?)", [fetched])
+    con.close()
+
+    now = fetched + timedelta(seconds=2000)  # 2000s old
+    due_close, reason_close = task_due(
+        str(db), "2026-07-15", "collect_market_context", phase="close", now=now)
+    assert due_close is False, reason_close  # 2000s < 3600s close TTL -> fresh
+    due_auction, reason_auction = task_due(
+        str(db), "2026-07-15", "collect_market_context", phase="auction", now=now)
+    assert due_auction is True, reason_auction  # 2000s > 300s auction TTL -> due

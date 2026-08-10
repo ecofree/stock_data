@@ -1,7 +1,9 @@
+from datetime import datetime
+
 import duckdb
 
 from schema import init_schema
-from scripts.derive_market_context_fallback import derive_market_context
+from scripts.derive_market_context import derive_market_context
 
 
 def test_market_context_fallback_uses_same_date_stock_flow(tmp_path):
@@ -53,15 +55,18 @@ def test_verified_full_market_flow_is_promoted_but_does_not_claim_kpl_source(tmp
         CREATE TABLE intraday_stock_flow_batch(
           trade_date DATE,provider VARCHAR,expected_rows INTEGER,
           fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,
-          updated_at TIMESTAMP DEFAULT current_timestamp
+          updated_at TIMESTAMP
         )
         """
     )
     con.execute(
         """
         INSERT INTO intraday_stock_flow_batch
-        (trade_date,provider,expected_rows,fetched_rows,coverage_pct,status)
-        VALUES ('2026-07-27','eastmoney_intraday_clist_delay',2,2,100,'success')
+        (trade_date,provider,expected_rows,fetched_rows,coverage_pct,status,updated_at)
+        VALUES (
+          '2026-07-27','eastmoney_intraday_clist_delay',2,2,100,'success',
+          '2026-07-27 10:00:00'
+        )
         """
     )
     # Exercise promotion of an earlier, low-coverage fallback row.
@@ -72,9 +77,11 @@ def test_verified_full_market_flow_is_promoted_but_does_not_claim_kpl_source(tmp
     con.commit()
     con.close()
 
-    result = derive_market_context(db, "2026-07-27")
-    assert result["status"] == "derived_current_written"
-    assert result["source_kind"] == "derived_current"
+    result = derive_market_context(
+        db, "2026-07-27", now=datetime(2026, 7, 27, 10, 5)
+    )
+    assert result["status"] == "secondary_verified_written"
+    assert result["source_kind"] == "secondary_verified"
     assert result["coverage_pct"] == 100.0
 
     con = duckdb.connect(str(db), read_only=True)
@@ -82,7 +89,7 @@ def test_verified_full_market_flow_is_promoted_but_does_not_claim_kpl_source(tmp
         assert con.execute(
             "SELECT rise_count,fall_count,source_kind FROM daily_summary "
             "WHERE date='2026-07-27'"
-        ).fetchone() == (1, 1, "derived_current")
+        ).fetchone() == (1, 1, "secondary_verified")
         payload = con.execute(
             "SELECT raw_json FROM daily_summary WHERE date='2026-07-27'"
         ).fetchone()[0]

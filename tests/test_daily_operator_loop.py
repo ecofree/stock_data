@@ -75,7 +75,7 @@ def test_daily_operator_loop_populates_manual_workflow_and_caps_weak_market_posi
         "trade_plan": 1,
         "risk_snapshot": 1,
         "portfolio_snapshot": 1,
-        "trade_journal": 4,
+        "trade_journal": 1,
     }
     assert max_position <= 5
     assert risk_state == "defensive"

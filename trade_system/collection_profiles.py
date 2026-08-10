@@ -39,7 +39,19 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
         ProfileTask("collect_market_context", "KPL market/rise-fall", 300, "market regime refresh"),
         ProfileTask("collect_realtime_limit_pool", "KPL L2 realtime/ladder", 180, "candidate-pool refresh"),
         ProfileTask("collect_intraday_stock_flow_market", "Eastmoney push2 clist", 300, "full-market stock capital flow"),
-        ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 600, "full-sector capital flow; partial stays visible"),
+        ProfileTask(
+            "collect_executable_quotes",
+            "Tencent qt.gtimg.cn spot",
+            180,
+            "candidate-only live prices for entry-executable signals when clist is delayed-only",
+        ),
+        ProfileTask(
+            "collect_l2_focus",
+            "KPL /l2/stock-intraday (candidates)",
+            300,
+            "bounded L2 price curves; phase mode never runs full L2",
+        ),
+        ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 600, "full-sector capital flow refreshed after L2"),
     ),
     "close": (
         ProfileTask("collect_market_context", "KPL market/rise-fall", 3600, "final market snapshot"),
@@ -49,6 +61,7 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
         ProfileTask("collect_kpl_stock_flow_focus", "KPL advanced/zjmm-min", 3600, "bounded independent money-flow confirmation for candidate stocks"),
         ProfileTask("collect_intraday_stock_flow_market", "Eastmoney push2 then push2delay + datacenter", 3600, "final stock capital-flow snapshot"),
         ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 3600, "final sector capital-flow snapshot"),
+        ProfileTask("collect_executable_quotes", "Tencent qt.gtimg.cn spot", 3600, "final candidate live prices; auto-boost if KPL stale"),
         ProfileTask("collect_finance_gapfill", "Eastmoney/Sina financial statements", 7 * 86400, "bounded quarterly gap-fill"),
     ),
     "history": (
@@ -123,7 +136,7 @@ def _latest(con: duckdb.DuckDBPyConnection, query: str, params: list[Any]) -> tu
 
 
 def task_due(db_path: str | Path, trade_date: str, task_name: str,
-             *, now: datetime | None = None, force: bool = False) -> tuple[bool, str]:
+             *, phase: str | None = None, now: datetime | None = None, force: bool = False) -> tuple[bool, str]:
     """Return ``(due, reason)`` without making any network request.
 
     A partial flow batch is retried on its shorter cadence; a successful batch
@@ -132,7 +145,16 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
     """
     if force:
         return True, "forced"
-    task = next((item for items in PROFILE_TASKS.values() for item in items if item.name == task_name), None)
+    # Resolve the task within the active phase first so the enforced cadence matches
+    # the documented per-phase contract (audit P2 #2: a shared name like
+    # collect_market_context must use the close 3600s TTL in the close phase, not the
+    # auction 300s that a first-match across all phases would pick).  Fall back to any
+    # phase for callers that do not supply one.
+    task = None
+    if phase and phase in PROFILE_TASKS:
+        task = next((item for item in PROFILE_TASKS[phase] if item.name == task_name), None)
+    if task is None:
+        task = next((item for items in PROFILE_TASKS.values() for item in items if item.name == task_name), None)
     if task is None or not task.network or task.cadence_seconds is None:
         return True, "no freshness gate"
     current = now or datetime.now()
@@ -230,7 +252,12 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
             fetched = datetime.fromisoformat(str(fetched).replace("Z", "+00:00")).replace(tzinfo=None)
         status = str(row[1]).lower() if len(row) > 1 and row[1] is not None else ""
         ttl = task.cadence_seconds
-        if status in {"partial", "failed", "empty", "stale", "error"}:
+        if task_name == "refresh_ths_weekly":
+            # THS web crawl is deliberately weekly.  A partial pagination
+            # result remains visible and can be manually retried, but must not
+            # trigger a full 374+ concept crawl at every daily close.
+            ttl = task.cadence_seconds
+        elif status in {"partial", "failed", "empty", "stale", "error"}:
             # Slow weekly sources are normally fetched once per week, but a
             # failed refresh should retry at the next daily close instead of
             # remaining broken for another 3.5 days.

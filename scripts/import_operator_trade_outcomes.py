@@ -17,12 +17,16 @@ def main() -> int:
     parser.add_argument("--slippage-bps", type=float, default=10.0)
     args = parser.parse_args()
 
-    result = import_operator_trade_outcomes(
-        args.db,
-        args.csv,
-        fee_rate=args.fee_rate,
-        slippage_bps=args.slippage_bps,
-    )
+    try:
+        result = import_operator_trade_outcomes(
+            args.db,
+            args.csv,
+            fee_rate=args.fee_rate,
+            slippage_bps=args.slippage_bps,
+        )
+    except ValueError as exc:
+        print(f"operator outcome import blocked: {exc}", file=sys.stderr)
+        return 2
     print(f"rows_imported={result['rows_imported']}")
     print(f"journal_rows={result['journal_rows']}")
     print(f"plans_updated={result['plans_updated']}")
@@ -31,4 +35,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

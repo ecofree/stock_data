@@ -3,6 +3,8 @@ from __future__ import annotations
 import duckdb
 
 from trade_system.daily_loop import run_daily_operator_loop
+from trade_system.risk import init_trading_tables
+from trade_system.stage_signals import ensure_stage_signal_schema
 
 
 def test_daily_operator_loop_uses_actionable_stage_pool_when_scores_absent(tmp_path):
@@ -25,10 +27,91 @@ def test_daily_operator_loop_uses_actionable_stage_pool_when_scores_absent(tmp_p
     )
     con.close()
 
-    result = run_daily_operator_loop(db, "2026-07-16", 20)
+    result = run_daily_operator_loop(db, "2026-07-16", 20, stage="intraday")
 
     assert result["watchlist"] == 1
     assert result["trade_plan"] == 1
     con = duckdb.connect(str(db), read_only=True)
-    assert con.execute("SELECT count(*) FROM trade_plan WHERE trade_date='2026-07-16'").fetchone()[0] == 1
+    try:
+        assert con.execute(
+            "SELECT count(*) FROM trade_plan WHERE trade_date='2026-07-16'"
+        ).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_intraday_risk_loop_promotes_actionable_candidate_to_executable(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "daily-loop-risk.duckdb"
+    init_trading_tables(db)
+    con = duckdb.connect(str(db))
+    ensure_stage_signal_schema(con)
+    con.execute(
+        "CREATE TABLE stock_candidate_score("
+        "trade_date VARCHAR,stock_code VARCHAR,stock_name VARCHAR,score DOUBLE,"
+        "source VARCHAR,sector_code VARCHAR,evidence_json VARCHAR,is_actionable BOOLEAN)"
+    )
+    con.execute(
+        "CREATE TABLE market_regime_snapshot("
+        "trade_date VARCHAR,regime VARCHAR,regime_score DOUBLE,"
+        "suggested_position_pct INTEGER,evidence_json VARCHAR,generated_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO market_regime_snapshot VALUES "
+        "('2026-07-31','normal',75,30,'{}',current_timestamp)"
+    )
+    con.execute(
+        "INSERT INTO stock_candidate_score VALUES "
+        "('2026-07-31','000001','Alpha',88,'stage','801001','{}',true)"
+    )
+    con.execute(
+        """
+        INSERT INTO stock_candidate_stage_signal(
+            trade_date,stage,stock_code,stock_name,score,decision,evidence_json,
+            is_actionable,data_complete,signal_triggered,tradable,
+            risk_approved,is_executable
+        )
+        VALUES (
+            '2026-07-31','intraday_strength','000001','Alpha',88,'follow','{}',
+            true,true,true,true,false,false
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO stock_candidate_stage_signal(
+            trade_date,stage,stock_code,stock_name,score,decision,evidence_json,
+            is_actionable,data_complete,signal_triggered,tradable,
+            risk_approved,is_executable
+        )
+        VALUES (
+            '2026-07-31','intraday_strength','000002','WatchOnly',99,'watch','{}',
+            true,true,false,true,true,true
+        )
+        """
+    )
     con.close()
+    monkeypatch.setattr(
+        "trade_system.daily_loop.assess_trade_date_readiness",
+        lambda *args, **kwargs: {"ready": True, "analytics_ready": True},
+    )
+
+    result = run_daily_operator_loop(
+        db, "2026-07-31", 20, stage="intraday"
+    )
+
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        promoted = con.execute(
+            "SELECT stock_code,risk_approved,is_executable "
+            "FROM stock_candidate_stage_signal "
+            "WHERE stage='intraday_strength' ORDER BY stock_code"
+        ).fetchall()
+    finally:
+        con.close()
+    assert result["trade_plan"] == 1
+    assert promoted == [
+        ("000001", True, True),
+        ("000002", False, False),
+    ]

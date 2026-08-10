@@ -613,7 +613,7 @@ def _from_tushare_basic(list_status="L"):
 
 # ---------------------------------------------------------------- 9) 同花顺（独立域名组：hexin.cn / 10jqka.com.cn）—— 零 token
 def _from_ths_northbound():
-    """同花顺北向资金当日分钟级累计净买入（沪股通 hgt / 深股通 sgt，单位亿元）。
+    """同花顺沪/深股通分钟字段（单位亿元，语义需以当日上游说明为准）。
     源 data.hexin.cn，免 token，沙箱出口被限（本机可用）。
     返回 dict：time 时间点列表 + hgt/sgt 列表 + 末值汇总（latest_hgt/sgt/total）。"""
     import urllib.request as _u
@@ -629,22 +629,32 @@ def _from_ths_northbound():
     times = d.get("time") or []
     hgt = d.get("hgt") or []
     sgt = d.get("sgt") or []
-    if not times:
+    # The endpoint has returned arrays with different lengths (for example
+    # time=262, hgt=262, sgt=35).  Truncating to the shortest array silently
+    # pairs different timestamps and creates a false "latest" total.  Treat
+    # that as a schema failure and let the caller omit the panel.
+    if not times or len(times) != len(hgt) or len(times) != len(sgt):
         return None
 
     def _flist(lst):
-        return [float(x) if x not in (None, "") else None for x in lst]
+        out = []
+        for value in lst:
+            if value in (None, ""):
+                return None
+            try:
+                out.append(float(value))
+            except (TypeError, ValueError):
+                return None
+        return out
 
-    def _last(lst):
-        try:
-            v = lst[-1]
-            return float(v) if v not in (None, "") else None
-        except Exception:
-            return None
+    hgt_values = _flist(hgt)
+    sgt_values = _flist(sgt)
+    if hgt_values is None or sgt_values is None:
+        return None
     return {
-        "time": times, "hgt": _flist(hgt), "sgt": _flist(sgt),
-        "latest_hgt": _last(hgt), "latest_sgt": _last(sgt),
-        "latest_total": (_last(hgt) or 0) + (_last(sgt) or 0),
+        "time": times, "hgt": hgt_values, "sgt": sgt_values,
+        "latest_hgt": hgt_values[-1], "latest_sgt": sgt_values[-1],
+        "latest_total": hgt_values[-1] + sgt_values[-1],
         "points": len(times), "_src": "ths",
     }
 
@@ -1815,7 +1825,9 @@ def _secid(code):
 def _from_em_trends(code, date=None):
     """分时（当日 1 分钟级）：东财 push2his trends2。零依赖 urllib。
     date='YYYYMMDD'，None=今天。返回 {code,name,date,trends:[{time,price,avg,volume,amount,change_pct}]}。"""
-    dt = date or datetime.date.today().strftime("%Y%m%d")
+    requested_date = _norm_date(
+        date or datetime.date.today().strftime("%Y%m%d")
+    )
     params = {
         "secid": _secid(code), "fields1": "f1,f2,f3,f7",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
@@ -1835,13 +1847,16 @@ def _from_em_trends(code, date=None):
         p = t.split(",")
         if len(p) < 6:
             continue
+        point_date = _norm_date(p[0])
+        if len(point_date) != 8 or point_date != requested_date:
+            continue
         out.append({
             "time": p[0], "price": float(p[1]), "avg": float(p[2]),
             "volume": float(p[3]), "amount": float(p[4]),
             "change_pct": (float(p[5]) if p[5] not in ("", "-") else None),
         })
     return {"code": _norm_code(code)[1], "name": data.get("name"),
-            "date": dt, "trends": out} if out else None
+            "date": requested_date, "trends": out} if out else None
 
 
 def _from_pytdx_minutes(code, date=None):
