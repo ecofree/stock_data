@@ -25,6 +25,8 @@ $LogDir = Join-Path $Root "logs"
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
 $ObservationRunner = Join-Path $Root "scripts\audit_p0_five_day_observation.py"
 
+$NotifyHelper = Join-Path $Root "scripts\pipeline_notify.py"
+
 if (-not (Test-Path -LiteralPath $DbPath)) {
     throw "Database not found: $DbPath"
 }
@@ -108,6 +110,10 @@ Push-Location $Root
 try {
     "DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath" |
         Tee-Object -FilePath $Log -Append
+    $prevEAP0 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $Python $NotifyHelper --event start 2>&1 | Tee-Object -FilePath $Log -Append
+    $ErrorActionPreference = $prevEAP0
     Copy-Item -LiteralPath $DbPath -Destination $backup
     # Python writes its logging to stderr.  Under $ErrorActionPreference='Stop' that
     # stderr is turned into a terminating NativeCommandError even when the process
@@ -148,9 +154,19 @@ try {
         throw "Integrated daily run failed with exit code $code. Backup: $backup"
     }
     "DAILY_RUN_COMPLETE backup=$compressed" | Tee-Object -FilePath $Log -Append
+    $prevEAP0 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $Python $NotifyHelper --event success --message "close run ok; backup=$compressed" 2>&1 |
+        Tee-Object -FilePath $Log -Append
+    $ErrorActionPreference = $prevEAP0
 } catch {
     "DAILY_RUN_FAILED time=$(Get-Date -Format o) error=$($_.Exception.Message)" |
         Tee-Object -FilePath $Log -Append
+    $prevEAP0 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $Python $NotifyHelper --event failure --message $_.Exception.Message 2>&1 |
+        Tee-Object -FilePath $Log -Append
+    $ErrorActionPreference = $prevEAP0
     throw
 } finally {
     $observationDate = if ($TradeDate) { $TradeDate } else { Get-Date -Format "yyyy-MM-dd" }
@@ -175,6 +191,10 @@ try {
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         & $Python (Join-Path $Root "scripts\generate_health_trend.py") --db $DbPath 2>&1 |
+            Tee-Object -FilePath $Log -Append
+        & $Python (Join-Path $Root "scripts\generate_cycle_analytics.py") --db $DbPath 2>&1 |
+            Tee-Object -FilePath $Log -Append
+        & $Python (Join-Path $Root "scripts\generate_signal_attribution.py") --db $DbPath 2>&1 |
             Tee-Object -FilePath $Log -Append
         $ErrorActionPreference = $prevEAP
     } catch {

@@ -33,3 +33,6 @@ mlruns/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Runtime heartbeat/state files
+state/

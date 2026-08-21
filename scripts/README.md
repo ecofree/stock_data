@@ -24,6 +24,33 @@
 | `generate_web_dashboard.py` | close | Static HTML dashboard |
 | `generate_daily_review.py` | post-close | Daily review markdown (+ statistics) |
 | `generate_health_trend.py` | post-close (auto) | Rolling data-health trend report |
+| `generate_cycle_analytics.py` | post-close (auto) | Emotion-cycle phase + premium/promotion matrices |
+| `generate_edge_profiles.py` | post-close | Hot-money seat profiles + auction pattern stats |
+| `generate_signal_attribution.py` | post-close (auto) | Stage-signal outcomes by phase (advisory position cap) |
+
+## Strategy validation
+
+- `run_strategy_backtest.py` — limit-up continuation backtest
+  (T+1, unfillable one-price boards skipped, slippage both sides).
+  Example: `--start 2026-07-01 --end 2026-08-15 --hold-days 1`.
+- `feature_ic_analysis.py` — cross-sectional Spearman IC for any feature
+  table before any model training. Example: `--table multi_source_stock_flow
+  --date-col source_date --features "main_net,super_net" --horizon 3`.
+
+## Ops & monitoring
+
+- `pipeline_notify.py --event start|success|failure` — heartbeat touch,
+  optional healthcheck ping and push alerts (env: `KPL_NOTIFY_*`,
+  `KPL_NOTIFY_HEALTHCHECK_URL`).
+- `check_pipeline_heartbeat.py [--alert-on-stale]` — external liveness gate.
+- `offsite_backup.ps1 -Destination <path|rclone:remote> [-Execute]` —
+  off-site copy of the newest daily/weekly backups (dry-run default).
+
+## Research console
+
+`research_server.py --port 8765` — read-only SQL console on localhost
+(SELECT-only guard, results clamped to 500 rows).
+| `generate_health_trend.py` | post-close (auto) | Rolling data-health trend report |
 
 ## Storage lifecycle
 
