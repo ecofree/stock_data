@@ -2,533 +2,296 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
 from trade_system.quality import table_columns, table_exists
+from trade_system.capital_flow_health import assess_capital_flow_health
+from trade_system.gate_contract import build_operator_state
+from trade_system.logging_setup import get_logger
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.reports.real_data_backfill import build_real_data_backfill_status
 from trade_system.review_statistics import build_daily_review_statistics
 
+logger = get_logger(__name__)
 
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
+# Facade re-exports: the implementations moved to review_format /
+# review_queries; every historical private name stays importable from here.
+from trade_system.review_format import (  # noqa: F401
+    _fmt_money,
+    _fmt_pct,
+    _format_flow_rows,
+)
+from trade_system.review_queries import (  # noqa: F401
+    _rows,
+    _latest_date,
+    _capital_flow_review,
+    _concept_limit_up_review,
+    _market_context_review,
+    _data_source_review,
+    _regime_key,
+    _ecology_review,
+    _derived_limit_board_levels,
+    _sector_trail_review,
+    _period_label,
+    _compound_pct,
+    _period_frames,
+    _sector_period_review,
+    _REGIME_NOTES,
+    _REGIME_FORECAST,
+)
 
 
-def _rows(con: duckdb.DuckDBPyConnection, table: str, sql: str, params: list[Any]) -> list[dict]:
-    if not table_exists(con, table):
-        return []
+def _cn_weekday(trade_date: str) -> str:
     try:
-        return _fetch_dicts(con, sql, params)
-    except Exception:
-        return []
-
-
-def _fmt_money(value: Any) -> str:
-    """Render canonical yuan amounts compactly without losing sign."""
-    if value in (None, ""):
-        return ""
-    try:
-        number = float(value)
+        day = datetime.strptime(str(trade_date)[:10], "%Y-%m-%d")
     except (TypeError, ValueError):
-        return str(value)
-    sign = "-" if number < 0 else ""
-    number = abs(number)
-    if number >= 100_000_000:
-        return f"{sign}{number / 100_000_000:.2f}亿"
-    if number >= 10_000:
-        return f"{sign}{number / 10_000:.2f}万"
-    return f"{sign}{number:.0f}"
-
-
-def _fmt_pct(value: Any) -> str:
-    if value in (None, ""):
         return ""
-    try:
-        return f"{float(value):.2f}%"
-    except (TypeError, ValueError):
-        return str(value)
+    return "星期" + "一二三四五六日"[day.weekday()]
 
 
-def _format_flow_rows(rows: list[dict], money_fields: tuple[str, ...], pct_fields: tuple[str, ...] = ("change_pct",)) -> list[dict]:
-    formatted = []
-    for row in rows:
-        item = dict(row)
-        for field in money_fields:
-            if field in item:
-                item[field] = _fmt_money(item[field])
-        for field in pct_fields:
-            if field in item:
-                item[field] = _fmt_pct(item[field])
-        formatted.append(item)
-    return formatted
+def _breadth_snapshot(context: dict) -> dict[str, Any]:
+    """Collapse multi-source breadth rows into one readable snapshot."""
+    market = context.get("market_context") or {}
+    breadth = market.get("breadth") or []
+    row = breadth[0] if breadth else {}
+    limit_up = row.get("limit_up_count")
+    limit_down = row.get("limit_down_count")
+    rise = fall = None
+    for item in breadth:
+        if item.get("rise_count") is not None:
+            rise = item.get("rise_count")
+        if item.get("fall_count") is not None:
+            fall = item.get("fall_count")
+    blown = None
+    limit_summary = market.get("limit_summary") or []
+    if limit_summary:
+        blown = limit_summary[0].get("blown_limit_up_rate")
+    return {
+        "limit_up": limit_up,
+        "limit_down": limit_down,
+        "rise": rise,
+        "fall": fall,
+        "blown_rate": blown,
+    }
 
 
-def _latest_date(con: duckdb.DuckDBPyConnection) -> str:
-    for table in ("market_regime_snapshot", "stock_candidate_stage_signal", "stock_candidate_score"):
-        if table_exists(con, table):
-            row = con.execute(f"SELECT max(trade_date) FROM {table}").fetchone()
-            if row and row[0]:
-                return str(row[0])
-    return ""
+def build_review_narrative(context: dict) -> dict[str, Any]:
+    """Deterministic one-screen review: verdict, lede, bullets, next-day focus.
 
-
-def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
-    """Build the explicit daily fund-flow review contract.
-
-    Rows are deduplicated by asset code before ranking.  Sector rankings are
-    kept in one taxonomy (THS concepts when available, otherwise the clearly
-    labelled derived concept fallback) instead of mixing DC industries and
-    concept aggregates with incompatible semantics.
+    Shared by the markdown archive and the HTML review page so the two
+    surfaces cannot drift into different conclusions.
     """
-    result: dict[str, Any] = {
-        "stock_inflow": [], "stock_outflow": [], "sector_inflow": [],
-        "sector_outflow": [], "industry_inflow": [], "industry_outflow": [],
-        "sector_limit_up": [], "stock_flow_meta": {},
-        "sector_flow_meta": {}, "candidate_picks": [],
-        "stock_flow_persistence": [], "sector_flow_persistence": [],
-        "lhb": [], "coverage_alerts": [],
-    }
-    if table_exists(con, "multi_source_stock_flow"):
-        result["stock_flow_meta"] = _fetch_dicts(
-            con,
-            """
-            SELECT count(*) AS rows, count(DISTINCT stock_code) AS codes,
-                   max(fetched_at) AS fetched_at,
-                   coalesce((SELECT status FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)), 'unknown') AS batch_status,
-                   coalesce((SELECT coverage_pct FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)), NULL) AS batch_coverage_pct,
-                   string_agg(DISTINCT coalesce(provider, 'unknown'), ', ' ORDER BY coalesce(provider, 'unknown')) AS providers
-            FROM multi_source_stock_flow
-            WHERE source_date=CAST(? AS DATE) AND coalesce(is_stale,FALSE)=FALSE
-            """,
-            [trade_date, trade_date, trade_date],
-        )[0]
-        member_name_join = ""
-        member_name_expr = "NULL"
-        if table_exists(con, "v_default_concept_stock_history"):
-            # Tushare stock_basic can lag newly listed names.  The quality-
-            # gated THS membership snapshot is a same-date, already-used
-            # catalogue; prefer an unprefixed name (rather than N/C listing
-            # markers) when it is available.
-            member_name_join = """
-                LEFT JOIN (
-                    SELECT stock_code, stock_name
-                    FROM (
-                        SELECT stock_code, stock_name,
-                               row_number() OVER (
-                                   PARTITION BY stock_code
-                                   ORDER BY CASE
-                                       WHEN left(coalesce(stock_name, ''), 1) IN ('N', 'C') THEN 1
-                                       ELSE 0
-                                   END,
-                                   length(coalesce(stock_name, '')),
-                                   stock_name
-                               ) AS name_rank
-                        FROM v_default_concept_stock_history
-                        WHERE trade_date=(
-                            SELECT max(trade_date)
-                            FROM v_default_concept_stock_history
-                            WHERE trade_date<=CAST(? AS DATE)
-                        )
-                          AND stock_name IS NOT NULL
-                    ) names
-                    WHERE name_rank=1
-                ) m ON m.stock_code=f.stock_code
-            """
-            member_name_expr = "nullif(m.stock_name, '')"
-        stock_sql = f"""
-            WITH ranked AS (
-                SELECT f.*, coalesce(
-                           nullif(json_extract_string(f.raw_json, '$.name'), ''),
-                           nullif(b.stock_name, ''),
-                           {member_name_expr},
-                           f.stock_code
-                       ) AS stock_name,
-                       row_number() OVER (
-                         PARTITION BY f.stock_code
-                          ORDER BY CASE f.provider
-                                     WHEN 'eastmoney_market' THEN 1
-                                     WHEN 'eastmoney_intraday_clist_delay' THEN 2
-                                     WHEN 'eastmoney_intraday_clist' THEN 3
-                                     WHEN 'tushare' THEN 4
-                                     WHEN 'tushare_relay' THEN 4
-                                     WHEN 'kpl' THEN 5
-                                     ELSE 9
-                                   END,
-                                  f.fetched_at DESC NULLS LAST
-                       ) AS provider_rank
-                FROM multi_source_stock_flow f
-                LEFT JOIN tushare_stock_basic b ON b.stock_code=f.stock_code
-                {member_name_join}
-                WHERE f.source_date=CAST(? AS DATE) AND coalesce(f.is_stale,FALSE)=FALSE
-            ), deduped AS (SELECT * FROM ranked WHERE provider_rank=1)
-            SELECT stock_code, stock_name, main_net, super_net, large_net, close,
-                   change_pct, turnover, provider, fetched_at
-            FROM deduped ORDER BY main_net {{direction}} NULLS LAST LIMIT 50
-        """
-        try:
-            query_params = [trade_date, trade_date] if member_name_join else [trade_date]
-            result["stock_inflow"] = _fetch_dicts(con, stock_sql.format(direction="DESC"), query_params)
-            result["stock_outflow"] = _fetch_dicts(con, stock_sql.format(direction="ASC"), query_params)
-        except Exception:
-            pass
+    trade_date = str(context.get("trade_date") or "")
+    regime = context.get("regime") or {}
+    readiness = context.get("readiness") or {}
+    control = context.get("execution_control") or {}
+    risk = context.get("risk") or {}
+    concepts = (context.get("concept_limit_up") or {}).get("groups") or []
+    flow = context.get("capital_flow") or {}
+    alerts = context.get("alerts") or []
+    outcomes = context.get("outcomes") or []
+    plans = context.get("plans") or []
+    journal = context.get("journal") or []
+    watchlist = context.get("watchlist") or []
+    breadth = _breadth_snapshot(context)
 
-    if table_exists(con, "multi_source_sector_flow"):
-        result["sector_flow_meta"] = _fetch_dicts(
-            con,
-            """
-            SELECT count(*) AS rows, count(DISTINCT sector_code) AS codes,
-                   max(fetched_at) AS fetched_at,
-                   coalesce((SELECT status FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)), 'unknown') AS batch_status,
-                   coalesce((SELECT coverage_pct FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)), NULL) AS batch_coverage_pct,
-                   string_agg(DISTINCT coalesce(sector_type,'unknown'), ', ' ORDER BY coalesce(sector_type,'unknown')) AS taxonomy
-            FROM multi_source_sector_flow
-            WHERE source_date=CAST(? AS DATE) AND coalesce(is_stale,FALSE)=FALSE
-            """,
-            [trade_date, trade_date, trade_date],
-        )[0]
-        sector_sql = """
-            SELECT sector_code, sector_name, sector_type, main_net, change_pct,
-                   provider, fetched_at
-            FROM multi_source_sector_flow
-            WHERE source_date=CAST(? AS DATE)
-              AND coalesce(is_stale,FALSE)=FALSE
-              AND sector_type IN ('ths_concept','ths_concept_derived')
-            ORDER BY main_net {direction} NULLS LAST LIMIT 10
-        """
-        try:
-            result["sector_inflow"] = _fetch_dicts(con, sector_sql.format(direction="DESC"), [trade_date])
-            result["sector_outflow"] = _fetch_dicts(con, sector_sql.format(direction="ASC"), [trade_date])
-            industry_sql = sector_sql.replace(
-                "sector_type IN ('ths_concept','ths_concept_derived')",
-                "sector_type = 'em_industry'",
-            )
-            result["industry_inflow"] = _fetch_dicts(con, industry_sql.format(direction="DESC"), [trade_date])
-            result["industry_outflow"] = _fetch_dicts(con, industry_sql.format(direction="ASC"), [trade_date])
-        except Exception:
-            pass
+    regime_name = str(regime.get("regime_name") or regime.get("regime") or "未知")
+    top_concept = (concepts[0].get("concept_name") if concepts else None) or None
+    top_limit_up = concepts[0].get("limit_up_count") if concepts else None
+    missing = [str(item) for item in (readiness.get("missing_groups") or []) if item]
+    blocked = control.get("override") == "BLOCK" or not readiness.get(
+        "analysis_ready", readiness.get("certified_ready", False)
+    )
+    execution_ready = bool(control.get("execution_ready"))
+    effective = control.get("effective_position_pct")
+    if effective is None:
+        effective = 0 if blocked else regime.get("suggested_position_pct")
+    suggested = regime.get("suggested_position_pct")
+    inflow = (flow.get("stock_inflow") or [None])[0]
+    outflow = (flow.get("stock_outflow") or [None])[0]
+    broad = {"融资融券", "沪股通", "深股通", "国企改革", "富时罗素", "标普道琼斯", "融资融券概念"}
 
-    if table_exists(con, "v_default_concept_stock_history") and table_exists(con, "v_limit_pool"):
-        result["sector_limit_up"] = _rows(
-            con,
-            "v_default_concept_stock_history",
-            """
-            SELECT h.concept_code AS sector_code, max(h.concept_name) AS sector_name,
-                   count(DISTINCT l.stock_code) AS limit_up_count,
-                   string_agg(DISTINCT coalesce(l.stock_name,h.stock_name), ', ' ORDER BY coalesce(l.stock_name,h.stock_name)) AS limit_up_stocks
-            FROM v_default_concept_stock_history h
-            JOIN v_limit_pool l
-              ON l.stock_code=regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
-             AND l.trade_date=?
-            WHERE h.trade_date=(
-                SELECT max(trade_date) FROM v_default_concept_stock_history
-                WHERE trade_date<=CAST(? AS DATE)
-            )
-            GROUP BY h.concept_code
-            ORDER BY limit_up_count DESC, sector_name
-            """,
-            [trade_date, trade_date],
-        )
+    def _first_named(rows: list, name_key: str) -> dict | None:
+        for row in rows or []:
+            name = str(row.get(name_key) or "")
+            if name and name not in broad:
+                return row
+        return None
 
-    if table_exists(con, "stock_candidate_score"):
-        result["candidate_picks"] = _rows(
-            con,
-            "stock_candidate_score",
-            """
-            WITH provider_ranked AS (
-                SELECT stock_code, main_net,
-                       row_number() OVER (
-                         PARTITION BY stock_code ORDER BY CASE provider
-                           WHEN 'eastmoney_market' THEN 1
-                           WHEN 'eastmoney_intraday_clist_delay' THEN 2
-                           WHEN 'eastmoney_intraday_clist' THEN 3
-                           WHEN 'tushare' THEN 4
-                           WHEN 'tushare_relay' THEN 4
-                           WHEN 'kpl' THEN 5
-                           ELSE 9 END,
-                         fetched_at DESC NULLS LAST
-                       ) AS provider_rank
-                FROM multi_source_stock_flow
-                WHERE source_date=CAST(? AS DATE) AND coalesce(is_stale,FALSE)=FALSE
-            ), flow AS (
-                SELECT stock_code,main_net,
-                       row_number() OVER (
-                         ORDER BY main_net DESC NULLS LAST,stock_code
-                       ) AS flow_rank
-                FROM provider_ranked
-                WHERE provider_rank=1
-            )
-            SELECT s.stock_code, s.stock_name, s.score, s.source, s.sector_code,
-                   f.main_net, f.flow_rank,
-                   CASE WHEN s.source='limit_pool' THEN 'research_only_limit_pool' ELSE 'research_only' END AS selection_status
-            FROM stock_candidate_score s
-            LEFT JOIN flow f ON f.stock_code=s.stock_code
-            WHERE s.trade_date=?
-            ORDER BY s.score DESC NULLS LAST, f.main_net DESC NULLS LAST
-            LIMIT 20
-            """,
-            [trade_date, trade_date],
-        )
+    sector_in = _first_named(flow.get("sector_inflow") or [], "sector_name")
+    sector_out = _first_named(flow.get("sector_outflow") or [], "sector_name")
 
-    # Persistence is deliberately calculated from the canonical flow table,
-    # not from the provider-specific top-50 snapshot.  This prevents a stock
-    # from looking persistent merely because one provider repeated it.
-    if table_exists(con, "multi_source_stock_flow") and result["stock_inflow"]:
-        codes = [str(row.get("stock_code")) for row in result["stock_inflow"][:10] if row.get("stock_code")]
-        if codes:
-            placeholders = ",".join("?" for _ in codes)
+    if blocked:
+        stance = "blocked"
+        stance_label = "仅可复盘"
+        if missing:
+            headline = f"{regime_name}格局，{top_concept or '主线不明'}，但{missing[0]}未齐"
+        else:
+            headline = f"{regime_name}格局，数据门禁未开放"
+        lede = "收盘源或链路尚未完成。本页只作复盘，不能把候选、分数或影子模型当成开仓依据。"
+    elif not execution_ready:
+        stance = "observe"
+        stance_label = "观察核验"
+        headline = f"{regime_name}格局，主线看{top_concept or '分散'}"
+        lede = "复盘事实已形成，执行门禁未开。计划只作核验，仓位仍受风险限额约束。"
+    else:
+        stance = "ready"
+        stance_label = "可核验计划"
+        headline = f"{regime_name}格局，主线{top_concept or '分散'}，可人工核验计划"
+        lede = "可进入人工交易计划核验，仍须遵守 T+1、涨跌停和风险限额。"
+
+    bullets: list[str] = []
+    lu, ld, rise, fall, blown = (
+        breadth.get("limit_up"),
+        breadth.get("limit_down"),
+        breadth.get("rise"),
+        breadth.get("fall"),
+        breadth.get("blown_rate"),
+    )
+    if lu is not None or rise is not None:
+        piece = []
+        if lu is not None:
+            piece.append(f"涨停 {lu} / 跌停 {ld if ld is not None else '—'}")
+        if rise is not None and fall is not None:
+            piece.append(f"上涨 {rise} / 下跌 {fall}")
+        if blown is not None:
             try:
-                result["stock_flow_persistence"] = _fetch_dicts(
-                    con,
-                    f"""
-                    WITH ranked AS (
-                        SELECT stock_code, source_date, main_net,
-                               row_number() OVER (
-                                 PARTITION BY stock_code, source_date
-                                 ORDER BY fetched_at DESC NULLS LAST
-                               ) AS rn
-                        FROM multi_source_stock_flow
-                        WHERE stock_code IN ({placeholders})
-                          AND source_date BETWEEN CAST(? AS DATE) - INTERVAL 20 DAY AND CAST(? AS DATE)
-                          AND coalesce(is_stale,FALSE)=FALSE
-                    )
-                    SELECT stock_code, count(*) AS observed_days,
-                           sum(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) AS positive_days,
-                           round(sum(main_net), 0) AS twenty_day_main_net,
-                           max(source_date) AS latest_date
-                    FROM ranked WHERE rn=1
-                    GROUP BY stock_code
-                    ORDER BY positive_days DESC, twenty_day_main_net DESC
-                    """,
-                    [*codes, trade_date, trade_date],
-                )
-            except Exception:
-                result["stock_flow_persistence"] = []
-
-    if table_exists(con, "multi_source_sector_flow") and result["sector_inflow"]:
-        codes = [str(row.get("sector_code")) for row in result["sector_inflow"][:10] if row.get("sector_code")]
-        if codes:
-            placeholders = ",".join("?" for _ in codes)
-            try:
-                result["sector_flow_persistence"] = _fetch_dicts(
-                    con,
-                    f"""
-                    WITH ranked AS (
-                        SELECT sector_code, sector_name, source_date, main_net,
-                               row_number() OVER (
-                                 PARTITION BY sector_code, source_date
-                                 ORDER BY fetched_at DESC NULLS LAST
-                               ) AS rn
-                        FROM multi_source_sector_flow
-                        WHERE sector_code IN ({placeholders})
-                          AND source_date BETWEEN CAST(? AS DATE) - INTERVAL 20 DAY AND CAST(? AS DATE)
-                          AND coalesce(is_stale,FALSE)=FALSE
-                          AND sector_type IN ('ths_concept','ths_concept_derived')
-                    )
-                    SELECT sector_code, max(sector_name) AS sector_name,
-                           count(*) AS observed_days,
-                           sum(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) AS positive_days,
-                           round(sum(main_net), 0) AS twenty_day_main_net,
-                           max(source_date) AS latest_date
-                    FROM ranked WHERE rn=1
-                    GROUP BY sector_code
-                    ORDER BY positive_days DESC, twenty_day_main_net DESC
-                    """,
-                    [*codes, trade_date, trade_date],
-                )
-            except Exception:
-                result["sector_flow_persistence"] = []
-
-    # 龙虎榜 is a post-market review input.  Keep it separate from executable
-    # candidates and show the source date explicitly when the feed is stale.
-    if table_exists(con, "lhb_list"):
-        result["lhb"] = _rows(
-            con,
-            "lhb_list",
-            """
-            SELECT date, stock_code, stock_name, change_pct, reason,
-                   buy_amount, sell_amount, net_amount
-            FROM lhb_list
-            WHERE date=CAST(? AS DATE)
-            ORDER BY abs(net_amount) DESC NULLS LAST
-            LIMIT 20
-            """,
-            [trade_date],
+                piece.append(f"炸板率 {float(blown):.1f}%")
+            except (TypeError, ValueError):
+                piece.append(f"炸板率 {blown}")
+        bullets.append("市场宽度：" + "，".join(piece) + "。")
+    if top_concept:
+        extra = f"，同日涨停 {top_limit_up} 只" if top_limit_up is not None else ""
+        bullets.append(f"主线证据：{top_concept}{extra}。概念排序只作复盘，不等于买入名单。")
+    else:
+        bullets.append("主线证据：当日没有足够干净的概念—涨停映射，主线按分散处理。")
+    if inflow and outflow:
+        bullets.append(
+            "资金确认：个股净流入首位 "
+            f"{inflow.get('stock_name') or inflow.get('stock_code')}，"
+            "净流出首位 "
+            f"{outflow.get('stock_name') or outflow.get('stock_code')}。"
         )
-
-    stock_meta = result.get("stock_flow_meta") or {}
-    sector_meta = result.get("sector_flow_meta") or {}
-    if float(stock_meta.get("batch_coverage_pct") or 0) < 99.5:
-        result["coverage_alerts"].append(
-            f"个股资金流覆盖 {stock_meta.get('batch_coverage_pct', 0)}%，低于 99.5%"
+    if sector_in or sector_out:
+        bits = []
+        if sector_in:
+            bits.append(f"概念流入 {sector_in.get('sector_name')}")
+        if sector_out:
+            bits.append(f"流出 {sector_out.get('sector_name')}")
+        bullets.append("板块资金：" + "，".join(bits) + "。")
+    if alerts:
+        first = alerts[0]
+        bullets.append(
+            f"风险告警 {len(alerts)} 条，首条 {first.get('severity') or ''} / "
+            f"{first.get('category') or ''}：{first.get('message') or '—'}"
         )
-    if float(sector_meta.get("batch_coverage_pct") or 0) < 99.5:
-        result["coverage_alerts"].append(
-            f"板块资金流覆盖 {sector_meta.get('batch_coverage_pct', 0)}%，低于 99.5%"
+    if outcomes:
+        bullets.append(f"操作闭环：已导入 {len(outcomes)} 条成交/跳过记录，按真实结果复盘。")
+    else:
+        bullets.append("操作闭环：今日没有导入成交。没有成交就不能用候选分数冒充胜率。")
+    if plans:
+        bullets.append(f"计划 {len(plans)} 条，观察池 {len(watchlist)} 条，日志 {len(journal)} 条。")
+
+    ecology = context.get("ecology") or {}
+    yday = ecology.get("yday") or {}
+    leader = ecology.get("leader") or {}
+    groups = ecology.get("ladder_groups") or []
+    if groups:
+        top = groups[0]
+        names = "、".join(str(n) for n in (top.get("names") or [])[:4])
+        extra = f"等 {top.get('count')} 只" if (top.get("count") or 0) > 4 else ""
+        bullets.append(f"连板梯队：最高 {top.get('height')} 板 {names}{extra}。")
+    if yday.get("n"):
+        avg = yday.get("avg_ret")
+        pos = yday.get("pos_rate")
+        first = yday.get("first_avg")
+        multi = yday.get("multi_avg")
+        bits = [f"昨日涨停 {int(yday.get('n') or 0)} 只今日平均 {_fmt_pct(avg) or avg}"]
+        if pos is not None:
+            bits.append(f"正收益 {_fmt_pct(pos) or pos}")
+        if first is not None:
+            bits.append(f"首板 {_fmt_pct(first) or first}")
+        if multi is not None:
+            bits.append(f"多板 {_fmt_pct(multi) or multi}")
+        bullets.append("溢价：" + "，".join(str(x) for x in bits) + "。")
+    broken = ecology.get("broken") or []
+    if broken:
+        names = "、".join(
+            f"{row.get('stock_name') or row.get('stock_code')}"
+            for row in broken[:4]
         )
-    return result
+        bullets.append(f"接力失败：{names}。这是今日亏钱效应的前排来源。")
 
+    key = _regime_key(regime_name)
+    note = _REGIME_NOTES.get(key) or ""
+    forecast = _REGIME_FORECAST.get(key) or "观望"
+    risks = []
+    if key == "退潮":
+        risks.append("退潮期严禁接力和反包。")
+    if key == "高潮":
+        risks.append("高潮期兑现后排，不新开仓。")
+    if (breadth.get("blown_rate") or 0) and float(breadth.get("blown_rate") or 0) >= 40:
+        risks.append("炸板率极高，严禁追高。")
+    if (breadth.get("limit_down") or 0) and int(breadth.get("limit_down") or 0) >= 10:
+        risks.append("跌停偏多，避开弱势股。")
+    if yday.get("avg_ret") is not None and float(yday.get("avg_ret") or 0) < 1:
+        risks.append("昨日涨停几乎没有溢价，打板环境差。")
 
-def _market_context_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
-    """Collect same-date breadth, auction, limit-up ecology and LHB evidence."""
-    context: dict[str, Any] = {
-        "breadth": [], "limit_summary": [], "auction": [],
-        "limit_ladder": [], "lhb_summary": {},
+    cap = effective if effective is not None else 0
+    tomorrow: list[str] = []
+    pos_line = f"仓位上限 {cap}%"
+    if suggested is not None:
+        pos_line += f"（理论 {suggested}%）"
+    tomorrow.append(f"{pos_line} · 情绪预判 {forecast} · 风险 {risk.get('risk_state') or '未评估'}。")
+    if note:
+        tomorrow.append(note)
+    tomorrow.extend(risks[:3])
+    if missing:
+        tomorrow.append(f"先补齐 {', '.join(missing[:4])}，再讨论执行。")
+    if leader.get("stock_name") or top_concept:
+        who = leader.get("stock_name") or top_concept
+        tomorrow.append(f"竞价核验 {who} 是否还能封住溢价，不能封就降级观察。")
+    else:
+        tomorrow.append("竞价前重新确认主线，避免把过宽概念当成方向。")
+    if not outcomes:
+        tomorrow.append("收盘后导入真实成交/跳过/取消，否则次日复盘仍是候选清单。")
+
+    return {
+        "trade_date": trade_date,
+        "weekday": _cn_weekday(trade_date),
+        "stance": stance,
+        "stance_label": stance_label,
+        "headline": headline,
+        "lede": lede,
+        "regime": regime_name,
+        "mainline": top_concept or "暂无可靠主线",
+        "effective_position_pct": cap,
+        "suggested_position_pct": suggested,
+        "missing": missing,
+        "bullets": bullets,
+        "tomorrow": tomorrow,
+        "breadth": breadth,
+        "playbook": {"note": note, "forecast": forecast, "risks": risks},
+        "plan_count": len(plans),
+        "outcome_count": len(outcomes),
+        "watch_count": len(watchlist),
+        "alert_count": len(alerts),
     }
-    if table_exists(con, "market_rise_fall"):
-        context["breadth"] = _rows(
-            con, "market_rise_fall",
-            """SELECT date, limit_up_count, limit_down_count, broken_limit_up_count,
-                    blown_limit_up_count, blown_limit_up_rate, raw_field_5, source_kind
-             FROM market_rise_fall WHERE date=CAST(? AS DATE) ORDER BY updated_at DESC LIMIT 1""",
-            [trade_date],
-        )
-    if table_exists(con, "daily_summary"):
-        context["breadth"] += _rows(
-            con, "daily_summary",
-            """SELECT date, limit_up_count, limit_down_count, rise_count, fall_count,
-                    consecutive_count, source_kind
-             FROM daily_summary WHERE date=CAST(? AS DATE) LIMIT 1""",
-            [trade_date],
-        )
-    if table_exists(con, "market_limit_up_down_summary"):
-        context["limit_summary"] = _rows(
-            con, "market_limit_up_down_summary",
-            """SELECT date, limit_up_count, limit_down_count, actual_limit_up_count,
-                    actual_limit_down_count, blown_limit_up_rate
-             FROM market_limit_up_down_summary WHERE date=CAST(? AS DATE) LIMIT 1""",
-            [trade_date],
-        )
-    if table_exists(con, "auction_bidding_anomaly"):
-        context["auction"] = _rows(
-            con, "auction_bidding_anomaly",
-            """SELECT date, count(*) AS anomaly_count,
-                    count(DISTINCT stock_code) AS stock_count,
-                    max(fetched_at) AS fetched_at
-             FROM auction_bidding_anomaly WHERE date=CAST(? AS DATE)
-             GROUP BY date""",
-            [trade_date],
-        )
-    if table_exists(con, "ladder_realtime_boards"):
-        cols = set(table_columns(con, "ladder_realtime_boards"))
-        date_col = "trade_date" if "trade_date" in cols else "date" if "date" in cols else None
-        if date_col:
-            context["limit_ladder"] = _rows(
-                con, "ladder_realtime_boards",
-                f"SELECT * FROM ladder_realtime_boards WHERE {date_col}=CAST(? AS DATE) LIMIT 20",
-                [trade_date],
-            )
-    if table_exists(con, "lhb_list"):
-        row = con.execute(
-            "SELECT count(*), count(DISTINCT stock_code), max(fetched_at) "
-            "FROM lhb_list WHERE date=CAST(? AS DATE)", [trade_date]
-        ).fetchone()
-        context["lhb_summary"] = {
-            "rows": int(row[0] or 0), "stocks": int(row[1] or 0),
-            "fetched_at": str(row[2]) if row and row[2] else None,
-        }
-    return context
 
 
-def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
-    """Expose same-date provider checkpoints and research evidence in the review."""
-    result: dict[str, Any] = {
-        "tushare": [], "kline": [], "ths": {}, "outcomes": 0, "qlib": [], "strategy": [],
-    }
-    if table_exists(con, "history_fetch_checkpoint"):
-        result["tushare"] = _rows(
-            con,
-            "history_fetch_checkpoint",
-            """SELECT dataset, status, rows_written, attempts, last_error, updated_at
-               FROM history_fetch_checkpoint
-               WHERE trade_date=CAST(? AS DATE)
-                 AND dataset IN ('daily','daily_basic','adj_factor','moneyflow','industry_flow','ths_concept_snapshot')
-               ORDER BY dataset""",
-            [trade_date],
-        )
-        expected_datasets = ("daily", "daily_basic", "adj_factor", "moneyflow", "industry_flow", "ths_concept_snapshot")
-        found = {str(row.get("dataset")) for row in result["tushare"]}
-        result["tushare"].extend(
-            {"dataset": name, "status": "missing", "rows_written": 0, "attempts": 0,
-             "last_error": "no same-date checkpoint", "updated_at": None}
-            for name in expected_datasets if name not in found
-        )
-        result["tushare"].sort(key=lambda row: str(row.get("dataset") or ""))
-    for relation in ("kline", "v_kline_daily"):
-        if table_exists(con, relation):
-            cols = set(table_columns(con, relation))
-            date_col = "date" if "date" in cols else "trade_date" if "trade_date" in cols else None
-            if date_col:
-                latest = con.execute(f"SELECT max({date_col}) FROM {relation}").fetchone()[0]
-                same_date = con.execute(
-                    f"SELECT count(*) FROM {relation} WHERE CAST({date_col} AS DATE)=CAST(? AS DATE)",
-                    [trade_date],
-                ).fetchone()[0]
-                result["kline"].append({"relation": relation, "latest": str(latest) if latest else None, "same_date_rows": int(same_date or 0)})
-    if table_exists(con, "ths_concept_member_checkpoint"):
-        latest = con.execute(
-            "SELECT max(trade_date) FROM ths_concept_member_checkpoint WHERE trade_date<=CAST(? AS DATE)",
-            [trade_date],
-        ).fetchone()[0]
-        if latest:
-            row = con.execute(
-                "SELECT count(*), sum(CASE WHEN status='success' THEN 1 ELSE 0 END), "
-                "sum(CASE WHEN status<>'success' THEN 1 ELSE 0 END) "
-                "FROM ths_concept_member_checkpoint WHERE trade_date=?", [latest]
-            ).fetchone()
-            raw_concepts = int(con.execute(
-                "SELECT count(DISTINCT concept_code) FROM ths_concept_daily WHERE trade_date=?", [latest]
-            ).fetchone()[0] or 0) if table_exists(con, "ths_concept_daily") else 0
-            raw_members = int(con.execute(
-                "SELECT count(*) FROM ths_concept_stock_history WHERE trade_date=?", [latest]
-            ).fetchone()[0] or 0) if table_exists(con, "ths_concept_stock_history") else 0
-            usable_concepts = int(con.execute(
-                "SELECT count(DISTINCT concept_code) FROM v_default_concept_daily WHERE trade_date=?", [latest]
-            ).fetchone()[0] or 0) if table_exists(con, "v_default_concept_daily") else 0
-            usable_members = int(con.execute(
-                "SELECT count(*) FROM v_default_concept_stock_history WHERE trade_date=?", [latest]
-            ).fetchone()[0] or 0) if table_exists(con, "v_default_concept_stock_history") else 0
-            result["ths"] = {"trade_date": str(latest), "concepts": raw_concepts, "members": raw_members,
-                           "usable_concepts": usable_concepts, "usable_members": usable_members,
-                           "stale_or_partial_concepts": max(0, raw_concepts - usable_concepts),
-                           "stale_or_partial_members": max(0, raw_members - usable_members),
-                           "checkpoint_rows": int(row[0] or 0), "success": int(row[1] or 0),
-                           "partial": int(row[2] or 0)}
-    if table_exists(con, "operator_trade_outcome"):
-        result["outcomes"] = int(con.execute(
-            "SELECT count(*) FROM operator_trade_outcome WHERE trade_date=CAST(? AS DATE)", [trade_date]
-        ).fetchone()[0] or 0)
-    if table_exists(con, "qlib_shadow_evaluation"):
-        cols = set(table_columns(con, "qlib_shadow_evaluation"))
-        qlib_select = ["model_id", "'shadow' AS stage", "sample_count", "hit_rate"]
-        qlib_select.append("top_quantile_return AS avg_forward_return_pct" if "top_quantile_return" in cols else "NULL AS avg_forward_return_pct")
-        qlib_select.append("'disabled' AS signal_impact")
-        order_col = "sample_end" if "sample_end" in cols else "model_id"
-        result["qlib"] = _rows(
-            con, "qlib_shadow_evaluation",
-            f"SELECT {', '.join(qlib_select)} FROM qlib_shadow_evaluation ORDER BY {order_col} DESC NULLS LAST LIMIT 10",
-            [],
-        )
-    if table_exists(con, "strategy_backtest_result"):
-        cols = set(table_columns(con, "strategy_backtest_result"))
-        strategy_select = ["strategy_id", "stage", "sample_count", "win_rate"]
-        strategy_select.append("avg_return AS avg_return_pct" if "avg_return" in cols else "NULL AS avg_return_pct")
-        strategy_select.append("'not_verified' AS verdict")
-        order_col = "sample_end" if "sample_end" in cols else "strategy_id"
-        result["strategy"] = _rows(
-            con, "strategy_backtest_result",
-            f"SELECT {', '.join(strategy_select)} FROM strategy_backtest_result ORDER BY {order_col} DESC NULLS LAST LIMIT 10",
-            [],
-        )
-    return result
-
-
-def build_daily_review_context(db_path: str | Path, trade_date: str | None = None) -> dict:
-    con = duckdb.connect(str(db_path), read_only=True)
+def build_daily_review_context(
+    db_path: str | Path,
+    trade_date: str | None = None,
+    *,
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> dict:
+    owns_connection = con is None
+    con = con or duckdb.connect(str(db_path), read_only=True)
+    flow_evidence_present = False
     try:
         selected_date = trade_date or _latest_date(con)
         regime_order = "generated_at DESC NULLS LAST" if "generated_at" in table_columns(con, "market_regime_snapshot") else "trade_date DESC"
@@ -538,10 +301,19 @@ def build_daily_review_context(db_path: str | Path, trade_date: str | None = Non
             f"SELECT * FROM market_regime_snapshot WHERE trade_date = ? ORDER BY {regime_order} LIMIT 1",
             [selected_date],
         )
+        rotation_columns = set(table_columns(con, "sector_rotation_score"))
+        rotation_taxonomy_filter = (
+            "AND (taxonomy IN ('ths_concept', 'ths_concept_derived') "
+            "OR (coalesce(taxonomy, 'unknown') = 'unknown' AND sector_code LIKE 'THS-%'))"
+            if "taxonomy" in rotation_columns
+            else "AND sector_code LIKE 'THS-%'"
+        )
         sectors = _rows(
             con,
             "sector_rotation_score",
-            "SELECT * FROM sector_rotation_score WHERE trade_date = ? ORDER BY score DESC LIMIT 10",
+            "SELECT * FROM sector_rotation_score WHERE trade_date = ? "
+            + rotation_taxonomy_filter
+            + " ORDER BY score DESC LIMIT 10",
             [selected_date],
         )
         stages = _rows(
@@ -599,27 +371,101 @@ def build_daily_review_context(db_path: str | Path, trade_date: str | None = Non
             [selected_date],
         )
         capital_flow = _capital_flow_review(con, selected_date)
+        concept_limit_up = _concept_limit_up_review(con, selected_date)
         market_context = _market_context_review(con, selected_date)
         data_sources = _data_source_review(con, selected_date)
+        ecology = _ecology_review(con, selected_date)
+        sector_trail = _sector_trail_review(con, selected_date)
+        sector_periods = _sector_period_review(con, selected_date)
+        flow_evidence_present = any(
+            table_exists(con, relation)
+            for relation in (
+                "multi_source_stock_flow",
+                "multi_source_sector_flow",
+                "sector_capital",
+            )
+        )
         try:
-            readiness = assess_trade_date_readiness(con, selected_date, stage="postmarket")
+            # A post-close review must not accept a stale intraday snapshot as
+            # current close evidence.  Keep the same 2-hour freshness contract
+            # used by the integrated close gate.
+            readiness = assess_trade_date_readiness(
+                con, selected_date, stage="postmarket", max_age_seconds=7200
+            )
         except Exception as exc:
             readiness = {
                 "trade_date": selected_date, "stage": "postmarket",
-                "ready": False, "analytics_ready": False, "execution_ready": False,
+                "ready": False, "source_ready": False, "pipeline_ready": False,
+                "artifact_current": False, "certified_ready": False,
+                "analytics_ready": False, "execution_ready": False,
                 "missing_groups": [f"readiness_error:{type(exc).__name__}"],
                 "groups": [], "actionable_candidates": 0,
                 "tradable_candidates": 0, "risk_approved_candidates": 0,
                 "executable_candidates": 0,
             }
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
+
+    # Merge the independent flow certification into the review's operator
+    # state.  Missing reconciliation is a hard false, so the page cannot show
+    # a misleading third "not assessed" ready state.
+    flow_health: dict[str, Any] = {}
+    if flow_evidence_present:
+        try:
+            flow_health = assess_capital_flow_health(
+                db_path,
+                selected_date,
+                max_age_seconds=None,
+            )
+        except Exception as exc:
+            flow_health = {
+                "flow_certified_ready": False,
+                "warnings": [f"capital_flow_health_error:{type(exc).__name__}"],
+            }
+    flow_certified = bool(flow_health.get("flow_certified_ready", False)) if flow_health else False
+    operator_state = build_operator_state(
+        source_ready=bool(readiness.get("source_ready", readiness.get("ready", False))),
+        pipeline_ready=bool(readiness.get("pipeline_ready", False)),
+        artifact_current=bool(readiness.get("artifact_current", False)),
+        data_certified_ready=bool(
+            readiness.get(
+                "data_certified_ready",
+                readiness.get("certified_ready", False),
+            )
+        ),
+        flow_certified_ready=flow_certified,
+        execution_ready=bool(readiness.get("execution_ready", False)),
+        run_status="reviewed",
+        blockers=(readiness.get("missing_groups") or [])
+        + (flow_health.get("blockers") or []),
+        warnings=flow_health.get("warnings") or [],
+    )
+    readiness.update(operator_state)
+    readiness["operator_state"] = dict(operator_state)
 
     suggested = regime[0].get("suggested_position_pct") if regime else None
     risk_position = risk[0].get("total_position_pct") if risk else None
-    analytics_ready = bool(readiness.get("analytics_ready"))
+    source_ready = bool(readiness.get("source_ready", readiness.get("analytics_ready", readiness.get("ready", False))))
+    pipeline_ready = bool(readiness.get("pipeline_ready", source_ready))
+    artifact_current = bool(readiness.get("artifact_current", False))
+    data_certified_ready = bool(
+        readiness.get("data_certified_ready", source_ready and pipeline_ready and artifact_current)
+    )
+    flow_certified_ready = readiness.get("flow_certified_ready")
+    analysis_ready = bool(
+        readiness.get(
+            "analysis_ready",
+            data_certified_ready
+            and (flow_certified_ready is None or bool(flow_certified_ready)),
+        )
+    )
+    # The explicit analysis gate is the operator decision.  The legacy aliases
+    # below remain in the payload for older consumers only.
+    certified_ready = analysis_ready
+    analytics_ready = analysis_ready
     execution_ready = bool(readiness.get("execution_ready"))
-    effective_position = suggested if analytics_ready else 0
+    effective_position = suggested if analysis_ready else 0
 
     return {
         "trade_date": selected_date,
@@ -633,16 +479,29 @@ def build_daily_review_context(db_path: str | Path, trade_date: str | None = Non
         "journal": journal,
         "outcomes": outcomes,
         "capital_flow": capital_flow,
+        "concept_limit_up": concept_limit_up,
         "market_context": market_context,
         "data_sources": data_sources,
+        "capital_flow_health": flow_health,
+        "ecology": ecology,
+        "sector_trail": sector_trail,
+        "sector_periods": sector_periods,
         "readiness": readiness,
         "execution_control": {
+            "source_ready": source_ready,
+            "pipeline_ready": pipeline_ready,
+            "artifact_current": artifact_current,
+            "data_certified_ready": data_certified_ready,
+            "flow_certified_ready": flow_certified_ready,
+            "analysis_ready": analysis_ready,
+            "operator_status": readiness.get("operator_status", "uncertified"),
+            "certified_ready": certified_ready,
             "analytics_ready": analytics_ready,
             "execution_ready": execution_ready,
             "effective_position_pct": effective_position,
             "suggested_position_pct": suggested,
             "risk_position_pct": risk_position,
-            "override": "ALLOW_REVIEW_ONLY" if analytics_ready and not execution_ready else "ALLOW" if execution_ready else "BLOCK",
+            "override": "ALLOW_REVIEW_ONLY" if analysis_ready and not execution_ready else "ALLOW" if execution_ready else "BLOCK",
         },
         "statistics": build_daily_review_statistics(db_path),
         "backfill": build_real_data_backfill_status(db_path),
@@ -761,29 +620,66 @@ def _render_flow_review_sections(flow: dict[str, Any]) -> list[str]:
             "",
             "### Capital Flow Persistence (20-Day Evidence)",
             "",
-            "| Stock | Observed Days | Positive Days | 20-Day Main Net | Latest |",
-            "|---|---:|---:|---:|---|",
+            "| Stock | Observed | Positive | 3D | 5D | 10D | 20D | Acceleration | Latest |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
-    persistence = [
-        {**row, "twenty_day_main_net": _fmt_money(row.get("twenty_day_main_net"))}
-        for row in flow.get("stock_flow_persistence", [])
-    ]
-    lines.extend(_table_rows(persistence, ["stock_code", "observed_days", "positive_days", "twenty_day_main_net", "latest_date"], "No stock persistence rows"))
+    persistence_money = ("main_net_3d", "main_net_5d", "main_net_10d", "twenty_day_main_net", "flow_acceleration_5d")
+    persistence = []
+    for row in flow.get("stock_flow_persistence", []):
+        item = dict(row)
+        for field in persistence_money:
+            item[field] = _fmt_money(item.get(field))
+        persistence.append(item)
+    lines.extend(_table_rows(persistence, ["stock_code", "observed_days_20d", "positive_days", "main_net_3d", "main_net_5d", "main_net_10d", "twenty_day_main_net", "flow_acceleration_5d", "latest_date"], "No stock persistence rows"))
+    lines.extend(
+        [
+            "",
+            "### Capital Flow Persistence Outflow (20-Day Evidence)",
+            "",
+            "| Stock | Observed | Positive | 3D | 5D | 10D | 20D | Acceleration | Latest |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    persistence_outflow = []
+    for row in flow.get("stock_flow_persistence_outflow", []):
+        item = dict(row)
+        for field in persistence_money:
+            item[field] = _fmt_money(item.get(field))
+        persistence_outflow.append(item)
+    lines.extend(_table_rows(persistence_outflow, ["stock_code", "observed_days_20d", "positive_days", "main_net_3d", "main_net_5d", "main_net_10d", "twenty_day_main_net", "flow_acceleration_5d", "latest_date"], "No stock outflow persistence rows"))
     lines.extend(
         [
             "",
             "### THS Concept Persistence (20-Day Evidence)",
             "",
-            "| Concept | Observed Days | Positive Days | 20-Day Main Net | Latest |",
-            "|---|---:|---:|---:|---|",
+            "| Concept | Observed | Positive | 3D | 5D | 10D | 20D | Acceleration | Latest |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
-    sector_persistence = [
-        {**row, "twenty_day_main_net": _fmt_money(row.get("twenty_day_main_net"))}
-        for row in flow.get("sector_flow_persistence", [])
-    ]
-    lines.extend(_table_rows(sector_persistence, ["sector_name", "observed_days", "positive_days", "twenty_day_main_net", "latest_date"], "No concept persistence rows"))
+    sector_persistence = []
+    for row in flow.get("sector_flow_persistence", []):
+        item = dict(row)
+        for field in persistence_money:
+            item[field] = _fmt_money(item.get(field))
+        sector_persistence.append(item)
+    lines.extend(_table_rows(sector_persistence, ["sector_name", "observed_days_20d", "positive_days", "main_net_3d", "main_net_5d", "main_net_10d", "twenty_day_main_net", "flow_acceleration_5d", "latest_date"], "No concept persistence rows"))
+    lines.extend(
+        [
+            "",
+            "### THS Concept Persistence Outflow (20-Day Evidence)",
+            "",
+            "| Concept | Observed | Positive | 3D | 5D | 10D | 20D | Acceleration | Latest |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    sector_persistence_outflow = []
+    for row in flow.get("sector_flow_persistence_outflow", []):
+        item = dict(row)
+        for field in persistence_money:
+            item[field] = _fmt_money(item.get(field))
+        sector_persistence_outflow.append(item)
+    lines.extend(_table_rows(sector_persistence_outflow, ["sector_name", "observed_days_20d", "positive_days", "main_net_3d", "main_net_5d", "main_net_10d", "twenty_day_main_net", "flow_acceleration_5d", "latest_date"], "No concept outflow persistence rows"))
     lines.extend(
         [
             "",
@@ -813,12 +709,99 @@ def render_daily_review_markdown(context: dict) -> str:
     control = context.get("execution_control", {})
     market_context = context.get("market_context", {})
     data_sources = context.get("data_sources", {})
-    stock_meta = flow.get("stock_flow_meta", {})
-    sector_meta = flow.get("sector_flow_meta", {})
+    story = build_review_narrative(context)
     lines = [
         f"# Daily Review - {context.get('trade_date', '')}",
         "",
-        "## Market Regime",
+        "## 今日裁决",
+        "",
+        f"- 裁决：`{story.get('stance_label')}`",
+        f"- 一句话：`{story.get('headline')}`",
+        f"- 说明：{story.get('lede')}",
+        f"- 主线：`{story.get('mainline')}`",
+        f"- 有效仓位：`{story.get('effective_position_pct')}%`",
+        f"- 缺失：`{', '.join(story.get('missing') or []) or 'none'}`",
+    ]
+    for bullet in story.get("bullets") or []:
+        lines.append(f"- {bullet}")
+    lines.extend(["", "### 次日只看这几件事", ""])
+    for item in story.get("tomorrow") or []:
+        lines.append(f"- {item}")
+    ecology = context.get("ecology") or {}
+    lines.extend(["", "### 连板梯队", "", "| 高度 | 家数 | 股票 | 备注 |", "|---:|---:|---|---|"])
+    for group in ecology.get("ladder_groups") or []:
+        names = "、".join(str(n) for n in (group.get("names") or [])[:8])
+        if (group.get("count") or 0) > 8:
+            names += f" 等{group.get('count')}只"
+        lines.append(f"| {group.get('height')}板 | {group.get('count')} | {names} | {group.get('note') or ''} |")
+    if not ecology.get("ladder_groups"):
+        lines.append("|  |  | 暂无连板名单 |  |")
+    trail = context.get("sector_trail") or {}
+    trail_dates = (trail.get("dates") or [])[:6]
+    lines.extend(["", "### 板块轨迹", "", f"- 成分快照：`{trail.get('membership_date') or '—'}`；对比日 `{', '.join(trail_dates) or 'none'}`。"])
+    if trail_dates:
+        header = "| 概念 | " + " | ".join(d[5:] if len(d) >= 10 else d for d in trail_dates) + " |"
+        align = "|---|" + "|".join("---:" for _ in trail_dates) + "|"
+        lines.extend(["", header, align])
+        for sector in (trail.get("sectors") or [])[:12]:
+            cells = [str(sector.get("name") or "")]
+            daily = sector.get("daily") or {}
+            for day in trail_dates:
+                cell = daily.get(day) or {}
+                lu = cell.get("limit_up")
+                cells.append(str(lu) if lu is not None else "—")
+            lines.append("| " + " | ".join(cells) + " |")
+    else:
+        lines.append("- 暂无板块轨迹")
+    periods = context.get("sector_periods") or {}
+    for kind, title in (("week", "周聚合"), ("month", "月聚合")):
+        block = periods.get(kind) or {}
+        labels = [item.get("label") for item in (block.get("periods") or [])[:6]]
+        lines.extend(["", f"### 板块轨迹 · {title}", ""])
+        if labels:
+            header = "| 概念 | " + " | ".join(str(label) for label in labels) + " |"
+            align = "|---|" + "|".join("---:" for _ in labels) + "|"
+            lines.extend([header, align])
+            for sector in (block.get("sectors") or [])[:10]:
+                cells = [str(sector.get("name") or "")]
+                pdata = sector.get("periods") or {}
+                for label in labels:
+                    cell = pdata.get(label) or {}
+                    lu = cell.get("limit_up")
+                    cells.append(str(lu) if lu is not None else "—")
+                lines.append("| " + " | ".join(cells) + " |")
+        else:
+            lines.append("- 暂无期间数据")
+    yday = ecology.get("yday") or {}
+    lines.extend(
+        [
+            "",
+            "### 昨日涨停今日表现",
+            "",
+            f"- 样本：`{yday.get('n') or 0}` 只（对比日 `{yday.get('prev_date') or '—'}`）",
+            f"- 平均涨幅：`{_fmt_pct(yday.get('avg_ret')) or '—'}`；正收益 `{_fmt_pct(yday.get('pos_rate')) or '—'}`",
+            f"- 继续涨停：`{yday.get('still_limit_up') or 0}`；跌停 `{yday.get('limit_down') or 0}`",
+            f"- 首板均涨：`{_fmt_pct(yday.get('first_avg')) or '—'}`；多板均涨 `{_fmt_pct(yday.get('multi_avg')) or '—'}`",
+            "",
+            "### 接力失败（昨 2 板+ 今日未封）",
+            "",
+            "| 股票 | 昨板 | 今日涨幅 |",
+            "|---|---:|---:|",
+        ]
+    )
+    broken_rows = [
+        {
+            "stock": row.get("stock_name") or row.get("stock_code"),
+            "board_level": row.get("board_level"),
+            "change_pct": _fmt_pct(row.get("change_pct")),
+        }
+        for row in (ecology.get("broken") or [])
+    ]
+    lines.extend(_table_rows(broken_rows, ["stock", "board_level", "change_pct"], "No failed-continuation rows"))
+    lines.extend(
+        [
+            "",
+            "## Market Regime",
         "",
         f"- Regime: `{regime.get('regime', 'unknown')}`",
         f"- Regime score: `{regime.get('regime_score', '')}`",
@@ -827,12 +810,14 @@ def render_daily_review_markdown(context: dict) -> str:
         "",
         "## P0 Data And Execution Gate",
         "",
-        f"- Analytics ready: `{str(readiness.get('analytics_ready', False)).lower()}`; execution ready: `{str(readiness.get('execution_ready', False)).lower()}`.",
+        f"- Source ready: `{str(readiness.get('source_ready', readiness.get('analytics_ready', False))).lower()}`; pipeline ready: `{str(readiness.get('pipeline_ready', False)).lower()}`; artifact current: `{str(readiness.get('artifact_current', False)).lower()}`.",
+        f"- Data certified: `{str(readiness.get('data_certified_ready', False)).lower()}`; flow certified: `{str(readiness.get('flow_certified_ready', 'not_assessed')).lower()}`; analysis ready: `{str(readiness.get('analysis_ready', readiness.get('certified_ready', False))).lower()}`; operator status: `{readiness.get('operator_status', 'uncertified')}`.",
         f"- Control: `{control.get('override', 'BLOCK')}`; effective position cap: `{control.get('effective_position_pct', 0)}%`.",
         f"- Actionable / tradable / risk-approved / executable: `{readiness.get('actionable_candidates', 0)} / {readiness.get('tradable_candidates', 0)} / {readiness.get('risk_approved_candidates', 0)} / {readiness.get('executable_candidates', 0)}`.",
         f"- Missing groups: `{', '.join(readiness.get('missing_groups', [])) or 'none'}`.",
         "- Review basis: same-date postmarket snapshot; use the live freshness gate before any executable decision.",
-    ]
+        ]
+    )
     lines.extend(
         [
             "",
@@ -867,6 +852,11 @@ def render_daily_review_markdown(context: dict) -> str:
         lines.append("| TuShare checkpoints | no same-date checkpoint |")
     for row in data_sources.get("kline", []):
         lines.append(f"| {row.get('relation')} | latest={row.get('latest') or '-'}, same-date rows={row.get('same_date_rows', 0)} |")
+    for relation, row in (data_sources.get("flow_features") or {}).items():
+        lines.append(
+            f"| {relation} | rows={row.get('rows', 0)}, dates={row.get('dates', 0)}, "
+            f"latest={row.get('latest') or '-'}, version={row.get('version') or '-'} |"
+        )
     ths = data_sources.get("ths") or {}
     if ths:
         lines.append(
@@ -876,16 +866,62 @@ def render_daily_review_markdown(context: dict) -> str:
         )
     lines.append(f"| Operator outcomes | same-date rows={data_sources.get('outcomes', 0)}; zero means proxy/backtest only |")
     for row in data_sources.get("qlib", [])[:5]:
-        lines.append(f"| QLib shadow {row.get('model_id') or '-'} | stage={row.get('stage')}, samples={row.get('sample_count', 0)}, hit={row.get('hit_rate')}, avg={row.get('avg_forward_return_pct')}, impact={row.get('signal_impact')} |")
+        lines.append(
+            f"| QLib shadow {row.get('model_id') or '-'} | stage={row.get('stage')}, "
+            f"samples={row.get('sample_count', 0)}, hit={row.get('hit_rate')}, "
+            f"avg={row.get('avg_forward_return_pct')}, IC={row.get('ic')}, "
+            f"RankIC={row.get('rank_ic')}, spread={row.get('top_bottom_spread')}, "
+            f"drawdown={row.get('max_drawdown')}, impact={row.get('signal_impact')} |"
+        )
     if not data_sources.get("qlib"):
         lines.append("| QLib shadow | no evaluation rows; optional dependency/model signal is not evidence for execution |")
     for row in data_sources.get("strategy", [])[:5]:
         lines.append(f"| Strategy {row.get('strategy_id') or '-'} | stage={row.get('stage')}, samples={row.get('sample_count', 0)}, win={row.get('win_rate')}, avg={row.get('avg_return_pct')}, verdict={row.get('verdict')} |")
     if not data_sources.get("strategy"):
         lines.append("| Strategy backtest | no stored summary rows |")
+    lines.extend(
+        [
+            "",
+            "## AI Review Contract",
+            "",
+            "- Facts snapshot: `reports/ai_review_facts_latest.json`",
+            "- Status: `facts_ready_no_model_call`; deterministic facts are ready for an optional local/remote model.",
+            "- Boundary: AI may summarize and explain sourced facts, but cannot fill missing data, change readiness, or turn QLib shadow scores into orders.",
+        ]
+    )
     lines.extend([""] + _render_flow_review_sections(flow))
     lines.extend(["", "## Mainline Themes", "", "| Sector | Score | Strength | Limit Up |", "|---|---:|---:|---:|"])
     lines.extend(_table_rows(context.get("sectors", []), ["sector_name", "score", "strength_value", "limit_up_count"]))
+
+    concept_review = context.get("concept_limit_up") or {}
+    lines.extend(
+        [
+            "",
+            "## Concept Limit-Up Drilldown",
+            "",
+            f"- Membership snapshot: `{concept_review.get('membership_date') or 'unavailable'}`; limit pool date: `{concept_review.get('limit_date') or context.get('trade_date')}`.",
+            "- The concept ranking is evidence for review only; same-date limit-up stocks are recomputed from the membership snapshot and limit pool.",
+            "",
+            "| Concept | Mainline | Limit Up | Max Board | Limit-Up Stocks |",
+            "|---|---:|---:|---:|---|",
+        ]
+    )
+    concept_rows = []
+    for group in concept_review.get("groups", [])[:12]:
+        stocks = ", ".join(
+            f"{row.get('stock_code')} {row.get('stock_name') or ''}".strip()
+            for row in group.get("limit_up_stocks", [])[:12]
+        )
+        concept_rows.append(
+            {
+                "concept": group.get("concept_name"),
+                "mainline_score": group.get("mainline_score"),
+                "limit_up_count": group.get("limit_up_count"),
+                "max_board": group.get("max_board"),
+                "limit_up_stocks": stocks,
+            }
+        )
+    lines.extend(_table_rows(concept_rows, ["concept", "mainline_score", "limit_up_count", "max_board", "limit_up_stocks"], "No concept limit-up drilldown rows"))
 
     lines.extend(
         [
@@ -975,14 +1011,19 @@ def render_daily_review_markdown(context: dict) -> str:
         )
     )
 
+    lines.extend(["", "## Next-Day Focus", ""])
+    for item in story.get("tomorrow") or []:
+        lines.append(f"- {item}")
+    if not story.get("tomorrow"):
+        lines.extend(
+            [
+                "- Recheck top mainline themes before auction.",
+                "- Keep candidates only if auction and intraday evidence confirm the thesis.",
+                "- Respect risk_snapshot max position before any manual action.",
+            ]
+        )
     lines.extend(
         [
-            "",
-            "## Next-Day Focus",
-            "",
-            "- Recheck top mainline themes before auction.",
-            "- Keep candidates only if auction and intraday evidence confirm the thesis.",
-            "- Respect risk_snapshot max position before any manual action.",
             "",
             "## Data Gaps And Degradation",
             "",
@@ -990,7 +1031,7 @@ def render_daily_review_markdown(context: dict) -> str:
     )
     for gap in flow.get("coverage_alerts", []):
         lines.append(f"- {gap}")
-    if not readiness.get("analytics_ready", False):
+    if not readiness.get("pipeline_ready", readiness.get("analytics_ready", False)):
         lines.append("- P0: same-date evidence is incomplete; this report is review-only and no position should be opened from it.")
     gaps = backfill.get("gaps", [])
     if gaps:

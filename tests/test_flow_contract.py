@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import duckdb
 
-from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
+from trade_system.flow_contract import normalize_stock_flow_row
 
 
 def test_tushare_total_is_not_main_orders_net():

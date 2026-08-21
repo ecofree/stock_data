@@ -478,7 +478,6 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         # Full-market stock flow is an execution input: require the exact
         # provider denominator, not a 95% approximation that can hide a
         # missing page/universe slice.
-        unavailable_rows = max(0, expected_rows - fetched_rows)
         status = "success" if expected_rows > 0 and fetched_rows >= expected_rows else (
             "success_with_unavailable"
             if expected_rows > 0 and fetched_pages >= expected_pages > 0 and coverage >= 99.5

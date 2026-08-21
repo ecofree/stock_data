@@ -114,6 +114,36 @@ def test_premarket_signal_uses_previous_trade_date_context(tmp_path):
     assert evidence["input_cutoff_enforced"] is True
 
 
+def test_auction_signal_falls_back_to_same_day_candidate_score(tmp_path):
+    db_path = tmp_path / "auction_fallback.duckdb"
+    _build_context(db_path, "2026-07-08")
+
+    result = generate_stage_signals(
+        db_path,
+        "2026-07-08",
+        "auction_confirmation",
+        as_of_time="2026-07-08T09:25:00",
+        run_id="auction-fallback",
+        limit=20,
+        strict_tradability=True,
+        freshness_seconds=300,
+    )
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        row = con.execute(
+            "SELECT source_trade_date, stock_code, is_actionable, decision "
+            "FROM stock_candidate_stage_signal WHERE stage='auction_confirmation'"
+        ).fetchone()
+    finally:
+        con.close()
+
+    # No premarket stage row exists, but today's scored candidate is retained;
+    # missing auction evidence correctly keeps it non-actionable.
+    assert result["inserted"] == 1
+    assert row == ("2026-07-08", "000001", False, "blocked_data_quality")
+
+
 def test_stage_signal_outside_window_is_non_actionable(tmp_path):
     db_path = tmp_path / "blocked.duckdb"
     _build_context(db_path)

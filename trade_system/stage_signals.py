@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import json
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from trade_system.executable_quotes import (
 from trade_system.flow_ranking import stock_provider_rank
 from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
 STAGE_NAMES = (
@@ -36,11 +37,6 @@ INTRADAY_STRENGTH_WEIGHT = 0.60
 INTRADAY_FOLLOW_THRESHOLD = 62.0
 INTRADAY_FOLLOW_THRESHOLD_LIVE = 58.0
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params=None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [description[0] for description in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def ensure_stage_signal_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -68,6 +64,7 @@ def ensure_stage_signal_schema(con: duckdb.DuckDBPyConnection) -> None:
             ,tradable BOOLEAN DEFAULT false
             ,risk_approved BOOLEAN DEFAULT false
             ,is_executable BOOLEAN DEFAULT false
+            ,execution_valid_until TIMESTAMP
         )
         """
     )
@@ -85,6 +82,7 @@ def ensure_stage_signal_schema(con: duckdb.DuckDBPyConnection) -> None:
         "tradable": "BOOLEAN DEFAULT false",
         "risk_approved": "BOOLEAN DEFAULT false",
         "is_executable": "BOOLEAN DEFAULT false",
+        "execution_valid_until": "TIMESTAMP",
     }
     existing = set(table_columns(con, "stock_candidate_stage_signal"))
     for column, data_type in additions.items():
@@ -121,6 +119,17 @@ def _within_stage_window(stage: str, trade_date: str, as_of: datetime) -> bool:
     if stage == "close_decision":
         return time(14, 50) <= current <= time(23, 59, 59)
     return False
+
+
+def _execution_valid_until(stage: str, as_of: datetime) -> datetime | None:
+    """Return the last moment at which a same-session entry may be used."""
+    if stage == "auction_confirmation":
+        return datetime.combine(as_of.date(), time(9, 30))
+    if stage != "intraday_strength":
+        return None
+    session_end = time(11, 30) if as_of.time() < time(12, 0) else time(14, 50)
+    hard_end = datetime.combine(as_of.date(), session_end)
+    return min(as_of + timedelta(minutes=10), hard_end)
 
 
 def _readiness_cutoff_ok(readiness: dict, as_of: datetime) -> bool:
@@ -212,6 +221,43 @@ def _auction_candidates(
     con: duckdb.DuckDBPyConnection, trade_date: str, limit: int, as_of: datetime
 ) -> tuple[str, list[dict]]:
     rows = _stage_source_rows(con, trade_date, ("premarket_pool",), limit)
+    source_date = trade_date
+    # The auction watcher can start after a reboot or before the premarket
+    # score job has populated ``premarket_pool``.  Carry the verified same-day
+    # candidate sources forward instead of silently producing zero rows.  The
+    # auction evidence and tradability gates below still decide whether any row
+    # is actionable; this fallback only preserves the research universe.
+    if not rows and table_exists(con, "stock_candidate_score"):
+        rows = _fetch_dicts(
+            con,
+            """
+            SELECT stock_code, stock_name, score AS source_score, evidence_json
+            FROM stock_candidate_score
+            WHERE CAST(trade_date AS VARCHAR) = ?
+            ORDER BY score DESC NULLS LAST, stock_code
+            LIMIT ?
+            """,
+            [trade_date, int(limit)],
+        )
+    if not rows and table_exists(con, "v_limit_pool"):
+        rows = _fetch_dicts(
+            con,
+            """
+            SELECT stock_code, stock_name,
+                   (45 + coalesce(board_level, 1) * 12) AS source_score,
+                   NULL AS evidence_json
+            FROM v_limit_pool
+            WHERE trade_date = ?
+            ORDER BY board_level DESC NULLS LAST, stock_code
+            LIMIT ?
+            """,
+            [trade_date, int(limit)],
+        )
+    if not rows:
+        # Last resort: use the prior-session research pool.  It remains clearly
+        # identified by source_trade_date and cannot pass a same-day evidence
+        # gate unless today's auction snapshot is available.
+        source_date, rows = _premarket_candidates(con, trade_date, limit)
     output = []
     for row in rows:
         evidence = _fetch_dicts(
@@ -239,7 +285,7 @@ def _auction_candidates(
             }
         )
         output.append(row)
-    return trade_date, output
+    return source_date, output
 
 
 def _aggregate_stock_source_as_of(
@@ -979,8 +1025,10 @@ def generate_stage_signals(
             readiness.get("ready") and effective_window and effective_cutoff
         )
         # If readiness still says kline missing but we just confirmed same-date
-        # bars exist (view lag / stale readiness snapshot), force analytics ready
-        # for close so filled prices become actionable.
+        # bars exist (view lag / stale readiness snapshot), allow this pending
+        # close refresh to process the filled prices.  Do not mutate the
+        # canonical readiness fields: a refresh exception is not full-chain
+        # certification and must not make another consumer report "ready".
         if (
             stage == "close_decision"
             and not actionable_context
@@ -989,8 +1037,6 @@ def generate_stage_signals(
         ):
             actionable_context = True
             readiness = dict(readiness or {})
-            readiness["ready"] = True
-            readiness["analytics_ready"] = True
             readiness["close_refresh_forced"] = True
 
         # The intraday scheduler wakes during the lunch break and after the
@@ -1097,6 +1143,11 @@ def generate_stage_signals(
                     "row_evidence_ready": row_ready,
                     "row_block_reason": row_block_reason,
                     "entry_executable": is_executable,
+                    "execution_valid_until": (
+                        _execution_valid_until(stage, as_of).isoformat(timespec="seconds")
+                        if is_executable or stage in {"auction_confirmation", "intraday_strength"}
+                        else None
+                    ),
                     "entry_block_reason": (
                         "close_signal_is_not_entry_executable"
                         if stage == "close_decision" and row_ready and not is_executable
@@ -1115,10 +1166,11 @@ def generate_stage_signals(
                         is_actionable, readiness_json, reference_price,
                         reference_price_type, feature_version
                         ,data_complete, signal_triggered, tradable, risk_approved, is_executable
+                        ,execution_valid_until
                     )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
                     """,
                     [
@@ -1142,6 +1194,7 @@ def generate_stage_signals(
                         tradable,
                         False,
                         is_executable,
+                        _execution_valid_until(stage, as_of),
                     ],
                 )
                 inserted += 1

@@ -10,6 +10,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from trade_system.collection_profiles import phase_tasks, resolve_phase
+from trade_system.pipeline_contract import (
+    CLOSE_DEFERRED_GATES,
+    DEGRADABLE_EXTERNAL_STEPS,
+    INFORMATIONAL_REVIEW_STEPS,
+    INTRADAY_DIAGNOSTIC_STEPS,
+    OPTIONAL_CLOSE_STEPS,
+    RESEARCH_CHAIN_STEPS,
+    REVIEW_CHAIN_STEPS,
+)
 
 CommandStep = tuple[str, list[str], bool]
 
@@ -27,98 +36,6 @@ TUSHARE_GAPFILL_LOOKBACK_DAYS = 10
 # trading day for the day-outcome decision, a different concern from collection freshness.
 CLOSE_READINESS_MAX_AGE_SECONDS = 7200
 
-DEGRADABLE_EXTERNAL_STEPS = {
-    "collect_market_context",
-    "sync_tushare_close",
-    "sync_tushare_ohlc_core",
-    "refresh_ths_weekly",
-    "collect_realtime_limit_pool",
-    "collect_auction_evidence",
-    "collect_kpl_stock_flow_focus",
-    "collect_intraday_stock_flow_market",
-    "collect_intraday_sector_flow_full",
-    "collect_executable_quotes",
-    "collect_l2_focus",
-    "collect_lhb_daily",
-    "collect_auction_anomaly_daily",
-    "collect_auction_tick_daily",
-    "collect_advanced_lhb_daily",
-    "collect_northbound_daily",
-    "collect_index_kline_daily",
-    "derive_market_context",
-    "collect_finance_gapfill",
-    "collect_capital_flow_focus",
-    "collect_multisource_capital_flow",
-    "backfill_2026_tushare",
-    "backfill_2026_ths_concepts",
-    "run_staged_after_close",
-    "run_news_radar",
-    "run_api_research_events",
-}
-
-# A readiness/acceptance report is an operator gate, not a data-collection
-# failure.  A day can have a perfectly valid close snapshot and still have no
-# executable candidate.  Keep that fact visible in the manifest without
-# turning the close task red or resetting the operational observation window.
-INFORMATIONAL_REVIEW_STEPS = {
-    "audit_p0_p3_acceptance",
-}
-
-INTRADAY_DIAGNOSTIC_STEPS = {
-    "audit_multisource_readiness",
-    "check_capital_flow_health",
-    "check_data_readiness",
-    "generate_intraday_stage_signals",
-}
-
-CLOSE_DEFERRED_GATES = {
-    # These commands return 2 when data is correctly fail-closed.  The close
-    # run must still generate the operator review, dashboard and gap reports,
-    # then finish non-zero so Task Scheduler cannot report a false success.
-    "check_data_readiness",
-    "check_capital_flow_health",
-    "generate_signals",
-    "generate_close_stage_signals",
-}
-
-# P2-4: the close stage is split into three independently-retryable chains.  DATA
-# steps (everything not listed below) stay fail-fast -- a hard data failure aborts
-# before producing reports over corrupt data.  RESEARCH and REVIEW steps are
-# failure-isolated: a failure is recorded but does NOT abort the pipeline or roll
-# back already-generated reports, so a strategy/QLib/news failure can no longer
-# block the review/dashboard chain (the audit's P2 finding).
-RESEARCH_CHAIN_STEPS = {
-    "audit_stock_flow_contract",
-    "run_stage_backtest",
-    "run_operator_backtest",
-    "build_data_catalog",
-    "audit_p2_gaps",
-    "run_news_radar",
-    "run_api_research_events",
-    "build_research_snapshot",
-    "run_strategy_scan",
-    "run_strategy_result_backtest",
-    "evaluate_qlib_shadow",
-    "audit_data_quality",
-    "build_empty_table_catalog",
-}
-
-REVIEW_CHAIN_STEPS = {
-    "audit_multisource_readiness",
-    "create_operator_outcome_template",
-    "run_daily_operator_loop",
-    "run_daily_review_statistics",
-    "generate_operator_reports",
-    "generate_daily_review",
-    "generate_daily_review_web",
-    "audit_p0_p3_acceptance",
-    "audit_p3_candidates",
-    "report_real_data_backfill",
-    "assess_data_chains",
-    "generate_professional_reports",
-    "generate_web_dashboard",
-    "generate_trading_terminal",
-}
 
 
 def _is_degradable_failure(selected_phase: str, name: str) -> bool:
@@ -153,9 +70,18 @@ def command_plan(
     history_start: str = "",
     history_end: str = "",
     history_max_days: int = 0,
+    include_research: bool | None = None,
 ) -> list[CommandStep]:
     py = sys.executable
     selected_date = trade_date or date.today().isoformat()
+    # ``None`` preserves the legacy full/compatibility plan.  Explicit close
+    # runs default to the operational chain only; research is opt-in so Qlib,
+    # news and backtests cannot lengthen or fail the close publication.
+    research_enabled = (
+        phase in {None, "full"}
+        if include_research is None
+        else bool(include_research)
+    )
     report = lambda name: str(Path(reports_dir) / name)
     steps: list[CommandStep] = []
     if include_collection and phase not in {None, "full"}:
@@ -182,30 +108,27 @@ def command_plan(
                  "--out", report("l2_focus_collection_latest.md")], False),
                 # Refresh the sector snapshot after the bounded L2 work so its
                 # 10-minute readiness TTL cannot expire while L2 is running.
+                ("repair_critical_integrity_pre_sector", [py, "scripts/repair_critical_integrity.py", "--db", db_path], False),
                 ("collect_intraday_sector_flow_full", [py, "scripts/collect_intraday_sector_flow_full.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_sector_flow_latest.md")], False),
                 ("derive_market_context", [py, "scripts/derive_market_context.py", "--db", db_path, "--date", selected_date, "--out", report("market_context_latest.json")], False),
             ]
         elif phase == "close":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
-                # P0#2: backfill recent trading-day gaps, not just today.  The lookback
-                # window plus the history checkpoint means already-synced dates are
-                # skipped and only missing/failed sessions are fetched; --max-days 0
-                # disables date truncation so recent gaps are reachable, and the budget
-                # bounds each close to a small batch.  The relay can be slow (~25s per
-                # request on 2026-08-10); --retry-passes 1 lets the first pass finish
-                # whatever the budget allows and retries only the failed checkpoints
-                # afterwards instead of failing the whole close chain.
+                # P0#2: close guarantees the newest snapshot here; the following
+                # physical-kline step also repairs the bounded recent-gap window
+                # before copying it, so older history remains a separate batch.
                 ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
                  "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y%m%d"),
                  "--end-date", selected_date.replace("-", ""),
-                 "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--max-days", "0",
+                 "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--gap-only", "--max-days", "1",
                  "--retry-passes", "1", "--retry-delay-seconds", "2.0",
                  "--report", report("tushare_close_latest.md")], False),
                 # Push TuShare daily into physical kline so data_chain / collectors
                 # that still read ``kline`` see the same session as v_kline_daily.
                 ("sync_tushare_ohlc_core", [py, "scripts/sync_tushare_ohlc.py", "--db", db_path,
-                 "--start-date", selected_date, "--end-date", selected_date], False),
+                 "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
+                 "--end-date", selected_date, "--repair-close-gaps", "--repair-budget-seconds", "180"], False),
                 ("refresh_ths_weekly", [py, "scripts/backfill_2026_ths_concepts.py", "--db", db_path,
                  "--start-date", selected_date.replace("-", ""), "--end-date", selected_date.replace("-", ""),
                  "--period", "week", "--mode", "full", "--max-member-pages", "0", "--max-concepts", "0",
@@ -406,6 +329,7 @@ def command_plan(
             ("generate_intraday_stage_signals", [py, "scripts/generate_stage_signals.py", "--db", db_path, "--date", selected_date, "--stage", "intraday_strength", "--run-id", "integrated_intraday", "--freshness-seconds", "600", "--strict-tradability", "--limit", str(signal_limit)], False),
             ("run_daily_operator_loop", [py, "scripts/run_daily_operator_loop.py", "--db", db_path, "--trade-date", selected_date, "--stage", "intraday", "--limit", str(signal_limit)], False),
             ("check_data_readiness", [py, "scripts/check_data_readiness.py", "--db", db_path, "--date", selected_date, "--stage", "intraday", "--max-age-seconds", "600", "--out", report("data_readiness_intraday_latest.md")], False),
+            ("audit_p3_candidates", [py, "scripts/audit_p3_candidates.py", "--db", db_path, "--date", selected_date, "--out", report("p3_candidate_audit_intraday_latest.md")], False),
             ("generate_web_dashboard", [py, "scripts/generate_web_dashboard.py", "--db", db_path, "--date", selected_date, "--out", report("trading_dashboard_latest.html")], False),
             ("generate_trading_terminal", [py, "scripts/generate_trading_terminal.py", "--db", db_path, "--date", selected_date, "--out", report("trading_terminal_latest.html")], False),
         ])
@@ -470,6 +394,13 @@ def command_plan(
             "audit_stock_flow_contract",
             [py, "scripts/audit_stock_flow_contract.py", "--db", db_path,
              "--out", report("stock_flow_contract_audit_latest.md"), "--date", selected_date],
+            False,
+        ),
+        (
+            "reconcile_independent_stock_flow",
+            [py, "scripts/reconcile_independent_stock_flow.py", "--db", db_path,
+             "--date", selected_date,
+             "--out", report("independent_stock_flow_reconciliation_latest.md")],
             False,
         ),
         ("build_operator_views", [py, "scripts/build_operator_views.py", "--db", db_path], False),
@@ -549,7 +480,62 @@ def command_plan(
             [py, "scripts/run_strategy_result_backtest.py", "--db", db_path, "--out", report("strategy_backtest_latest.md")],
             False,
         ),
+        *(
+            [
+                (
+                    "build_flow_features",
+                    [
+                        py,
+                        "scripts/build_flow_features.py",
+                        "--db",
+                        db_path,
+                        "--end-date",
+                        selected_date,
+                        "--out",
+                        report("flow_features_latest.json"),
+                    ],
+                    False,
+                ),
+                (
+                    "export_qlib_features_close",
+                    [
+                        py,
+                        "scripts/export_qlib_features.py",
+                        "--db",
+                        db_path,
+                        "--start-date",
+                        "2024-01-01",
+                        "--end-date",
+                        selected_date,
+                        "--out",
+                        report("qlib_features_2026_exec.parquet"),
+                        "--format",
+                        "parquet",
+                        "--label-mode",
+                        "t1_exec",
+                    ],
+                    False,
+                )
+            ]
+            if phase in {None, "full", "close"}
+            else []
+        ),
         ("evaluate_qlib_shadow", [py, "scripts/evaluate_qlib_shadow.py", "--db", db_path, "--out", report("qlib_shadow_latest.md")], False),
+        (
+            "run_qlib_daily",
+            [
+                py,
+                "scripts/run_qlib_daily.py",
+                "--db",
+                db_path,
+                "--trade-date",
+                selected_date,
+                "--allow-shadow",
+                "--out",
+                report("qlib_daily_latest.json"),
+            ],
+            False,
+        ),
         (
             "generate_operator_reports",
             [py, "scripts/generate_operator_reports.py", "--db", db_path, "--trade-date", selected_date, "--out", report("operator_report_latest.md")],
@@ -563,6 +549,20 @@ def command_plan(
         (
             "generate_daily_review_web",
             [py, "scripts/generate_daily_review_web.py", "--db", db_path, "--trade-date", selected_date, "--out", report("daily_review_latest.html")],
+            False,
+        ),
+        (
+            "build_ai_review_snapshot",
+            [
+                py,
+                "scripts/generate_ai_review_snapshot.py",
+                "--db",
+                db_path,
+                "--trade-date",
+                selected_date,
+                "--out",
+                report("ai_review_facts_latest.json"),
+            ],
             False,
         ),
         (
@@ -603,6 +603,8 @@ def command_plan(
             False,
         ),
     ])
+    if not research_enabled and phase in {None, "full", "close"}:
+        steps = [step for step in steps if step[0] not in RESEARCH_CHAIN_STEPS]
     return steps
 
 
@@ -610,6 +612,44 @@ def _script_exists(cmd: list[str]) -> bool:
     if len(cmd) < 2 or not cmd[1].startswith("scripts/"):
         return True
     return (ROOT / cmd[1]).exists()
+
+
+def _command_option(cmd: list[str], name: str, default: str = "") -> str:
+    try:
+        index = cmd.index(name)
+    except ValueError:
+        return default
+    return str(cmd[index + 1]) if index + 1 < len(cmd) else default
+
+
+def _run_report_in_process(name: str, cmd: list[str]) -> int:
+    """Run the two read/render-only daily reports without a child process.
+
+    Collection, signal generation and database migrations intentionally remain
+    subprocess tasks until their write/lock boundaries are measured and
+    migrated separately. Keeping this optimization to read/render tasks
+    removes interpreter churn without changing the data or gate contract.
+    """
+    db_path = _command_option(cmd, "--db")
+    trade_date = _command_option(cmd, "--trade-date")
+    out_path = _command_option(cmd, "--out")
+    if name == "generate_daily_review":
+        from trade_system.daily_review import build_daily_review_context, write_daily_review
+
+        context = build_daily_review_context(db_path, trade_date or None)
+        path = write_daily_review(db_path, out_path, context["trade_date"])
+        print(f"daily_review_report={path}")
+        print(f"trade_date={context['trade_date']}")
+        print(f"plans={len(context.get('plans', []))}")
+        print(f"journal={len(context.get('journal', []))}")
+        return 0
+    if name == "generate_daily_review_web":
+        from trade_system.review_web import write_review_web
+
+        path = write_review_web(db_path, out_path, trade_date or None)
+        print(f"review_web={path}")
+        return 0
+    raise ValueError(f"unsupported in-process report task: {name}")
 
 
 def main() -> int:
@@ -637,9 +677,8 @@ def main() -> int:
     )
     parser.add_argument("--run-id", default="")
     parser.add_argument(
-        "--step-timeout", type=int, default=0,
-        help="Per-step wall-clock timeout in seconds; a step exceeding it is killed and "
-             "marked failed/degraded. 0 disables the timeout (default).",
+        "--step-timeout", type=int, default=900,
+        help="Per-step wall-clock timeout in seconds (default 900); pass 0 only for a manual, unbounded run.",
     )
     parser.add_argument("--as-of", default="", help="ISO timestamp used by the close-stage cutoff gate.")
     parser.add_argument("--reports-dir", default="reports")
@@ -648,6 +687,16 @@ def main() -> int:
         choices=("priority", "full"),
         default="priority",
         help="priority avoids duplicate focus/staged collection; full keeps the compatibility fan-out",
+    )
+    parser.add_argument(
+        "--include-research",
+        action="store_true",
+        help="Include the optional Qlib/news/backtest research chain; close defaults to operational review only.",
+    )
+    parser.add_argument(
+        "--subprocess-reports",
+        action="store_true",
+        help="Keep daily markdown/HTML report rendering in child processes for compatibility.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -682,6 +731,14 @@ def main() -> int:
             )
             return 2
 
+    run_id = args.run_id or f"{args.trade_date.replace('-', '')}_{datetime.now().strftime('%H%M%S')}_{os.getpid()}"
+    # P0: every report-producing subprocess writes into an isolated run staging
+    # directory.  Root ``*_latest`` files remain the last published snapshot
+    # until the complete run reaches its final status.
+    artifact_reports_dir = args.reports_dir
+    if not args.dry_run:
+        artifact_reports_dir = str(Path(args.reports_dir).resolve() / ".staging" / run_id)
+        Path(artifact_reports_dir).mkdir(parents=True, exist_ok=True)
     plan = command_plan(
         args.db,
         args.trade_date,
@@ -690,13 +747,14 @@ def main() -> int:
         max_sectors=args.max_sectors,
         finance_max_stocks=args.finance_max_stocks,
         signal_limit=args.signal_limit,
-        reports_dir=args.reports_dir,
+        reports_dir=artifact_reports_dir,
         as_of_time=args.as_of or None,
         collection_profile=args.collection_profile,
         phase=selected_phase,
         history_start=args.history_start,
         history_end=args.history_end,
         history_max_days=args.history_max_days,
+        include_research=True if args.include_research else None,
     )
     if args.dry_run:
         print(f"COLLECTION_PHASE={selected_phase}")
@@ -713,16 +771,22 @@ def main() -> int:
         PipelineAlreadyRunning,
         PipelineLock,
         RunManifest,
+        reap_stale_run_manifests,
         prune_run_reports,
     )
     from trade_system.pipeline_audit import ensure_pipeline_task_audit, record_pipeline_task
 
-    run_id = args.run_id or f"{args.trade_date.replace('-', '')}_{datetime.now().strftime('%H%M%S')}_{os.getpid()}"
     ensure_pipeline_task_audit(args.db)
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
-    report_tx = LatestReportTransaction(args.reports_dir, run_id)
+    report_tx = LatestReportTransaction(args.reports_dir, run_id, artifact_reports_dir)
     try:
         with PipelineLock(args.db, run_id):
+            reaped = reap_stale_run_manifests(
+                args.reports_dir,
+                exclude_run_id=run_id,
+            )
+            if reaped:
+                print(f"REAP_STALE_MANIFESTS run_ids={','.join(reaped)}")
             report_tx.begin()
             degraded_steps = []
             chain_failed_steps = []
@@ -766,11 +830,14 @@ def main() -> int:
                 )
                 timed_out = False
                 try:
-                    completed = subprocess.run(
-                        cmd, cwd=ROOT, check=False,
-                        timeout=(args.step_timeout if args.step_timeout > 0 else None),
-                    )
-                    return_code = completed.returncode
+                    if not args.subprocess_reports and name in {"generate_daily_review", "generate_daily_review_web"}:
+                        return_code = _run_report_in_process(name, cmd)
+                    else:
+                        completed = subprocess.run(
+                            cmd, cwd=ROOT, check=False,
+                            timeout=(args.step_timeout if args.step_timeout > 0 else None),
+                        )
+                        return_code = completed.returncode
                 except subprocess.TimeoutExpired:
                     # subprocess.run kills the child before raising; this bounds a
                     # step that would otherwise hang the whole pipeline.
@@ -784,6 +851,9 @@ def main() -> int:
                 elif name in INFORMATIONAL_REVIEW_STEPS:
                     status = "warning"
                     reason = "operator_readiness_gate_not_passed"
+                elif selected_phase == "close" and name in OPTIONAL_CLOSE_STEPS:
+                    status = "warning"
+                    reason = "optional_capability_unavailable"
                 elif is_degradable:
                     status = "degraded"
                     reason = (f"step_timeout_after_{args.step_timeout}s" if timed_out
@@ -834,6 +904,8 @@ def main() -> int:
                 if chain_failed
                 else "completed_with_degradation"
                 if degraded_steps
+                else "completed_with_warnings"
+                if informational_steps
                 else "completed"
             )
             failed_steps = ",".join(degraded_steps + chain_failed_steps)
@@ -841,10 +913,17 @@ def main() -> int:
             report_tx.commit(manifest.run_dir)
             prune_run_reports(args.reports_dir, keep=30)
             print(f"RUN_COMPLETE run_id={run_id} status={final_status} degraded={','.join(degraded_steps)} chain_failed={','.join(chain_failed_steps)} warnings={','.join(informational_steps)} manifest={manifest.path}")
-            # Any real degraded data chain must be visible to Task Scheduler.
-            # Informational readiness warnings alone do not fail the data run.
+            # A close run that published its reports but is blocked by a data
+            # gate is an operationally completed run, not a process crash.
+            # The manifest/readiness report carries the blocked state; keeping
+            # exit code 0 prevents Task Scheduler from labelling a published
+            # fail-closed review as an infrastructure failure.  Other data or
+            # chain failures remain non-zero.
+            if final_status == "completed_blocked":
+                return 0
             return 2 if (bool(degraded_steps) or chain_failed) else 0
     except PipelineAlreadyRunning as exc:
+        report_tx.cleanup_staging()
         manifest.finish("blocked", str(exc))
         print(str(exc), file=sys.stderr)
         return 3
@@ -856,6 +935,8 @@ def main() -> int:
                     f"RUN_FAILED_REPORTS run_id={run_id} retained={','.join(sorted(retained))}",
                     file=sys.stderr,
                 )
+        else:
+            report_tx.cleanup_staging()
         manifest.finish("failed", str(exc))
         print(f"RUN_FAILED run_id={run_id} error={exc}", file=sys.stderr)
         return 2

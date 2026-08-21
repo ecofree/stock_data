@@ -10,12 +10,8 @@ import duckdb
 
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.quality import table_exists
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str) -> list[dict]:
-    cur = con.execute(sql)
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def run_strategy_result_backtest(

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import duckdb
 
 from trade_system.quality import table_exists
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
 EXTERNAL_TABLE_PREFIXES = ("qlib", "finance")
@@ -21,11 +21,6 @@ WORKFLOW_TABLES = {
     "research_note",
 }
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _endpoint_map(con: duckdb.DuckDBPyConnection) -> dict[str, dict]:

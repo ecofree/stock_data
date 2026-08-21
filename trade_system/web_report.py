@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -12,8 +12,9 @@ import duckdb
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.data_chain import assess_data_chains
 from trade_system.flow_ranking import sector_flow_rank_sql, stock_flow_rank_sql
-from trade_system.quality import table_exists
+from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 try:
     from base import connect_duckdb
@@ -63,6 +64,11 @@ COUNT_RELATIONS = [
     "stock_candidate_score",
     "stock_candidate_stage_signal",
     "operator_trade_outcome",
+    "qlib_stock_flow_features",
+    "qlib_sector_flow_features",
+    "qlib_model_registry",
+    "qlib_prediction",
+    "qlib_shadow_evaluation",
     "v_operator_candidates",
     "alert_events",
     "risk_snapshot",
@@ -80,11 +86,6 @@ SOURCE_VIEWS = [
     "v_lhb_review_evidence",
 ]
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _safe_count(con: duckdb.DuckDBPyConnection, relation_name: str) -> int:
@@ -462,10 +463,16 @@ def _qlib_shadow_rows(con: duckdb.DuckDBPyConnection, limit: int = 20) -> list[d
     if not table_exists(con, "qlib_shadow_evaluation"):
         return []
     try:
+        columns = set(table_columns(con, "qlib_shadow_evaluation"))
+        optional = [
+            "ic", "rank_ic", "avg_forward_return", "top_bottom_spread", "max_drawdown",
+        ]
+        select_optional = [column if column in columns else f"NULL AS {column}" for column in optional]
         return _fetch_dicts(
             con,
             f"""
-            SELECT model_id, sample_count, hit_rate, top_quantile_return, bottom_quantile_return
+            SELECT model_id, sample_count, hit_rate, top_quantile_return, bottom_quantile_return,
+                   {', '.join(select_optional)}
             FROM qlib_shadow_evaluation
             ORDER BY sample_count DESC, model_id
             LIMIT {int(limit)}
@@ -904,14 +911,37 @@ def _execution_status(con, trade_date: str) -> dict:
     actionable = 0
     executable = 0
     block_reasons: list = []
+    now = datetime.now()
+    active_stage = None
+    if str(trade_date)[:10] == now.date().isoformat():
+        current = now.time()
+        if time(9, 15) <= current < time(9, 30):
+            active_stage = "auction_confirmation"
+        elif (time(9, 30) <= current <= time(11, 30)) or (
+            time(13, 0) <= current < time(14, 50)
+        ):
+            active_stage = "intraday_strength"
     try:
         if table_exists(con, "stock_candidate_stage_signal"):
+            columns = table_columns(con, "stock_candidate_stage_signal")
+            stage_filter = " AND stage=?" if active_stage else " AND 1=0"
+            valid_filter = (
+                " AND execution_valid_until IS NOT NULL AND execution_valid_until >= ?"
+                if "execution_valid_until" in columns and active_stage
+                else ""
+            )
+            params = [str(trade_date)[:10]]
+            if active_stage:
+                params.append(active_stage)
+                if valid_filter:
+                    params.append(now)
             row = con.execute(
                 "SELECT count(*), "
                 "sum(CASE WHEN coalesce(is_actionable,false) THEN 1 ELSE 0 END), "
                 "sum(CASE WHEN coalesce(is_executable,false) THEN 1 ELSE 0 END) "
-                "FROM stock_candidate_stage_signal WHERE CAST(trade_date AS VARCHAR)=?",
-                [str(trade_date)[:10]],
+                "FROM stock_candidate_stage_signal WHERE CAST(trade_date AS VARCHAR)=?"
+                + stage_filter + valid_filter,
+                params,
             ).fetchone()
             total = int(row[0] or 0)
             actionable = int(row[1] or 0)
@@ -924,9 +954,10 @@ def _execution_status(con, trade_date: str) -> dict:
                 "decision) AS reason, "
                 "count(*) AS n FROM stock_candidate_stage_signal "
                 "WHERE CAST(trade_date AS VARCHAR)=? "
+                + stage_filter + valid_filter + " "
                 "AND coalesce(is_executable,false)=false "
                 "GROUP BY 1 ORDER BY n DESC LIMIT 6",
-                [str(trade_date)[:10]],
+                params,
             ).fetchall()
             block_reasons = [
                 {"reason": str(r[0] or "unknown"), "count": int(r[1] or 0)}
@@ -969,7 +1000,26 @@ def load_dashboard_context(
             for name, detail in count_details.items()
         }
         sources = {name: _source_rows(con, name) for name in SOURCE_VIEWS}
-        sectors = _latest_rows(con, "sector_rotation_score", "score", 10)
+        sector_columns = set(table_columns(con, "sector_rotation_score"))
+        sector_filter = (
+            "AND (taxonomy IN ('ths_concept','ths_concept_derived') "
+            "OR (coalesce(taxonomy,'unknown')='unknown' AND sector_code LIKE 'THS-%'))"
+            if "taxonomy" in sector_columns else "AND sector_code LIKE 'THS-%'"
+        )
+        if effective_trade_date and table_exists(con, "sector_rotation_score"):
+            try:
+                sectors = _fetch_dicts(
+                    con,
+                    "SELECT * FROM sector_rotation_score "
+                    "WHERE CAST(trade_date AS VARCHAR)=? "
+                    + sector_filter
+                    + " ORDER BY score DESC NULLS LAST LIMIT 10",
+                    [str(effective_trade_date)[:10]],
+                )
+            except Exception:
+                sectors = []
+        else:
+            sectors = []
         # Lock candidates to the page trade date when available.
         if effective_trade_date and table_exists(con, "stock_candidate_score"):
             try:
@@ -1007,6 +1057,8 @@ def load_dashboard_context(
             readiness = assess_trade_date_readiness(con, effective_trade_date, stage="postmarket")
         except Exception as exc:
             readiness = {
+                "source_ready": False, "pipeline_ready": False,
+                "artifact_current": False, "certified_ready": False,
                 "analytics_ready": False, "execution_ready": False,
                 "missing_groups": [f"readiness_error:{type(exc).__name__}"],
                 "actionable_candidates": 0, "tradable_candidates": 0,
@@ -1096,8 +1148,11 @@ def render_dashboard_html(context: dict) -> str:
     exec_actionable = execution.get("actionable_candidates", 0)
     exec_executable = execution.get("executable_candidates", 0)
     exec_block_reasons = execution.get("block_reasons") or []
-    readiness_class = "ok" if readiness.get("analytics_ready") else "bad"
-    readiness_label = "READY" if readiness.get("analytics_ready") else "BLOCKED"
+    source_ready = bool(readiness.get("source_ready", readiness.get("analytics_ready", False)))
+    pipeline_ready = bool(readiness.get("pipeline_ready", source_ready))
+    certified_ready = bool(readiness.get("certified_ready", False))
+    readiness_class = "ok" if certified_ready else "warn" if pipeline_ready else "bad"
+    readiness_label = "CERTIFIED" if certified_ready else "PIPELINE" if pipeline_ready else "SOURCE" if source_ready else "BLOCKED"
     readiness_missing = ", ".join(readiness.get("missing_groups") or []) or "none"
     exec_block_note = "; ".join(
         f"{item.get('reason')}×{item.get('count')}" for item in exec_block_reasons
@@ -1402,7 +1457,8 @@ def render_dashboard_html(context: dict) -> str:
       {f'<p class="muted">入场阻断原因：{escape(exec_block_note)}</p>' if exec_block_note and not exec_ready else ''}
       <p class="muted">说明：入场执行就绪看 is_executable；分析可用候选含 close keep/reduce。盘中 delayed 资金流仅供分析；close 的 signal_close 是复盘价，不等于可入场。</p>
       <div class="summary">
-        <div class="metric {readiness_class}"><span>Analytics gate</span><strong>{readiness_label}</strong></div>
+        <div class="metric {readiness_class}"><span>Certified gate</span><strong>{readiness_label}</strong></div>
+        <div class="metric"><span>Source / pipeline</span><strong>{str(source_ready).lower()} / {str(pipeline_ready).lower()}</strong></div>
         <div class="metric"><span>Missing groups</span><strong>{escape(readiness_missing)}</strong></div>
       </div>
     </section>

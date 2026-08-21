@@ -6,13 +6,21 @@ import os
 from pathlib import Path
 import sys
 
-import duckdb
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trade_system.ml.qlib_shadow import import_qlib_predictions
 from trade_system.ml.shadow_evaluator import evaluate_qlib_shadow
+
+
+def _date_literal(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(text) < 8:
+        raise ValueError(f"invalid date: {value}")
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
 
 
 class QlibFrameDataset:
@@ -64,7 +72,20 @@ def _load_features(path: Path, features: list[str], max_rows: int) -> pd.DataFra
     frame = frame.dropna(subset=["label_next_ret"])
     if max_rows > 0 and len(frame) > max_rows:
         per_day = max(1, max_rows // max(1, frame["datetime"].nunique()))
-        frame = frame.sort_values(["datetime", "instrument"]).groupby("datetime", group_keys=False).head(per_day)
+        # A plain ``head(per_day)`` systematically keeps the lowest stock
+        # codes and silently removes much of the cross-section.  Use a stable
+        # hash order per date so a bounded research run samples the full
+        # universe deterministically without introducing random drift.
+        frame = frame.copy()
+        frame["_sample_key"] = pd.util.hash_pandas_object(
+            frame[["datetime", "instrument"]], index=False
+        ).astype("uint64")
+        frame = (
+            frame.sort_values(["datetime", "_sample_key", "instrument"])
+            .groupby("datetime", group_keys=False)
+            .head(per_day)
+            .drop(columns=["_sample_key"])
+        )
     return frame.sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
@@ -82,6 +103,8 @@ def train_shadow(
     feature_path = Path(feature_file)
     metadata_path = feature_path.with_suffix(".metadata.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    label_mode = str(metadata.get("label_mode") or "legacy")
+    prediction_horizon = "t1_exec" if label_mode == "t1_exec" else "t1"
     features = list(metadata.get("feature_columns") or [
         "open", "high", "low", "close", "volume", "turnover", "change_pct",
         "turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv",
@@ -92,9 +115,9 @@ def train_shadow(
     dates = sorted(frame["datetime"].unique())
     if len(dates) < 20:
         raise RuntimeError(f"need at least 20 trading dates for shadow training, got {len(dates)}")
-    train_end_value = train_end or dates[max(1, int(len(dates) * 0.8)) - 1]
-    valid_start_value = valid_start or dates[min(len(dates) - 1, dates.index(train_end_value) + 1)]
-    valid_end_value = valid_end or dates[-1]
+    train_end_value = _date_literal(train_end) or dates[max(1, int(len(dates) * 0.8)) - 1]
+    valid_start_value = _date_literal(valid_start) or dates[min(len(dates) - 1, dates.index(train_end_value) + 1)]
+    valid_end_value = _date_literal(valid_end) or dates[-1]
     train = frame[frame["datetime"] <= train_end_value].copy()
     valid = frame[(frame["datetime"] >= valid_start_value) & (frame["datetime"] <= valid_end_value)].copy()
     if train.empty or valid.empty:
@@ -123,16 +146,30 @@ def train_shadow(
     )
     model.fit(dataset, verbose_eval=40, evals_result=evals_result)
     predictions = model.predict(dataset, segment="valid")
-    valid_index = valid.set_index(["datetime", "instrument"]).index
     pred_frame = pd.DataFrame({"score": predictions}).reset_index()
     pred_frame = pred_frame.rename(columns={"datetime": "trade_date", "instrument": "symbol"})
     pred_frame["rank"] = pred_frame.groupby("trade_date")["score"].rank(method="first", ascending=False).astype(int)
-    pred_frame["horizon"] = "t1"
+    pred_frame["horizon"] = prediction_horizon
     rows = pred_frame[["trade_date", "symbol", "score", "rank", "horizon"]].to_dict("records")
     model_dir = Path("reports") / "qlib_models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / f"{model_id}.pkl"
     model.to_pickle(str(model_path))
+    artifact_metadata = {
+        "model_id": model_id,
+        "feature_columns": features,
+        "feature_medians": {key: float(value) for key, value in medians.to_dict().items()},
+        "label_mode": label_mode,
+        "prediction_horizon": prediction_horizon,
+        "train_start": str(dates[0]),
+        "train_end": str(train_end_value),
+        "valid_start": str(valid_start_value),
+        "valid_end": str(valid_end_value),
+        "source_feature_file": str(feature_path),
+    }
+    model_path.with_suffix(".metadata.json").write_text(
+        json.dumps(artifact_metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     imported = import_qlib_predictions(
         db_path,
         model_id=model_id,
@@ -141,11 +178,14 @@ def train_shadow(
         rows=rows,
         train_start=str(dates[0]),
         train_end=str(train_end_value),
-        predict_horizon="t1",
+        predict_horizon=prediction_horizon,
         source_project="stock_data",
         model_file_ref=str(model_path),
         status="shadow",
-        notes="QLib LGBModel; prediction impact remains disabled until manual outcome gate passes.",
+        notes=(
+            "QLib LGBModel; prediction impact remains disabled until manual outcome gate passes; "
+            f"label_mode={label_mode}."
+        ),
     )
     evaluation = evaluate_qlib_shadow(db_path)
     result = {
@@ -157,6 +197,8 @@ def train_shadow(
         "train_end": str(train_end_value),
         "valid_start": str(valid_start_value),
         "valid_end": str(valid_end_value),
+        "label_mode": label_mode,
+        "prediction_horizon": prediction_horizon,
         "features": features,
         "model_file": str(model_path),
         "imported": imported,

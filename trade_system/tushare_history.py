@@ -1,4 +1,4 @@
-"""Batch, resumable TuShare history collection for calendar-year analysis.
+﻿"""Batch, resumable TuShare history collection for calendar-year analysis.
 
 The relay accepts date-wide ``daily``/``daily_basic`` requests.  ``moneyflow``
 is paged at 1,000 rows, then normalized into the project's source-aware flow
@@ -8,6 +8,7 @@ tables.  Every date/dataset is committed before the next request starts.
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
 import json
 from pathlib import Path
 import time
@@ -16,7 +17,7 @@ from typing import Any, Iterable
 import duckdb
 
 from base import DuckDBStore
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.tushare_relay import (
     TushareRelayClient,
     TushareRelayError,
@@ -51,7 +52,18 @@ INDUSTRY_SIZE_FIELDS = "trade_date,ts_code,buy_md_amount,sell_md_amount,buy_sm_a
 # the main moneyflow projection.  Keeping the fallback at this size reduces
 # a full-market day from ~13 requests to ~5 without widening the rejected
 # size-bucket projection.
-MONEYFLOW_CODE_BATCH_SIZE = 1000
+# The relay accepts date-wide moneyflow for recent sessions, but older
+# partitions silently truncate comma-separated code lists above roughly 50
+# symbols.  Keep the historical fallback at 50; larger batches can return a
+# plausible-looking but incomplete snapshot.
+MONEYFLOW_CODE_BATCH_SIZE = 50
+# Older relay partitions occasionally reject a date-wide ``daily`` or
+# ``daily_basic`` request while accepting the same date when scoped by
+# ``ts_code``.  Keep code batches bounded so the fallback remains resumable
+# and below the relay's request-size ceiling.
+QUOTE_CODE_BATCH_SIZE = 500
+STOCK_SNAPSHOT_DATASETS = {"daily", "daily_basic", "adj_factor"}
+MIN_STOCK_SNAPSHOT_COVERAGE = 0.99
 
 
 def _iso(value: str | date) -> str:
@@ -114,6 +126,83 @@ class TushareHistoryCollector:
     def _budget_left(self) -> bool:
         return time.monotonic() - self.started < self.budget_seconds
 
+    def _validate_stock_snapshot(self, dataset: str, rows: list[Any], trade_date: str) -> None:
+        """Reject an empty/short real close snapshot before publishing it."""
+        if not isinstance(self.client, TushareRelayClient):
+            return
+        observed = len(rows)
+        if observed <= 0:
+            raise TushareRelayError(f"empty {dataset} response for {_iso(trade_date)}")
+        expected = self._expected_stock_count()
+        # A live listed universe is normally >5,000 rows.  Keep the threshold
+        # proportional so a few suspended/unavailable names are acceptable,
+        # while a truncated relay page cannot become a successful close.
+        if expected >= 1000 and observed < max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE)):
+            raise TushareRelayError(
+                f"incomplete {dataset} response: {observed}/{expected} rows for {_iso(trade_date)}"
+            )
+
+    def _expected_stock_count(self) -> int:
+        return int(self.store.conn.execute(
+            "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
+        ).fetchone()[0] or 0)
+
+    def _is_complete_stock_table(self, table: str, date_column: str, trade_date: str) -> bool:
+        expected = self._expected_stock_count()
+        if expected < 1000:
+            return False
+        observed = int(self.store.conn.execute(
+            f"SELECT count(DISTINCT ts_code) FROM {table} WHERE {date_column}=? AND ts_code IS NOT NULL",
+            [_iso(trade_date)],
+        ).fetchone()[0] or 0)
+        return observed >= max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE))
+
+    def _certify_close_snapshot(self, dataset: str, trade_date: str, *, status: str,
+                                error_message: str = "") -> None:
+        table_by_dataset = {
+            "daily": ("tushare_daily", "date", "close"),
+            "daily_basic": ("tushare_daily_basic", "date", None),
+            "adj_factor": ("tushare_adj_factor", "date", "adj_factor"),
+        }
+        spec = table_by_dataset.get(dataset)
+        if not spec:
+            return
+        table, date_column, value_column = spec
+        expected = self._expected_stock_count()
+        observed = int(self.store.conn.execute(
+            f"SELECT count(*) FROM {table} WHERE {date_column}=?", [_iso(trade_date)]
+        ).fetchone()[0] or 0)
+        distinct_codes = int(self.store.conn.execute(
+            f"SELECT count(DISTINCT ts_code) FROM {table} WHERE {date_column}=? AND ts_code IS NOT NULL",
+            [_iso(trade_date)],
+        ).fetchone()[0] or 0)
+        invalid_rows = 0
+        if value_column:
+            invalid_rows = int(self.store.conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {date_column}=? AND ({value_column} IS NULL OR {value_column} <= 0)",
+                [_iso(trade_date)],
+            ).fetchone()[0] or 0)
+        coverage = round(distinct_codes * 100.0 / expected, 4) if expected else None
+        certified = (
+            status == "certified"
+            and expected >= 1000
+            and distinct_codes >= math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE)
+            and invalid_rows == 0
+        )
+        final_status = "certified" if certified else (status if status != "certified" else "incomplete")
+        self.store.conn.execute(
+            "INSERT INTO close_snapshot_certification "
+            "(dataset,trade_date,provider,expected_rows,observed_rows,distinct_codes,invalid_rows,coverage_pct,source_event_date,fetched_at,status,error_message) "
+            "VALUES (?,?,?,?,?,?,?,?,CAST(? AS DATE),current_timestamp,?,?) "
+            "ON CONFLICT(dataset,trade_date,provider) DO UPDATE SET "
+            "expected_rows=excluded.expected_rows,observed_rows=excluded.observed_rows,distinct_codes=excluded.distinct_codes,"
+            "invalid_rows=excluded.invalid_rows,coverage_pct=excluded.coverage_pct,source_event_date=excluded.source_event_date,"
+            "fetched_at=excluded.fetched_at,status=excluded.status,error_message=excluded.error_message",
+            [dataset, _iso(trade_date), "tushare", expected, observed, distinct_codes, invalid_rows,
+             coverage, _iso(trade_date), final_status, error_message[:500]],
+        )
+        self.store.conn.commit()
+
     def _checkpoint(self, dataset: str, trade_date: str, status: str, *, rows: int = 0,
                     attempts: int = 0, error: str = "") -> None:
         now = datetime.now()
@@ -166,6 +255,8 @@ class TushareHistoryCollector:
             # re-fetches the date instead of permanently skipping it.
             if count == 0:
                 return False
+            if dataset in STOCK_SNAPSHOT_DATASETS and not self._is_complete_stock_table(table, date_column, trade_date):
+                return False
         return True
 
     def _next_attempt(self, dataset: str, trade_date: str) -> int:
@@ -205,34 +296,106 @@ class TushareHistoryCollector:
         params = {"trade_date": _ymd(trade_date)}
         if with_limit:
             params["limit"] = self.batch_limit
-        rows = self.client.query_rows(api, params, fields)
         target = _iso(trade_date)
-        dated_rows = []
-        for row in rows:
+        semantic_attempts = max(1, min(4, int(getattr(self.client, "retries", 1))))
+        best_rows: list[dict[str, Any]] = []
+        last_reason = "empty response"
+        for attempt in range(semantic_attempts):
             try:
-                if row.get("trade_date") and _iso(row.get("trade_date")) == target:
-                    dated_rows.append(row)
-            except (TypeError, ValueError):
+                rows = self.client.query_rows(api, params, fields)
+            except Exception as exc:
+                if not isinstance(self.client, TushareRelayClient):
+                    raise
+                last_reason = f"{type(exc).__name__}: {exc}"
+                rows = []
+            dated_rows = []
+            for row in rows:
+                try:
+                    if row.get("trade_date") and _iso(row.get("trade_date")) == target:
+                        dated_rows.append(row)
+                except (TypeError, ValueError):
+                    continue
+            if len(dated_rows) > len(best_rows):
+                best_rows = dated_rows
+            if not isinstance(self.client, TushareRelayClient):
+                return dated_rows
+            if not dated_rows:
+                last_reason = f"empty {api} response for requested date {target}"
+            elif api in STOCK_SNAPSHOT_DATASETS and len(dated_rows) < max(1000, math.ceil(self._expected_stock_count() * MIN_STOCK_SNAPSHOT_COVERAGE)):
+                last_reason = f"incomplete {api} response: {len(dated_rows)} rows for requested date {target}"
+            elif len(dated_rows) < 1000:
+                last_reason = f"suspiciously short {api} response: {len(dated_rows)} rows"
+            else:
+                return dated_rows
+            if attempt + 1 < semantic_attempts:
+                time.sleep(min(15.0, 2.0 ** attempt))
+        raise TushareRelayError(last_reason)
+
+    def _query_code_batches(self, api: str, trade_date: str, fields: str) -> list[dict[str, Any]]:
+        """Fallback for relay shards that fail date-wide quote snapshots.
+
+        The fallback deliberately uses the canonical TuShare relay and the
+        same stock universe stored in ``tushare_stock_basic``.  It never
+        relabels another session's rows and only returns a snapshot when the
+        result is large enough to be useful; callers still checkpoint an
+        incomplete result as an error.
+        """
+        if not isinstance(self.client, TushareRelayClient):
+            return []
+        codes = [str(row[0]) for row in self.store.conn.execute(
+            "SELECT DISTINCT ts_code FROM tushare_stock_basic "
+            "WHERE ts_code IS NOT NULL ORDER BY ts_code"
+        ).fetchall()]
+        if not codes:
+            return []
+        target = _iso(trade_date)
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for start in range(0, len(codes), QUOTE_CODE_BATCH_SIZE):
+            if not self._budget_left():
+                break
+            batch = codes[start:start + QUOTE_CODE_BATCH_SIZE]
+            try:
+                rows = self.client.query_rows(
+                    api,
+                    {"ts_code": ",".join(batch), "trade_date": _ymd(trade_date)},
+                    fields,
+                )
+            except Exception:
+                # One bounded retry with a smaller slice handles relay URL
+                # limits without turning a transient failure into a storm.
+                if len(batch) <= 100:
+                    continue
+                midpoint = len(batch) // 2
+                for smaller in (batch[:midpoint], batch[midpoint:]):
+                    if not self._budget_left():
+                        break
+                    try:
+                        rows = self.client.query_rows(
+                            api,
+                            {"ts_code": ",".join(smaller), "trade_date": _ymd(trade_date)},
+                            fields,
+                        )
+                    except Exception:
+                        continue
+                    for row in rows:
+                        try:
+                            if row.get("ts_code") and _iso(row.get("trade_date")) == target:
+                                out[(str(row.get("ts_code")), target)] = row
+                        except (TypeError, ValueError):
+                            continue
                 continue
-        if isinstance(self.client, TushareRelayClient) and rows and not dated_rows:
-            raise TushareRelayError(f"{api} returned no rows for requested date {target}")
-        # Never relabel a previous-session response as the requested date.
-        rows = dated_rows
-        # A relay that answers with an empty item list is a successful HTTP
-        # response, not a market snapshot.  Without this guard an empty day
-        # is recorded as a success checkpoint after DELETE+INSERT of zero
-        # rows (observed 2026-08-10: daily/daily_basic marked success with 0
-        # rows while adj_factor for the same date landed 5,553 rows).
-        if isinstance(self.client, TushareRelayClient) and not rows:
-            raise TushareRelayError(f"empty {api} response for requested date {target}")
-        if isinstance(self.client, TushareRelayClient) and 0 < len(rows) < 1000:
-            time.sleep(1)
-            retry = self.client.query_rows(api, params, fields)
-            if len(retry) > len(rows):
-                rows = retry
-            if 0 < len(rows) < 1000:
-                raise TushareRelayError(f"suspiciously short {api} response: {len(rows)} rows")
-        return rows
+            for row in rows:
+                try:
+                    if row.get("ts_code") and _iso(row.get("trade_date")) == target:
+                        out[(str(row.get("ts_code")), target)] = row
+                except (TypeError, ValueError):
+                    continue
+        minimum = max(1000, int(len(codes) * 0.50))
+        if len(out) < minimum:
+            raise TushareRelayError(
+                f"incomplete {api} code-batch fallback: {len(out)}/{len(codes)} rows"
+            )
+        return list(out.values())
 
     def ensure_calendar(self, start_date: str, end_date: str) -> list[str]:
         start = datetime.strptime(_iso(start_date), "%Y-%m-%d").date()
@@ -253,6 +416,21 @@ class TushareHistoryCollector:
                 )
                 self.store.conn.commit()
             except Exception as exc:
+                # Historical relay partitions may reject trade_cal even when
+                # the canonical daily table already proves the requested
+                # session existed.  Use only those real observed dates as a
+                # fail-safe; never synthesize weekdays.
+                observed = int(self.store.conn.execute(
+                    "SELECT count(DISTINCT date) FROM tushare_daily "
+                    "WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
+                    params,
+                ).fetchone()[0] or 0)
+                if observed == expected_calendar_days:
+                    return [str(row[0])[:10] for row in self.store.conn.execute(
+                        "SELECT DISTINCT CAST(date AS VARCHAR) FROM tushare_daily "
+                        "WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE) ORDER BY date",
+                        params,
+                    ).fetchall()]
                 raise TushareRelayError(
                     f"trade_cal fetch failed for {_iso(start_date)}..{_iso(end_date)}: {exc}"
                 ) from exc
@@ -307,6 +485,7 @@ class TushareHistoryCollector:
                     _num(row.get("open")), _num(row.get("high")), _num(row.get("low")), _num(row.get("close")),
                     _num(row.get("vol")), _num(row.get("amount")), _num(row.get("pct_chg")))
         out = list(deduped.values())
+        self._validate_stock_snapshot("daily", out, trade_date)
         # Clear stale/partial rows only after a complete-looking response has
         # arrived, so a failed request never destroys the last usable batch.
         self.store.conn.execute("BEGIN TRANSACTION")
@@ -318,6 +497,7 @@ class TushareHistoryCollector:
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
+            self._certify_close_snapshot("daily", trade_date, status="certified")
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -333,6 +513,7 @@ class TushareHistoryCollector:
                     _num(row.get("turnover_rate")), _num(row.get("volume_ratio")), _num(row.get("pe")),
                     _num(row.get("pb")), _num(row.get("total_mv")), _num(row.get("circ_mv")))
         out = list(deduped.values())
+        self._validate_stock_snapshot("daily_basic", out, trade_date)
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute("DELETE FROM tushare_daily_basic WHERE date=?", [_iso(trade_date)])
@@ -342,6 +523,7 @@ class TushareHistoryCollector:
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
+            self._certify_close_snapshot("daily_basic", trade_date, status="certified")
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -358,6 +540,7 @@ class TushareHistoryCollector:
                     row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")),
                     _iso(row.get("trade_date")), _num(row.get("adj_factor")))
         out = list(deduped.values())
+        self._validate_stock_snapshot("adj_factor", out, trade_date)
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute("DELETE FROM tushare_adj_factor WHERE date=?", [_iso(trade_date)])
@@ -367,6 +550,7 @@ class TushareHistoryCollector:
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
+            self._certify_close_snapshot("adj_factor", trade_date, status="certified")
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -525,6 +709,14 @@ class TushareHistoryCollector:
                 )
                 if total < 4000:
                     raise TushareRelayError(f"incomplete moneyflow response: {total} rows")
+            if isinstance(self.client, TushareRelayClient):
+                expected = int(self.store.conn.execute(
+                    "SELECT count(*) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
+                ).fetchone()[0] or 0)
+                if expected >= 1000 and total < max(1000, int(expected * 0.80)):
+                    raise TushareRelayError(
+                        f"incomplete moneyflow response: {total}/{expected} rows"
+                    )
             self.store.conn.execute("COMMIT")
             return total
         except Exception:
@@ -669,12 +861,26 @@ class TushareHistoryCollector:
             raise
 
     def run(self, start_date: str, end_date: str, *, datasets: Iterable[str],
-            max_days: int | None = None, force: bool = False,
+            max_days: int | None = None, force: bool = False, gap_only: bool = False,
             retry_passes: int = 0, retry_delay_seconds: float = 0.0) -> dict[str, Any]:
         datasets = list(dict.fromkeys(datasets))
         dates = self.ensure_calendar(start_date, end_date)
+        if gap_only:
+            dates = [
+                trade_date for trade_date in dates
+                if any(
+                    dataset != "stock_basic" and not self._is_done(dataset, trade_date, force=False)
+                    for dataset in datasets
+                )
+            ]
         if max_days is not None:
-            dates = dates[: max(0, int(max_days))]
+            limit = max(0, int(max_days))
+            if limit:
+                dates = dates[-limit:]
+        # Close runs commonly scan a lookback window under a fixed budget.  The
+        # newest session is the operational dependency, so process newest first
+        # and let the checkpointed history pass repair older gaps afterwards.
+        dates = list(reversed(dates))
         results_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         if "stock_basic" in datasets and self._budget_left():
             results_by_key[("stock_basic", CHECKPOINT_DATE)] = {
@@ -734,6 +940,13 @@ class TushareHistoryCollector:
                         # make the checkpoint carry the error instead of deleting
                         # good data from the production tables.
                         self._checkpoint(dataset, trade_date, "error", attempts=attempt, error=str(exc))
+                        if dataset in STOCK_SNAPSHOT_DATASETS:
+                            self._certify_close_snapshot(
+                                dataset,
+                                trade_date,
+                                status="error",
+                                error_message=str(exc),
+                            )
                         results_by_key[key] = {
                             "dataset": dataset,
                             "trade_date": trade_date,

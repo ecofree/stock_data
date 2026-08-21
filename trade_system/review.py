@@ -7,8 +7,9 @@ from pathlib import Path
 import duckdb
 
 from trade_system.backtest import run_market_regime_backtest
-from trade_system.quality import run_quality_audit, table_exists
+from trade_system.quality import run_quality_audit, table_columns, table_exists
 from trade_system.signals import generate_signals
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
 def _safe_json_text(value) -> str:
@@ -167,11 +168,6 @@ def render_risk_alert_report(trade_date: str, alerts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params=None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
-
 
 def load_daily_report_context(db_path: str | Path, trade_date: str | None = None) -> dict:
     signal_result = generate_signals(db_path, trade_date)
@@ -183,9 +179,17 @@ def load_daily_report_context(db_path: str | Path, trade_date: str | None = None
             "SELECT * FROM market_regime_snapshot WHERE trade_date = ? ORDER BY generated_at DESC LIMIT 1",
             [selected_date],
         )
+        sector_columns = set(table_columns(con, "sector_rotation_score"))
+        sector_filter = (
+            "AND (taxonomy IN ('ths_concept','ths_concept_derived') "
+            "OR (coalesce(taxonomy,'unknown')='unknown' AND sector_code LIKE 'THS-%'))"
+            if "taxonomy" in sector_columns else "AND sector_code LIKE 'THS-%'"
+        )
         sectors = _fetch_dicts(
             con,
-            "SELECT * FROM sector_rotation_score WHERE trade_date = ? ORDER BY score DESC LIMIT 20",
+            "SELECT * FROM sector_rotation_score WHERE trade_date = ? "
+            + sector_filter
+            + " ORDER BY score DESC LIMIT 20",
             [selected_date],
         )
         candidates = _fetch_dicts(

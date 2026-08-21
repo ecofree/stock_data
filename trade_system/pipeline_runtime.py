@@ -9,6 +9,14 @@ import os
 from pathlib import Path
 import shutil
 
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional on minimal runtimes
+    psutil = None
+
+
+STALE_LOCAL_LOCK_GRACE_SECONDS = 120
+
 
 class PipelineAlreadyRunning(RuntimeError):
     pass
@@ -39,15 +47,32 @@ class PipelineLock:
                 existing_pid = int(existing_payload.get("pid") or 0)
                 started_at = datetime.fromisoformat(str(existing_payload.get("started_at")))
                 age_seconds = max(0.0, (datetime.now() - started_at).total_seconds())
-            except (TypeError, ValueError, json.JSONDecodeError):
-                existing_pid, age_seconds, existing_payload = 0, 0.0, {}
-            # Recover only a demonstrably stale local lock.  A live process or
-            # a young malformed lock remains a hard block.
+            except (TypeError, ValueError, json.JSONDecodeError, OSError):
+                existing_pid, existing_payload = 0, {}
+                # A truncated lock from a hard power loss is still recoverable
+                # once its filesystem mtime is older than the local grace
+                # period.  Treating malformed content as age zero otherwise
+                # leaves the scheduler blocked forever.
+                try:
+                    age_seconds = max(
+                        0.0, (datetime.now() - datetime.fromtimestamp(self.path.stat().st_mtime)).total_seconds()
+                    )
+                except OSError:
+                    age_seconds = 0.0
+            # Recover a demonstrably stale local lock.  A process that died
+            # during a reboot/provider crash must not block the next market
+            # phase for six hours; the short grace period protects a just-
+            # created lock from racing with the owner process.
             process_alive = False
             if existing_pid and existing_pid != os.getpid():
                 try:
-                    os.kill(existing_pid, 0)
-                    process_alive = True
+                    if psutil is not None:
+                        process = psutil.Process(existing_pid)
+                        process_started = datetime.fromtimestamp(process.create_time())
+                        process_alive = process.is_running() and process_started <= started_at
+                    else:
+                        os.kill(existing_pid, 0)
+                        process_alive = True
                 # Windows can surface dead/reused PIDs as SystemError instead
                 # of OSError (for example when the scheduler account no
                 # longer owns the process).  Any failure to prove liveness is
@@ -55,7 +80,17 @@ class PipelineLock:
                 # a young lock from accidental recovery.
                 except Exception:
                     process_alive = False
-            if not process_alive and age_seconds > 6 * 3600:
+            current_host = str(os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "unknown")
+            lock_host = str(existing_payload.get("host") or "")
+            recovery_age = (
+                STALE_LOCAL_LOCK_GRACE_SECONDS
+                if lock_host in {"", current_host, "unknown"}
+                else 6 * 3600
+            )
+            if (
+                not process_alive
+                and age_seconds > recovery_age
+            ):
                 try:
                     self.path.unlink()
                     return self.__enter__()
@@ -140,16 +175,83 @@ class RunManifest:
         temp.replace(self.path)
 
 
-class LatestReportTransaction:
-    """Restore root latest reports if a pipeline fails midway."""
+def reap_stale_run_manifests(
+    reports_dir: str | Path,
+    *,
+    max_age_seconds: int = STALE_LOCAL_LOCK_GRACE_SECONDS,
+    exclude_run_id: str | None = None,
+) -> list[str]:
+    """Mark abandoned ``running`` manifests as aborted after a restart.
 
-    def __init__(self, reports_dir: str | Path, run_id: str) -> None:
+    The pipeline lock is acquired before this helper is called, so the current
+    run is protected and no other phase can be live against the same database.
+    Historical ``running`` JSON files otherwise survive a reboot forever and
+    make the P0 observation report a false active run.
+    """
+    root = Path(reports_dir).resolve() / "runs"
+    if not root.exists():
+        return []
+    # Direct/manual callers must not reap a live run.  The production runner
+    # passes ``exclude_run_id`` only after acquiring the database lock; without
+    # that proof, an active ``*.duckdb.pipeline.lock`` makes this a no-op.
+    if exclude_run_id is None and any(root.parent.glob("*.duckdb.pipeline.lock")):
+        return []
+    now = datetime.now()
+    reaped: list[str] = []
+    for path in root.glob("*/run.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("status") != "running" or data.get("run_id") == exclude_run_id:
+                continue
+            started = datetime.fromisoformat(str(data.get("started_at")))
+            if (now - started).total_seconds() <= max_age_seconds:
+                continue
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        data["status"] = "aborted"
+        data["completed_at"] = now.isoformat(timespec="seconds")
+        data["error"] = "stale_running_manifest_reaped_after_seconds"
+        for step in data.get("steps") or []:
+            if step.get("status") == "running":
+                step["status"] = "aborted"
+                step["reason"] = "parent_run_manifest_reaped"
+        temp = path.with_suffix(".json.tmp")
+        try:
+            temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(path)
+            reaped.append(str(data.get("run_id") or path.parent.name))
+        except OSError:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+    return reaped
+
+
+class LatestReportTransaction:
+    """Publish a completed run's latest reports atomically.
+
+    Generators are pointed at ``staging_dir`` by the integrated runner.  Root
+    ``*_latest`` files therefore remain coherent while a long close run is in
+    progress and are only replaced with temp-file swaps after the manifest has
+    reached its final status.
+    """
+
+    def __init__(self, reports_dir: str | Path, run_id: str, staging_dir: str | Path | None = None) -> None:
         self.reports_dir = Path(reports_dir).resolve()
         self.snapshot_dir = self.reports_dir / f".rollback_{run_id}"
+        self.staging_dir = Path(staging_dir).resolve() if staging_dir else self.reports_dir
         self.original_names: set[str] = set()
 
     def begin(self) -> None:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+        if self.staging_dir != self.reports_dir and self.staging_dir.exists():
+            # A reused explicit run-id may leave a partial staging directory
+            # after a power loss.  It is not a published artifact and is safe
+            # to replace before taking the new root snapshot.
+            shutil.rmtree(self.staging_dir)
+        if self.staging_dir != self.reports_dir:
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=False)
         for path in self.reports_dir.glob("*latest*"):
             if path.is_file():
@@ -173,14 +275,19 @@ class LatestReportTransaction:
         run_path = Path(run_dir) if run_dir is not None else None
         if run_path is not None:
             run_path.mkdir(parents=True, exist_ok=True)
-            for path in self.reports_dir.glob("*latest*"):
+            staged = self.staging_dir != self.reports_dir
+            source_paths = self.staging_dir.glob("*latest*") if staged else self.reports_dir.glob("*latest*")
+            for path in source_paths:
                 if not path.is_file() or not self._run_artifact(path):
                     continue
-                snapshot = self.snapshot_dir / path.name
-                changed = not snapshot.exists() or not filecmp.cmp(path, snapshot, shallow=False)
-                if changed:
-                    shutil.copy2(path, run_path / path.name)
-                    retained.append(path.name)
+                if not staged:
+                    snapshot = self.snapshot_dir / path.name
+                    if snapshot.exists() and filecmp.cmp(path, snapshot, shallow=False):
+                        continue
+                shutil.copy2(path, run_path / path.name)
+                retained.append(path.name)
+        if self.staging_dir != self.reports_dir and self.staging_dir.exists():
+            shutil.rmtree(self.staging_dir)
         for path in self.reports_dir.glob("*latest*"):
             if path.is_file() and path.name not in self.original_names:
                 path.unlink()
@@ -190,9 +297,16 @@ class LatestReportTransaction:
         shutil.rmtree(self.snapshot_dir)
         return retained
 
+    def cleanup_staging(self) -> None:
+        """Remove an unpublished staging tree after a pre-commit failure."""
+        if self.staging_dir != self.reports_dir and self.staging_dir.exists():
+            shutil.rmtree(self.staging_dir)
+
     def commit(self, run_dir: str | Path) -> None:
         run_path = Path(run_dir)
-        for path in self.reports_dir.glob("*latest*"):
+        source_paths = self.staging_dir.glob("*latest*") if self.staging_dir != self.reports_dir else self.reports_dir.glob("*latest*")
+        published_names: list[str] = []
+        for path in source_paths:
             if path.is_file():
                 # Large model diagnostics are current-state artifacts, not
                 # immutable per-run evidence.  Copying them into every 5-minute
@@ -200,6 +314,34 @@ class LatestReportTransaction:
                 if not self._run_artifact(path):
                     continue
                 shutil.copy2(path, run_path / path.name)
+                target = self.reports_dir / path.name
+                temp = target.with_suffix(target.suffix + ".publish.tmp")
+                shutil.copy2(path, temp)
+                temp.replace(target)
+                published_names.append(path.name)
+        # One small, machine-readable pointer makes the root ``*_latest``
+        # files auditable as a set.  The pointer itself is included in the
+        # transaction snapshot because its name also contains ``latest``.
+        manifest_path = run_path / "run.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pointer = {
+            "run_id": manifest.get("run_id"),
+            "trade_date": manifest.get("trade_date"),
+            "phase": manifest.get("phase"),
+            "run_status": manifest.get("status"),
+            "started_at": manifest.get("started_at"),
+            "completed_at": manifest.get("completed_at"),
+            "published_at": datetime.now().isoformat(timespec="seconds"),
+            "run_dir": str(run_path.relative_to(self.reports_dir)),
+            "artifact_files": sorted(published_names),
+        }
+        pointer_path = self.reports_dir / "pipeline_run_latest.json"
+        pointer_temp = pointer_path.with_suffix(pointer_path.suffix + ".publish.tmp")
+        pointer_temp.write_text(json.dumps(pointer, ensure_ascii=False, indent=2), encoding="utf-8")
+        pointer_temp.replace(pointer_path)
+        shutil.copy2(pointer_path, run_path / pointer_path.name)
+        if self.staging_dir != self.reports_dir and self.staging_dir.exists():
+            shutil.rmtree(self.staging_dir)
         shutil.rmtree(self.snapshot_dir)
 
 

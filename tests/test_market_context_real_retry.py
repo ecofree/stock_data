@@ -355,7 +355,10 @@ def test_readiness_splits_analytics_and_execution(tmp_path):
     assert result["actionable_candidates"] == 0
     assert result["execution_ready"] is False
 
-    # Add an executable candidate -> execution-ready, 1 actionable.
+    # Add an executable-looking candidate.  The candidate is actionable, but
+    # execution remains blocked until the independent flow certification gate
+    # is explicitly true; otherwise a populated pool would bypass the P0
+    # readiness contract.
     con = duckdb.connect(str(db))
     con.execute(
         "INSERT INTO stock_candidate_stage_signal VALUES "
@@ -364,4 +367,7 @@ def test_readiness_splits_analytics_and_execution(tmp_path):
     con.close()
     result2 = assess_trade_date_readiness(str(db), "2026-07-28", stage="intraday")
     assert result2["actionable_candidates"] == 1
-    assert result2["execution_ready"] is True
+    assert result2["execution_ready"] is False
+    assert result2["analysis_ready"] is False
+    assert result2["analysis_scope"] == "blocked"
+    assert result2["flow_certified_ready"] is False

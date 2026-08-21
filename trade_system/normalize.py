@@ -6,7 +6,11 @@ from pathlib import Path
 
 import duckdb
 
+from trade_system.schema import _refresh_default_concept_views
+from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
+
+logger = get_logger(__name__)
 
 
 def _empty_view_sql(view_name: str, columns: list[tuple[str, str]]) -> str:
@@ -25,7 +29,10 @@ def _timestamp_column(con: duckdb.DuckDBPyConnection, table_name: str) -> str:
 def _relation_has_rows(con: duckdb.DuckDBPyConnection, relation_name: str) -> bool:
     try:
         row = con.execute(f'SELECT count(*) FROM "{relation_name}"').fetchone()
-    except Exception:
+    except Exception as exc:
+        # Missing optional relations are routine control flow here, so this
+        # stays at debug level; schema drift still shows up with KPL_LOG_LEVEL=DEBUG.
+        logger.debug("relation %s not queryable: %s", relation_name, exc)
         return False
     return bool(row and row[0] > 0)
 
@@ -176,6 +183,7 @@ def _create_sector_daily(con: duckdb.DuckDBPyConnection) -> None:
         ("trade_date", "VARCHAR"),
         ("sector_code", "VARCHAR"),
         ("sector_name", "VARCHAR"),
+        ("sector_type", "VARCHAR"),
         ("strength_value", "DOUBLE"),
         ("limit_up_count", "INTEGER"),
         ("seal_rate", "DOUBLE"),
@@ -506,6 +514,7 @@ def _create_sector_capital(con: duckdb.DuckDBPyConnection) -> None:
         ("trade_date", "VARCHAR"),
         ("sector_code", "VARCHAR"),
         ("sector_name", "VARCHAR"),
+        ("sector_type", "VARCHAR"),
         ("main_net_inflow", "BIGINT"),
         ("super_net_inflow", "BIGINT"),
         ("big_net_inflow", "BIGINT"),
@@ -531,6 +540,7 @@ def _create_sector_capital(con: duckdb.DuckDBPyConnection) -> None:
                     CAST(source_date AS VARCHAR) AS trade_date,
                     sector_code,
                     coalesce(nullif(sector_name, ''), sector_code) AS sector_name,
+                    coalesce(nullif(sector_type, ''), CASE WHEN sector_code LIKE 'THS-%' THEN 'ths_concept' ELSE 'em_industry' END) AS sector_type,
                     main_net AS main_net_inflow,
                     super_net AS super_net_inflow,
                     large_net AS big_net_inflow,
@@ -550,7 +560,7 @@ def _create_sector_capital(con: duckdb.DuckDBPyConnection) -> None:
                 FROM multi_source_sector_flow
                 WHERE coalesce(is_stale, false) = false
             )
-            SELECT trade_date, sector_code, sector_name, main_net_inflow,
+            SELECT trade_date, sector_code, sector_name, sector_type, main_net_inflow,
                    super_net_inflow, big_net_inflow, mid_net_inflow,
                    small_net_inflow, strength_value, limit_up_count, seal_rate,
                    source_table, is_fallback, fetched_at
@@ -572,6 +582,7 @@ def _create_sector_capital(con: duckdb.DuckDBPyConnection) -> None:
                 CAST(c.date AS VARCHAR) AS trade_date,
                 c.sector_code,
                 coalesce(s.sector_name, '') AS sector_name,
+                CASE WHEN c.sector_code LIKE 'THS-%' THEN 'ths_concept' ELSE 'em_industry' END AS sector_type,
                 c.main_net_inflow,
                 c.super_net_inflow,
                 c.big_net_inflow,
@@ -597,6 +608,7 @@ def _create_sector_capital(con: duckdb.DuckDBPyConnection) -> None:
                 trade_date,
                 sector_code,
                 sector_name,
+                CASE WHEN sector_code LIKE 'THS-%' THEN 'ths_concept' ELSE 'em_industry' END AS sector_type,
                 CAST(NULL AS BIGINT) AS main_net_inflow,
                 CAST(NULL AS BIGINT) AS super_net_inflow,
                 CAST(NULL AS BIGINT) AS big_net_inflow,
@@ -999,7 +1011,7 @@ def _create_index_state(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> None:
-    cols = [
+    _unused_cols = [
         ("trade_date", "VARCHAR"),
         ("stock_code", "VARCHAR"),
         ("main_monitor_net_inflow", "BIGINT"),
@@ -1253,7 +1265,7 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
 
 
 def _create_intraday_strength_evidence(con: duckdb.DuckDBPyConnection) -> None:
-    cols = [
+    _unused_cols = [
         ("trade_date", "VARCHAR"),
         ("stock_code", "VARCHAR"),
         ("intraday_high", "DOUBLE"),
@@ -1459,6 +1471,7 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
         ("trade_date", "VARCHAR"),
         ("sector_code", "VARCHAR"),
         ("sector_name", "VARCHAR"),
+        ("sector_type", "VARCHAR"),
         ("strength_value", "DOUBLE"),
         ("limit_up_count", "INTEGER"),
         ("seal_rate", "DOUBLE"),
@@ -1477,6 +1490,7 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
                 trade_date,
                 sector_code,
                 sector_name,
+                sector_type,
                 strength_value,
                 limit_up_count,
                 seal_rate,
@@ -1490,6 +1504,7 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
                 trade_date,
                 sector_code,
                 sector_name,
+                CASE WHEN sector_code LIKE 'THS-%' THEN 'ths_concept' ELSE 'em_industry' END AS sector_type,
                 strength_value,
                 limit_up_count,
                 seal_rate,
@@ -1515,24 +1530,24 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
     if component_source in {"v_default_concept_stock_history", "ths_concept_stock_history"}:
         component_sql = """
             SELECT
-                CAST(trade_date AS VARCHAR) AS trade_date,
-                concept_code AS sector_code,
+                CAST(trade_date AS DATE) AS membership_date,
+                CAST(concept_code AS VARCHAR) AS sector_code,
                 count(DISTINCT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')) AS component_count
-            FROM ths_concept_stock_history
+            FROM {source}
             GROUP BY trade_date, concept_code
-        """
+        """.format(source=component_source)
     elif _table_has_columns(con, "sector_all_stocks", ["date", "sector_code", "stock_code"]):
         component_sql = """
             SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                sector_code,
+                CAST(date AS DATE) AS membership_date,
+                CAST(sector_code AS VARCHAR) AS sector_code,
                 count(DISTINCT stock_code) AS component_count
             FROM sector_all_stocks
             GROUP BY date, sector_code
         """
     else:
         component_sql = _empty_relation_sql(
-            [("trade_date", "VARCHAR"), ("sector_code", "VARCHAR"), ("component_count", "BIGINT")]
+            [("membership_date", "DATE"), ("sector_code", "VARCHAR"), ("component_count", "BIGINT")]
         )
 
     if _table_has_columns(con, "sector_son_plates", ["parent_code", "son_code"]):
@@ -1567,6 +1582,25 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
             [("trade_date", "VARCHAR"), ("sector_code", "VARCHAR"), ("boom_reason", "VARCHAR")]
         )
 
+    # Minimal legacy databases used by maintenance tools may not have gone
+    # through init_schema yet.  Keep their industry-only evidence renderable;
+    # once the canonical THS relation exists, enforce the full concept gate.
+    if table_exists(con, "v_default_concept_daily"):
+        taxonomy_gate = """
+            WHERE coalesce(b.sector_type, CASE WHEN b.sector_code LIKE 'THS-%' THEN 'ths_concept' ELSE 'em_industry' END)
+                  IN ('ths_concept', 'ths_concept_derived')
+              AND EXISTS (
+                  SELECT 1
+                  FROM v_default_concept_daily d
+                  WHERE d.trade_date = CAST(b.trade_date AS DATE)
+                    AND d.concept_code LIKE 'THS-%'
+                  GROUP BY d.trade_date
+                  HAVING count(DISTINCT d.concept_code) >= 374
+              )
+        """
+    else:
+        taxonomy_gate = "WHERE TRUE"
+
     con.execute(
         f"""
         CREATE OR REPLACE VIEW v_theme_mainline_evidence AS
@@ -1580,6 +1614,7 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
             b.trade_date,
             b.sector_code,
             b.sector_name,
+            b.sector_type,
             b.strength_value,
             b.limit_up_count,
             b.seal_rate,
@@ -1593,7 +1628,7 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
                 + coalesce(b.limit_up_count, 0) * 2.0
                 + coalesce(b.seal_rate, 0) * 0.10
                 + coalesce(b.main_net_inflow, 0) / 100000000.0
-                + coalesce(c.component_count, 0) * 0.20
+                + ln(1 + coalesce(c.component_count, 0)) * 1.50
                 + coalesce(s.son_plate_count, 0) * 0.50
                 + coalesce(sc.sub_concept_count, 0) * 0.50,
                 4
@@ -1602,14 +1637,21 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
             b.is_fallback
         FROM base b
         LEFT JOIN components c
-          ON b.trade_date = c.trade_date AND b.sector_code = c.sector_code
+          ON c.sector_code = b.sector_code
+         AND c.membership_date = (
+             SELECT max(c2.membership_date)
+             FROM components c2
+             WHERE c2.sector_code = b.sector_code
+               AND c2.membership_date <= CAST(b.trade_date AS DATE)
+         )
         LEFT JOIN son s
           ON b.sector_code = s.sector_code
         LEFT JOIN sub_concepts sc
           ON b.sector_code = sc.sector_code
         LEFT JOIN reasons r
           ON b.trade_date = r.trade_date AND b.sector_code = r.sector_code
-        """
+            {taxonomy_gate}
+            """
     )
 
 
@@ -1954,6 +1996,7 @@ def _create_data_coverage(con: duckdb.DuckDBPyConnection) -> None:
 def build_normalized_views(db_path: str | Path) -> list[str]:
     con = duckdb.connect(str(db_path))
     try:
+        _refresh_default_concept_views(con)
         _create_market_daily(con)
         _create_sector_daily(con)
         _create_limit_pool(con)
@@ -1971,6 +2014,8 @@ def build_normalized_views(db_path: str | Path) -> list[str]:
         _create_lhb_review_evidence(con)
         _create_data_coverage(con)
         return [
+            "v_default_concept_daily",
+            "v_default_concept_stock_history",
             "v_market_daily",
             "v_sector_daily",
             "v_limit_pool",

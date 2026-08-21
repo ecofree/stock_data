@@ -78,7 +78,6 @@ def _query(reportName: str, code: str, pageSize: int = 10,
            f"&filter={urllib.parse.quote(flt)}"
            f"&pageSize={pageSize}"
            f"&sortColumns={sort_col}&sortTypes={sort_type}")
-    last = None
     for attempt in range(4):
         try:
             d = _curl_json(url)
@@ -87,8 +86,8 @@ def _query(reportName: str, code: str, pageSize: int = 10,
                 if rows:
                     # 已按 sortColumns 排好序；兜底再按日期列确认倒序
                     return rows
-        except Exception as e:
-            last = e
+        except Exception:
+            pass  # swallow and retry with backoff
         # 指数退避 + 随机抖动（akshare 风格）
         time.sleep(1.0 * (2 ** attempt) + random.uniform(0.3, 1.0))
     return []

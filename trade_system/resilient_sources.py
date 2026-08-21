@@ -84,7 +84,7 @@ CLI：
 本机运行可设环境变量 STOCK_DATA_LOCAL=1 启用东方财富 K 线源（沙箱默认关闭）。
 """
 from __future__ import annotations
-import os, sys, json, time, sqlite3, threading, subprocess, datetime
+import os, json, time, sqlite3, threading, datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # ---- 路径 / 环境 ----
@@ -102,7 +102,7 @@ from .stock_data_sources import (  # noqa: E402
     _from_sina_fund_flow, _from_tencent_valuation, _from_tushare_basic,
     _from_ths_northbound, _from_ths_hot_reason, _from_ths_eps_forecast,
     get_financials, get_fund_flow, get_financial_statements,
-    _norm_code, _norm_date, TUSHARE_RELAY, TUSHARE_TOKEN, _tushare_query,
+    _norm_code, _norm_date, TUSHARE_TOKEN, _tushare_query,
     # —— 新增：东财数据中心 / 新闻 / 公告 / 涨停池 / 同花顺 / 期权 ——
     _from_em_dragon_tiger, _from_em_dragon_tiger_daily, _from_em_margin,
     _from_em_holder, _from_em_lockup, _from_em_dividend, _from_em_block_trade,
@@ -1213,8 +1213,8 @@ def main():
     pdash = sub.add_parser("dashboard", help="渲染盘面看板 HTML（snapshot_to_html）")
     pdash.add_argument("--codes", default=",".join(WATCHLIST))
     pdash.add_argument("--out", default="snapshot_dashboard.html")
-    pselftest = sub.add_parser("selftest", help="运行离线回归测试(_test_offline.py)")
-    prun = sub.add_parser("run", help="一次性预热+快照，可直接当定时任务体")
+    sub.add_parser("selftest", help="运行离线回归测试(_test_offline.py)")
+    sub.add_parser("run", help="一次性预热+快照，可直接当定时任务体")
 
     a = ap.parse_args()
     if a.cmd == "status":

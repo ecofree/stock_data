@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import datetime
@@ -17,7 +17,7 @@ from trade_system.capital_flow_health import (
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check stored stock and sector capital-flow freshness.")
     parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--date", default=TODAY)
+    parser.add_argument("--trade-date", "--date", dest="trade_date", default=TODAY)
     parser.add_argument("--expected-stocks", type=int, default=0)
     parser.add_argument("--expected-sectors", type=int, default=0)
     parser.add_argument("--out", default="reports/capital_flow_freshness_latest.md")
@@ -34,7 +34,7 @@ def main() -> int:
 
     result = assess_capital_flow_health(
         args.db,
-        args.date,
+        args.trade_date,
         args.expected_stocks,
         args.expected_sectors,
         collected_after=args.collected_after,
@@ -46,11 +46,18 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_capital_flow_health_markdown(result), encoding="utf-8")
     print(
-        f"date={args.date} ready={str(result['ready']).lower()} "
+        f"date={args.trade_date} source_ready={str(result.get('source_ready', result['ready'])).lower()} "
+        f"data_certified_ready={str(result.get('data_certified_ready', False)).lower()} "
+        f"flow_certified_ready={str(result.get('flow_certified_ready', False)).lower()} "
+        f"analysis_ready={str(result.get('analysis_ready', False)).lower()} "
         f"stock_ready={str(result['stock_flow']['ready']).lower()} "
         f"sector_ready={str(result['sector_flow']['ready']).lower()} out={out}"
     )
-    return 0 if result["ready"] or args.report_only else 2
+    # ``source_ready`` only means that some same-date source rows exist.  The
+    # independent flow certification is the actual downstream gate; returning
+    # zero for source-only data made the close runner treat an uncertified flow
+    # snapshot as successful.
+    return 0 if result.get("flow_certified_ready", False) or args.report_only else 2
 
 
 if __name__ == "__main__":

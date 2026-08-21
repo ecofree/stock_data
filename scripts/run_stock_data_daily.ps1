@@ -6,7 +6,13 @@ param(
     [ValidateSet("priority", "full")]
     [string]$CollectionProfile = "priority",
     [switch]$SkipCollection,
-    [int]$BackupKeep = 14
+    # Keep one week of daily rollback points by default.  Backups are gzip
+    # compressed after verification (the raw copy is removed), so the same
+    # window costs a fraction of the previous tens-of-GB footprint.
+    # Operators can override this explicitly.
+    [int]$BackupKeep = 7,
+    # Weekly anchors (Monday backups) kept on top of the rolling daily set.
+    [int]$WeeklyKeep = 4
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,13 +51,56 @@ $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $backup = Join-Path $BackupDir ("kpl_data_pre_daily_{0}.duckdb" -f $stamp)
 $Log = Join-Path $LogDir ("scheduled_close_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 
+function Compress-VerifiedBackup {
+    param([string]$Path)
+    # gzip the verified raw copy and remove it.  A DuckDB file is highly
+    # compressible, so this cuts backup disk usage by roughly 4x.  Restore
+    # with: python -c "import gzip,shutil; gzip.open(r'<file>','rb') ..."
+    $gz = "$Path.gz"
+    $src = [System.IO.File]::OpenRead($Path)
+    $dst = [System.IO.File]::Create($gz)
+    try {
+        $stream = New-Object System.IO.Compression.GZipStream(
+            $dst, [System.IO.Compression.CompressionLevel]::Optimal)
+        try {
+            $src.CopyTo($stream)
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $src.Dispose()
+        $dst.Dispose()
+    }
+    Remove-Item -LiteralPath $Path -Force
+    return $gz
+}
+
 function Remove-OldBackups {
-    $old = Get-ChildItem -LiteralPath $BackupDir -Filter "kpl_data_pre_daily_*.duckdb" -File |
+    # Retention over both legacy raw copies and compressed .gz backups.
+    # Newest $BackupKeep files are always kept; Monday-stamped files are
+    # treated as weekly anchors and kept up to $WeeklyKeep on top of that,
+    # so a bad week cannot destroy every pre-week rollback point.
+    $files = @(Get-ChildItem -LiteralPath $BackupDir -File |
+        Where-Object {
+            $_.Name -like "kpl_data_pre_daily_*.duckdb" -or
+            $_.Name -like "kpl_data_pre_daily_*.duckdb.gz"
+        } |
         # Copy-Item preserves the DuckDB source timestamp, so the timestamped
         # filename is the durable creation order for retention.
-        Sort-Object Name -Descending | Select-Object -Skip ([Math]::Max(1, $BackupKeep))
-    foreach ($file in $old) {
-        Remove-Item -LiteralPath $file.FullName -Force
+        Sort-Object Name -Descending)
+    if ($files.Count -le $BackupKeep) { return }
+    $keptWeekly = 0
+    for ($i = $BackupKeep; $i -lt $files.Count; $i++) {
+        $name = $files[$i].Name
+        if ($name -match "_\d{8}_") {
+            $stamp = $Matches[0].Trim("_")
+            try {
+                if ([datetime]::ParseExact($stamp, "yyyyMMdd", $null).DayOfWeek -eq [System.DayOfWeek]::Monday) {
+                    if ($keptWeekly -lt $WeeklyKeep) { $keptWeekly++; continue }
+                }
+            } catch { }
+        }
+        Remove-Item -LiteralPath $files[$i].FullName -Force
     }
 }
 
@@ -74,6 +123,8 @@ try {
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
         throw "Backup verification failed: $backup"
     }
+    $compressed = Compress-VerifiedBackup -Path $backup
+    "backup compressed: $compressed" | Tee-Object -FilePath $Log -Append
 
     $args = @(
         $IntegratedRunner,
@@ -96,7 +147,7 @@ try {
     if ($code -ne 0) {
         throw "Integrated daily run failed with exit code $code. Backup: $backup"
     }
-    "DAILY_RUN_COMPLETE backup=$backup" | Tee-Object -FilePath $Log -Append
+    "DAILY_RUN_COMPLETE backup=$compressed" | Tee-Object -FilePath $Log -Append
 } catch {
     "DAILY_RUN_FAILED time=$(Get-Date -Format o) error=$($_.Exception.Message)" |
         Tee-Object -FilePath $Log -Append
@@ -119,6 +170,15 @@ try {
         }
     } catch {
         "P0_OBSERVATION_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
+    }
+    try {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $Python (Join-Path $Root "scripts\generate_health_trend.py") --db $DbPath 2>&1 |
+            Tee-Object -FilePath $Log -Append
+        $ErrorActionPreference = $prevEAP
+    } catch {
+        "HEALTH_TREND_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
     }
     Remove-OldBackups
     Pop-Location

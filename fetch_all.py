@@ -3,7 +3,6 @@ import sys
 import os
 import time
 import argparse
-from datetime import datetime
 
 # Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +15,6 @@ from schema import init_schema
 from collect_market import collect_all_market
 from collect_ladder import collect_all_ladder
 from collect_sector import collect_all_sector
-from collect_lhb import collect_all_lhb
 from collect_daily import collect_all_daily
 from collect_dingpan import collect_all_dingpan
 from collect_fengk import collect_all_fengk

@@ -71,20 +71,36 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path):
         "INSERT INTO history_fetch_checkpoint VALUES "
         "('ths_concept_snapshot','2026-07-23',0,'success',1000,current_timestamp)"
     )
-    con.execute("CREATE TABLE ths_concept_daily(trade_date DATE,concept_code VARCHAR)")
+    con.execute(
+        "CREATE TABLE ths_concept_daily("
+        "trade_date DATE,concept_code VARCHAR,stock_count INTEGER,"
+        "raw_json VARCHAR,date_verified BOOLEAN)"
+    )
     con.execute(
         "INSERT INTO ths_concept_daily "
-        "SELECT '2026-07-23', 'THS-' || lpad(CAST(i AS VARCHAR),4,'0') "
+        "SELECT '2026-07-23', 'THS-' || lpad(CAST(i AS VARCHAR),4,'0'), 2, "
+        "'{\"fetched_date\":\"2026-07-23\"}', true "
         "FROM range(374) t(i)"
     )
     con.execute(
         "CREATE TABLE ths_concept_stock_history("
-        "trade_date DATE,concept_code VARCHAR,stock_code VARCHAR)"
+        "trade_date DATE,concept_code VARCHAR,stock_code VARCHAR,"
+        "raw_json VARCHAR,date_verified BOOLEAN)"
     )
     con.execute(
         "INSERT INTO ths_concept_stock_history "
-        "SELECT '2026-07-23', 'THS-' || lpad(CAST(i AS VARCHAR),4,'0'), "
-        "'00' || lpad(CAST(i AS VARCHAR),4,'0') FROM range(748) t(i)"
+        "SELECT '2026-07-23', 'THS-' || lpad(CAST(i % 374 AS VARCHAR),4,'0'), "
+        "'00' || lpad(CAST(i AS VARCHAR),4,'0'), "
+        "'{\"fetched_date\":\"2026-07-23\"}', true FROM range(748) t(i)"
+    )
+    con.execute(
+        "CREATE TABLE ths_concept_member_checkpoint("
+        "trade_date DATE,concept_code VARCHAR,status VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO ths_concept_member_checkpoint "
+        "SELECT '2026-07-23', 'THS-' || lpad(CAST(i AS VARCHAR),4,'0'), 'success' "
+        "FROM range(374) t(i)"
     )
     con.close()
     for trade_date in ("2026-07-23", "2026-07-24"):

@@ -6,6 +6,32 @@ from pathlib import Path
 
 import duckdb
 
+# Canonical definition shared with trade_system.operator_outcomes (which
+# already imports this module).  Both ensure-paths execute the same
+# CREATE OR REPLACE VIEW so execution order never changes the result.
+OPERATOR_PLAN_OUTCOME_VIEW_SQL = """
+CREATE OR REPLACE VIEW v_operator_plan_outcome AS
+SELECT
+    coalesce(p.trade_date, o.trade_date) AS trade_date,
+    coalesce(p.stock_code, o.stock_code) AS stock_code,
+    coalesce(p.stock_name, o.stock_name) AS stock_name,
+    p.setup_type,
+    p.max_position_pct AS planned_position_pct,
+    p.status AS plan_status,
+    o.execution_status,
+    o.position_pct AS actual_position_pct,
+    o.gross_return_pct,
+    o.net_return_pct,
+    o.outcome_tag,
+    o.mistake_tag,
+    o.review_note,
+    o.imported_from,
+    o.created_at AS outcome_created_at
+FROM trade_plan p
+FULL OUTER JOIN operator_trade_outcome o
+    ON p.trade_date = o.trade_date AND p.stock_code = o.stock_code
+"""
+
 
 def init_trading_tables(db_path: str | Path) -> list[str]:
     con = duckdb.connect(str(db_path))
@@ -110,30 +136,7 @@ def init_trading_tables(db_path: str | Path) -> list[str]:
             )
             """
         )
-        con.execute(
-            """
-            CREATE OR REPLACE VIEW v_operator_plan_outcome AS
-            SELECT
-                coalesce(p.trade_date, o.trade_date) AS trade_date,
-                coalesce(p.stock_code, o.stock_code) AS stock_code,
-                coalesce(p.stock_name, o.stock_name) AS stock_name,
-                p.setup_type,
-                p.max_position_pct AS planned_position_pct,
-                p.status AS plan_status,
-                o.execution_status,
-                o.position_pct AS actual_position_pct,
-                o.gross_return_pct,
-                o.net_return_pct,
-                o.outcome_tag,
-                o.mistake_tag,
-                o.review_note,
-                o.imported_from,
-                o.created_at AS outcome_created_at
-            FROM trade_plan p
-            FULL OUTER JOIN operator_trade_outcome o
-                ON p.trade_date = o.trade_date AND p.stock_code = o.stock_code
-            """
-        )
+        con.execute(OPERATOR_PLAN_OUTCOME_VIEW_SQL)
         con.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_watchlist_date_code "
             "ON watchlist(trade_date, stock_code)"

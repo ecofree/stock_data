@@ -9,11 +9,13 @@ the freshness gate used by ``run_integrated_daily.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
 import duckdb
+
+from trade_system.ths_quality import canonical_ths_snapshot
 
 
 PHASES = ("auction", "intraday", "close", "history")
@@ -51,7 +53,9 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
             300,
             "bounded L2 price curves; phase mode never runs full L2",
         ),
-        ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 600, "full-sector capital flow refreshed after L2"),
+        # Keep the sector snapshot inside the 10-minute readiness window even
+        # when L2/quote collection consumes several minutes before the gate.
+        ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 300, "full-sector capital flow refreshed after L2"),
     ),
     "close": (
         ProfileTask("collect_market_context", "KPL market/rise-fall", 3600, "final market snapshot"),
@@ -203,6 +207,21 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
         elif task_name == "refresh_ths_weekly":
             if not _table_exists(con, "history_fetch_checkpoint"):
                 return True, "THS history checkpoint missing"
+            if all(_table_exists(con, name) for name in (
+                "ths_concept_daily",
+                "ths_concept_stock_history",
+                "ths_concept_member_checkpoint",
+            )):
+                canonical = canonical_ths_snapshot(
+                    con, trade_date, minimum_concepts=374
+                )
+                if canonical is None:
+                    return True, "canonical THS snapshot missing or incomplete"
+                fetched = datetime.fromisoformat(canonical["snapshot_date"])
+                age = max(0.0, (current.replace(tzinfo=None) - fetched).total_seconds())
+                if age < task.cadence_seconds:
+                    return False, f"fresh canonical snapshot age={int(age)}s ttl={task.cadence_seconds}s"
+                return True, f"expired canonical snapshot age={int(age)}s ttl={task.cadence_seconds}s"
             row = _latest(
                 con,
                 "SELECT updated_at, status FROM history_fetch_checkpoint "
@@ -253,10 +272,12 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
         status = str(row[1]).lower() if len(row) > 1 and row[1] is not None else ""
         ttl = task.cadence_seconds
         if task_name == "refresh_ths_weekly":
-            # THS web crawl is deliberately weekly.  A partial pagination
-            # result remains visible and can be manually retried, but must not
-            # trigger a full 374+ concept crawl at every daily close.
-            ttl = task.cadence_seconds
+            # A successful THS snapshot is weekly.  Interrupted/partial
+            # snapshots are not successful freshness and must retry on the
+            # next close with the resumable checkpoint, instead of freezing
+            # the project for another seven days.
+            if status in {"partial", "failed", "empty", "stale", "error", "running"}:
+                ttl = max(60, min(ttl // 2, 86400))
         elif status in {"partial", "failed", "empty", "stale", "error", "running"}:
             # Slow weekly sources are normally fetched once per week, but a
             # failed refresh should retry at the next daily close instead of

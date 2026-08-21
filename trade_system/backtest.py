@@ -9,6 +9,7 @@ import duckdb
 
 from trade_system.quality import table_columns, table_exists
 from trade_system.signals import classify_market_regime
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
 def run_market_regime_backtest(db_path: str | Path) -> dict:
@@ -59,11 +60,6 @@ def run_market_regime_backtest(db_path: str | Path) -> dict:
         con.close()
 
 
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params=None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
-
 
 def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = False) -> dict:
     """Backtest actionable stage-v2 signals with stage-appropriate prices.
@@ -103,15 +99,32 @@ def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = Fals
         )
         if not signals:
             return {"sample_count": 0, "stage_counts": {}, "stage_stats": {}, "rows": []}
+        # Never scan the complete daily-history relation for a candidate
+        # backtest.  The production database contains millions of rows while
+        # this report only needs the stocks present in the signal set.  The
+        # old unbounded fetchall() was the direct cause of MemoryError after
+        # several days of accumulated history.
+        stock_codes = sorted({str(row.get("stock_code")) for row in signals if row.get("stock_code") is not None})
+        if not stock_codes:
+            return {
+                "sample_count": len(signals),
+                "stage_counts": {},
+                "stage_stats": {},
+                "rows": [],
+                "excluded_count": len(signals),
+            }
+        code_placeholders = ",".join("?" for _ in stock_codes)
         if table_exists(con, "v_kline_daily"):
             kline_rows = _fetch_dicts(
                 con,
-                """
+                f"""
                 SELECT trade_date, stock_code, open, close
                 FROM v_kline_daily
                 WHERE close IS NOT NULL
+                  AND CAST(stock_code AS VARCHAR) IN ({code_placeholders})
                 ORDER BY stock_code, trade_date
                 """,
+                stock_codes,
             )
         elif table_exists(con, "kline"):
             kline_columns = set(table_columns(con, "kline"))
@@ -126,12 +139,14 @@ def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = Fals
                 SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, {open_expr}, close
                 FROM kline
                 WHERE close IS NOT NULL {ktype_filter}
+                  AND CAST(stock_code AS VARCHAR) IN ({code_placeholders})
                 QUALIFY row_number() OVER (
                     PARTITION BY date, stock_code
                     ORDER BY {order_expr}
                 ) = 1
                 ORDER BY stock_code, date
                 """,
+                stock_codes,
             )
         else:
             kline_rows = []

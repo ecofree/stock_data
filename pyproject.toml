@@ -18,11 +18,46 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.1.1",
+  "ruff>=0.6",
 ]
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [".venv-qlib", "trade_system/vendor", "tmp", "backups"]
+
+[tool.ruff.lint]
+# Correctness rules plus unused-import/variable hygiene (F401/F841).
+# The historical `from base import logger` concern is gone: base.py remains
+# imported everywhere it matters for its logging side effect, and the
+# root collect_*.py shims re-expose implementations via collectors.*.
+select = [
+  "E9",   # syntax-level errors
+  "F63",  # invalid print/str comparisons etc.
+  "F7",   # syntax error in type annotation
+  "F82",  # undefined names
+  "F401", # unused imports
+  "F841", # unused local variables
+]
+
+[tool.mypy]
+# Incremental adoption (not in CI yet): start from the already well-typed
+# core, then widen per-module.  Run: D:\anaconda\python.exe -m mypy trade_system
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+exclude = ["build", ".venv-qlib", "trade_system/vendor"]
+
+[[tool.mypy.overrides]]
+module = [
+  "trade_system.db_utils",
+  "trade_system.cli",
+  "trade_system.migrations",
+  "trade_system.logging_setup",
+  "trade_system.readiness",
+]
+disallow_untyped_defs = true
 
 [tool.setuptools.packages.find]
-include = ["trade_system*"]
+include = ["trade_system*", "collectors*"]

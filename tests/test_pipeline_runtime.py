@@ -9,6 +9,7 @@ from trade_system.pipeline_runtime import (
     PipelineAlreadyRunning,
     PipelineLock,
     RunManifest,
+    reap_stale_run_manifests,
     prune_run_reports,
 )
 
@@ -60,6 +61,59 @@ def test_pipeline_lock_recovers_stale_lock_when_windows_pid_probe_errors(tmp_pat
         assert lock_path.exists()
 
 
+def test_pipeline_lock_recovers_recent_dead_local_process(tmp_path, monkeypatch):
+    db_path = tmp_path / "rebooted.duckdb"
+    db_path.touch()
+    lock_path = db_path.with_name("rebooted.duckdb.pipeline.lock")
+    lock_path.write_text(
+        json.dumps({
+            "run_id": "abandoned-after-reboot",
+            "pid": 999999,
+            "started_at": (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds"),
+            "host": os.environ.get("COMPUTERNAME") or "unknown",
+        }),
+        encoding="utf-8",
+    )
+
+    def dead_kill(*_args):
+        raise ProcessLookupError("dead scheduler child")
+
+    monkeypatch.setattr(os, "kill", dead_kill)
+    with PipelineLock(db_path, "recovered-after-reboot"):
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        assert payload["run_id"] == "recovered-after-reboot"
+
+
+def test_pipeline_lock_recovers_old_malformed_local_lock(tmp_path):
+    db_path = tmp_path / "malformed.duckdb"
+    db_path.touch()
+    lock_path = db_path.with_name("malformed.duckdb.pipeline.lock")
+    lock_path.write_text("{truncated", encoding="utf-8")
+    old = (datetime.now() - timedelta(minutes=5)).timestamp()
+    os.utime(lock_path, (old, old))
+
+    with PipelineLock(db_path, "recovered-malformed"):
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        assert payload["run_id"] == "recovered-malformed"
+
+
+def test_reap_stale_running_manifest_marks_parent_and_running_step_aborted(tmp_path):
+    reports = tmp_path / "reports"
+    manifest = RunManifest(reports, "old-run", "2026-08-11", "auction")
+    manifest.upsert_step("collect", "running", ["python", "collect.py"])
+    old = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    data = json.loads(manifest.path.read_text(encoding="utf-8"))
+    data["started_at"] = old
+    manifest.path.write_text(json.dumps(data), encoding="utf-8")
+
+    reaped = reap_stale_run_manifests(reports, max_age_seconds=120)
+
+    assert reaped == ["old-run"]
+    updated = json.loads(manifest.path.read_text(encoding="utf-8"))
+    assert updated["status"] == "aborted"
+    assert updated["steps"][0]["status"] == "aborted"
+
+
 def test_failed_run_retains_changed_reports_before_restoring_latest(tmp_path):
     reports = tmp_path / "reports"
     reports.mkdir()
@@ -85,6 +139,34 @@ def test_failed_run_retains_changed_reports_before_restoring_latest(tmp_path):
     assert (run_dir / changed.name).read_text(encoding="utf-8") == "partial current run"
     assert (run_dir / created.name).read_text(encoding="utf-8") == '{"status":"partial"}'
     assert not tx.snapshot_dir.exists()
+
+
+def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
+    reports = tmp_path / "reports"
+    staging = reports / ".staging" / "run-one"
+    manifest = RunManifest(reports, "run-one", "2026-08-14", "close")
+    tx = LatestReportTransaction(reports, "run-one", staging)
+    tx.begin()
+    (staging / "daily_review_latest.md").write_text("review", encoding="utf-8")
+    (staging / "daily_review_latest.lazy.js").write_text(
+        "window.__REVIEW_LAZY_DATA__ = {};", encoding="utf-8"
+    )
+    manifest.finish("completed")
+
+    tx.commit(manifest.run_dir)
+
+    pointer = json.loads(
+        (reports / "pipeline_run_latest.json").read_text(encoding="utf-8")
+    )
+    assert pointer["run_id"] == "run-one"
+    assert pointer["trade_date"] == "2026-08-14"
+    assert pointer["phase"] == "close"
+    assert pointer["run_status"] == "completed"
+    assert pointer["artifact_files"] == [
+        "daily_review_latest.lazy.js",
+        "daily_review_latest.md",
+    ]
+    assert (manifest.run_dir / "pipeline_run_latest.json").exists()
 
 
 def test_prune_retains_one_phase_anchor_for_recent_trade_dates(tmp_path):

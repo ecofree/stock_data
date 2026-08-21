@@ -24,8 +24,11 @@ def test_migrated_source_plan_contains_non_tushare_capital_flow_paths():
 
 
 def test_sector_flow_parser_normalizes_all_order_buckets(monkeypatch):
+    # Implementation moved to trade_system.adapters.eastmoney_dc; patch there.
+    from trade_system.adapters import eastmoney_dc
+
     monkeypatch.setattr(
-        stock_data_sources,
+        eastmoney_dc,
         "_em_get_clist_json",
         lambda *args, **kwargs: {"data": {"diff": [{
             "f12": "BK0001", "f14": "测试板块", "f3": 2.5, "f62": 100,
@@ -40,8 +43,12 @@ def test_sector_flow_parser_normalizes_all_order_buckets(monkeypatch):
 
 
 def test_tushare_dc_sector_flow_keeps_yuan_and_direct_net_buckets(monkeypatch):
+    # The implementation lives in trade_system.adapters.kline_sources after
+    # the adapter split; patch it there so the real code path is exercised.
+    from trade_system.adapters import kline_sources
+
     monkeypatch.setattr(
-        stock_data_sources,
+        kline_sources,
         "_tushare_query",
         lambda api, params, fields="": [{
             "trade_date": "20260714", "content_type": "概念", "ts_code": "BK0001.DC",

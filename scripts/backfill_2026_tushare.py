@@ -21,6 +21,7 @@ def main() -> int:
     parser.add_argument("--datasets", default="stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow",
                         help="Comma-separated: stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow")
     parser.add_argument("--max-days", type=int, default=0, help="Limit this invocation; 0 means all open dates.")
+    parser.add_argument("--gap-only", action="store_true", help="Only process dates whose requested dataset is not complete.")
     parser.add_argument("--budget-seconds", type=float, default=300.0)
     parser.add_argument("--request-timeout", type=int, default=20)
     parser.add_argument("--retries", type=int, default=3)
@@ -56,6 +57,7 @@ def main() -> int:
             datasets=datasets,
             max_days=args.max_days or None,
             force=args.force,
+            gap_only=args.gap_only,
             retry_passes=args.retry_passes,
             retry_delay_seconds=args.retry_delay_seconds,
         )

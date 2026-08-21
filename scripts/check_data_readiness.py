@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import datetime
@@ -13,7 +13,7 @@ from trade_system.readiness import assess_trade_date_readiness, render_readiness
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check same-date trading data readiness.")
     parser.add_argument("--db", default="kpl_data.duckdb")
-    parser.add_argument("--date", required=True)
+    parser.add_argument("--trade-date", "--date", dest="trade_date", required=True)
     parser.add_argument(
         "--stage",
         choices=["premarket", "auction", "intraday", "close", "postmarket"],
@@ -36,7 +36,7 @@ def main() -> int:
 
     result = assess_trade_date_readiness(
         args.db,
-        args.date,
+        args.trade_date,
         args.stage,
         max_age_seconds=args.max_age_seconds,
         now=datetime.fromisoformat(args.as_of) if args.as_of else None,
@@ -46,7 +46,11 @@ def main() -> int:
     out.write_text(render_readiness_markdown(result), encoding="utf-8")
     print(
         f"trade_date={result['trade_date']} stage={result['stage']} "
-        f"analytics_ready={str(result.get('analytics_ready', result['ready'])).lower()} "
+        f"source_ready={str(result.get('source_ready', result['ready'])).lower()} "
+        f"pipeline_ready={str(result.get('pipeline_ready', False)).lower()} "
+        f"data_certified_ready={str(result.get('data_certified_ready', False)).lower()} "
+        f"flow_certified_ready={str(result.get('flow_certified_ready', 'not_assessed')).lower()} "
+        f"analysis_ready={str(result.get('analysis_ready', False)).lower()} "
         f"execution_ready={str(result.get('execution_ready', False)).lower()} "
         f"actionable_candidates={result.get('actionable_candidates', 0)} "
         f"tradable_candidates={result.get('tradable_candidates', 0)} "
@@ -54,7 +58,7 @@ def main() -> int:
         f"executable_candidates={result.get('executable_candidates', 0)} "
         f"missing={','.join(result['missing_groups']) or 'none'} out={out}"
     )
-    return 0 if result["ready"] or args.report_only else 2
+    return 0 if result.get("source_ready", result["ready"]) or args.report_only else 2
 
 
 if __name__ == "__main__":

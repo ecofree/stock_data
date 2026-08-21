@@ -60,6 +60,9 @@ def test_evaluate_qlib_shadow_uses_next_close_without_affecting_signals(tmp_path
 
     assert result["sample_count"] == 2
     assert result["models"]["shadow.alstm"]["hit_rate"] == 50.0
+    assert result["models"]["shadow.alstm"]["ic"] == 1.0
+    assert result["models"]["shadow.alstm"]["rank_ic"] == 1.0
+    assert result["models"]["shadow.alstm"]["top_bottom_spread"] == 20.0
     con = duckdb.connect(str(db_path))
     try:
         assert con.execute("SELECT count(*) FROM qlib_shadow_evaluation").fetchone()[0] == 1

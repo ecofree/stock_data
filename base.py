@@ -1,4 +1,5 @@
 """HTTP client and DuckDB store for KPL data collection."""
+import contextlib
 import json
 import time
 import logging
@@ -53,10 +54,29 @@ def connect_duckdb(db_path=None, *, read_only=False):
         "temp_directory": DUCKDB_TEMP_DIR,
     }
     try:
-        return duckdb.connect(path, read_only=read_only, config=config)
+        conn = duckdb.connect(path, read_only=read_only, config=config)
     except TypeError:
         # Older duckdb without the config kwarg: fall back to a bare connection.
-        return duckdb.connect(path, read_only=read_only)
+        conn = duckdb.connect(path, read_only=read_only)
+    _attach_cold_storage(conn)
+    return conn
+
+
+def _attach_cold_storage(conn):
+    """Optionally ATTACH the cold-storage database as ``cold``.
+
+    Opt-in via ``KPL_COLD_DB_PATH``; see scripts/split_cold_storage.py.
+    Views in the main database may reference ``cold.<table>`` so historical
+    partitions stay queryable transparently once this is enabled.
+    """
+    cold_path = os.environ.get("KPL_COLD_DB_PATH", "").strip()
+    if not cold_path or not os.path.exists(cold_path):
+        return
+    try:
+        cold_lit = cold_path.replace("'", "''")
+        conn.execute(f"ATTACH '{cold_lit}' AS cold (READ_ONLY)")
+    except Exception as exc:
+        logger.warning("could not attach cold storage %s: %s", cold_path, exc)
 
 
 class KPLClient:
@@ -378,6 +398,27 @@ class DuckDBStore:
             self.conn.execute(sql, params)
         else:
             self.conn.execute(sql)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Explicit transaction scope for multi-statement writes.
+
+        DuckDB autocommits every statement, so a DELETE-then-INSERT pair that
+        crashes in between silently drops the day's data.  Wrap such pairs in
+        ``with store.transaction():`` to make them all-or-nothing.  Nested
+        transactions are not supported by DuckDB and raise from the driver.
+        """
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            yield self.conn
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                logger.warning("rollback failed after failed transaction", exc_info=True)
+            raise
+        else:
+            self.conn.execute("COMMIT")
 
     def fetchall(self, sql, params=None):
         if params:

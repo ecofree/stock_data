@@ -21,6 +21,7 @@ def test_intraday_plan_excludes_after_close_fanout():
         "collect_realtime_limit_pool",
         "collect_intraday_stock_flow_market",
         "collect_l2_focus",
+        "repair_critical_integrity_pre_sector",
         "collect_intraday_sector_flow_full",
         "derive_market_context",
         "build_normalized_views",
@@ -31,6 +32,7 @@ def test_intraday_plan_excludes_after_close_fanout():
         "generate_intraday_stage_signals",
         "run_daily_operator_loop",
         "check_data_readiness",
+        "audit_p3_candidates",
         "generate_web_dashboard",
         "generate_trading_terminal",
     ]
@@ -52,7 +54,7 @@ def test_fresh_intraday_snapshots_are_not_due(tmp_path):
     con.execute("CREATE TABLE intraday_sector_flow_batch(trade_date DATE, updated_at TIMESTAMP, status VARCHAR)")
     con.execute("INSERT INTO realtime_candidate_pool_snapshot VALUES ('2026-07-15', '2026-07-15 10:59:00', 'success')")
     con.execute("INSERT INTO intraday_stock_flow_batch VALUES ('2026-07-15', '2026-07-15 10:57:00', 'success')")
-    con.execute("INSERT INTO intraday_sector_flow_batch VALUES ('2026-07-15', '2026-07-15 10:56:00', 'partial')")
+    con.execute("INSERT INTO intraday_sector_flow_batch VALUES ('2026-07-15', '2026-07-15 10:58:00', 'partial')")
     con.close()
     now = datetime(2026, 7, 15, 11, 0)
     assert task_due(db, "2026-07-15", "collect_realtime_limit_pool", now=now)[0] is False
@@ -142,12 +144,14 @@ def test_ths_weekly_gate_uses_latest_attempt_status(tmp_path):
     )
     assert due is False
     assert "status=failed" in reason
-    assert task_due(
+    due_retry, retry_reason = task_due(
         db,
         "2026-07-16",
         "refresh_ths_weekly",
         now=datetime(2026, 7, 17, 10, 0),
-    )[0] is False
+    )
+    assert due_retry is True
+    assert "expired" in retry_reason
     assert task_due(
         db,
         "2026-07-16",

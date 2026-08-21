@@ -58,6 +58,42 @@ def test_generate_signals_creates_market_regime_and_sector_scores(tmp_path):
     assert sector[1] > 0
 
 
+def test_generate_signals_repeated_replace_keeps_one_consistent_snapshot(tmp_path):
+    db_path = tmp_path / "repeated.duckdb"
+    make_signal_db(db_path)
+    build_normalized_views(str(db_path))
+
+    for _ in range(20):
+        generate_signals(str(db_path), "2026-07-06")
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        counts = {
+            table: con.execute(
+                f"SELECT count(*) FROM {table} WHERE trade_date='2026-07-06'"
+            ).fetchone()[0]
+            for table in (
+                "market_regime_snapshot",
+                "sector_rotation_score",
+                "stock_candidate_score",
+                "alert_events",
+            )
+        }
+        indexes = {
+            row[0]
+            for row in con.execute("SELECT index_name FROM duckdb_indexes() WHERE index_name LIKE 'uq_%'").fetchall()
+        }
+    finally:
+        con.close()
+
+    assert counts["market_regime_snapshot"] == 1
+    assert counts["sector_rotation_score"] == 1
+    assert counts["stock_candidate_score"] == 0
+    assert "uq_market_regime_date" in indexes
+    assert "uq_sector_rotation_date_code" in indexes
+    assert "uq_candidate_date_code" in indexes
+
+
 def test_init_trading_tables_creates_operator_tables(tmp_path):
     db_path = tmp_path / "sample.duckdb"
     init_trading_tables(str(db_path))

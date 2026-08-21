@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import duckdb
 
 import trade_system.ths_history as ths_history
@@ -118,6 +119,40 @@ def test_ths_snapshot_aggregates_concepts_and_members(tmp_path):
         assert con.execute("select concept_code from ths_concept_daily where concept_name='银行'").fetchone()[0] == _concept_code("银行")
     finally:
         con.close()
+
+
+def test_ths_recovery_skips_cached_stale_boards_by_default(tmp_path, monkeypatch):
+    db = tmp_path / "ths-stale-recovery.duckdb"
+    catalog = [("300001", "板块一"), ("300002", "板块二")]
+    monkeypatch.setattr(ths_history, "_ths_catalog", lambda: catalog)
+    calls = []
+
+    def fake_members(code, _max_pages):
+        calls.append(code)
+        return ([{"code": "000001", "name": "平安银行"}], 1, 1)
+
+    monkeypatch.setattr(ths_history, "_ths_detail_members_with_meta", fake_members)
+    with THSConceptHistoryCollector(db, mode="full", max_member_pages=0) as collector:
+        catalog_hash = hashlib.sha256("300001|板块一\n300002|板块二".encode("utf-8")).hexdigest()
+        collector.store.conn.execute(
+            "INSERT INTO ths_concept_member_checkpoint "
+            "(trade_date,concept_code,concept_name,status,pages_expected,pages_fetched,member_rows,provider,crawler_version,catalog_hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ["2026-07-14", "THS-300001", "板块一", "success_stale", 1, 1, 1,
+             "ths_cached_weekly", "ths_web_v2", catalog_hash],
+        )
+        collector.store.conn.execute(
+            "INSERT INTO ths_concept_daily(trade_date,concept_code,concept_name,rank,stock_count,source,raw_json,date_verified) "
+            "VALUES ('2026-07-14','THS-300001','板块一',1,1,'ths_cached_weekly','{}',false)"
+        )
+        collector.store.conn.execute(
+            "INSERT INTO ths_concept_stock_history(trade_date,concept_code,concept_name,stock_code,stock_name,concept_rank,source,raw_json,date_verified) "
+            "VALUES ('2026-07-14','THS-300001','板块一','000001','平安银行',1,'ths_cached_weekly','{}',false)"
+        )
+        collector.store.conn.commit()
+        result = collector.collect_snapshot("2026-07-14", force=False)
+    assert result["status"] == "partial"
+    assert calls == ["300002"]
 
 
 def test_ths_run_reports_unavailable_history(tmp_path):

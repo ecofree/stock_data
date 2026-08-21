@@ -74,13 +74,33 @@ def ensure_qlib_shadow_tables(db_path: str | Path) -> None:
                 sample_count INTEGER,
                 ic DOUBLE,
                 rank_ic DOUBLE,
+                avg_forward_return DOUBLE,
                 top_quantile_return DOUBLE,
                 bottom_quantile_return DOUBLE,
+                top_bottom_spread DOUBLE,
                 hit_rate DOUBLE,
+                top_hit_rate DOUBLE,
+                daily_top_hit_rate DOUBLE,
                 max_drawdown DOUBLE
             )
             """
         )
+        for column, kind in (
+            ("avg_forward_return", "DOUBLE"),
+            ("avg_net_return", "DOUBLE"),
+            ("top_bottom_spread", "DOUBLE"),
+            ("net_top_bottom_spread", "DOUBLE"),
+            ("top_quantile_net_return", "DOUBLE"),
+            ("bottom_quantile_net_return", "DOUBLE"),
+            ("top_hit_rate", "DOUBLE"),
+            ("daily_top_hit_rate", "DOUBLE"),
+            ("evaluation_method", "VARCHAR"),
+            ("quantile", "DOUBLE"),
+            ("updated_at", "TIMESTAMP"),
+        ):
+            con.execute(
+                f"ALTER TABLE qlib_shadow_evaluation ADD COLUMN IF NOT EXISTS {column} {kind}"
+            )
         if _relation_exists(con, "strategy_scan_result"):
             con.execute(
                 """
@@ -205,5 +225,55 @@ def import_qlib_predictions(
                 con.execute("SELECT count(*) FROM qlib_prediction WHERE model_id = ?", [model_id]).fetchone()[0]
             ),
         }
+    finally:
+        con.close()
+
+
+def import_qlib_predictions_for_date(
+    db_path: str | Path,
+    *,
+    model_id: str,
+    trade_date: str,
+    rows: list[dict[str, Any]],
+    predict_horizon: str = "t1_exec",
+) -> int:
+    """Replace one prediction date while preserving the model registry.
+
+    Daily inference must not delete historical predictions or downgrade a
+    champion's registry status.  This helper is intentionally date-scoped.
+    """
+    ensure_qlib_shadow_tables(db_path)
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            "DELETE FROM qlib_prediction WHERE model_id = ? AND trade_date = ?",
+            [model_id, str(trade_date)],
+        )
+        values = []
+        for row in rows:
+            payload = dict(row)
+            values.append([
+                str(trade_date),
+                str(payload.get("symbol", "")),
+                model_id,
+                float(payload.get("score", 0.0) or 0.0),
+                int(payload.get("rank", 0) or 0),
+                str(payload.get("horizon", predict_horizon)),
+                _hash_payload(payload),
+            ])
+        if values:
+            import pandas as pd
+
+            batch = pd.DataFrame(values, columns=PREDICTION_COLUMNS)
+            con.register("_qlib_prediction_daily_batch", batch)
+            try:
+                con.execute(
+                    "INSERT INTO qlib_prediction "
+                    "SELECT trade_date, symbol, model_id, score, rank, horizon, prediction_payload_hash "
+                    "FROM _qlib_prediction_daily_batch"
+                )
+            finally:
+                con.unregister("_qlib_prediction_daily_batch")
+        return len(values)
     finally:
         con.close()

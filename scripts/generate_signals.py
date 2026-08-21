@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -12,7 +12,7 @@ from trade_system.signals import generate_signals
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate trading signal tables.")
     parser.add_argument("--db", default="kpl_data.duckdb")
-    parser.add_argument("--date")
+    parser.add_argument("--trade-date", "--date", dest="trade_date")
     parser.add_argument(
         "--allow-partial",
         action="store_true",
@@ -31,7 +31,7 @@ def main() -> int:
     args = parser.parse_args()
     result = generate_signals(
         args.db,
-        args.date,
+        args.trade_date,
         require_ready=args.require_ready and not args.allow_partial,
         readiness_stage=args.readiness_stage,
     )

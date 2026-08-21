@@ -58,6 +58,29 @@ UNIQUE_INDEX_SPECS = (
     ),
 )
 
+# These indexes protect the small, frequently replaced signal snapshots.  They
+# are intentionally rebuilt on each integrity pass: DuckDB can retain an index
+# catalog entry after a failed delete, while ``CREATE ... IF NOT EXISTS`` then
+# incorrectly treats the damaged index as healthy.
+SIGNAL_INDEX_NAMES = {
+    "uq_market_regime_date",
+    "uq_sector_rotation_date_code",
+    "uq_candidate_date_code",
+    "uq_stage_signal_date_stage_code",
+}
+
+# These are non-unique operational indexes.  They are deliberately rebuilt on
+# every integrity pass because DuckDB may retain a damaged index catalog entry
+# after an interrupted DELETE/INSERT cycle.  A later CREATE INDEX IF NOT
+# EXISTS would otherwise keep treating the broken index as healthy.
+REBUILDABLE_INDEX_SPECS = (
+    (
+        "idx_intraday_sector_batch_date_updated",
+        "intraday_sector_flow_batch",
+        ("trade_date", "updated_at"),
+    ),
+)
+
 
 def normalize_kline_periods(db_path: str | Path) -> dict[str, int]:
     con = duckdb.connect(str(db_path))
@@ -224,13 +247,39 @@ def ensure_unique_indexes(db_path: str | Path) -> list[str]:
             if not set(columns) <= existing:
                 continue
             column_sql = ", ".join(f'"{column}"' for column in columns)
-            con.execute(
-                f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" ON "{table}" ({column_sql})'
-            )
+            if index_name in SIGNAL_INDEX_NAMES:
+                # Rebuild rather than trusting a catalog entry left by a
+                # failed DELETE/INSERT cycle.  This is safe here because the
+                # caller has already run the business-key dedupe pass.
+                con.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+                create_sql = f'CREATE UNIQUE INDEX "{index_name}" ON "{table}" ({column_sql})'
+            else:
+                create_sql = f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" ON "{table}" ({column_sql})'
+            con.execute(create_sql)
             created.append(index_name)
     finally:
         con.close()
     return created
+
+
+def rebuild_operational_indexes(db_path: str | Path) -> list[str]:
+    """Rebuild non-unique indexes whose writers replace same-day snapshots."""
+    con = duckdb.connect(str(db_path))
+    rebuilt: list[str] = []
+    try:
+        for index_name, table, columns in REBUILDABLE_INDEX_SPECS:
+            if not table_exists(con, table):
+                continue
+            existing = set(table_columns(con, table))
+            if not set(columns) <= existing:
+                continue
+            column_sql = ", ".join(f'"{column}"' for column in columns)
+            con.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+            con.execute(f'CREATE INDEX "{index_name}" ON "{table}" ({column_sql})')
+            rebuilt.append(index_name)
+    finally:
+        con.close()
+    return rebuilt
 
 
 def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dict:
@@ -276,6 +325,7 @@ def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dic
         finally:
             con.close()
         indexes = ensure_unique_indexes(db_path)
+        indexes.extend(rebuild_operational_indexes(db_path))
     else:
         indexes = []
 

@@ -17,6 +17,7 @@ import duckdb
 
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
+from trade_system.gate_contract import build_operator_state
 
 
 def _normalize_trade_date(value: str) -> str:
@@ -369,6 +370,11 @@ def assess_trade_date_readiness(
     # readiness when an operator reviews a weekend or historical audit.
     now = as_local_naive(now) or datetime.now()
     selected_groups = tuple(required_groups or STAGE_REQUIREMENTS.get(stage, STAGE_REQUIREMENTS["close"]))
+    # Postmarket is a completed-session review.  Its evidence contract is
+    # exact trade-date coverage plus a timestamp from the same local date;
+    # applying the intraday two-hour TTL after the close incorrectly turns a
+    # valid 17:30 snapshot into a blocker when the report is opened later.
+    freshness_max_age_seconds = None if stage == "postmarket" else max_age_seconds
     owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
     con = duckdb.connect(str(db_path), read_only=True) if owns_connection else db_path
     try:
@@ -381,7 +387,7 @@ def assess_trade_date_readiness(
                         con,
                         name,
                         trade_date,
-                        max_age_seconds=max_age_seconds,
+                        max_age_seconds=freshness_max_age_seconds,
                         now=now,
                     ),
                     "evidence_trade_date": trade_date,
@@ -525,6 +531,77 @@ def assess_trade_date_readiness(
                 if not semantic["ready"]:
                     group_results[-1]["ready"] = False
                     group_results[-1]["status"] = "invalid"
+            if group_name == "kline" and table_exists(con, "tushare_stock_basic"):
+                expected = int(con.execute(
+                    "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
+                ).fetchone()[0] or 0)
+                selected = group_results[-1].get("selected_relation")
+                selected_rows = next(
+                    (int(item.get("rows") or 0) for item in relations if item.get("relation") == selected),
+                    0,
+                )
+                minimum = max(1000, int(expected * 0.99 + 0.9999)) if expected >= 1000 else 1
+                if expected >= 1000 and selected_rows < minimum:
+                    group_results[-1]["ready"] = False
+                    group_results[-1]["status"] = "partial"
+                    group_results[-1]["coverage_pct"] = round(selected_rows * 100.0 / expected, 4)
+                    group_results[-1]["expected_rows"] = expected
+                    group_results[-1]["observed_rows"] = selected_rows
+        # A close review needs a completed daily OHLC snapshot, not merely an
+        # intraday/fallback kline.  Minimal unit-test databases may not have the
+        # TuShare staging table; production databases do, so a stale source is
+        # explicitly exposed as a separate blocking group.
+        if stage in {"close", "postmarket"} and table_exists(con, "tushare_daily"):
+            close_source = relation_freshness(
+                con,
+                "tushare_daily",
+                trade_date,
+                max_age_seconds=freshness_max_age_seconds,
+                now=now,
+            )
+            expected = int(con.execute(
+                "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
+            ).fetchone()[0] or 0) if table_exists(con, "tushare_stock_basic") else 0
+            certification = None
+            if table_exists(con, "close_snapshot_certification"):
+                certification = con.execute(
+                    "SELECT status,expected_rows,observed_rows,distinct_codes,invalid_rows,coverage_pct,error_message "
+                    "FROM close_snapshot_certification WHERE dataset='daily' AND trade_date=CAST(? AS DATE) "
+                    "AND provider='tushare'",
+                    [trade_date],
+                ).fetchone()
+            if certification:
+                cert_status, cert_expected, cert_observed, cert_distinct, cert_invalid, cert_coverage, cert_error = certification
+                close_source["certification"] = {
+                    "status": cert_status,
+                    "expected_rows": cert_expected,
+                    "observed_rows": cert_observed,
+                    "distinct_codes": cert_distinct,
+                    "invalid_rows": cert_invalid,
+                    "coverage_pct": cert_coverage,
+                    "error_message": cert_error,
+                }
+                if str(cert_status) != "certified":
+                    close_source["status"] = "uncertified"
+            elif expected >= 1000:
+                observed = int(close_source.get("rows") or 0)
+                minimum = max(1000, int(expected * 0.99 + 0.9999))
+                close_source["coverage_pct"] = round(observed * 100.0 / expected, 4)
+                close_source["expected_rows"] = expected
+                close_source["observed_rows"] = observed
+                if observed < minimum:
+                    close_source["status"] = "partial"
+            group_results.append(
+                {
+                    "group": "close_source",
+                    "ready": close_source.get("status") == "ready" and close_source.get("rows", 0) > 0
+                    and (not certification or str(certification[0]) == "certified"),
+                    "status": close_source.get("status"),
+                    "selected_relation": "tushare_daily",
+                    "context_trade_date": None,
+                    "relations": [close_source],
+                }
+            )
     finally:
         if owns_connection:
             con.close()
@@ -590,18 +667,34 @@ def assess_trade_date_readiness(
         risk_approved_candidates,
         executable_candidates,
     ) = candidate_counts
-    analytics_ready = not missing
+    source_ready = not missing
+    # Capital-flow certification is a hard operational input.  There is no
+    # third "not assessed" ready state in the daily report: when the
+    # independent reconciliation has not run, the result is explicitly false
+    # and the operator state stays blocked/uncertified.
+    pipeline_ready = source_ready
+    artifact_current = True
+    operator_state = build_operator_state(
+        source_ready=source_ready,
+        pipeline_ready=pipeline_ready,
+        artifact_current=artifact_current,
+        data_certified_ready=source_ready and pipeline_ready and artifact_current,
+        flow_certified_ready=False,
+        execution_ready=executable_candidates > 0,
+        run_status="not_run",
+        blockers=missing,
+    )
     return {
+        **operator_state,
+        "operator_state": dict(operator_state),
         "trade_date": trade_date,
         "stage": stage,
         "as_of": now.isoformat(sep=" ", timespec="seconds"),
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
-        # ``ready`` stays the data-readiness gate (drives pipeline exit codes); the
-        # analytics/execution split below is the operator-facing clarification.
-        "ready": analytics_ready,
-        "analytics_ready": analytics_ready,
-        # Entry-ready only when same-session executable evidence exists.
-        "execution_ready": executable_candidates > 0,
+        "freshness_contract": (
+            "same_trade_date_after_close"
+            if stage == "postmarket" else "timestamp_ttl"
+        ),
         "actionable_candidates": actionable_candidates,
         "tradable_candidates": tradable_candidates,
         "risk_approved_candidates": risk_approved_candidates,
@@ -624,7 +717,12 @@ def render_readiness_markdown(result: dict) -> str:
         f"- Trade date: `{result['trade_date']}`",
         f"- Stage: `{result['stage']}`",
         f"- As of: `{result.get('as_of') or 'runtime clock'}`",
-        f"- Analytics ready: `{str(analytics_ready).lower()}`",
+        f"- Source ready: `{str(result.get('source_ready', analytics_ready)).lower()}`",
+        f"- Pipeline ready: `{str(result.get('pipeline_ready', analytics_ready)).lower()}`",
+        f"- Artifact current: `{str(result.get('artifact_current', False)).lower()}`",
+        f"- Data certified ready: `{str(result.get('data_certified_ready', False)).lower()}`",
+        f"- Flow certified ready: `{str(result.get('flow_certified_ready', 'not_assessed')).lower()}`",
+        f"- Analysis ready: `{str(result.get('analysis_ready', analytics_ready)).lower()}`",
         f"- Execution ready: `{str(execution_ready).lower()}`",
         f"- Actionable candidates: `{actionable_candidates}`",
         f"- Tradable candidates: `{tradable_candidates}`",

@@ -80,19 +80,27 @@ def collect_realtime_limit_pool(db_path: str | Path, trade_date: str) -> dict:
             if rows:
                 con = duckdb.connect(str(db_path))
                 try:
-                    con.execute("DELETE FROM eastmoney_limit_up_pool WHERE date=?", [trade_date])
-                    con.executemany(
-                        "INSERT INTO eastmoney_limit_up_pool "
-                        "(date,board_level,stock_code,stock_name,limit_up_time,fetched_at,raw_json) "
-                        "VALUES (?,?,?,?,?,current_timestamp,?)",
-                        [
-                            [trade_date, int(row.get("limit_days") or 1), str(row.get("code") or ""),
-                             row.get("name") or "", row.get("last_seal") or row.get("first_seal") or "",
-                             json.dumps(row, ensure_ascii=False)]
-                            for row in rows if str(row.get("code") or "").isdigit()
-                        ],
-                    )
-                    con.commit()
+                    con.execute("BEGIN TRANSACTION")
+                    try:
+                        con.execute("DELETE FROM eastmoney_limit_up_pool WHERE date=?", [trade_date])
+                        con.executemany(
+                            "INSERT INTO eastmoney_limit_up_pool "
+                            "(date,board_level,stock_code,stock_name,limit_up_time,fetched_at,raw_json) "
+                            "VALUES (?,?,?,?,?,current_timestamp,?)",
+                            [
+                                [trade_date, int(row.get("limit_days") or 1), str(row.get("code") or ""),
+                                 row.get("name") or "", row.get("last_seal") or row.get("first_seal") or "",
+                                 json.dumps(row, ensure_ascii=False)]
+                                for row in rows if str(row.get("code") or "").isdigit()
+                            ],
+                        )
+                        con.execute("COMMIT")
+                    except Exception:
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
                 finally:
                     con.close()
                 fetched_count = len({str(row.get("code")) for row in rows if row.get("code")})

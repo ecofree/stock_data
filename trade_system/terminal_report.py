@@ -16,12 +16,14 @@ import json
 import os
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
 
 import duckdb
 
 from trade_system.signals import classify_market_regime
 from trade_system.readiness import assess_trade_date_readiness
+from trade_system.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 _ECHARTS_CDN = ('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js">'
                 '</script>')
@@ -567,8 +569,8 @@ def _data_health(con, trade_date: str, db_path) -> dict:
     try:
         from trade_system.data_chain import assess_data_chains
         out["chains"] = assess_data_chains(db_path)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("assess_data_chains failed; data-health panel degraded: %s", exc)
     recon = _q(con,
         "SELECT status, reference_rows, primary_provider, reference_provider, overlap_reference_pct "
         "FROM intraday_stock_flow_reconciliation WHERE CAST(trade_date AS VARCHAR)=? LIMIT 1",
@@ -1053,7 +1055,6 @@ def _candidates_section(cand: dict) -> str:
         row for row in actionable if not row.get("executable")
     ]
     blocked = cand.get("blocked", [])
-    reasons = cand.get("block_reasons", {})
     pool = cand.get("pool_size")
     evaluated = cand.get("evaluated", 0)
     close_passed = cand.get("close_passed")
@@ -1162,7 +1163,6 @@ def _plan_console_section(pc: dict) -> str:
         return ""
     risk_html = ""
     if risk:
-        defensive = risk.get("state") in ("defensive", "reduce", "offensive")
         risk_html = (
             '<div class="panel risk-card reveal"><div class="panel-head"><h3>风险态</h3>'
             f'{_badge(risk.get("state") or "", "b-warn" if risk.get("state") == "defensive" else "b-ok")}</div>'
@@ -2125,7 +2125,7 @@ def _echarts_script_tag(out_path: Path) -> str:
             local = f'<script src="{rel}"></script>'
             fallback = ('<script>window.echarts||document.write('
                         "'<script src=\"https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js\"><\\/script>')"
-                        ')</script>')
+                        '</script>')
             return local + fallback
     return _ECHARTS_CDN
 

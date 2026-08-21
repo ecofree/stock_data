@@ -49,6 +49,7 @@ def test_daily_review_report_contains_operator_required_sections(tmp_path):
 
     assert context["trade_date"] == "2026-07-06"
     for section in [
+        "今日裁决",
         "Market Regime",
         "Capital Flow Coverage",
         "Individual Stock Main-Net Inflow Top 50",

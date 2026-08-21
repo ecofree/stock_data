@@ -32,6 +32,10 @@ def main() -> int:
                         help="Maximum unfinished boards per invocation; 0 processes all unfinished boards (weekly job can resume checkpoints).")
     parser.add_argument("--member-source", choices=("web", "tushare"), default="web",
                         help="web crawls the THS concept pages (project default); tushare is explicit opt-in.")
+    parser.add_argument("--snapshot-date", default="",
+                        help="Resume a specific stored snapshot date (YYYYMMDD). Use only for an interrupted/partial checkpoint; it is never marked as date-verified unless it is today.")
+    parser.add_argument("--retry-stale", action="store_true",
+                        help="Retry success_stale boards too; default recovery skips cached boards and focuses on missing/error checkpoints.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--report", default="reports/ths_2026_concepts_latest.md")
     args = parser.parse_args()
@@ -39,11 +43,13 @@ def main() -> int:
     with THSConceptHistoryCollector(args.db, period=args.period, mode=args.mode,
                                     max_member_pages=args.max_member_pages,
                                     member_source=args.member_source,
-                                    max_concepts=args.max_concepts) as collector:
+                                    max_concepts=args.max_concepts,
+                                    retry_stale=args.retry_stale) as collector:
         # The collector intentionally stores only today's fetched snapshot;
         # the requested range is used to enumerate historical missing dates.
         collector.period = args.period
-        result = collector.run(args.start_date, args.end_date, force=args.force)
+        result = collector.run(args.start_date, args.end_date, force=args.force,
+                               snapshot_date=args.snapshot_date or None)
     report = render_report(args.db, result, args.report)
     snapshot = result["snapshot"]
     print(

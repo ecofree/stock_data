@@ -19,6 +19,7 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "ensure_operational_indexes",
         "audit_multisource_readiness",
         "audit_stock_flow_contract",
+        "reconcile_independent_stock_flow",
         "build_operator_views",
         "build_auction_evidence",
         "check_capital_flow_health",
@@ -37,10 +38,14 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "build_research_snapshot",
         "run_strategy_scan",
         "run_strategy_result_backtest",
+        "build_flow_features",
+        "export_qlib_features_close",
         "evaluate_qlib_shadow",
+        "run_qlib_daily",
         "generate_operator_reports",
         "generate_daily_review",
         "generate_daily_review_web",
+        "build_ai_review_snapshot",
         "audit_p0_p3_acceptance",
         "audit_p3_candidates",
         "report_real_data_backfill",
@@ -203,6 +208,16 @@ def test_acceptance_audit_is_informational_and_does_not_red_flag_data_run():
     assert "audit_p0_p3_acceptance" in INFORMATIONAL_REVIEW_STEPS
 
 
+def test_northbound_is_optional_close_capability():
+    from scripts.run_integrated_daily import (
+        DEGRADABLE_EXTERNAL_STEPS,
+        OPTIONAL_CLOSE_STEPS,
+    )
+
+    assert "collect_northbound_daily" in OPTIONAL_CLOSE_STEPS
+    assert "collect_northbound_daily" not in DEGRADABLE_EXTERNAL_STEPS
+
+
 def test_integrated_collection_exits_before_network_on_verified_holiday(
     tmp_path, monkeypatch, capsys
 ):
@@ -277,13 +292,15 @@ def test_manifest_finish_persists_informational_warnings(tmp_path):
 
 
 def test_close_tushare_sync_uses_gapfill_lookback():
-    """P0#2: the close-phase TuShare sync scans a lookback window with --max-days 0 so
-    recent missing sessions are backfilled (the history checkpoint skips dates that
-    are already synced)."""
+    """P0#2: close keeps a lookback query but processes only the newest open day.
+
+    Older gaps belong to the explicit history phase; the close budget first
+    guarantees today's close snapshot.
+    """
     steps = command_plan("sample.duckdb", "2026-07-28", include_collection=True, phase="close")
     by_name = {name: cmd for name, cmd, _ in steps}
     cmd = by_name["sync_tushare_close"]
-    assert cmd[cmd.index("--max-days") + 1] == "0"
+    assert cmd[cmd.index("--max-days") + 1] == "1"
     assert cmd[cmd.index("--end-date") + 1] == "20260728"
     # The start date precedes the trade date (a lookback window, not a single day).
     assert cmd[cmd.index("--start-date") + 1] < "20260728"
@@ -300,18 +317,28 @@ def test_close_plan_chains_isolate_research_and_review():
 
     assert "evaluate_qlib_shadow" in RESEARCH_CHAIN_STEPS
     assert "run_strategy_scan" in RESEARCH_CHAIN_STEPS
+    assert "reconcile_independent_stock_flow" in RESEARCH_CHAIN_STEPS
     assert "generate_web_dashboard" in REVIEW_CHAIN_STEPS
     assert "generate_daily_review" in REVIEW_CHAIN_STEPS
     # DATA steps are in neither chain (fail-fast).
     assert "repair_critical_integrity" not in RESEARCH_CHAIN_STEPS | REVIEW_CHAIN_STEPS
     assert "build_normalized_views" not in RESEARCH_CHAIN_STEPS | REVIEW_CHAIN_STEPS
-    # The close plan contains both research and review steps.
+    # Close now publishes the operational review without the optional research
+    # chain; research remains an explicit compatibility opt-in.
     names = {
         name for name, _, _ in command_plan(
             "sample.duckdb", "2026-07-28", include_collection=True, phase="close")
     }
-    assert "evaluate_qlib_shadow" in names
+    assert "evaluate_qlib_shadow" not in names
+    assert "build_flow_features" not in names
+    assert "build_ai_review_snapshot" not in names
     assert "generate_web_dashboard" in names
+    research_names = {
+        name for name, _, _ in command_plan(
+            "sample.duckdb", "2026-07-28", include_collection=True,
+            phase="close", include_research=True)
+    }
+    assert {"evaluate_qlib_shadow", "build_flow_features", "build_ai_review_snapshot"} <= research_names
 
 
 def test_close_readiness_gate_is_tightened_to_2h():

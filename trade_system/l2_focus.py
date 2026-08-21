@@ -1,4 +1,4 @@
-"""Bounded L2 stock-curve collection for operator candidates.
+﻿"""Bounded L2 stock-curve collection for operator candidates.
 
 Production phase mode only runs ``fetch_all.py --only-market``, which never
 reaches ``collect_all_l2``.  That froze ``l2_stock_intraday`` at an old date.
@@ -17,9 +17,8 @@ import duckdb
 
 from base import DuckDBStore, KPLClient, logger
 from collect_l2 import collect_l2_stock_bigorder, collect_l2_stock_intraday
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.executable_quotes import candidate_codes_for_quotes
-from trade_system.quality import table_exists
 
 
 def _compact_date(value: Any) -> str:

@@ -8,6 +8,7 @@ from pathlib import Path
 import duckdb
 
 from base import connect_duckdb
+from trade_system.gate_contract import build_operator_state
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
 
@@ -340,7 +341,34 @@ def assess_capital_flow_health(
         and independent_source_present
         and independent_status.lower() == "pass"
     )
+    source_ready = stock_ready and sector_ready
+    # Coverage is a source/pipeline property.  Independent reconciliation is a
+    # certification property and must not be hidden behind the same ``ready``
+    # label used by collectors.
+    pipeline_ready = source_ready
+    artifact_current = True
+    flow_certified_ready = independent_reconciliation_ready and not sector_taxonomy_stale
+    operator_state = build_operator_state(
+        source_ready=source_ready,
+        pipeline_ready=pipeline_ready,
+        artifact_current=artifact_current,
+        data_certified_ready=source_ready and pipeline_ready and artifact_current,
+        flow_certified_ready=flow_certified_ready,
+        execution_ready=False,
+        run_status="assessed",
+        blockers=(
+            (["stock_flow_not_ready"] if not stock_ready else [])
+            + (["sector_flow_not_ready"] if not sector_ready else [])
+        ),
+        warnings=(
+            (["sector_taxonomy_stale"] if sector_taxonomy_stale else [])
+            + (["independent_flow_reconciliation_not_ready"]
+               if not independent_reconciliation_ready else [])
+        ),
+    )
     return {
+        **operator_state,
+        "operator_state": dict(operator_state),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "trade_date": trade_date,
         "collection_started_at": collected_after.isoformat(timespec="seconds")
@@ -348,7 +376,6 @@ def assess_capital_flow_health(
         else None,
         "min_coverage_pct": float(min_coverage_pct),
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
-        "ready": stock_ready and sector_ready,
         "stock_flow": {
             "ready": stock_ready,
             "observed_codes": stock_codes,
@@ -385,7 +412,12 @@ def render_capital_flow_health_markdown(result: dict) -> str:
         "",
         f"- Generated at: `{result['generated_at']}`",
         f"- Trade date: `{result['trade_date']}`",
-        f"- Overall ready: `{str(result['ready']).lower()}`",
+        f"- Source ready: `{str(result.get('source_ready', result['ready'])).lower()}`",
+        f"- Pipeline ready: `{str(result.get('pipeline_ready', False)).lower()}`",
+        f"- Artifact current: `{str(result.get('artifact_current', False)).lower()}`",
+        f"- Data certified ready: `{str(result.get('data_certified_ready', False)).lower()}`",
+        f"- Flow certified ready: `{str(result.get('flow_certified_ready', False)).lower()}`",
+        f"- Analysis ready: `{str(result.get('analysis_ready', result.get('certified_ready', False))).lower()}`",
         f"- Stock flow ready: `{str(result['stock_flow']['ready']).lower()}`",
         f"- Sector flow ready: `{str(result['sector_flow']['ready']).lower()}`",
         "",

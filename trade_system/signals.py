@@ -7,10 +7,24 @@ from pathlib import Path
 
 import duckdb
 
+from trade_system.integrity import ensure_unique_indexes
 from trade_system.normalize import build_normalized_views
 from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.stage_signals import ensure_stage_signal_schema
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
+
+
+_SIGNAL_INDEX_SPECS = (
+    ("uq_market_regime_date", "market_regime_snapshot", ("trade_date",)),
+    ("uq_sector_rotation_date_code", "sector_rotation_score", ("trade_date", "sector_code")),
+    ("uq_candidate_date_code", "stock_candidate_score", ("trade_date", "stock_code")),
+    (
+        "uq_stage_signal_date_stage_code",
+        "stock_candidate_stage_signal",
+        ("trade_date", "stage", "stock_code"),
+    ),
+)
 
 
 def classify_market_regime(row: dict) -> dict:
@@ -82,11 +96,6 @@ def classify_market_regime(row: dict) -> dict:
     }
 
 
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params=None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
-
 
 def _relation_has_rows(con: duckdb.DuckDBPyConnection, relation_name: str) -> bool:
     try:
@@ -151,6 +160,7 @@ def _ensure_signal_tables(con: duckdb.DuckDBPyConnection) -> None:
             trade_date VARCHAR,
             sector_code VARCHAR,
             sector_name VARCHAR,
+            taxonomy VARCHAR DEFAULT 'unknown',
             score DOUBLE,
             strength_value DOUBLE,
             limit_up_count INTEGER,
@@ -180,6 +190,11 @@ def _ensure_signal_tables(con: duckdb.DuckDBPyConnection) -> None:
         "is_actionable": "BOOLEAN DEFAULT false",
         "candidate_status": "VARCHAR DEFAULT 'research_only'",
     }
+    rotation_columns = {"taxonomy": "VARCHAR DEFAULT 'unknown'"}
+    existing_rotation_columns = set(table_columns(con, "sector_rotation_score"))
+    for column, data_type in rotation_columns.items():
+        if column not in existing_rotation_columns:
+            con.execute(f'ALTER TABLE sector_rotation_score ADD COLUMN "{column}" {data_type}')
     existing_candidate_columns = set(table_columns(con, "stock_candidate_score"))
     for column, data_type in candidate_columns.items():
         if column not in existing_candidate_columns:
@@ -235,6 +250,20 @@ def _clear_signal_date(con: duckdb.DuckDBPyConnection, trade_date: str) -> None:
         con.execute(f"DELETE FROM {table} WHERE trade_date = ?", [trade_date])
 
 
+def _drop_signal_indexes(con: duckdb.DuckDBPyConnection) -> None:
+    """Drop replace-snapshot indexes before a delete/insert transaction."""
+    for index_name, _, _ in _SIGNAL_INDEX_SPECS:
+        con.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+
+
+def _create_signal_indexes(con: duckdb.DuckDBPyConnection) -> None:
+    for index_name, table, columns in _SIGNAL_INDEX_SPECS:
+        column_sql = ", ".join(f'"{column}"' for column in columns)
+        con.execute(
+            f'CREATE UNIQUE INDEX "{index_name}" ON "{table}" ({column_sql})'
+        )
+
+
 def _generate_regime(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict:
     rows = _fetch_dicts(con, "SELECT * FROM v_market_state_inputs WHERE trade_date = ?", [trade_date])
     if not rows:
@@ -267,7 +296,27 @@ def _generate_regime(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict:
 
 
 def _generate_sectors(con: duckdb.DuckDBPyConnection, trade_date: str) -> int:
-    sector_source = "v_theme_mainline_evidence" if table_exists(con, "v_theme_mainline_evidence") else "v_sector_capital"
+    # Prefer the THS-only mainline view.  A live multi-source snapshot with no
+    # THS rows is a genuine missing-concept condition, not permission to fall
+    # back to a mixed BK/THS ranking.  Tiny legacy/test databases without the
+    # multi-source contract retain the old industry fallback for compatibility.
+    theme_rows = 0
+    if table_exists(con, "v_theme_mainline_evidence"):
+        theme_rows = int(con.execute(
+            "SELECT count(*) FROM v_theme_mainline_evidence WHERE trade_date=?",
+            [trade_date],
+        ).fetchone()[0] or 0)
+    multi_source_live = table_exists(con, "multi_source_sector_flow") and int(con.execute(
+        "SELECT count(*) FROM multi_source_sector_flow WHERE source_date=CAST(? AS DATE) "
+        "AND coalesce(is_stale,false)=false",
+        [trade_date],
+    ).fetchone()[0] or 0) > 0 if table_exists(con, "multi_source_sector_flow") else False
+    if theme_rows:
+        sector_source = "v_theme_mainline_evidence"
+    elif multi_source_live:
+        sector_source = "v_theme_mainline_evidence"
+    else:
+        sector_source = "v_sector_capital"
     order_expr = (
         "coalesce(mainline_score, strength_value, 0) DESC, coalesce(limit_up_count, 0) DESC"
         if sector_source == "v_theme_mainline_evidence"
@@ -350,14 +399,18 @@ def _generate_sectors(con: duckdb.DuckDBPyConnection, trade_date: str) -> int:
         con.execute(
             """
             INSERT INTO sector_rotation_score
-            (trade_date, sector_code, sector_name, score, strength_value,
+            (trade_date, sector_code, sector_name, taxonomy, score, strength_value,
              limit_up_count, seal_rate, evidence_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 trade_date,
                 sector.get("sector_code"),
                 sector.get("sector_name") or "",
+                sector.get("sector_type") or (
+                    "ths_concept" if str(sector.get("sector_code") or "").startswith("THS-")
+                    else "em_industry"
+                ),
                 score,
                 strength,
                 limit_up,
@@ -680,296 +733,6 @@ def _generate_candidates_enriched(con: duckdb.DuckDBPyConnection, trade_date: st
     return count
 
 
-def _stage_candidate_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
-    intraday_source = (
-        """
-            SELECT
-                stock_code,
-                intraday_high,
-                active_fund_net AS max_main_fund_net,
-                intraday_turnover,
-                big_net_amount AS evidence_big_net_amount,
-                tick_rows,
-                tick_volume,
-                tick_order_rows,
-                tick_order_volume,
-                tick_all_rows,
-                tick_all_volume,
-                pankou_net_volume,
-                capital_flow_score,
-                capital_flow_source_tables,
-                strength_score AS intraday_strength_score,
-                source_tables AS intraday_evidence_source,
-                is_fallback AS intraday_evidence_is_fallback
-            FROM v_intraday_strength_evidence
-            WHERE trade_date = ?
-        """
-        if table_exists(con, "v_intraday_strength_evidence")
-        else """
-            SELECT
-                CAST(NULL AS VARCHAR) AS stock_code,
-                CAST(NULL AS DOUBLE) AS intraday_high,
-                CAST(NULL AS BIGINT) AS max_main_fund_net,
-                CAST(NULL AS BIGINT) AS intraday_turnover,
-                CAST(NULL AS BIGINT) AS evidence_big_net_amount,
-                CAST(NULL AS BIGINT) AS tick_rows,
-                CAST(NULL AS BIGINT) AS tick_volume,
-                CAST(NULL AS BIGINT) AS tick_order_rows,
-                CAST(NULL AS BIGINT) AS tick_order_volume,
-                CAST(NULL AS BIGINT) AS tick_all_rows,
-                CAST(NULL AS BIGINT) AS tick_all_volume,
-                CAST(NULL AS BIGINT) AS pankou_net_volume,
-                CAST(NULL AS DOUBLE) AS capital_flow_score,
-                CAST(NULL AS VARCHAR) AS capital_flow_source_tables,
-                CAST(NULL AS DOUBLE) AS intraday_strength_score,
-                CAST(NULL AS VARCHAR) AS intraday_evidence_source,
-                CAST(NULL AS BOOLEAN) AS intraday_evidence_is_fallback
-            WHERE ? IS NULL AND false
-        """
-    )
-    bigorder_source = (
-        """
-            SELECT
-                stock_code,
-                sum(big_net_amount) AS big_net_amount
-            FROM l2_stock_bigorder
-            WHERE CAST(date AS VARCHAR) = ?
-            GROUP BY stock_code
-        """
-        if table_exists(con, "l2_stock_bigorder")
-        else """
-            SELECT
-                CAST(NULL AS VARCHAR) AS stock_code,
-                CAST(NULL AS BIGINT) AS big_net_amount
-            WHERE ? IS NULL AND false
-        """
-    )
-    return _fetch_dicts(
-        con,
-        f"""
-        WITH intraday AS (
-            {intraday_source}
-        ),
-        bigorder AS (
-            {bigorder_source}
-        )
-        SELECT
-            l.trade_date,
-            l.stock_code,
-            l.stock_name,
-            l.board_level,
-            l.limit_up_time,
-            s.sector_code,
-            sr.score AS sector_score,
-            k.source_table AS kline_source_table,
-            k.is_fallback AS kline_is_fallback,
-            k.open AS kline_open,
-            k.close AS kline_close,
-            k.change_pct AS kline_change_pct,
-            coalesce(a.source_table, ma.source_table) AS auction_source_table,
-            coalesce(a.is_fallback, ma.is_fallback) AS auction_is_fallback,
-            coalesce(a.confirmation, ma.confirmation) AS auction_confirmation,
-            coalesce(a.auction_strength, ma.auction_strength) AS auction_strength,
-            i.intraday_high,
-            i.max_main_fund_net,
-            i.intraday_turnover,
-            coalesce(i.evidence_big_net_amount, b.big_net_amount) AS big_net_amount,
-            i.tick_rows,
-            i.tick_volume,
-            i.tick_order_rows,
-            i.tick_order_volume,
-            i.tick_all_rows,
-            i.tick_all_volume,
-            i.pankou_net_volume,
-            i.capital_flow_score,
-            i.capital_flow_source_tables,
-            i.intraday_strength_score,
-            i.intraday_evidence_source,
-            i.intraday_evidence_is_fallback
-        FROM v_limit_pool l
-        LEFT JOIN v_stock_pool s
-          ON l.trade_date = s.trade_date AND l.stock_code = s.stock_code
-        LEFT JOIN sector_rotation_score sr
-          ON l.trade_date = sr.trade_date AND s.sector_code = sr.sector_code
-        LEFT JOIN v_kline_daily k
-          ON l.trade_date = k.trade_date AND l.stock_code = k.stock_code
-             AND (upper(k.ktype) = 'D' OR k.ktype IS NULL)
-        LEFT JOIN v_auction_status a
-          ON l.trade_date = a.trade_date AND l.stock_code = a.stock_code
-        LEFT JOIN v_auction_status ma
-          ON l.trade_date = ma.trade_date AND ma.stock_code IS NULL
-        LEFT JOIN intraday i
-          ON l.stock_code = i.stock_code
-        LEFT JOIN bigorder b
-          ON l.stock_code = b.stock_code
-        WHERE l.trade_date = ?
-        LIMIT 100
-        """,
-        [trade_date, trade_date, trade_date],
-    )
-
-
-def _stage_signal_payload(item: dict, stage: str, score: float, decision: str, operator_action: str) -> dict:
-    return {
-        **item,
-        "stage": stage,
-        "decision": decision,
-        "operator_action": operator_action,
-        "data_sources": {
-            "sector_score": item.get("sector_score"),
-            "auction_source": item.get("auction_source_table"),
-            "auction_is_fallback": bool(item.get("auction_is_fallback")) if item.get("auction_is_fallback") is not None else None,
-            "kline_source": item.get("kline_source_table"),
-            "kline_is_fallback": bool(item.get("kline_is_fallback")) if item.get("kline_is_fallback") is not None else None,
-            "intraday_source": "l2_stock_intraday" if item.get("intraday_high") is not None else None,
-            "bigorder_source": "l2_stock_bigorder" if item.get("big_net_amount") is not None else None,
-            "intraday_evidence_source": (
-                "v_intraday_strength_evidence" if item.get("intraday_evidence_source") else None
-            ),
-            "intraday_evidence_tables": item.get("intraday_evidence_source"),
-            "capital_flow_source": (
-                "v_intraday_capital_flow_evidence" if item.get("capital_flow_source_tables") else None
-            ),
-            "capital_flow_tables": item.get("capital_flow_source_tables"),
-            "capital_flow_score": item.get("capital_flow_score"),
-            "intraday_evidence_is_fallback": (
-                bool(item.get("intraday_evidence_is_fallback"))
-                if item.get("intraday_evidence_is_fallback") is not None
-                else None
-            ),
-        },
-        "score_components_note": (
-            "Stage scores are rule-based and auditable; they are suitable for sampling "
-            "and backtest statistics, not automatic order placement."
-        ),
-        "invalidation": {
-            "premarket_pool": "Drop if sector score falls below threshold or stock loses liquidity.",
-            "auction_confirmation": "Drop if auction source is fallback-only or auction strength weakens.",
-            "intraday_strength": "Drop if board opens, main fund net weakens, or big-order net turns negative.",
-            "close_decision": "Reduce if close is weak, index state is fallback-risk, or next-day gap risk rises.",
-        }.get(stage, "Drop if evidence no longer supports the setup."),
-    }
-
-
-def _insert_stage_signal(
-    con: duckdb.DuckDBPyConnection,
-    trade_date: str,
-    item: dict,
-    stage: str,
-    score: float,
-    decision: str,
-    operator_action: str,
-) -> None:
-    evidence = _stage_signal_payload(item, stage, score, decision, operator_action)
-    con.execute(
-        """
-        INSERT INTO stock_candidate_stage_signal
-        (trade_date, stage, stock_code, stock_name, score, decision, evidence_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            trade_date,
-            stage,
-            item.get("stock_code"),
-            item.get("stock_name"),
-            max(0.0, min(100.0, score)),
-            decision,
-            json.dumps(evidence, ensure_ascii=False, default=str),
-        ],
-    )
-
-
-def _generate_stage_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int:
-    rows = _stage_candidate_rows(con, trade_date)
-    count = 0
-    for item in rows:
-        board_level = int(item.get("board_level") or 1)
-        sector_score = float(item.get("sector_score") or 0)
-        change_pct = float(item.get("kline_change_pct") or 0)
-        auction_strength = float(item.get("auction_strength") or 0)
-        big_net_amount = float(item.get("big_net_amount") or 0)
-        intraday_turnover = float(item.get("intraday_turnover") or 0)
-        intraday_evidence_score = float(item.get("intraday_strength_score") or 0)
-
-        premarket_score = 35 + sector_score * 0.35 + max(-5.0, min(10.0, change_pct))
-        _insert_stage_signal(
-            con,
-            trade_date,
-            item,
-            "premarket_pool",
-            premarket_score,
-            "pool",
-            "Keep in premarket pool only if sector remains top-ranked and K-line liquidity is acceptable.",
-        )
-        count += 1
-
-        auction_bonus = 12 if item.get("auction_is_fallback") is False else -5
-        auction_score = premarket_score + auction_strength * 1.2 + auction_bonus
-        _insert_stage_signal(
-            con,
-            trade_date,
-            item,
-            "auction_confirmation",
-            auction_score,
-            "confirm" if auction_score >= 65 else "watch",
-            "Confirm only when stock-level auction evidence supports the premarket thesis.",
-        )
-        count += 1
-
-        intraday_score = (
-            40
-            + board_level * 12
-            + min(18.0, big_net_amount / 10000000.0)
-            + min(8.0, intraday_turnover / 100000000.0)
-            + max(-8.0, min(16.0, intraday_evidence_score))
-        )
-        _insert_stage_signal(
-            con,
-            trade_date,
-            item,
-            "intraday_strength",
-            intraday_score,
-            "follow" if intraday_score >= 70 else "watch",
-            "Monitor board durability, active funds, tick/order flow,盘口 balance, and large-order net during the session.",
-        )
-        count += 1
-
-        close_score = 45 + board_level * 10 + max(-8.0, min(12.0, change_pct))
-        _insert_stage_signal(
-            con,
-            trade_date,
-            item,
-            "close_decision",
-            close_score,
-            "keep" if close_score >= 70 else "reduce",
-            "Use close decision for overnight risk control and next-day plan only.",
-        )
-        count += 1
-    return count
-
-
-def _generate_alerts(con: duckdb.DuckDBPyConnection, trade_date: str, regime: dict, sector_count: int) -> int:
-    alerts = []
-    if regime["regime"] in {"退潮", "冰点", "数据缺失"}:
-        alerts.append(("P0", "market_regime", f"Market regime is {regime['regime']}; reduce exposure."))
-    if regime["regime"] == "高潮":
-        alerts.append(("P1", "market_regime", "Market is overheated; lock profit and avoid fresh chase entries."))
-    if sector_count == 0:
-        alerts.append(("P1", "data_quality", "No sector score rows generated for this date."))
-    if not table_exists(con, "auction_bidding_anomaly"):
-        alerts.append(("P2", "data_gap", "Auction anomaly table is missing; opening auction signals are incomplete."))
-
-    for severity, category, message in alerts:
-        con.execute(
-            """
-            INSERT INTO alert_events (trade_date, severity, category, message, evidence_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [trade_date, severity, category, message, json.dumps(regime["evidence"], ensure_ascii=False)],
-        )
-    return len(alerts)
-
-
 def _generate_alerts_enriched(
     con: duckdb.DuckDBPyConnection,
     trade_date: str,
@@ -1025,19 +788,62 @@ def generate_signals(
     readiness_stage: str = "close",
 ) -> dict:
     build_normalized_views(db_path)
+    try:
+        return _generate_signals_once(
+            db_path,
+            trade_date,
+            require_ready=require_ready,
+            readiness_stage=readiness_stage,
+        )
+    except duckdb.Error as exc:
+        # A known DuckDB failure mode is a stale/corrupt index catalog entry
+        # reporting that fewer rows were deleted than expected.  Rebuild only
+        # the small signal indexes and retry once.  The retry is bounded and the
+        # generation itself remains atomic, so a second failure cannot publish
+        # a partial same-day snapshot.
+        message = str(exc)
+        if not (
+            "Failed to delete all rows from index" in message
+            or isinstance(exc, duckdb.ConstraintException)
+        ):
+            raise
+        ensure_unique_indexes(db_path)
+        return _generate_signals_once(
+            db_path,
+            trade_date,
+            require_ready=require_ready,
+            readiness_stage=readiness_stage,
+        )
+
+
+def _generate_signals_once(
+    db_path: str | Path,
+    trade_date: str | None,
+    *,
+    require_ready: bool,
+    readiness_stage: str,
+) -> dict:
     con = duckdb.connect(str(db_path))
+    in_transaction = False
+    indexes_dropped = False
     try:
         _ensure_signal_tables(con)
         selected_date = trade_date or _latest_trade_date(con)
         if not selected_date:
             raise ValueError("No trade_date available from v_market_daily")
         readiness = assess_trade_date_readiness(con, selected_date, readiness_stage)
-        if require_ready and not readiness["ready"]:
+        if require_ready and not readiness.get("source_ready", readiness["ready"]):
             missing = ", ".join(readiness["missing_groups"])
             raise ValueError(
                 f"Trade date {selected_date} is not actionable for {readiness_stage}; "
                 f"missing or stale groups: {missing}"
             )
+        _drop_signal_indexes(con)
+        indexes_dropped = True
+        # A signal date is one replaceable snapshot.  Do not expose a mixture
+        # of old and new rows if any sector/candidate calculation fails.
+        con.execute("BEGIN TRANSACTION")
+        in_transaction = True
         _clear_signal_date(con, selected_date)
         regime = _generate_regime(con, selected_date)
         sector_count = _generate_sectors(con, selected_date)
@@ -1049,6 +855,10 @@ def generate_signals(
         # rewriting premarket, auction, or intraday evidence.
         stage_candidate_count = 0
         alert_count = _generate_alerts_enriched(con, selected_date, regime, sector_count)
+        con.execute("COMMIT")
+        in_transaction = False
+        _create_signal_indexes(con)
+        indexes_dropped = False
         return {
             "trade_date": selected_date,
             "regime": regime["regime"],
@@ -1059,5 +869,19 @@ def generate_signals(
             "alert_count": alert_count,
             "readiness": readiness,
         }
+    except Exception:
+        if in_transaction:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+        if indexes_dropped:
+            try:
+                _create_signal_indexes(con)
+            except Exception:
+                # Preserve the original generation failure.  The next
+                # integrity pass will make a missing-index condition visible.
+                pass
+        raise
     finally:
         con.close()

@@ -6,8 +6,10 @@ from schema import init_schema
 def test_finance_collector_persists_rows_and_checkpoint(tmp_path, monkeypatch):
     store = DuckDBStore(str(tmp_path / "finance.duckdb"))
     init_schema(store.conn)
+    # Patch the implementation module (collectors.collect_finance); the root
+    # collect_finance.py is only a compatibility shim.
     monkeypatch.setattr(
-        "collect_finance._fetch",
+        "collectors.collect_finance._fetch",
         lambda code, periods: (
             [{"REPORT_DATE": "2026-03-31", "TOTAL_OPERATE_INCOME": 1000,
               "PARENT_NETPROFIT": 100, "BASIC_EPS": 0.2}],

@@ -1,6 +1,7 @@
 # Secrets and local overrides
 .env
-.env.*.local
+.env.*
+.env.bak*
 
 # Python
 __pycache__/

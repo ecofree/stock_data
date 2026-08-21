@@ -7,28 +7,46 @@ def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):
     db_path = tmp_path / "quality_views.duckdb"
     con = duckdb.connect(str(db_path))
     init_schema(con)
-    con.execute(
-        "INSERT INTO ths_concept_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp), "
-        "(?, ?, ?, ?, ?, ?, ?, ?, current_timestamp), "
-        "(?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
-        [
-            "2026-08-07", "THS-OK", "可用", 1, 1, "ths", '{"stale_fallback": false}', True,
-            "2026-08-07", "THS-STALE", "过期", 2, 1, "ths_cached_weekly", '{"stale_fallback": true}', False,
-            "2026-08-07", "THS-PARTIAL", "部分", 3, 1, "ths", '{"stale_fallback": false}', False,
+    # The production contract requires a complete 374-board snapshot.  Keep
+    # three negative rows in the same date to prove they are excluded while
+    # the 374 verified rows remain eligible.
+    good = [
+        ("2026-08-07", f"THS-{i:03d}", f"概念{i}", i, 1, "ths",
+         '{"stale_fallback":false,"fetched_date":"2026-08-07"}', True)
+        for i in range(1, 375)
+    ]
+    con.executemany(
+        "INSERT INTO ths_concept_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        good,
+    )
+    con.executemany(
+        "INSERT INTO ths_concept_stock_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+            [
+                ("2026-08-07", f"THS-{i:03d}", f"概念{i}", f"{i:06d}", f"股票{i}", 1,
+                 "ths", '{"stale_fallback":false,"fetched_date":"2026-08-07"}', True)
+                for i in range(1, 375)
+            ] + [
+                ("2026-08-07", "THS-001", "概念1", "100001", "补充股票1", 2,
+                 "ths", '{"stale_fallback":false,"fetched_date":"2026-08-07"}', True),
+                ("2026-08-07", "THS-002", "概念2", "100002", "补充股票2", 2,
+                 "ths", '{"stale_fallback":false,"fetched_date":"2026-08-07"}', True),
+            ] + [
+            ("2026-08-08", "THS-STALE", "过期", "999991", "过期A", 1,
+             "ths_cached_weekly", '{"stale_fallback":true,"fetched_date":"2026-08-08"}', False),
+            ("2026-08-08", "THS-PARTIAL", "部分", "999992", "部分A", 1,
+             "ths", '{"stale_fallback":false,"fetched_date":"2026-08-08"}', False),
+            ("2026-08-08", "THS-UNVERIFIED", "未验证", "999993", "未验证A", 1,
+             "ths", '{"stale_fallback":false,"fetched_date":"2026-08-08"}', False),
         ],
     )
-    con.execute(
-        "INSERT INTO ths_concept_stock_history VALUES "
-        "('2026-08-07','THS-OK','可用','000001','平安银行',1,'ths','{\"stale_fallback\":false}',true,current_timestamp), "
-        "('2026-08-07','THS-STALE','过期','000002','万科A',1,'ths_cached_weekly','{\"stale_fallback\":true}',false,current_timestamp), "
-        "('2026-08-07','THS-PARTIAL','部分','000003','国农科技',1,'ths','{\"stale_fallback\":false}',false,current_timestamp)",
-    )
-    con.execute(
+    con.executemany(
         "INSERT INTO ths_concept_member_checkpoint "
-        "(trade_date, concept_code, concept_name, status, member_rows) VALUES "
-        "('2026-08-07','THS-OK','可用','success',1), "
-        "('2026-08-07','THS-STALE','过期','success_stale',1), "
-        "('2026-08-07','THS-PARTIAL','部分','partial',1)"
+        "(trade_date, concept_code, concept_name, status, member_rows) VALUES (?, ?, ?, ?, 1)",
+        [("2026-08-07", f"THS-{i:03d}", f"概念{i}", "success") for i in range(1, 375)] + [
+            ("2026-08-08", "THS-STALE", "过期", "success_stale"),
+            ("2026-08-08", "THS-PARTIAL", "部分", "partial"),
+            ("2026-08-08", "THS-UNVERIFIED", "未验证", "success"),
+        ],
     )
     rows = con.execute(
         "SELECT concept_code FROM v_default_concept_daily WHERE trade_date='2026-08-07' ORDER BY concept_code"
@@ -39,8 +57,13 @@ def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):
     ).fetchall()
     con.close()
 
-    assert rows == [("THS-OK",)]
-    assert members == [("THS-OK", "000001")]
+    assert len(rows) == 374
+    assert rows[0] == ("THS-001",)
+    assert ("THS-STALE",) not in rows
+    assert ("THS-PARTIAL",) not in rows
+    assert ("THS-UNVERIFIED",) not in rows
+    assert len(members) == 376
+    assert members[0] == ("THS-001", "000001")
 
 
 def test_default_concept_views_use_kpl_only_when_no_valid_ths_snapshot(tmp_path):

@@ -1,4 +1,4 @@
-"""Recoverable TuShare backfill planning.
+﻿"""Recoverable TuShare backfill planning.
 
 This module keeps TuShare supplementation incremental: identify missing rows,
 create resumable tasks, and run only the pending work. It stores operational
@@ -14,7 +14,7 @@ from typing import Any
 import duckdb
 
 from base import DuckDBStore
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.tushare_relay import (
     TushareRelayClient,
     collect_tushare_adj_factor,

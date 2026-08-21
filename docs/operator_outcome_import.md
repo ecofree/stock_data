@@ -42,6 +42,15 @@ trade_date,stock_code,stock_name,execution_status,entry_time,exit_time,entry_pri
 
 ## Import
 
+The close pipeline creates a dated template after the candidate/plan stage:
+
+```powershell
+D:\anaconda\python.exe scripts\create_operator_outcome_template.py --db kpl_data.duckdb --date YYYY-MM-DD --out reports\operator_outcomes_template_YYYY-MM-DD.csv
+```
+
+Fill every row before importing. An untouched or partially reviewed template
+is rejected; it cannot create fake returns or silently mark a plan complete.
+
 ```powershell
 D:\anaconda\python.exe scripts\import_operator_trade_outcomes.py --db kpl_data.duckdb --csv path\to\operator_outcomes.csv
 ```
@@ -63,3 +72,5 @@ D:\anaconda\python.exe scripts\generate_operator_reports.py --db kpl_data.duckdb
 
 `operator_backtest_latest.md` uses real outcomes first. If no imported outcomes
 exist, it falls back to proxy K-line samples and labels them as proxy data.
+Proxy samples are for diagnostics only and must not be reported as live
+operator performance.

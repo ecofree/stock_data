@@ -7,6 +7,7 @@ It does not create orders and does not imply automatic execution.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +17,8 @@ from trade_system.operator_risk import TradePlanInput, evaluate_trade_plan
 from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.risk import init_trading_tables
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _loads(value: Any) -> dict:
@@ -297,7 +294,7 @@ def run_daily_operator_loop(
         data_blocked = (
             suggested <= 0
             or str(regime.get("regime") or "") in {"数据缺失", "unknown"}
-            or not data_readiness.get("ready", False)
+            or not data_readiness.get("source_ready", data_readiness.get("ready", False))
         )
         max_single = _max_single_position(regime)
         max_sector = min(max(0.0, suggested), 20.0)
@@ -417,22 +414,48 @@ def run_daily_operator_loop(
             ):
                 stage_columns = table_columns(con, "stock_candidate_stage_signal")
                 if {"risk_approved", "is_executable"}.issubset(stage_columns):
+                    valid_col = ", execution_valid_until" if "execution_valid_until" in stage_columns else ""
+                    current = con.execute(
+                        f"SELECT evidence_json, readiness_json{valid_col} "
+                        "FROM stock_candidate_stage_signal "
+                        "WHERE trade_date=? AND stock_code=? AND stage=?",
+                        [trade_date, row.get("stock_code"), signal_stage],
+                    ).fetchone()
+                    current_evidence = _loads(current[0] if current else None)
+                    current_readiness = _loads(current[1] if current else None)
+                    valid_until = current[2] if current and valid_col else None
+                    valid_now = valid_until is None or valid_until >= datetime.now()
+                    executable = bool(
+                        decision.allowed
+                        and row.get("stock_code")
+                        and valid_now
+                        and signal_stage in {"auction_confirmation", "intraday_strength"}
+                    )
+                    current_evidence.update({
+                        "risk_approved": bool(decision.allowed),
+                        "entry_executable": executable,
+                        "entry_block_reason": None if executable else (
+                            current_evidence.get("entry_block_reason")
+                            or decision.reason
+                        ),
+                    })
+                    current_readiness.update({
+                        "row_scope": "candidate",
+                        "execution_ready": executable,
+                        "risk_approved_candidates": int(bool(decision.allowed)),
+                        "executable_candidates": int(executable),
+                    })
                     con.execute(
-                        """
+                        f"""
                         UPDATE stock_candidate_stage_signal
-                        SET risk_approved=?, is_executable=(
-                            coalesce(data_complete,false)
-                            AND coalesce(signal_triggered,false)
-                            AND coalesce(tradable,false)
-                            AND ?
-                            AND stage=?
-                        )
+                        SET risk_approved=?, is_executable=?, evidence_json=?, readiness_json=?
                         WHERE trade_date=? AND stock_code=? AND stage=?
                         """,
                         [
                             bool(decision.allowed),
-                            bool(decision.allowed),
-                            signal_stage,
+                            executable,
+                            json.dumps(current_evidence, ensure_ascii=False, default=str),
+                            json.dumps(current_readiness, ensure_ascii=False, default=str),
                             trade_date,
                             row.get("stock_code"),
                             signal_stage,

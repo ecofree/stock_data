@@ -9,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 import re
 import time
-from typing import Any
 import urllib.parse
 
 import duckdb

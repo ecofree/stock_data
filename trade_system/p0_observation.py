@@ -10,6 +10,7 @@ from typing import Any
 import duckdb
 
 from trade_system.quality import table_exists
+from trade_system.ths_quality import canonical_ths_snapshot
 
 
 PHASES = ("auction", "intraday", "close")
@@ -171,6 +172,26 @@ def _ths_status(
     trade_date: str,
     minimum_concepts: int,
 ) -> dict[str, Any]:
+    canonical = canonical_ths_snapshot(con, trade_date, minimum_concepts=minimum_concepts)
+    if canonical:
+        snapshot_date = canonical["snapshot_date"]
+        age_days = canonical["age_days"]
+        passed = 0 <= age_days <= 7
+        return {
+            "passed": passed,
+            "snapshot_date": snapshot_date,
+            "age_days": age_days,
+            "status": "success" if passed else "canonical_stale",
+            "raw_status": "success",
+            "concepts": canonical["concepts"],
+            "members": canonical["members"],
+            "rows_written": canonical["members"],
+            "checkpoint_total": canonical["checkpoint_total"],
+            "checkpoint_success": canonical["checkpoint_success"],
+        }
+    # A raw checkpoint or a partially verified default view is not a usable
+    # snapshot.  Keep the diagnostics, but fail closed until one global
+    # snapshot passes the shared contract.
     checkpoint = _fetchone(
         con,
         "SELECT trade_date,status,rows_written,updated_at "
@@ -184,6 +205,7 @@ def _ths_status(
             "passed": False,
             "snapshot_date": None,
             "status": "missing",
+            "raw_status": "missing",
             "concepts": 0,
             "members": 0,
         }
@@ -208,17 +230,16 @@ def _ths_status(
     )
     age_days = (date.fromisoformat(trade_date) - date.fromisoformat(snapshot_date)).days
     status = str(checkpoint[1] or "")
-    passed = (
-        status == "success"
-        and 0 <= age_days <= 7
-        and concepts >= minimum_concepts
-        and members > concepts
-    )
+    # The checkpoint is retained for diagnostics only.  It may say success
+    # even when rows were written across multiple fetch dates or only a
+    # subset is date-verified; canonical_ths_snapshot is the sole authority.
+    passed = False
     return {
         "passed": passed,
         "snapshot_date": snapshot_date,
         "age_days": age_days,
-        "status": status,
+        "status": "canonical_incomplete" if status == "success" else status,
+        "raw_status": status,
         "concepts": concepts,
         "members": members,
         "rows_written": int(checkpoint[2] or 0),
@@ -248,7 +269,12 @@ def audit_five_day_observation(
                 phases[phase] = {
                     "run_id": (manifest or {}).get("run_id"),
                     "status": status,
-                    "passed": status == "completed",
+                    # Optional post-close capabilities (currently northbound
+                    # historical net-buy) may be unavailable without invalidating
+                    # the day's core close run.  Only the explicit warning status
+                    # is accepted here; degraded/blocked/chain-failure runs stay
+                    # fail-closed.
+                    "passed": status in {"completed", "completed_with_warnings"},
                     "run_dir": (manifest or {}).get("_run_dir"),
                 }
             close_dir = Path(phases["close"]["run_dir"]) if phases["close"]["run_dir"] else None

@@ -26,13 +26,17 @@ $endAtToday = (Get-Date).Date.Add($endTime.TimeOfDay)
 $effectiveMinRunWindow = if ($MinRunWindowSeconds -gt 0) {
     $MinRunWindowSeconds
 } elseif ($Phase -eq "auction") {
-    60
+    # A complete auction collection can take several minutes. Do not start
+    # another run when the 09:27 drain leaves only a short tail.
+    360
 } else {
-    180
+    # Intraday also needs a bounded-run window before the 15:05 drain.
+    600
 }
 $attempts = 0
 $successes = 0
 $failures = 0
+$nextRun = Get-Date
 
 function Write-WatchEvent([string]$Message) {
     $line = "$(Get-Date -Format o) $Message"
@@ -49,6 +53,7 @@ while ((Get-Date) -lt $endAtToday) {
     if ($SkipLunch -and $Phase -eq "intraday" -and (Get-Date).TimeOfDay -ge ([timespan]::Parse("11:30")) -and (Get-Date).TimeOfDay -lt ([timespan]::Parse("13:00"))) {
         $sleepUntil = (Get-Date).Date.AddHours(13)
         Start-Sleep -Seconds ([int][Math]::Max(1, ($sleepUntil - (Get-Date)).TotalSeconds))
+        $nextRun = Get-Date
         continue
     }
     $attempts++
@@ -66,7 +71,17 @@ while ((Get-Date) -lt $endAtToday) {
     }
     $remaining = [int][Math]::Max(0, ($endAtToday - (Get-Date)).TotalSeconds)
     if ($remaining -le 0) { break }
-    Start-Sleep -Seconds ([int][Math]::Min([Math]::Max(30, $IntervalSeconds), $remaining))
+    # Keep the interval anchored to the scheduled start time.  Sleeping for
+    # interval seconds after a long run silently turns a 5-minute watcher
+    # into a 9-10 minute cadence and creates false freshness gaps.
+    $nextRun = $nextRun.AddSeconds([Math]::Max(30, $IntervalSeconds))
+    $sleepSeconds = ($nextRun - (Get-Date)).TotalSeconds
+    if ($sleepSeconds -gt 0) {
+        Start-Sleep -Seconds ([int][Math]::Min($sleepSeconds, $remaining))
+    } else {
+        Write-WatchEvent "PHASE_WATCH_OVERRUN phase=$Phase lag_seconds=$([int][Math]::Abs($sleepSeconds))"
+        $nextRun = Get-Date
+    }
 }
 
 Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase attempts=$attempts successes=$successes failures=$failures end=$EndAt"

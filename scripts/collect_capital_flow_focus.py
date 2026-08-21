@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
@@ -136,7 +136,7 @@ def _collect_resilient_fallbacks(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect bounded stock and sector capital-flow evidence.")
     parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--date", default=TODAY)
+    parser.add_argument("--trade-date", "--date", dest="trade_date", default=TODAY)
     parser.add_argument("--max-stocks", type=int, default=20)
     parser.add_argument("--max-sectors", type=int, default=20)
     parser.add_argument("--stock-codes", help="Comma-separated bounded stock-code override.")
@@ -155,9 +155,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.date != date.today().isoformat():
+    if args.trade_date != date.today().isoformat():
         print(
-            f"date={args.date} status=historical_collection_blocked "
+            f"date={args.trade_date} status=historical_collection_blocked "
             "reason=focused endpoints include current-snapshot APIs"
         )
         return 2
@@ -169,14 +169,14 @@ def main() -> int:
         store.close()
 
     stocks = _parse_codes(args.stock_codes, args.max_stocks) or infer_stock_codes(
-        args.db, args.date, max(0, args.max_stocks)
+        args.db, args.trade_date, max(0, args.max_stocks)
     )
     sectors = _parse_codes(args.sector_codes, args.max_sectors) or infer_sector_codes(
-        args.db, args.date, max(0, args.max_sectors)
+        args.db, args.trade_date, max(0, args.max_sectors)
     )
     if not stocks or (not args.moneyflow_only and not sectors):
         print(
-            f"date={args.date} status=no_universe stocks={len(stocks)} sectors={len(sectors)}"
+            f"date={args.trade_date} status=no_universe stocks={len(stocks)} sectors={len(sectors)}"
         )
         return 2 if args.strict else 0
 
@@ -196,22 +196,22 @@ def main() -> int:
             # provider.
             results = {
                 "advanced_zjmm_min": collect_advanced_zjmm_min(
-                    client, store, args.date, stocks
+                    client, store, args.trade_date, stocks
                 )
             }
         else:
             results = {
-                "sector_capital": collect_sector_capital(client, store, args.date, sectors),
-                "l2_sector_intraday": collect_l2_sector_intraday(client, store, args.date, sectors),
-                "l2_sector_volume": collect_l2_sector_volume(client, store, args.date, sectors),
-                "l2_stock_intraday": collect_l2_stock_intraday(client, store, args.date, stocks),
-                "l2_stock_bigorder": collect_l2_stock_bigorder(client, store, args.date, stocks),
-                "advanced_zjmm_min": collect_advanced_zjmm_min(client, store, args.date, stocks),
-                "advanced_dadan_kline": collect_advanced_dadan_kline(client, store, args.date, stocks),
+                "sector_capital": collect_sector_capital(client, store, args.trade_date, sectors),
+                "l2_sector_intraday": collect_l2_sector_intraday(client, store, args.trade_date, sectors),
+                "l2_sector_volume": collect_l2_sector_volume(client, store, args.trade_date, sectors),
+                "l2_stock_intraday": collect_l2_stock_intraday(client, store, args.trade_date, stocks),
+                "l2_stock_bigorder": collect_l2_stock_bigorder(client, store, args.trade_date, stocks),
+                "advanced_zjmm_min": collect_advanced_zjmm_min(client, store, args.trade_date, stocks),
+                "advanced_dadan_kline": collect_advanced_dadan_kline(client, store, args.trade_date, stocks),
                 "advanced_main_activity_kline": collect_advanced_main_activity_kline(
-                    client, store, args.date, stocks
+                    client, store, args.trade_date, stocks
                 ),
-                "advanced_pankou": collect_advanced_pankou(client, store, args.date, stocks),
+                "advanced_pankou": collect_advanced_pankou(client, store, args.trade_date, stocks),
             }
     finally:
         store.close()
@@ -219,13 +219,13 @@ def main() -> int:
     # Keep the KPL intraday snapshot visible in the same source-aware layer as
     # Eastmoney/Sina, without summing cumulative minute points twice.
     with MultiSourceStore(args.db) as multi_store:
-        kpl_source_rows = multi_store.sync_kpl_intraday_flow(args.date)
+        kpl_source_rows = multi_store.sync_kpl_intraday_flow(args.trade_date)
 
     fallback_results = {"stock_rows": 0, "stock_codes": 0, "sector_rows": 0, "sector_codes": 0}
     if not args.no_resilient_fallback and not args.moneyflow_only:
         fallback_results = _collect_resilient_fallbacks(
             args.db,
-            args.date,
+            args.trade_date,
             stocks,
             sectors,
             started_monotonic=collection_started_monotonic,
@@ -235,7 +235,7 @@ def main() -> int:
     build_normalized_views(args.db)
     health = assess_capital_flow_health(
         args.db,
-        args.date,
+        args.trade_date,
         len(stocks),
         len(sectors),
         collected_after=collection_started_at,
@@ -244,7 +244,11 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_capital_flow_health_markdown(health), encoding="utf-8")
-    print(f"date={args.date} stocks={len(stocks)} sectors={len(sectors)} ready={str(health['ready']).lower()}")
+    print(
+        f"date={args.trade_date} stocks={len(stocks)} sectors={len(sectors)} "
+        f"source_ready={str(health.get('source_ready', health['ready'])).lower()} "
+        f"analysis_ready={str(health.get('analysis_ready', health.get('certified_ready', False))).lower()}"
+    )
     for name in sorted(results):
         print(f"{name}={results[name]}")
     print(f"multi_source_kpl_stock_flow={kpl_source_rows}")

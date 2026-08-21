@@ -1,4 +1,4 @@
-"""TuShare relay adapter for basic historical data.
+﻿"""TuShare relay adapter for basic historical data.
 
 The relay is used as a bounded base-data supplement. It must not be used as an
 automatic trading trigger; collectors write staging tables first, then an
@@ -18,7 +18,7 @@ from typing import Any, Callable
 from trade_system.host_limiter import shared_host_limiter
 
 from base import DuckDBStore
-from config import SETTINGS
+from trade_system.config import SETTINGS
 from trade_system.backfill import TABLE_SPECS
 
 

@@ -9,6 +9,7 @@ from typing import Any
 import duckdb
 
 from trade_system.quality import table_exists
+from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
 EVIDENCE_COLUMNS = [
@@ -94,11 +95,6 @@ def ensure_auction_evidence_tables(db_path: str | Path) -> None:
     finally:
         con.close()
 
-
-def _fetch_dicts(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None) -> list[dict]:
-    cur = con.execute(sql, params or [])
-    columns = [desc[0] for desc in cur.description]
-    return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:

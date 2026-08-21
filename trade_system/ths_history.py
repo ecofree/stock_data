@@ -1,4 +1,4 @@
-"""同花顺概念/所属个股快照采集。
+﻿"""同花顺概念/所属个股快照采集。
 
 同花顺公开的热榜接口返回 ``stock_list[].tag.concept_tag``，可以稳定形成
 “概念 -> 热榜个股”关系；当前接口只接受 ``period``，不提供历史日期参数。
@@ -22,9 +22,10 @@ from html import unescape
 import duckdb
 
 from base import DuckDBStore
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.stock_data_sources import _auto_decode, _from_ths_hot_list
 from trade_system.host_limiter import shared_host_limiter
+from trade_system.ths_quality import canonical_ths_snapshot
 
 
 DEFAULT_CONCEPT_SOURCE = "ths"
@@ -40,6 +41,60 @@ _THS_LAST_REQUEST_AT: float | None = None
 # absent, only the public anti-bot cookie is generated and blocked/partial
 # pages remain fail-closed.
 _THS_COOKIE: str | None = os.getenv("THS_COOKIE", "").strip() or None
+
+
+def _repair_member_checkpoint_storage(con: duckdb.DuckDBPyConnection) -> None:
+    """Rebuild the small THS checkpoint table before a recovery write.
+
+    DuckDB can leave a stale primary-key/secondary-index entry after an
+    interrupted ``ON CONFLICT DO UPDATE``.  The table is only a board-level
+    checkpoint (a few hundred rows), so a deterministic copy-and-recreate is
+    safer and cheaper than allowing the next page write to hit a fatal index
+    error and invalidate the whole connection.
+    """
+    exists = con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema='main' AND table_name='ths_concept_member_checkpoint'"
+    ).fetchone()[0]
+    if not exists:
+        return
+    columns = (
+        "trade_date, concept_code, concept_name, status, pages_expected, "
+        "pages_fetched, member_rows, attempts, last_error, updated_at, "
+        "provider, crawler_version, catalog_hash"
+    )
+    con.execute("DROP INDEX IF EXISTS idx_ths_member_date_status_updated")
+    con.execute(
+        "CREATE TABLE ths_concept_member_checkpoint_repair AS "
+        f"SELECT {columns} FROM ths_concept_member_checkpoint"
+    )
+    con.execute("DROP TABLE ths_concept_member_checkpoint")
+    con.execute(
+        "ALTER TABLE ths_concept_member_checkpoint_repair "
+        "RENAME TO ths_concept_member_checkpoint"
+    )
+    con.execute(
+        "ALTER TABLE ths_concept_member_checkpoint "
+        "ADD PRIMARY KEY (trade_date, concept_code)"
+    )
+    con.execute(
+        "CREATE INDEX idx_ths_member_date_status_updated "
+        "ON ths_concept_member_checkpoint(trade_date, status, updated_at)"
+    )
+    # The member rows are also replaced board-by-board.  Rebuild their unique
+    # business index in the same recovery pass so the first successful board
+    # cannot fail after the checkpoint table has been repaired.
+    stock_history_exists = con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema='main' AND table_name='ths_concept_stock_history'"
+    ).fetchone()[0]
+    if stock_history_exists:
+        con.execute("DROP INDEX IF EXISTS uq_ths_concept_member_business")
+        con.execute(
+            "CREATE UNIQUE INDEX uq_ths_concept_member_business "
+            "ON ths_concept_stock_history(trade_date, concept_code, stock_code)"
+        )
+    con.commit()
 
 
 def _ths_request_cookie() -> str:
@@ -500,10 +555,12 @@ class THSConceptHistoryCollector:
 
     def __init__(self, db_path: str | Path, *, fetcher: Callable[[str], Any] | None = None,
                  period: str = DEFAULT_PERIOD, mode: str = "hot", max_member_pages: int = 0,
-                 member_source: str = "web", max_concepts: int = 0):
+                 member_source: str = "web", max_concepts: int = 0,
+                 retry_stale: bool = False):
         self.db_path = str(db_path)
         self.store = DuckDBStore(self.db_path)
         init_schema(self.store.conn)
+        _repair_member_checkpoint_storage(self.store.conn)
         self.fetcher = fetcher or _from_ths_hot_list
         self.period = period
         self.mode = mode
@@ -514,6 +571,9 @@ class THSConceptHistoryCollector:
         if member_source not in {"web", "tushare"}:
             raise ValueError("member_source must be web or tushare")
         self.member_source = member_source
+        # Cached weekly mappings are useful for review, but retrying them on
+        # every recovery pass can starve genuinely missing boards.
+        self.retry_stale = bool(retry_stale)
         self.crawler_version = "ths_web_v2"
         self.catalog_hash = ""
         self.started = time.monotonic()
@@ -544,7 +604,11 @@ class THSConceptHistoryCollector:
             "SELECT status FROM history_fetch_checkpoint WHERE dataset=? AND trade_date=? AND page_no=0",
             ["ths_concept_snapshot", _iso(trade_date)],
         ).fetchone()
-        return bool(row and row[0] == "success")
+        if not row or row[0] != "success":
+            return False
+        return canonical_ths_snapshot(
+            self.store.conn, trade_date, exact_date=trade_date
+        ) is not None
 
     def _member_checkpoint(self, trade_date: str, concept_code: str, concept_name: str,
                            status: str, *, pages_expected: int = 0, pages_fetched: int = 0,
@@ -655,11 +719,30 @@ class THSConceptHistoryCollector:
         for concept_rank, (concept_id, concept_name) in enumerate(catalog, 1):
             concept_code = f"THS-{concept_id}"
             prior = self._member_checkpoint_row(requested_date, concept_code)
+            resumable_statuses = {"success"}
+            if not self.retry_stale:
+                resumable_statuses.add("success_stale")
+            live_providers = {
+                "ths_concept_board", "ths_index_blockrank",
+                "ths_web+ths_member_supplement", "tushare_ths_member",
+            }
+            prior_provider_ok = bool(
+                prior and (
+                    (prior[0] == "success" and str(prior[6] or "") in live_providers
+                     and (self.member_source == "web" or prior[6] == "tushare_ths_member"))
+                    or (prior[0] == "success_stale" and prior[6] == "ths_cached_weekly")
+                )
+            )
+            # A refreshed catalogue can add boards without changing the
+            # identity of an already-complete board.  Match by stored concept
+            # name as a stable per-board key; otherwise a catalog-wide hash
+            # change would force a full re-crawl and starve the new boards.
+            catalog_matches = bool(prior and (prior[8] == self.catalog_hash or prior[2] == concept_name))
             if (
-                prior and prior[0] == "success" and not force
-                and prior[6] == self.member_source
+                prior and prior[0] in resumable_statuses and not force
+                and prior_provider_ok
                 and prior[7] == self.crawler_version
-                and prior[8] == self.catalog_hash
+                and catalog_matches
             ):
                 existing = self.store.conn.execute(
                     "SELECT (SELECT stock_count FROM ths_concept_daily WHERE trade_date=? AND concept_code=?), "
@@ -851,10 +934,30 @@ class THSConceptHistoryCollector:
             "SELECT count(*) FROM ths_concept_member_checkpoint WHERE trade_date=? AND status IN ('partial','empty','running')",
             [requested_date],
         ).fetchone()[0])
+        concept_fetch_dates = int(self.store.conn.execute(
+            "SELECT count(DISTINCT CASE WHEN json_valid(raw_json) "
+            "THEN json_extract_string(raw_json,'$.fetched_date') END) "
+            "FROM ths_concept_daily WHERE trade_date=?", [requested_date]
+        ).fetchone()[0] or 0)
+        member_fetch_dates = int(self.store.conn.execute(
+            "SELECT count(DISTINCT CASE WHEN json_valid(raw_json) "
+            "THEN json_extract_string(raw_json,'$.fetched_date') END) "
+            "FROM ths_concept_stock_history WHERE trade_date=?", [requested_date]
+        ).fetchone()[0] or 0)
+        verified_concepts = int(self.store.conn.execute(
+            "SELECT count(*) FROM ths_concept_daily WHERE trade_date=? AND date_verified", [requested_date]
+        ).fetchone()[0] or 0)
+        verified_members = int(self.store.conn.execute(
+            "SELECT count(*) FROM ths_concept_stock_history WHERE trade_date=? AND date_verified", [requested_date]
+        ).fetchone()[0] or 0)
         complete = (int(concept_count) == len(catalog) and int(checkpoint_success or 0) == len(catalog)
-                    and zero_member == 0 and failed_total == 0 and partial_total == 0)
+                    and zero_member == 0 and failed_total == 0 and partial_total == 0
+                    and concept_fetch_dates == 1 and member_fetch_dates == 1
+                    and verified_concepts == int(concept_count)
+                    and verified_members == int(member_count))
         status = "success" if complete else "partial"
-        self._checkpoint(requested_date, status, rows=int(concept_count) + int(member_count),
+        checkpoint_status = status if complete else "canonical_incomplete"
+        self._checkpoint(requested_date, checkpoint_status, rows=int(concept_count) + int(member_count),
                          error="; ".join(failed_codes[:5] + partial_codes[:5] + empty_codes[:5]))
         return {"trade_date": requested_date, "status": status, "concept_rows": int(concept_count),
                 "member_rows": int(member_count), "input_stocks": int(member_count),
@@ -863,7 +966,12 @@ class THSConceptHistoryCollector:
                 "partial_member_concepts": partial_total, "missing_member_concepts": zero_member,
                 "stale_member_concepts": len(stale_codes),
                 "checkpoint_total": int(checkpoint_total or 0),
-                "checkpoint_success": int(checkpoint_success or 0)}
+                "checkpoint_success": int(checkpoint_success or 0),
+                "canonical_snapshot": complete,
+                "concept_fetch_dates": concept_fetch_dates,
+                "member_fetch_dates": member_fetch_dates,
+                "verified_concepts": verified_concepts,
+                "verified_members": verified_members}
 
     def collect_snapshot(self, trade_date: str | date | None = None, *, force: bool = False,
                          mode: str | None = None) -> dict[str, Any]:
@@ -1003,13 +1111,20 @@ class THSConceptHistoryCollector:
                     "failed_concepts": len(payload.get("failed_codes", [])) if isinstance(payload, dict) else 0,
                     "error": str(exc)[:240]}
 
-    def run(self, start_date: str, end_date: str, *, force: bool = False) -> dict[str, Any]:
-        """Run one current snapshot and report all unavailable historical dates."""
+    def run(self, start_date: str, end_date: str, *, force: bool = False,
+            snapshot_date: str | None = None) -> dict[str, Any]:
+        """Run one snapshot and report unavailable historical dates.
+
+        ``snapshot_date`` is an explicit recovery escape hatch for an
+        interrupted weekly crawl.  Without it, the collector only targets
+        today's snapshot; with it, it resumes that stored checkpoint without
+        relabelling the historical snapshot as date-verified.
+        """
         requested_dates = _weekday_dates(start_date, end_date)
         today = date.today().isoformat()
-        snapshot_date = today if today in requested_dates else today
-        snapshot = self.collect_snapshot(snapshot_date, force=force)
-        missing_dates = [item for item in requested_dates if item != snapshot_date]
+        selected_snapshot = _iso(snapshot_date) if snapshot_date else today
+        snapshot = self.collect_snapshot(selected_snapshot, force=force)
+        missing_dates = [item for item in requested_dates if item != selected_snapshot]
         return {
             "start_date": _iso(start_date), "end_date": _iso(end_date),
             "requested_dates": requested_dates, "snapshot": snapshot,
