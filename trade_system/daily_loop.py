@@ -1,4 +1,4 @@
-"""Daily manual operator workflow loop.
+﻿"""Daily manual operator workflow loop.
 
 This module turns generated signals into auditable manual workflow records.
 It does not create orders and does not imply automatic execution.
@@ -15,6 +15,7 @@ import duckdb
 
 from trade_system.operator_risk import TradePlanInput, evaluate_trade_plan
 from trade_system.quality import table_columns, table_exists
+from trade_system.i18n_labels import zh_text
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.risk import init_trading_tables
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
@@ -343,8 +344,12 @@ def run_daily_operator_loop(
         for priority, row in enumerate(candidates, start=1):
             evidence = _loads(row.get("evidence_json"))
             risk_points = evidence.get("risk_points") or []
-            thesis = evidence.get("entry_reason") or f"candidate_score={float(row.get('score') or 0):.2f}"
-            invalidation = evidence.get("invalidation") or "Invalidate if score/fallback/risk evidence deteriorates."
+            thesis = zh_text(evidence.get("entry_reason")
+                             or f"候选得分={float(row.get('score') or 0):.2f}")
+            invalidation = zh_text(
+                evidence.get("invalidation")
+                or "Invalidate if score/fallback/risk evidence deteriorates."
+            )
             planned_position = 0.0 if data_blocked else max_single
             sector_code = str(row.get("sector_code") or "")
             risk_flags_for_plan = list(risk_points if risk_state == "defensive" and float(row.get("score") or 0) < 70 else ())
@@ -365,7 +370,7 @@ def run_daily_operator_loop(
                     thesis,
                     invalidation,
                     priority,
-                    "blocked_data_quality" if data_blocked else "active",
+                    "blocked_data_quality" if data_blocked else "active",  # status 值渲染时经 i18n 映射
                 ],
             )
             watchlist_count += 1
@@ -397,9 +402,12 @@ def run_daily_operator_loop(
                     row.get("stock_code"),
                     row.get("stock_name"),
                     "manual_shortline_plan",
-                    f"Only consider after auction/intraday evidence confirms; risk_gate={decision.reason}",
-                    invalidation,
-                    "Review at close; no automatic execution.",
+                    zh_text(
+                        f"Only consider after auction/intraday evidence confirms; "
+                        f"risk_gate={decision.reason}"
+                    ),
+                    zh_text(invalidation),
+                    zh_text("Review at close; no automatic execution."),
                      planned_position,
                     (
                         "blocked_data_quality"

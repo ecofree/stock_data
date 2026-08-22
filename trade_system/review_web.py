@@ -27,6 +27,18 @@ from trade_system.daily_review import (
     _latest_date,
 )
 from trade_system.review_facts import build_review_page_facts
+from trade_system.i18n_labels import (
+    CATEGORY_CN,
+    PROVIDER_CN,
+    SELECTION_STATUS_CN,
+    SEVERITY_CN,
+    SETUP_TYPE_CN,
+    PLAN_STATUS_CN,
+    EXECUTION_STATUS_CN,
+    WATCHLIST_STATUS_CN,
+    cn,
+    zh_text,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -454,11 +466,11 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         for row in outcomes[:15]:
             rows.append(
                 f"<tr><td>{_e(row.get('stock_name') or row.get('stock_code'))}</td>"
-                f"<td>{_status_pill(row.get('execution_status'))}</td>"
+                f"<td>{_status_pill(zh_text(cn(EXECUTION_STATUS_CN, row.get('execution_status'))))}</td>"
                 f"<td class='num'>{_pct(row.get('position_pct'))}</td>"
                 f"<td class='num {_sign_class(row.get('net_return_pct'))}'>{_fmt(row.get('net_return_pct'))}</td>"
-                f"<td>{_e(row.get('outcome_tag') or '—')}</td>"
-                f"<td class='dim'>{_e(row.get('review_note') or row.get('mistake_tag') or '—')}</td></tr>"
+                f"<td>{_e(zh_text(row.get('outcome_tag')) or '—')}</td>"
+                f"<td class='dim'>{_e(zh_text(row.get('review_note') or row.get('mistake_tag')) or '—')}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>真实成交</strong><span class='dim'>导入结果，不是候选分数</span></div>"
@@ -477,10 +489,10 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         for plan in plans[:12]:
             rows.append(
                 f"<tr><td class='mono'>{_e(plan.get('stock_code'))}</td><td>{_e(plan.get('stock_name'))}</td>"
-                f"<td>{_e(plan.get('setup_type') or '—')}</td><td class='num'>{_pct(plan.get('max_position_pct'))}</td>"
-                f"<td>{_status_pill(plan.get('status'))}</td>"
-                f"<td class='dim'>{_e(plan.get('entry_condition') or '—')}</td>"
-                f"<td class='dim'>{_e(plan.get('stop_condition') or '—')}</td></tr>"
+                f"<td>{_e(cn(SETUP_TYPE_CN, plan.get('setup_type')))}</td><td class='num'>{_pct(plan.get('max_position_pct'))}</td>"
+                f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, plan.get('status'))))}</td>"
+                f"<td class='dim'>{_e(zh_text(plan.get('entry_condition')) or '—')}</td>"
+                f"<td class='dim'>{_e(zh_text(plan.get('stop_condition')) or '—')}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>今日计划</strong></div>"
@@ -493,9 +505,9 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         for row in watchlist[:10]:
             rows.append(
                 f"<tr><td class='mono'>{_e(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
-                f"<td class='dim'>{_e(row.get('thesis') or '—')}</td>"
-                f"<td class='dim'>{_e(row.get('invalidation') or '—')}</td>"
-                f"<td>{_e(row.get('status') or '—')}</td></tr>"
+                f"<td class='dim'>{_e(zh_text(row.get('thesis')) or '—')}</td>"
+                f"<td class='dim'>{_e(zh_text(row.get('invalidation')) or '—')}</td>"
+                f"<td>{_e(zh_text(cn(WATCHLIST_STATUS_CN, row.get('status'))))}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>观察池</strong></div>"
@@ -526,7 +538,7 @@ def _render_loop(ctx: dict[str, Any]) -> str:
                 f"<tr><td class='mono'>{_e(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
                 f"<td class='num'>{_fmt(row.get('score'))}</td>"
                 f"<td class='num {_sign_class(row.get('main_net'))}'>{_fmt(row.get('main_net'))}</td>"
-                f"<td>{_e(row.get('selection_status') or '—')}</td></tr>"
+                f"<td>{_e(zh_text(cn(SELECTION_STATUS_CN, row.get('selection_status'))))}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>研究候选</strong><span class='dim'>不是订单</span></div>"
@@ -759,7 +771,9 @@ def _flow_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str,
         tds = []
         for key, _, cls in columns:
             val = row.get(key)
-            if key in money_keys:
+            if key == "provider":
+                val = cn(PROVIDER_CN, val)
+            elif key in money_keys:
                 tds.append(f"<td class='num {_sign_class(val)}'>{_fmt(val)}</td>")
             elif key in {"change_pct", "seal_rate"}:
                 tds.append(f"<td class='num {_sign_class(val)}'>{_pct(val)}</td>")
@@ -860,7 +874,12 @@ def _render_concept_limit_up(ctx: dict[str, Any], inline_stock_limit: int | None
     review = ctx.get("concept_limit_up") or {}
     groups = review.get("groups") or []
     if not groups:
-        message = review.get("message") or "暂无概念—涨停个股联动数据"
+        message = zh_text(review.get("message") or "暂无概念—涨停个股联动数据")
+        if review.get("membership_stale"):
+            message += (
+                f"；最新成分快照 {review.get('membership_date') or '未知'}。"
+                "请在收盘后运行 scripts/backfill_2026_ths_concepts.py 更新同花顺概念成分。"
+            )
         return f"<div class='empty'>{_e(message)}</div>"
     tabs = []
     for index, group in enumerate(groups):
@@ -980,14 +999,17 @@ def _render_stages(ctx: dict[str, Any]) -> str:
 def _render_alerts(ctx: dict[str, Any]) -> str:
     alerts = ctx.get("alerts", [])
     if not alerts:
-        return "<div class='empty'>无风险告警</div>"
+        return ("<div class='empty'>今日无风险告警。"
+                "告警按复盘交易日过滤；若确认该日应有告警，请检查 alert_events 表。</div>")
     out = []
     for a in alerts[:10]:
         severity = str(a.get("severity") or "info")
         cls = "bad" if severity in {"error", "critical", "warning"} else "warn"
+        sev_cn = zh_text(cn(SEVERITY_CN, severity))
+        cat_cn = zh_text(cn(CATEGORY_CN, a.get("category")))
         out.append(
-            f"<div class='alert {cls}'><strong>{_e(severity)} / {_e(a.get('category') or '')}</strong>"
-            f"<div>{_e(a.get('message') or '')}</div></div>"
+            f"<div class='alert {cls}'><strong>{_e(sev_cn)} / {_e(cat_cn)}</strong>"
+            f"<div>{_e(zh_text(a.get('message')))}</div></div>"
         )
     return "\n".join(out)
 
@@ -1010,10 +1032,10 @@ def _render_plans(ctx: dict[str, Any]) -> str:
         for p in plans[:15]:
             rows.append(
                 f"<tr><td class='mono'>{_e(p.get('stock_code'))}</td><td>{_e(p.get('stock_name'))}</td>"
-                f"<td>{_e(p.get('setup_type') or '—')}</td><td class='num'>{_pct(p.get('max_position_pct'))}</td>"
-                f"<td>{_status_pill(p.get('status'))}</td>"
-                f"<td class='dim'>{_e(p.get('entry_condition') or '—')}</td>"
-                f"<td class='dim'>{_e(p.get('stop_condition') or '—')}</td></tr>"
+                f"<td>{_e(cn(SETUP_TYPE_CN, p.get('setup_type')))}</td><td class='num'>{_pct(p.get('max_position_pct'))}</td>"
+                f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, p.get('status'))))}</td>"
+                f"<td class='dim'>{_e(zh_text(p.get('entry_condition')) or '—')}</td>"
+                f"<td class='dim'>{_e(zh_text(p.get('stop_condition')) or '—')}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>今日交易计划</strong></div>"
@@ -1761,12 +1783,14 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     {stages}
   </section>
 
-  <section id="s-next" class="tomorrow" data-screen-label="tomorrow">
-    <div class="sec-title"><strong>次日只看这几件事</strong><span class="sec-kicker">约束，不是展望</span></div>
+    <section id="s-next" class="tomorrow" data-screen-label="tomorrow">
+    <div class="sec-title"><strong>明天只看这几件事</strong><span class="sec-kicker">约法三章，防止乱开仓</span></div>
     {tomorrow}
     <div class="sec-title" style="margin-top:22px"><strong>风险告警</strong></div>
     {alerts}
   </section>
+
+  <!--EXTRAS-->
 
   <details class="appendix" id="s-appendix">
     <summary>附录<span>龙虎榜 · 全表资金 · QLib · 门禁 · 研究接口</span></summary>
@@ -1817,6 +1841,8 @@ def _render_review_bundle(
     try:
         selected = trade_date or _latest_date(con)
         ctx = build_daily_review_context(db_path, selected, con=con)
+        from trade_system import review_extras
+        ctx["extras_sections"] = review_extras.render_all(db_path, selected)
         ctx["page_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ctx["data_as_of"] = str((ctx.get("readiness") or {}).get("as_of") or selected)
         page_facts = build_review_page_facts(con, selected)
@@ -1837,7 +1863,7 @@ def _render_review_bundle(
             ladder,
             rotation,
             lazy_asset_name=lazy_asset_name,
-        )
+        ).replace("<!--EXTRAS-->", ctx.get("extras_sections") or "")
         lazy_out = _build_review_lazy_asset(ctx) if lazy_asset_name else None
     finally:
         con.close()

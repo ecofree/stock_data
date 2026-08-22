@@ -22,6 +22,12 @@ import duckdb
 from trade_system.signals import classify_market_regime
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.logging_setup import get_logger
+from trade_system.i18n_labels import (
+    PLAN_STATUS_CN,
+    SETUP_TYPE_CN,
+    cn,
+    zh_text,
+)
 
 logger = get_logger(__name__)
 
@@ -642,10 +648,13 @@ def _plan_console(con, trade_date: str) -> dict:
     rows = []
     for code, name, setup, maxpos, status, entry, stop in plans:
         w = watch_map.get(str(code), {})
-        rows.append({"code": code, "name": name or "", "setup": setup,
-                     "maxpos": _fnum(maxpos), "status": status,
-                     "entry": entry, "stop": stop,
-                     "thesis": w.get("thesis"), "invalidation": w.get("invalidation")})
+        rows.append({"code": code, "name": name or "",
+                     "setup": cn(SETUP_TYPE_CN, setup),
+                     "maxpos": _fnum(maxpos),
+                     "status": zh_text(cn(PLAN_STATUS_CN, status)),
+                     "entry": zh_text(entry), "stop": zh_text(stop),
+                     "thesis": zh_text(w.get("thesis")),
+                     "invalidation": zh_text(w.get("invalidation"))})
     risk_row = risk[0] if risk else None
     return {"rows": rows,
             "risk": ({"state": risk_row[0], "total": _fnum(risk_row[1]),

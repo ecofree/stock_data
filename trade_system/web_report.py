@@ -1,4 +1,4 @@
-"""Static HTML dashboard for inspecting the professional trading assistant state."""
+﻿"""Static HTML dashboard for inspecting the professional trading assistant state."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import duckdb
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.data_chain import assess_data_chains
 from trade_system.flow_ranking import sector_flow_rank_sql, stock_flow_rank_sql
+from trade_system.i18n_labels import CATEGORY_CN, PROVIDER_CN, SEVERITY_CN, cn, zh_text
 from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
@@ -1228,22 +1229,22 @@ def render_dashboard_html(context: dict) -> str:
     flow_rows = "\n".join(flow_rows) or "<tr><td colspan='5' class='muted'>暂无资金流数据</td></tr>"
     stock_flow_rows = "\n".join(
         f"<tr><td>{_fmt(item.get('stock_code'))}</td><td>{_fmt(item.get('main_net'))}</td>"
-        f"<td>{_fmt(item.get('provider'))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
+        f"<td>{_fmt(zh_text(cn(PROVIDER_CN, item.get('provider'))))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
         for item in flow.get("stock_top", [])[:10]
     ) or "<tr><td colspan='4' class='muted'>暂无当前个股资金流</td></tr>"
     stock_outflow_rows = "\n".join(
         f"<tr><td>{_fmt(item.get('stock_code'))}</td><td>{_fmt(item.get('main_net'))}</td>"
-        f"<td>{_fmt(item.get('provider'))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
+        f"<td>{_fmt(zh_text(cn(PROVIDER_CN, item.get('provider'))))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
         for item in flow.get("stock_bottom", [])[:10]
     ) or "<tr><td colspan='4' class='muted'>No current stock outflow</td></tr>"
     sector_flow_rows = "\n".join(
         f"<tr><td>{_fmt(item.get('sector_name') or item.get('sector_code'))}</td><td>{_fmt(item.get('main_net'))}</td>"
-        f"<td>{_fmt(item.get('provider'))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
+        f"<td>{_fmt(zh_text(cn(PROVIDER_CN, item.get('provider'))))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
         for item in flow.get("sector_top", [])[:10]
     ) or "<tr><td colspan='4' class='muted'>暂无当前板块资金流</td></tr>"
     sector_outflow_rows = "\n".join(
         f"<tr><td>{_fmt(item.get('sector_name') or item.get('sector_code'))}</td><td>{_fmt(item.get('main_net'))}</td>"
-        f"<td>{_fmt(item.get('provider'))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
+        f"<td>{_fmt(zh_text(cn(PROVIDER_CN, item.get('provider'))))}</td><td>{_fmt(item.get('fetched_at'))}</td></tr>"
         for item in flow.get("sector_bottom", [])[:10]
     ) or "<tr><td colspan='4' class='muted'>No current sector outflow</td></tr>"
     concept = context.get("concept_status", {})
@@ -1320,9 +1321,11 @@ def render_dashboard_html(context: dict) -> str:
         for item in context.get("operator_candidates", [])[:30]
     )
     alert_rows = "\n".join(
-        f"<tr><td>{_fmt(item.get('severity'))}</td><td>{_fmt(item.get('category'))}</td><td>{_fmt(item.get('message'))}</td></tr>"
+        f"<tr><td>{_fmt(zh_text(cn(SEVERITY_CN, item.get('severity'))))}</td>"
+        f"<td>{_fmt(zh_text(cn(CATEGORY_CN, item.get('category'))))}</td>"
+        f"<td>{_fmt(zh_text(item.get('message')))}</td></tr>"
         for item in context.get("alerts", [])
-    )
+    ) or "<tr><td colspan='3' class='empty'>今日无风险告警（按数据最新交易日过滤）</td></tr>"
     report_links = "\n".join(
         f"<a class='report-link' href='{escape(str(item.get('path')))}'>{_fmt(item.get('name'))}<span>{_fmt(item.get('size'))} bytes</span></a>"
         for item in context.get("reports", [])

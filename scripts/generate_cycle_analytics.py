@@ -1,4 +1,4 @@
-"""Build the emotion-cycle phase table, premium and promotion matrices.
+﻿"""Build the emotion-cycle phase table, premium and promotion matrices.
 
 Read-only over normalized views; writes three derived tables (migration 0002)
 and a markdown summary.  Safe to re-run: rows are replaced per date.
@@ -14,8 +14,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import duckdb  # noqa: E402
 
-from trade_system.cycle import PHASE_CN, DayMetrics, classify_phase, \
-    compute_premium, compute_promotion  # noqa: E402
+from trade_system.cycle import PHASE_CN, DayMetrics, KLINE_DEDUP_CTE, \
+    classify_phase, compute_premium, compute_promotion  # noqa: E402
 from trade_system.logging_setup import configure, get_logger  # noqa: E402
 
 logger = get_logger("cycle_analytics")
@@ -24,8 +24,11 @@ logger = get_logger("cycle_analytics")
 def _trading_days(con) -> list[str]:
     rows = con.execute(
         """
-        SELECT DISTINCT CAST(trade_date AS DATE) AS d FROM v_limit_pool
-        ORDER BY d
+        SELECT d FROM (
+            SELECT DISTINCT CAST(trade_date AS DATE) AS d FROM v_limit_pool
+            UNION
+            SELECT DISTINCT trade_date AS d FROM derived_limit_up_daily
+        ) ORDER BY d
         """
     ).fetchall()
     return [str(r[0]) for r in rows]
@@ -33,6 +36,12 @@ def _trading_days(con) -> list[str]:
 
 def build(con, dates: list[str], min_sample: int = 3) -> dict:
     stats = {"phase": 0, "premium": 0, "promotion": 0}
+    # Materialize the deduplicated kline panel once for the whole loop;
+    # re-running the dedup CTE per day does not finish within minutes.
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE _kline_dedup AS {KLINE_DEDUP_CTE}"
+    )
+    kline_src = "_kline_dedup"
     for day in dates:
         mood = con.execute(
             """SELECT limit_up_count, limit_down_count FROM market_mood
@@ -48,8 +57,8 @@ def build(con, dates: list[str], min_sample: int = 3) -> dict:
             [day],
         ).fetchone()[0]
 
-        prem_rows = compute_premium(con, day)
-        promo_rows = compute_promotion(con, day)
+        prem_rows = compute_premium(con, day, kline_src=kline_src)
+        promo_rows = compute_promotion(con, day, kline_src=kline_src)
 
         overall_prem = next(
             (r["avg_pct"] for r in prem_rows if r["board_bucket"] == "_all"), None

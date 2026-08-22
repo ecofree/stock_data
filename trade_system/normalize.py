@@ -1,4 +1,4 @@
-"""Build normalized, deduplicated DuckDB views for trading workflows."""
+﻿"""Build normalized, deduplicated DuckDB views for trading workflows."""
 
 from __future__ import annotations
 
@@ -246,8 +246,23 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
     has_l2 = table_exists(con, "l2_realtime_all_boards")
     has_ladder = table_exists(con, "ladder_realtime_boards")
     has_eastmoney = table_exists(con, "eastmoney_limit_up_pool")
-    if has_l2 or has_ladder or has_eastmoney:
+    has_tushare = table_exists(con, "official_limit_pool")
+    if has_l2 or has_ladder or has_eastmoney or has_tushare:
         sources = []
+        if has_tushare:
+            # Priority 0: backfilled exchange-grade history with exact
+            # limit_times (board level) and first/last seal times.  Days
+            # covered by the backfill use this source exclusively.
+            sources.append(
+                """
+                SELECT CAST(trade_date AS VARCHAR) AS trade_date,
+                       continue_day_cnt AS board_level, stock_code, stock_name,
+                       limit_up_time, fetched_at,
+                       0 AS source_priority
+                FROM official_limit_pool
+                WHERE continue_day_cnt IS NOT NULL
+                """
+            )
         if has_eastmoney:
             latest = _latest_cte(
                 "eastmoney_limit_up_pool",
@@ -308,6 +323,45 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
         )
         return
     con.execute(_empty_view_sql("v_limit_pool", cols))
+
+
+def _create_limit_pool_rich(con: duckdb.DuckDBPyConnection) -> None:
+    """Exchange-grade limit-up detail (seal times, reopen count, float mv).
+
+    Empty-tolerant: when the backfill table is absent the view collapses to
+    the same shape fed only by v_limit_pool basics.
+    """
+    if not table_exists(con, "official_limit_pool"):
+        con.execute(
+            _empty_view_sql(
+                "v_limit_pool_rich",
+                [
+                    ("trade_date", "DATE"),
+                    ("stock_code", "VARCHAR"),
+                    ("stock_name", "VARCHAR"),
+                    ("industry", "VARCHAR"),
+                    ("board_level", "INTEGER"),
+                    ("close", "DOUBLE"),
+                    ("pct_chg", "DOUBLE"),
+                    ("fd_amount", "DOUBLE"),
+                    ("first_time", "VARCHAR"),
+                    ("last_time", "VARCHAR"),
+                    ("open_times", "INTEGER"),
+                ],
+            )
+        )
+        return
+    con.execute(
+        """
+        CREATE OR REPLACE VIEW v_limit_pool_rich AS
+        SELECT CAST(trade_date AS DATE) AS trade_date, stock_code, stock_name,
+               limit_up_reason AS industry, continue_day_cnt AS board_level,
+               close, pct_chg, seal_money AS fd_amount,
+               limit_up_time AS first_time, NULL AS last_time,
+               NULL AS open_times
+        FROM official_limit_pool
+        """
+    )
 
 
 def _create_lhb_daily(con: duckdb.DuckDBPyConnection) -> None:
@@ -2000,6 +2054,7 @@ def build_normalized_views(db_path: str | Path) -> list[str]:
         _create_market_daily(con)
         _create_sector_daily(con)
         _create_limit_pool(con)
+        _create_limit_pool_rich(con)
         _create_lhb_daily(con)
         _create_stock_pool(con)
         _create_auction_status(con)

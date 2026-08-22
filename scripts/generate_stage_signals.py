@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+import duckdb
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trade_system.stage_signals import STAGE_NAMES, generate_stage_signals
@@ -23,6 +25,11 @@ def main() -> int:
         "--strict-tradability",
         action="store_true",
         help="Require positive current flow and sell-side liquidity evidence before execution-ready status.",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Skip the signal push hook (delivery is a no-op without KPL_NOTIFY_* channels).",
     )
     parser.add_argument(
         "--allow-blocked",
@@ -51,6 +58,25 @@ def main() -> int:
     # diagnostics the integrated runner may deliberately retain a
     # non-actionable candidate set while its readiness step marks the whole
     # run degraded.  Other callers remain fail-closed by default.
+    # Push triggered signals to configured channels (no-op without env).
+    if result.get("readiness", {}).get("ready", False) and not args.no_notify:
+        try:
+            from scripts.push_stage_signals import collect_triggered, compose
+            from trade_system.notify import send_text
+
+            con = duckdb.connect(args.db, read_only=True)
+            try:
+                rows = collect_triggered(con, str(result["trade_date"]), args.stage)
+            finally:
+                con.close()
+            if rows:
+                send_text(
+                    f"[stock_data] {result['trade_date']} 信号提醒",
+                    compose(str(result["trade_date"]), rows),
+                )
+        except Exception as exc:  # push must never break signal generation
+            print(f"notify_skipped={exc!r}")
+
     if not result.get("readiness", {}).get("ready", False):
         return 0 if args.allow_blocked else 2
     return 0
