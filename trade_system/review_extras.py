@@ -219,6 +219,46 @@ def render_market_note(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
             f"<ul class='mj-list'>{items}</ul>")
 
 
+# ------------------------------------------------- ⑥ QLib 最新选股 Top
+def render_qlib_screen(con: duckdb.DuckDBPyConnection) -> str:
+    day_row = con.execute(
+        """SELECT trade_date, model_id FROM qlib_prediction
+           ORDER BY trade_date DESC LIMIT 1"""
+    ).fetchone()
+    if not day_row:
+        return ""
+    day, model_id = str(day_row[0]), str(day_row[1])
+    rows = con.execute(
+        f"""
+        SELECT p.symbol, p.score, p."rank",
+               max(CASE WHEN o.trade_date IS NOT NULL THEN 1 ELSE 0 END) AS in_pool
+        FROM qlib_prediction p
+        LEFT JOIN official_limit_pool o
+          ON o.stock_code = p.symbol
+         AND o.trade_date = DATE '{day}'
+        WHERE p.model_id = ? AND p.trade_date = ?
+        GROUP BY p.symbol, p.score, p."rank"
+        ORDER BY p.score DESC LIMIT 10
+        """,
+        [model_id, day],
+    ).fetchall()
+    if not rows:
+        return ""
+    trs = "".join(
+        f"<tr><td class='num'>{_esc(rank)}</td><td class='mono'>{_esc(symbol)}</td>"
+        f"<td class='num'>{score:.4f}</td>"
+        f"<td>{'🔥 涨停池' if in_pool else ''}</td></tr>"
+        for symbol, score, rank, in_pool in rows
+    )
+    return (
+        "<div class='sec-title'><strong>QLib 最新选股 Top10</strong>"
+        f"<span class='sec-kicker'>模型 {model_id} · 特征日 {day} · research-only</span></div>"
+        "<div class='table-scroll'><table><thead><tr><th>排名</th><th>代码</th>"
+        "<th class='num'>模型分</th><th>标记</th></tr></thead>"
+        f"<tbody>{trs}</tbody></table></div>"
+    )
+
+
 # ------------------------------------------------------------------ all
 def render_all(db_path: str | Path, trade_date: str) -> str:
     con = _connect(db_path)
@@ -229,6 +269,7 @@ def render_all(db_path: str | Path, trade_date: str) -> str:
             "stats_card": render_stats_card(con, trade_date),
             "loss_panel": render_loss_panel(con, trade_date),
             "market_note": render_market_note(con, trade_date),
+            "qlib_screen": render_qlib_screen(con),
         }
     finally:
         con.close()
