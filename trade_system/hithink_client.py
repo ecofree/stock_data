@@ -48,6 +48,12 @@ class HiThinkClient:
         self.min_interval = min_interval
         self.timeout = timeout
         self._last_call = 0.0
+        self.call_count = 0
+
+    @property
+    def quota_note(self) -> str:
+        """Per-instance call counter for quota observation."""
+        return f"hithink calls this session: {self.call_count}"
 
     # ------------------------------------------------------------ transport
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
@@ -63,6 +69,7 @@ class HiThinkClient:
                 payload = json.loads(resp.read().decode("utf-8"))
         finally:
             self._last_call = time.time()
+            self.call_count += 1
         code = payload.get("code")
         if code != 0:
             raise HiThinkError(f"{path} -> code={code} message={payload.get('message')}")

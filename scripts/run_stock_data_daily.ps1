@@ -196,6 +196,10 @@ try {
             Tee-Object -FilePath $Log -Append
         & $Python (Join-Path $Root "scripts\generate_signal_attribution.py") --db $DbPath 2>&1 |
             Tee-Object -FilePath $Log -Append
+        # Minute snapshots must run daily: TDX servers only keep recent
+        # sessions, so the replay-axis history accumulates day by day.
+        & $Python (Join-Path $Root "scripts\collect_minute_snapshots.py") --db $DbPath `
+            --source limit-pool 2>&1 | Tee-Object -FilePath $Log -Append
         $ErrorActionPreference = $prevEAP
     } catch {
         "HEALTH_TREND_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
