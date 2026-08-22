@@ -1,4 +1,4 @@
-"""Detailed post-market review page renderer (HTML + ECharts).
+﻿"""Detailed post-market review page renderer (HTML + ECharts).
 
 Consumes the same context as the markdown daily review
 (``trade_system.daily_review.build_daily_review_context``) plus one page-facts
@@ -1653,6 +1653,92 @@ window.addEventListener('DOMContentLoaded', () => {{
 # Page assembly
 # ---------------------------------------------------------------------------
 
+def _top_nav(active: str) -> str:
+    """Shared top navigation across the multi-page report set."""
+    items = [
+        ("daily_review_latest.html", "总览", "overview"),
+        ("sector_trail_latest.html", "板块轨迹", "trail"),
+        ("trading_dashboard_latest.html", "仪表盘", "dashboard"),
+        ("trading_terminal_latest.html", "终端", "terminal"),
+    ]
+    links = "".join(
+        f"<a href='{href}' class='tn-link{' active' if key == active else ''}'"
+        f"{' target=_blank rel=noopener' if key in ('dashboard', 'terminal') else ''}"
+        f">{label}</a>"
+        for href, label, key in items
+    )
+    return f"<nav class='topnav'>{links}</nav>"
+
+
+_TRAIL_PAGE_CSS = """
+body{background:#0f1420;color:#dfe6f2;font-family:'Segoe UI','Microsoft YaHei',sans-serif;margin:0}
+.topnav{display:flex;gap:18px;align-items:center;padding:14px 28px;background:#131a2a;
+position:sticky;top:0;z-index:50;border-bottom:1px solid #26304a}
+.topnav .brand{font-weight:800;letter-spacing:2px;color:#7fb2ff;margin-right:12px}
+.tn-link{color:#9fb0cc;text-decoration:none;font-size:14px;padding:4px 10px;border-radius:6px}
+.tn-link.active{color:#fff;background:#223055}
+.wrap{max-width:1840px;margin:0 auto;padding:20px 28px}
+.page-title{font-size:24px;font-weight:700;margin:6px 0 2px}
+.page-sub{color:#8fa1c0;font-size:13px;margin-bottom:16px}
+.sec-title{font-size:17px;font-weight:700;margin:10px 0 10px}
+.detail-item{margin-top:10px}
+.d-label{color:#8fa1c0;font-size:12px}
+.d-value{font-size:15px}
+.amber{color:#ffb454}
+.concept-footnote{color:#7484a3;font-size:11px;line-height:1.7;margin-top:14px;
+border-top:1px dashed #26304a;padding-top:12px}
+"""
+
+
+def _render_sector_trail_standalone(
+    ctx: dict[str, Any], trade_date: str, echarts_src: str,
+    trend: dict[str, Any], ladder: list[dict[str, Any]],
+    rotation: list[dict[str, Any]],
+    concept_limit_up: dict[str, Any] | None = None,
+    extras_html: str = "",
+) -> str:
+    """Desktop-width standalone 板块轨迹 page.
+
+    Reuses the same ``_render_sector_trail`` fragment and ``_chart_js``
+    pipeline as the overview page so every interaction stays identical —
+    only the layout (full-width, dark, desktop grid) is its own.
+    """
+    from trade_system.cycle import PHASE_CN
+
+    trail_html = _render_sector_trail(ctx)
+    phase_row = ctx.get("cycle_phase") or {}
+    chart_js = _chart_js(ctx, trend, ladder, rotation, concept_limit_up)
+    phase_txt = (
+        f"{PHASE_CN.get(phase_row.get('phase'), phase_row.get('phase', '—'))}"
+        f" · 温度 {phase_row.get('score', '—')}"
+        if isinstance(phase_row, dict) and phase_row else "—"
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>板块轨迹 · {_e(trade_date)}</title>
+<style>{_TRAIL_PAGE_CSS}</style>
+</head>
+<body>
+{_top_nav("trail")}
+<main class="wrap">
+  <div class="page-title">板块轨迹 <span style="color:#8fa1c0;font-size:14px">· {_e(trade_date)}</span></div>
+  <div class="page-sub">当前相位：{phase_txt} ｜ 日 / 周 / 月 / 季 四个窗口自由切换 · 全部数据来自本地 DuckDB · research-only</div>
+  <section id="s-trail" data-screen-label="trail">
+    {trail_html}
+    <div class="concept-footnote">口径：当日涨停且属于该概念/行业/同花顺板块的个股；涨停时间早的排前。一只股票可同时属于多个概念。历史窗口内某日缺失表示当日无该板块涨停或数据未覆盖，不代表没有行情。</div>
+  </section>
+  {extras_html}
+</main>
+<script>{echarts_src}</script>
+<script>{chart_js}</script>
+</body>
+</html>
+"""
+
+
 def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
                trend: dict[str, Any], ladder: list[dict[str, Any]],
                rotation: list[dict[str, Any]],
@@ -1698,6 +1784,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
 </head>
 <body>
 
+{_top_nav("overview")}
 <header class="masthead">
   <div class="mast-mark">盘后复盘</div>
   <nav class="toc">
@@ -1743,7 +1830,10 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
   </section>
 
   <section id="s-trail" data-screen-label="trail">
-    <div class="sec-title"><strong>板块轨迹</strong><span class="sec-kicker">日 / 周 / 月 / 季 · 点概念看个股</span></div>
+    <div class="sec-title"><strong>板块轨迹</strong><span class="sec-kicker">日 / 周 / 月 / 季 · 四个窗口看轮动</span>
+      <a href="sector_trail_latest.html" target="_blank" rel="noopener"
+         style="float:right;font-size:13px;color:#7fb2ff;text-decoration:none">
+        ↗ 进入全宽专页（桌面布局）</a></div>
     {sector_trail}
     <div class="concept-footnote">日：当日涨停只数。周/月/季：窗口内涨停次数、概念资金涨幅、资金净流入合计；下方个股区间收益为窗口首收至末收。一只票可以同时属于多个概念。过宽概念已排除。</div>
   </section>
@@ -1829,6 +1919,7 @@ def _render_review_bundle(
     trade_date: str | None = None,
     echarts_path: str | Path | None = None,
     lazy_asset_name: str | None = None,
+    trail_out: str | Path | None = None,
 ) -> tuple[str, str, str | None]:
     """Build HTML and, when requested, the optional same-directory sidecar."""
     if echarts_path is None:
@@ -1865,6 +1956,26 @@ def _render_review_bundle(
             lazy_asset_name=lazy_asset_name,
         ).replace("<!--EXTRAS-->", ctx.get("extras_sections") or "")
         lazy_out = _build_review_lazy_asset(ctx) if lazy_asset_name else None
+        if trail_out:
+            from trade_system.cycle import PHASE_CN  # noqa: F401 (page CSS/JS refs)
+
+            phase_row = con.execute(
+                """SELECT phase, score FROM market_cycle_phase
+                   WHERE trade_date <= ? ORDER BY trade_date DESC LIMIT 1""",
+                [selected],
+            ).fetchone()
+            ctx["cycle_phase"] = (
+                {"phase": phase_row[0],
+                 "score": float(phase_row[1]) if phase_row and phase_row[1] is not None else None}
+                if phase_row else {}
+            )
+            trail_page = _render_sector_trail_standalone(
+                ctx, selected, echarts_src, trend, ladder, rotation,
+                concept_limit_up=ctx.get("concept_limit_up") or {},
+                extras_html=ctx.get("extras_sections") or "",
+            )
+            Path(trail_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(trail_out).write_text(trail_page, encoding="utf-8")
     finally:
         con.close()
     return html_out, selected, lazy_out
@@ -1887,6 +1998,7 @@ def write_review_web(db_path: str | Path, out_path: str | Path,
         db_path,
         trade_date,
         lazy_asset_name=lazy_name,
+        trail_out=out.parent / "sector_trail_latest.html",
     )
     out.write_text(html_out, encoding="utf-8")
     if lazy_out is not None:
