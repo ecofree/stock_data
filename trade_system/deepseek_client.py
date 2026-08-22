@@ -169,3 +169,50 @@ class DeepSeekReviewClient:
                 if attempt + 1 < attempts:
                     self._sleep(min(2.0 * (attempt + 1), 5.0))
         raise DeepSeekReviewError(str(last_error or "provider request failed"))
+
+    def chat(self, user_content: str, *, system: str | None = None,
+             max_tokens: int = 2048) -> str:
+        """Free-form single-turn completion; returns the assistant text.
+
+        Used by callers that need plain-text reasoning (e.g. the daily
+        stock screener's narrative review) rather than the fixed review
+        JSON contract.
+        """
+        if not self.configured:
+            raise DeepSeekReviewError("DeepSeek API key or endpoint is not configured")
+        payload = {
+            "model": self.settings.model,
+            "messages": [
+                {"role": "system", "content": system or (
+                    "你是严谨的A股短线研究助理。只依据给定证据作答，"
+                    "缺失信息明确说“数据不足”，不臆测。")},
+                {"role": "user", "content": user_content},
+            ],
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+        last_error: Exception | None = None
+        attempts = max(0, int(self.settings.max_retries)) + 1
+        for attempt in range(attempts):
+            try:
+                response = self._post(
+                    self.settings.base_url.rstrip("/") + "/chat/completions",
+                    headers={
+                        "Authorization": "Bearer " + self.settings.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self.settings.timeout,
+                )
+                if not response.ok:
+                    raise DeepSeekReviewError(f"provider HTTP {response.status_code}")
+                body = response.json()
+                choices = body.get("choices") or []
+                return ((choices[0].get("message") or {}).get("content") if choices else "") or ""
+            except (requests.RequestException, DeepSeekReviewError) as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    self._sleep(min(2.0 * (attempt + 1), 5.0))
+        raise DeepSeekReviewError(str(last_error or "provider request failed"))

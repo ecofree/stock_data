@@ -259,6 +259,40 @@ def render_qlib_screen(con: duckdb.DuckDBPyConnection) -> str:
     )
 
 
+# ------------------------------------------------- ⑦ 次日候选筛选
+def render_daily_picks(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
+    rows = con.execute(
+        """
+        SELECT rank, stock_code, stock_name, board, total_score,
+               limit_up_reason, llm_bull_case, llm_risk, llm_watch_condition,
+               factor_json
+        FROM daily_stock_picks WHERE trade_date = ? ORDER BY rank LIMIT 10
+        """,
+        [trade_date],
+    ).fetchall()
+    if not rows:
+        return ""
+    trs = []
+    for rank, code, name, board, score, reason, bull, risk, watch, fj in rows:
+        trs.append(
+            f"<tr><td class='num'>{_esc(rank)}</td><td class='mono'>{_esc(code)}</td>"
+            f"<td>{_esc(name)}</td><td>{_esc(board or '—')}</td>"
+            f"<td class='num'><b>{_esc(score)}</b></td>"
+            f"<td class='dim'>{_esc((reason or '')[:26])}</td>"
+            f"<td class='dim'>{_esc(bull or '—')}</td>"
+            f"<td class='dim'>{_esc(risk or '—')}</td>"
+            f"<td class='dim'>{_esc(watch or '—')}</td></tr>"
+        )
+    return (
+        "<div class='sec-title'><strong>次日候选 Top10</strong>"
+        "<span class='sec-kicker'>规则评分 + QLib + DeepSeek 复核 · research-only</span></div>"
+        "<div class='table-scroll'><table><thead><tr><th>#</th><th>代码</th><th>名称</th>"
+        "<th>板</th><th class='num'>总分</th><th>涨停原因</th><th>做多逻辑</th>"
+        "<th>风险</th><th>明日观察</th></tr></thead>"
+        f"<tbody>{''.join(trs)}</tbody></table></div>"
+    )
+
+
 # ------------------------------------------------------------------ all
 def render_all(db_path: str | Path, trade_date: str) -> str:
     con = _connect(db_path)
@@ -269,6 +303,7 @@ def render_all(db_path: str | Path, trade_date: str) -> str:
             "stats_card": render_stats_card(con, trade_date),
             "loss_panel": render_loss_panel(con, trade_date),
             "market_note": render_market_note(con, trade_date),
+            "daily_picks": render_daily_picks(con, trade_date),
             "qlib_screen": render_qlib_screen(con),
         }
     finally:
