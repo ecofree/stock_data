@@ -38,7 +38,9 @@ def load_panel(con, table: str, date_col: str, code_col: str,
                features: list[str], horizon: int,
                start_date: str | None = None) -> pd.DataFrame:
     quoted = ", ".join(f'b."{f}"' for f in features)
-    start_clause = "WHERE base.d >= ?" if start_date else ""
+    # Inside the CTE the WHERE must reference the raw table columns; the
+    # projected alias `d` is not visible yet.
+    start_clause = f'WHERE b."{date_col}" >= ?' if start_date else ""
     binds = [start_date] if start_date else []
     binds.append(horizon)
     sql = f"""
@@ -116,6 +118,8 @@ def main() -> int:
                         help="Comma-separated numeric feature column names.")
     parser.add_argument("--horizon", type=int, default=5,
                         help="Forward return horizon in sessions.")
+    parser.add_argument("--start-date", default=None,
+                        help="Restrict the feature panel to dates >= this.")
     parser.add_argument("--min-names", type=int, default=10,
                         help="Minimum names per day for a valid cross-section.")
     parser.add_argument("--out",
@@ -127,7 +131,7 @@ def main() -> int:
     con = duckdb.connect(args.db, read_only=True)
     try:
         panel = load_panel(con, args.table, args.date_col, args.code_col,
-                           features, args.horizon)
+                           features, args.horizon, start_date=args.start_date)
     finally:
         con.close()
     if panel.empty:

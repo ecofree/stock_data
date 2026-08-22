@@ -58,6 +58,12 @@ def build(con, dates: list[str], min_sample: int = 3) -> dict:
             (r["rate"] for r in promo_rows if r["from_board"] == 1), None
         )
 
+        # Days with neither mood data nor measurable cohort outcomes carry no
+        # signal; writing a placeholder phase would pollute the time series.
+        if mood is None and overall_prem is None:
+            logger.debug("skip %s: no mood and no premium evidence", day)
+            continue
+
         metrics = DayMetrics(
             trade_date=day,
             limit_up_count=mood[0] if mood else None,

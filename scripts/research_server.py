@@ -19,6 +19,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -124,7 +125,18 @@ async function run(){
 </script></body></html>"""
 
 
-def make_handler(con: duckdb.DuckDBPyConnection):
+def make_handler(db_path: str):
+    """Each worker thread gets its own read-only connection (DuckDB
+    connections are not safe for concurrent execute from multiple threads)."""
+    local = threading.local()
+
+    def get_con() -> duckdb.DuckDBPyConnection:
+        conn = getattr(local, "con", None)
+        if conn is None:
+            conn = duckdb.connect(db_path, read_only=True)
+            local.con = conn
+        return conn
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: str, ctype: str = "application/json"):
             data = body.encode("utf-8")
@@ -138,7 +150,7 @@ def make_handler(con: duckdb.DuckDBPyConnection):
             if self.path == "/":
                 self._send(200, _PAGE, "text/html; charset=utf-8")
             elif self.path == "/api/tables":
-                rows = con.execute(
+                rows = get_con().execute(
                     """SELECT table_type, table_name FROM information_schema.tables
                        WHERE table_schema='main' ORDER BY table_type, table_name"""
                 ).fetchall()
@@ -153,7 +165,7 @@ def make_handler(con: duckdb.DuckDBPyConnection):
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                result = run_query(con, str(payload.get("sql", "")))
+                result = run_query(get_con(), str(payload.get("sql", "")))
                 self._send(200, json.dumps(result, ensure_ascii=False))
             except QueryRejected as exc:
                 self._send(400, json.dumps({"error": str(exc)}))
@@ -172,15 +184,14 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    con = duckdb.connect(args.db, read_only=True)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(con))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.db))
     print(f"research console: http://127.0.0.1:{args.port}/ (Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        con.close()
+        server.server_close()
     return 0
 
 

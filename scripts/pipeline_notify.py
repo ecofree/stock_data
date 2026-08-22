@@ -42,10 +42,12 @@ def main() -> int:
     heartbeat.write("daily_close", {"event": args.event})
     statuses: dict[str, str] = {}
 
+    # Healthcheck semantics: only completion is pinged.  A start ping would
+    # register success before the run finished, defeating the liveness check.
     healthcheck_url = __import__("os").environ.get("KPL_NOTIFY_HEALTHCHECK_URL", "").strip()
-    if healthcheck_url:
+    if healthcheck_url and args.event != "start":
         statuses["healthcheck"] = ping_healthcheck(
-            healthcheck_url, ok=args.event in ("start", "success")
+            healthcheck_url, ok=args.event == "success"
         )
 
     if args.event == "failure":

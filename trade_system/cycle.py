@@ -156,6 +156,7 @@ def compute_premium(con: duckdb.DuckDBPyConnection, prev_trade_date: str) -> lis
             SELECT stock_code, max(board_level) AS board
             FROM v_limit_pool
             WHERE CAST(trade_date AS DATE) = ?1
+              AND board_level IS NOT NULL
             GROUP BY stock_code
         ),
         kline AS ({KLINE_DEDUP_CTE})
@@ -219,6 +220,7 @@ def compute_promotion(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[d
         WITH y AS (
             SELECT stock_code, max(board_level) AS board
             FROM v_limit_pool WHERE CAST(trade_date AS DATE) = ?1
+              AND board_level IS NOT NULL
             GROUP BY stock_code
         ),
         t AS (

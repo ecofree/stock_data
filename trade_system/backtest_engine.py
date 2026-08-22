@@ -61,6 +61,7 @@ def load_universe(con: duckdb.DuckDBPyConnection, start: str, end: str) -> list[
         SELECT CAST(trade_date AS DATE) AS d, stock_code, max(board_level) AS board
         FROM v_limit_pool
         WHERE CAST(trade_date AS DATE) BETWEEN ? AND ?
+          AND board_level IS NOT NULL
         GROUP BY 1, 2 ORDER BY 1, 2
         """,
         [start, end],
@@ -119,8 +120,10 @@ def simulate(
             continue
 
         free_slot = min(range(params.max_positions), key=lambda k: slot_free_at[k])
-        if slot_free_at[free_slot] > entry_i:
-            continue                          # all slots busy -> skip candidate
+        # A slot whose previous trade exits at the close of session X cannot
+        # take a new entry at X's open (the capital is still in the market).
+        if slot_free_at[free_slot] >= entry_i:
+            continue
         slot_free_at[free_slot] = exit_i
 
         entry_px = e_bar["open"] * (1 + slip)

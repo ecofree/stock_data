@@ -102,6 +102,25 @@ def test_slot_capacity_limits_concurrent_entries(con):
     assert result["stats"]["n_trades"] == 1
 
 
+def test_no_same_day_overlap_when_single_slot(con):
+    """A slot freeing at close of D must NOT take an entry at D's open."""
+    _kline(con, "2026-08-03", "000001", 9.5, 10.0, 9.4, 10.0)
+    _kline(con, "2026-08-04", "000001", 10.0, 10.5, 9.9, 10.4)
+    _kline(con, "2026-08-05", "000001", 10.3, 10.9, 10.2, 10.8)
+    _kline(con, "2026-08-04", "000002", 9.5, 10.0, 9.4, 10.0)   # signal next day
+    _kline(con, "2026-08-05", "000002", 10.0, 10.5, 9.9, 10.4)  # would-be entry
+    universe = [
+        {"date": "2026-08-03", "stock_code": "000001", "board": 1},
+        {"date": "2026-08-04", "stock_code": "000002", "board": 1},
+    ]
+    result = simulate(universe, load_kline(con), SESSIONS,
+                      BacktestParams(hold_days=1, max_positions=1))
+    # trade1 exits at close of 08-05; trade2's entry is the open of 08-05
+    # -> overlapping, must be skipped.
+    codes = [t.stock_code for t in result["trades"]]
+    assert codes == ["000001"]
+
+
 def test_equity_curve_compounds_and_drawdown_nonnegative(con):
     _kline(con, "2026-08-03", "000001", 9.5, 10.0, 9.4, 10.0)
     _kline(con, "2026-08-04", "000001", 10.0, 10.5, 9.9, 10.4)

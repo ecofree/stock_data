@@ -57,6 +57,18 @@ def test_load_panel_computes_forward_return(con):
     assert row["fwd_ret"].iloc[0] == pytest.approx(11.0 / 10.0 - 1)
 
 
+def test_load_panel_start_date_filters_rows(con):
+    full = load_panel(con, "feat_panel", "trade_date", "stock_code",
+                      ["momentum"], horizon=1)
+    filtered = load_panel(con, "feat_panel", "trade_date", "stock_code",
+                          ["momentum"], horizon=1,
+                          start_date="2026-08-04")
+    assert len(full) == 6
+    # only the 08-04 signal day survives the filter
+    assert len(filtered) == 3
+    assert set(filtered["d"]) == {pd.Timestamp("2026-08-04")}
+
+
 def test_ic_summary_perfect_feature_has_ic_one(con):
     panel = load_panel(con, "feat_panel", "trade_date", "stock_code",
                        ["momentum"], horizon=1)
