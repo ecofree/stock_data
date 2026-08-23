@@ -17,10 +17,12 @@ from typing import Any
 
 # factor weights (sum = 100 before phase adjustment)
 WEIGHTS = {
-    "qlib": 30,
-    "flow": 20,
-    "seal": 20,
-    "heat": 15,
+    "qlib": 25,
+    "flow": 18,
+    "seal": 18,
+    "heat": 12,
+    "valuation": 15,
+    "earnings": 12,
 }
 
 PHASE_BOARD_ADJUST = {
@@ -72,6 +74,20 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
     ]
     q_heat = _percentile_ranks([r.get("concept_heat") for r in rows])
 
+    # valuation score: lower PE_TTM = higher score (cheap + momentum = alpha)
+    pe_ttm_vals = [r.get("pe_ttm") for r in rows]
+    q_val = _percentile_ranks(
+        [-v if v is not None and v > 0 else None for v in pe_ttm_vals]
+    )
+
+    # earnings score: revenue_yoy or net_profit_yoy percentile (higher = better)
+    earn_vals = [
+        r.get("revenue_yoy") if r.get("revenue_yoy") is not None
+        else r.get("net_profit_yoy")
+        for r in rows
+    ]
+    q_earn = _percentile_ranks(earn_vals)
+
     thr, penalty, first_bonus = PHASE_BOARD_ADJUST.get(
         phase, (None, 0.0, 0.0))
 
@@ -84,6 +100,10 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
             "flow": round(q_flow[i] * WEIGHTS["flow"], 2),
             "seal": round(q_seal[i] * WEIGHTS["seal"], 2),
             "heat": round(q_heat[i] * WEIGHTS["heat"], 2),
+            "valuation": round(q_val[i] * WEIGHTS["valuation"], 2)
+                if pe_ttm_vals[i] is not None else 0,
+            "earnings": round(q_earn[i] * WEIGHTS["earnings"], 2)
+                if earn_vals[i] is not None else 0,
         }
         total = sum(factor_scores.values())
         notes: list[str] = []
