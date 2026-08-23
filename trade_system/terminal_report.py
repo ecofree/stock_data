@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Rich "trading war-room" dashboard: data layer.
 
 Builds a self-contained context dict from the DuckDB warehouse (read-only), feeding
@@ -28,6 +28,7 @@ from trade_system.i18n_labels import (
     cn,
     zh_text,
 )
+from trade_system.cycle import PHASE_CN
 
 logger = get_logger(__name__)
 
@@ -761,6 +762,37 @@ def _promotion_stats(con, trade_date: str, days: int = 15) -> dict:
 
 
 # ------------------------------------------------------------------ northbound
+def _theme_timeline_data(con, trade_date: str, days: int = 20, top_n: int = 12) -> dict:
+    has = con.execute("SELECT count(*) FROM information_schema.tables "
+                      "WHERE table_name='ths_concept_stock_history'").fetchone()[0]
+    if not has:
+        return {"dates": [], "rows": [], "coverage": 0}
+    dates = [str(r[0]) for r in con.execute(
+        """SELECT DISTINCT CAST(trade_date AS DATE) FROM ths_concept_stock_history
+           WHERE date_verified AND CAST(trade_date AS DATE) <= ?
+           ORDER BY 1 DESC LIMIT ?""", [trade_date, days]).fetchall()]
+    if not dates:
+        return {"dates": [], "rows": [], "coverage": 0}
+    marks = ",".join("?" * len(dates))
+    coverage = con.execute(
+        """SELECT count(DISTINCT concept_code) FROM ths_concept_daily
+           WHERE CAST(trade_date AS DATE)=?""", [dates[0]]).fetchone()[0]
+    rows_raw = con.execute(
+        f"""SELECT concept_name, CAST(trade_date AS VARCHAR), count(*) AS zt
+            FROM ths_concept_stock_history
+            WHERE date_verified AND CAST(trade_date AS DATE) IN ({marks})
+            GROUP BY 1, 2""", dates).fetchall()
+    by_theme = {}
+    for name, d, zt in rows_raw:
+        by_theme.setdefault(name, {})[d] = zt
+    totals = {n: sum(v.values()) for n, v in by_theme.items()}
+    top = sorted(totals, key=lambda n: -totals[n])[:top_n]
+    rows = [{"name": n, "cells": [by_theme[n].get(d, 0) for d in reversed(dates)],
+             "total": totals[n]} for n in top]
+    return {"dates": list(reversed(dates)), "rows": rows,
+            "coverage": int(coverage)}
+
+
 def _northbound(con, trade_date: str) -> dict:
     """Return only structurally aligned THS沪/深股通 minute fields.
 
@@ -797,6 +829,193 @@ def _northbound(con, trade_date: str) -> dict:
 
 
 # --------------------------------------------------------------------- context
+def _cycle_state(con, trade_date: str) -> dict:
+    row = con.execute(
+        """SELECT CAST(trade_date AS VARCHAR), phase, score,
+                  limit_up_count, premium_pct, promotion_rate
+           FROM market_cycle_phase WHERE trade_date <= ?
+           ORDER BY trade_date DESC LIMIT 1""",
+        [trade_date],
+    ).fetchone()
+    if not row:
+        return {}
+    return {"trade_date": row[0], "phase": row[1],
+            "score": _fnum(row[2]), "limit_up_count": row[3],
+            "premium_pct": _fnum(row[4]), "promotion_rate": _fnum(row[5])}
+
+
+def _advisory_cap(phase: str | None) -> int | None:
+    from trade_system.signal_attribution import PHASE_POSITION_CAP_PCT
+    return PHASE_POSITION_CAP_PCT.get(phase or "")
+
+
+def synthesize_strategy(phase: str | None, premium: float | None,
+                        promo_first: float | None) -> str:
+    """Rule-based one-liner: what kind of day tomorrow likely is."""
+    p = PHASE_CN.get(phase or "", None)
+    prem = premium if premium is not None else 0.0
+    if phase == "ice":
+        return "冰点期：以观察为主，等待首板带动情绪修复，严禁接力高位。"
+    if phase == "retreat":
+        return "退潮期：只做低位首板或空仓休息，高标一律回避。"
+    if prem >= 3 and phase == "climax":
+        return "高潮期：打板期望值高，可适度参与主线龙头，注意分歧信号随时撤退。"
+    if prem >= 1:
+        return "发酵期：赚钱效应扩散，优先主线低位补涨与强趋势股低吸。"
+    if -1 < prem < 1:
+        return f"{'分歧' if phase == 'divergence' else (p or '震荡')}市：控制仓位试错，等方向明朗再加。"
+    return "溢价偏弱：降低预期，多看少动，重点跟踪亏钱效应是否收敛。"
+
+
+def _premium_matrix_section_data(con, trade_date: str) -> tuple[str, list]:
+    row = con.execute(
+        """SELECT max(CAST(prev_trade_date AS VARCHAR)) FROM limit_premium_matrix
+           WHERE prev_trade_date <= ?""", [trade_date]).fetchone()
+    if not row or not row[0]:
+        return "", []
+    rows = con.execute(
+        """SELECT board_bucket, sample_size, avg_pct, median_pct, win_rate
+           FROM limit_premium_matrix WHERE prev_trade_date = ?
+           ORDER BY CASE WHEN board_bucket='_all' THEN 0 ELSE 1 END,
+                    TRY_CAST(board_bucket AS INTEGER) NULLS LAST""",
+        [row[0]]).fetchall()
+    return str(row[0]), rows
+
+
+def _picks_top(con, trade_date: str, n: int = 10) -> list:
+    has = con.execute("SELECT count(*) FROM information_schema.tables "
+                      "WHERE table_name='daily_stock_picks'").fetchone()[0]
+    if not has:
+        return []
+    latest = con.execute(
+        "SELECT max(trade_date) FROM daily_stock_picks "
+        "WHERE trade_date <= ?", [trade_date]).fetchone()[0]
+    if not latest:
+        return []
+    return con.execute(
+        """SELECT rank, stock_code, stock_name, total_score, board,
+                  limit_up_reason, llm_bull_case, llm_risk, llm_watch_condition
+           FROM daily_stock_picks WHERE trade_date=? ORDER BY rank LIMIT ?""",
+        [latest, n]).fetchall()
+
+
+def _qlib_screen_rows(con) -> tuple[str, str, list]:
+    reg = con.execute("SELECT status FROM qlib_model_registry "
+                      "ORDER BY model_id DESC LIMIT 1").fetchone()
+    status = reg[0] if reg else "unregistered"
+    head = con.execute(
+        """SELECT trade_date, model_id FROM qlib_prediction
+           ORDER BY trade_date DESC LIMIT 1""").fetchone()
+    if not head:
+        return "", status, []
+    rows = con.execute(
+        """SELECT symbol, score FROM qlib_prediction
+           WHERE trade_date=? AND model_id=? ORDER BY score DESC LIMIT 10""",
+        [head[0], head[1]]).fetchall()
+    return str(head[0]), str(head[1]), rows
+
+
+def _operator_stats(con, trade_date: str) -> dict:
+    row = con.execute(
+        """SELECT count(*),
+                  avg(CASE WHEN net_return_pct>0 THEN 1.0 ELSE 0 END),
+                  avg(net_return_pct)
+           FROM operator_trade_outcome
+           WHERE execution_status IN ('executed','filled')
+             AND net_return_pct IS NOT NULL
+             AND substr(CAST(created_at AS VARCHAR),1,7)=substr(?,1,7)""",
+        [trade_date]).fetchone()
+    pf = con.execute(
+        """SELECT sum(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END)
+                  / NULLIF(-sum(CASE WHEN net_return_pct<=0 THEN net_return_pct ELSE 0 END),0)
+           FROM operator_trade_outcome
+           WHERE execution_status IN ('executed','filled')
+             AND net_return_pct IS NOT NULL
+             AND substr(CAST(created_at AS VARCHAR),1,7)=substr(?,1,7)""",
+        [trade_date]).fetchone()[0]
+    return {"n": row[0], "win": row[1], "avg_ret": row[2], "pf": _fnum(pf)}
+
+
+def _journal_recent(con, trade_date: str, n: int = 5) -> list:
+    return con.execute(
+        """SELECT CAST(trade_date AS VARCHAR), note, tags FROM market_journal
+           WHERE trade_date <= ? ORDER BY trade_date DESC LIMIT ?""",
+        [trade_date, n]).fetchall()
+
+
+def _plan_vs_actual(con, trade_date: str) -> list:
+    return con.execute(
+        """
+        WITH prev AS (
+            SELECT stock_code, max(stock_name) AS stock_name FROM trade_plan
+            WHERE CAST(trade_date AS VARCHAR) = (
+                SELECT max(CAST(trade_date AS VARCHAR)) FROM trade_plan
+                WHERE CAST(trade_date AS VARCHAR) < ?)
+            GROUP BY stock_code),
+        k0 AS (
+            SELECT stock_code, close AS pc FROM v_kline_daily
+            WHERE ktype='D' AND CAST(trade_date AS DATE) = (
+                SELECT max(CAST(trade_date AS DATE)) FROM v_kline_daily
+                WHERE CAST(trade_date AS DATE) < ?)),
+        k1 AS (
+            SELECT stock_code, open, high, close, change_pct FROM v_kline_daily
+            WHERE ktype='D' AND CAST(trade_date AS DATE) = ?)
+        SELECT p.stock_code, max(p.stock_name),
+               round((k1.open/k0.pc-1)*100,2), round(k1.change_pct,2),
+               round((k1.high/k0.pc-1)*100,2),
+               CASE WHEN k1.high>=k0.pc*1.05 THEN '给了介入点'
+                    WHEN k1.open>k0.pc*1.07 THEN '高开过大难接'
+                    ELSE '未给介入点' END
+        FROM prev p JOIN k1 ON k1.stock_code=p.stock_code
+        LEFT JOIN k0 ON k0.stock_code=p.stock_code
+        GROUP BY p.stock_code,k1.open,k1.high,k1.close,k1.change_pct,k0.pc
+        ORDER BY 3 DESC NULLS LAST LIMIT 15
+        """, [trade_date]*3).fetchall()
+
+
+def _first_seal_buckets(con, trade_date: str) -> list:
+    """Buckets on normalized HHMM integer (source format is 'HH:MM')."""
+    buckets = [("集合竞价秒板", 925, 926),
+               ("早盘抢板", 926, 1000),
+               ("上午中段", 1000, 1130),
+               ("午后", 1300, 1400),
+               ("尾盘偷袭", 1400, 1500)]
+    out = []
+    for label, lo, hi in buckets:
+        n = con.execute(
+            """SELECT count(*) FROM official_limit_pool
+               WHERE trade_date=? AND continue_day_cnt IS NOT NULL
+                 AND CAST(replace(limit_up_time,':','') AS INTEGER) BETWEEN ? AND ?""",
+            [trade_date, lo, hi]).fetchone()[0]
+        out.append((label, int(n)))
+    return out
+
+
+def _loss_trend(con, trade_date: str, days: int = 20) -> list:
+    return con.execute(
+        """SELECT CAST(date AS VARCHAR), limit_down_count, blown_limit_up_rate
+           FROM market_limit_up_down_summary
+           WHERE date <= ? ORDER BY date DESC LIMIT ?""",
+        [trade_date, days]).fetchall()
+
+
+def _loss_trend(con, trade_date: str, days: int = 20) -> list:
+    return con.execute(
+        """SELECT CAST(date AS VARCHAR), limit_down_count, blown_limit_up_rate
+           FROM market_limit_up_down_summary
+           WHERE date <= ? ORDER BY date DESC LIMIT ?""",
+        [trade_date, days]).fetchall()
+
+
+def _cycle_series(con, trade_date: str, days: int = 60) -> list:
+    return con.execute(
+        """SELECT CAST(trade_date AS VARCHAR), phase, score,
+                  limit_up_count, premium_pct, promotion_rate
+           FROM market_cycle_phase WHERE trade_date <= ?
+           ORDER BY trade_date DESC LIMIT ?""",
+        [trade_date, days]).fetchall()
+
+
 def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -> dict:
     trade_date = trade_date or date.today().isoformat()
     con = _connect(db_path)
@@ -809,7 +1028,12 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
                 "index_kline": {}, "auction": {}, "lhb": [], "data_health": {},
                 "alerts": [], "stage_validation": {}, "plan_console": {},
                 "blown_history": [], "promotion": {}, "auction_confirmation": {},
-                "flow_coverage": {}, "pipeline_matrix": {}, "northbound": {}}
+                "flow_coverage": {}, "pipeline_matrix": {}, "northbound": {},
+            "cycle_state": {}, "premium_matrix": ("", []), "picks_top": [],
+            "qlib_screen": ("", "", []), "operator_stats": {}, "journal": [],
+            "plan_vs_actual": [], "first_seal": [], "loss_trend": [],
+            "cycle_series": [],
+            "strategy_line": ""}
     try:
         names = _name_map(con)
         lu_map, lu_covered = _concept_limit_up_map(con, trade_date)
@@ -833,6 +1057,7 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
             "blown_history": _blown_history(con, trade_date),
             "promotion": _promotion_stats(con, trade_date),
             "northbound": _northbound(con, trade_date),
+            "theme_timeline": _theme_timeline_data(con, trade_date),
         }
         active_stage = ctx["candidates"].get("active_stage")
         readiness_stage = {
@@ -846,6 +1071,29 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
             trade_date,
             stage=readiness_stage,
         )
+        try:
+            cycle = _cycle_state(con, trade_date)
+            ctx["cycle_state"] = cycle
+            ctx["premium_matrix"] = _premium_matrix_section_data(con, trade_date)
+            ctx["picks_top"] = _picks_top(con, trade_date)
+            ctx["qlib_screen"] = _qlib_screen_rows(con)
+            ctx["operator_stats"] = _operator_stats(con, trade_date)
+            ctx["journal"] = _journal_recent(con, trade_date)
+            ctx["plan_vs_actual"] = _plan_vs_actual(con, trade_date)
+            ctx["first_seal"] = _first_seal_buckets(con, trade_date)
+            ctx["loss_trend"] = _loss_trend(con, trade_date)
+            ctx["cycle_series"] = _cycle_series(con, trade_date)
+        except duckdb.Error:
+            # Maintenance/test databases may miss the analytics tables.
+            cycle = {}
+            pass
+        promo_first = None
+        if isinstance(cycle.get("promotion_rate"), (int, float)):
+            promo_first = float(cycle["promotion_rate"])
+        ctx["strategy_line"] = synthesize_strategy(
+            cycle.get("phase"),
+            cycle.get("premium_pct") if isinstance(cycle.get("premium_pct"), (int, float)) else None,
+            promo_first)
     finally:
         con.close()
     # Fetchers that open their own config-governed connections (via
@@ -1594,6 +1842,64 @@ def _health_section(health: dict, trade_date: str | None = None) -> str:
 
 
 # ---- CSS (plain string; no f-string to avoid brace escaping) ----
+_TERMINAL_CSS_V2 = """
+/* ---- war-room v2: layered layout + new sections ---- */
+.sec{max-width:1840px}
+.laynav{position:sticky;top:0;z-index:60;display:flex;gap:10px;justify-content:center;
+padding:8px 0;background:rgba(10,15,24,.92);backdrop-filter:blur(8px);
+border-bottom:1px solid var(--line)}
+.ln-link{color:var(--muted);text-decoration:none;font-size:13px;padding:4px 14px;
+border-radius:14px;border:1px solid transparent}
+.ln-link:hover{color:var(--text)}
+.ln-link.on{color:var(--amber);border-color:var(--amber)}
+.pcard{display:flex;gap:28px;align-items:stretch;justify-content:space-between;
+background:linear-gradient(135deg,rgba(240,185,11,.06),rgba(76,195,255,.04));
+border:1px solid var(--line2);border-radius:12px;padding:20px 26px;margin-bottom:18px;
+flex-wrap:wrap}
+.pc-phase{font-size:30px;font-weight:900;letter-spacing:.06em;border-bottom:3px solid;
+display:inline-block;padding-bottom:4px}
+.pc-phase span{display:block;font-size:11px;color:var(--muted);font-weight:400;
+letter-spacing:.1em;margin-top:2px}
+.pc-strategy{margin-top:12px;font-size:15px;color:var(--text);max-width:760px;line-height:1.7}
+.pc-right{display:grid;grid-template-columns:repeat(2,minmax(160px,auto));gap:10px 34px;
+align-content:center}
+.pc-kv span{display:block;font-size:10px;color:var(--dim);letter-spacing:.08em}
+.pc-kv b{font-family:var(--mono);font-size:18px}
+.coreband{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:14px 0 6px}
+.band-cell{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+text-align:center;padding:12px 6px}
+.band-cell span{display:block;font-size:10px;color:var(--muted);margin-bottom:4px;
+letter-spacing:.08em}
+.band-cell b{font-family:var(--mono);font-size:22px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.panel h3{font-size:13px;color:var(--cyan);margin-bottom:10px;font-weight:700}
+.panel table{width:100%;border-collapse:collapse}
+.panel th,.panel td{padding:5px 8px;border-bottom:1px solid var(--line);font-size:12.5px;text-align:left}
+.panel th{color:var(--muted);font-weight:600}
+.cb-strip,.cbd-strip{display:flex;gap:2px;overflow-x:auto;align-items:flex-end;padding:4px 0}
+.cbd-cell{flex:1;min-width:26px;border-radius:4px 4px 0 0;display:flex;align-items:flex-end;
+justify-content:center;color:#fff;font-size:9px}
+.cbd-lg{margin-top:8px;font-size:11px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap}
+.ls-strip{display:flex;align-items:flex-end;gap:2px;height:100px}
+.ls-col{flex:1;background:#101a2a;border-radius:2px 2px 0 0;display:flex;align-items:flex-end}
+.ls-col i{width:100%;background:linear-gradient(180deg,#ff5b6a,#2ebd85);border-radius:2px 2px 0 0}
+.fs-wrap{display:flex;gap:12px;align-items:flex-end;min-height:130px}
+.fsx{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end}
+.fsx i{width:72%;background:linear-gradient(180deg,#f0b90b,#ff5b6a);border-radius:4px 4px 0 0}
+.tlb-head,.tlb-row{display:grid;grid-template-columns:170px repeat(auto-fit,minmax(30px,1fr));
+gap:2px;margin-bottom:2px;font-size:10px}
+.tlh-date{color:var(--dim);text-align:center}
+.tlb-name{color:var(--text);font-weight:600;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.tlb-cell{min-height:24px;border-radius:3px;text-align:center;line-height:24px;color:#fff}
+.jr-list{list-style:none}
+.jr-list li{padding:6px 0;border-bottom:1px dashed var(--line2)}
+.appendix{max-width:1840px;margin:30px auto;color:var(--muted)}
+.appendix summary{cursor:pointer;font-size:13px}
+.empty{color:var(--muted);font-size:12.5px}
+"""
+
 _TERMINAL_CSS = """
 :root{
   --bg:#0a0f18; --bg2:#0d1420; --panel:#101a2a; --panel2:#0d1624;
@@ -2087,6 +2393,246 @@ document.addEventListener('DOMContentLoaded',()=>{
 """
 
 
+# ===========================================================================
+# LAYERED WAR-ROOM v2  (L0 decision -> L1 structure -> L2 flow/theme ->
+#                      L3 execution -> L4 review/archive)
+# ===========================================================================
+
+def _esc(v) -> str:
+    import html as _html
+    return _html.escape(str(v)) if v is not None else "—"
+
+_LAYER_NAV = [
+    ("l0", "决策"),
+    ("l1", "市场结构"),
+    ("l2", "资金题材"),
+    ("l3", "执行参考"),
+    ("l4", "复盘沉淀"),
+]
+
+_PHASE_COLOR_DARK = {
+    "climax": "#ff5b6a", "ferment": "#f0854c", "recovery": "#f0b90b",
+    "divergence": "#8a93a6", "retreat": "#4c7fd6", "ice": "#3457d5",
+}
+
+
+def _layer_nav(active: str) -> str:
+    links = "".join(
+        f"<a href='#{lid}' class='ln-link{' on' if lid == active else ''}'>{label}</a>"
+        for lid, label in _LAYER_NAV
+    )
+    return f"<div class='laynav'>{links}</div>"
+
+
+def _phase_command_v2(ctx: dict) -> str:
+    cyc = ctx.get("cycle_state") or {}
+    phase = cyc.get("phase")
+    color = _PHASE_COLOR_DARK.get(phase, "#8a93a6")
+    cap = None
+    try:
+        from trade_system.signal_attribution import PHASE_POSITION_CAP_PCT
+        cap = PHASE_POSITION_CAP_PCT.get(phase or "")
+    except Exception:
+        cap = None
+    risk_state = (ctx.get("plan_console", {}).get("risk") or {}).get("state") or "—"
+    strategy = ctx.get("strategy_line") or "—"
+    prem = cyc.get("premium_pct")
+    promo = cyc.get("promotion_rate")
+    return f"""
+<div class='pcard'>
+  <div class='pc-left'>
+    <div class='pc-phase' style='color:{color};border-color:{color}'>
+      {PHASE_CN.get(phase, phase or '—')}<span>相位 · 温度 {_fmt_num(cyc.get('score'))}</span></div>
+    <div class='pc-strategy'>{_esc(strategy)}</div>
+  </div>
+  <div class='pc-right'>
+    <div class='pc-kv'><span>建议仓位上限</span><b style='color:{color}'>{cap if cap is not None else '—'}%</b></div>
+    <div class='pc-kv'><span>风控状态</span><b>{_esc(risk_state)}</b></div>
+    <div class='pc-kv'><span>昨日涨停溢价</span><b>{_fmt_pct(prem)}</b></div>
+    <div class='pc-kv'><span>首板晋级率</span><b>{f"{promo:.0%}" if isinstance(promo,(int,float)) else '—'}</b></div>
+  </div>
+</div>"""
+
+
+def _core_band(ctx: dict) -> str:
+    b = ctx.get("breadth", {}) or {}
+    cyc = ctx.get("cycle_state") or {}
+    cells = [
+        ("涨停", b.get("limit_up_count"), "up"),
+        ("跌停", b.get("limit_down_count"), "down"),
+        ("最高板", ctx.get("cycle_state", {}).get("max_board"), ""),
+        ("炸板率",
+         (lambda v: f"{round(v * 100, 1)}%" if isinstance(v, (int, float)) else "—")
+         ((ctx.get("blown_history") or [{}])[0].get("blown_limit_up_rate")
+          if ctx.get("blown_history") else None), "amber"),
+        ("昨日溢价", _fmt_pct(cyc.get("premium_pct")), "up"),
+        ("首板晋级", (f"{cyc['promotion_rate']:.0%}" if isinstance(cyc.get("promotion_rate"), (int, float)) else "—"), "cyan"),
+    ]
+    items = "".join(
+        f"<div class='band-cell'><span>{label}</span>"
+        f"<b class='{cls}'>{_fmt_num(v) if not isinstance(v, str) else v}</b></div>"
+        for label, v, cls in cells)
+    return f"<div class='coreband'>{items}</div>"
+
+
+def _cycle_band_dark(series: list) -> str:
+    if not series:
+        return "<div class='empty'>暂无相位数据</div>"
+    cells = "".join(
+        f"<div class='cbd-cell' title='{_esc(d)} {PHASE_CN.get(p, p)} 温度{_esc(s)}"
+        f" 涨停{_esc(lu)} 溢价{_esc(prem)}'"
+        f" style='background:{_PHASE_COLOR_DARK.get(p, '#8a93a6')};"
+        f"height:{28 + min(34.0, float(s or 0) / 2)}px'>"
+        f"<span>{str(d)[5:]}</span></div>"
+        for d, p, s, lu, prem, _pr in reversed(series))
+    legend = " · ".join(
+        f"<span style='color:{c}'>{PHASE_CN.get(k, k)}</span>"
+        for k, c in _PHASE_COLOR_DARK.items())
+    return f"<div class='cbd-strip'>{cells}</div><div class='cbd-lg'>{legend}</div>"
+
+
+def _premium_matrix_section(prem) -> str:
+    as_of, rows = prem
+    if not rows:
+        return "<div class='empty'>暂无溢价矩阵数据</div>"
+    trs = "".join(
+        f"<tr><td>{'全部' if b == '_all' else b + '板'}</td><td class='mono'>{n}</td>"
+        f"<td class='{('up' if (a or 0) > 0 else 'down')}'>{_fmt_pct(a)}</td>"
+        f"<td class='mono'>{_fmt_pct(m)}</td><td class='mono'>{_fmt_rate(w)}</td></tr>"
+        for b, n, a, m, w in rows)
+    return (f"<div class='dim' style='margin-bottom:8px'>快照日 {as_of}"
+            "（昨日涨停股 → 今日表现）</div>"
+            "<table><thead><tr><th>板位</th><th>样本</th><th>平均溢价</th>"
+            "<th>中位数</th><th>胜率</th></tr></thead>"
+            f"<tbody>{trs}</tbody></table>")
+
+
+def _loss_section_v2(trend: list) -> str:
+    if not trend:
+        return "<div class='empty'>暂无数据</div>"
+    today = trend[0]
+    bars = "".join(
+        f"<div class='ls-col' title='{_esc(d)} 跌停{_esc(ld)} 炸板率"
+        f"{_esc(round(bl, 1) if bl is not None else '—')}%'>"
+        f"<i style='height:{min(90, int((ld or 0) * 5) + 4)}px'></i></div>"
+        for d, ld, bl in reversed(trend))
+    blown_txt = (f"{round(today[2], 1)}%" if today[2] is not None else "—")
+    return (f"<div class='ls-head'>当日：跌停 <b class='down'>{today[1] or 0}</b> 家 · "
+            f"炸板率 <b class='amber'>{blown_txt}</b></div>"
+            f"<div class='ls-strip'>{bars}</div>")
+
+
+def _first_seal_section_v2(buckets: list) -> str:
+    total = sum(n for _, n in buckets) or 1
+    items = "".join(
+        f"<div class='fsx' title='{_esc(label)} {_esc(n)} 只（{_esc(round(n/total*100))}%）'>"
+        f"<i style='height:{max(8, int(n / total * 96))}px'></i>"
+        f"<span>{_esc(label)}<br><b class='mono'>{n}</b></span></div>"
+        for label, n in buckets)
+    return ("<div class='sec-head'><h3>首次涨停时点分布</h3>"
+            "<span class='dim' style='font-size:12px'>越早封板越强，尾盘板次日溢价通常最差</span></div>"
+            + f"<div class='fs-wrap'>{items}</div>")
+
+
+def _picks_section_v2(picks: list) -> str:
+    if not picks:
+        return ("<div class='empty'>今日无候选存档。运行 scripts/run_daily_screen.py 生成。</div>")
+    trs = "".join(
+        f"<tr><td class='mono'>{rank}</td><td class='mono'>{code}</td><td>{name or '—'}</td>"
+        f"<td class='num'><b>{score}</b></td><td>{board or '—'}</td>"
+        f"<td class='reason'>{(reason or '—')[:26]}</td>"
+        f"<td class='reason dim'>{(bull or '—')[:80]}</td>"
+        f"<td class='reason dim'>{(risk or '—')[:60]}</td>"
+        f"<td class='reason dim'>{(watch or '—')[:60]}</td></tr>"
+        for rank, code, name, score, board, reason, bull, risk, watch in picks)
+    return ("<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>总分</th>"
+            "<th>板</th><th>原因</th><th>做多逻辑</th><th>风险</th><th>明日观察</th>"
+            "</tr></thead><tbody>" + trs + "</tbody></table>")
+
+
+def _qlib_screen_section_v2(head: tuple) -> str:
+    day, model_id, data = head
+    if not day or not data:
+        return "<div class='empty'>QLib 尚无预测。运行 predict_qlib_daily 后重试。</div>"
+    trs = "".join(
+        f"<tr><td class='mono'>{i + 1}</td><td class='mono'>{s}</td>"
+        f"<td class='num'>{sc:.4f}</td></tr>"
+        for i, (s, sc) in enumerate(data))
+    return (f"<div class='dim' style='margin-bottom:8px'>{model_id} · 特征日 {day} · "
+            "shadow 状态仅供研究，不进计划</div>"
+            "<table><thead><tr><th>#</th><th>代码</th><th>模型分</th></tr></thead>"
+            f"<tbody>{trs}</tbody></table>")
+
+
+def _stats_section_v2(st: dict) -> str:
+    cards = "".join(
+        f"<div class='metric'><span>{label}</span><strong>{val}</strong></div>"
+        for label, val in [
+            ("本月执行", st.get("n", 0)),
+            ("胜率", f"{st['win']:.0%}" if isinstance(st.get("win"), (int, float)) else "—"),
+            ("平均收益", f"{st['avg_ret']:.2f}%" if st.get("avg_ret") is not None else "—"),
+            ("盈亏比 PF", f"{st['pf']:.2f}" if st.get("pf") else "—"),
+        ])
+    return f"<div class='ticker'>{cards}</div>"
+
+
+def _journal_section_v2(rows: list) -> str:
+    if not rows:
+        return "<div class='empty'>暂无市场日志（add_market_note.py）</div>"
+    lis = "".join(
+        f"<li><span class='mono dim'>{d}</span> {note} "
+        f"<span class='badge b-neutral'>{tags or ''}</span></li>"
+        for d, note, tags in rows)
+    return f"<ul class='jr-list'>{lis}</ul>"
+
+
+def _plan_vs_actual_section_v2(rows: list) -> str:
+    if not rows:
+        return "<div class='empty'>昨日无交易计划，无法对照。</div>"
+    trs = "".join(
+        f"<tr><td class='mono'>{code}</td><td>{name or '—'}</td>"
+        f"<td class='num'>{gap if gap is not None else '—'}%</td>"
+        f"<td class='num {_ud(day)}'>{day}%</td>"
+        f"<td class='num'>{touch}%</td><td>{verdict}</td></tr>"
+        for code, name, gap, day, touch, verdict in rows)
+    return ("<table><thead><tr><th>代码</th><th>名称</th><th>竞价高开%</th>"
+            "<th>全天涨幅%</th><th>最高触及%</th><th>结论</th></tr></thead>"
+            f"<tbody>{trs}</tbody></table>")
+
+
+def _theme_timeline_html(ctx: dict) -> str:
+    tl = ctx.get("theme_timeline") or {}
+    dates = tl.get("dates") or []
+    rows = tl.get("rows") or []
+    if not dates or not rows:
+        return "<div class='empty'>暂无题材成员数据</div>"
+    max_zt = max((c for r in rows for c in r["cells"]), default=1)
+    head = "".join(f"<div class='tlh-date'>{d[5:]}</div>" for d in dates)
+    body_rows = []
+    for r in rows:
+        cells = "".join(
+            f"<div class='tlb-cell' style='background:rgba(255,91,106,"
+            f"{0.12 + 0.88 * c / max_zt:.2f})' title='{r['name']} {d}：{c} 只涨停'>{c or ''}</div>"
+            for c, d in zip(r["cells"], dates))
+        body_rows.append(
+            f"<div class='tlb-row'><div class='tlb-name'>{r['name'] or '—'}</div>{cells}</div>")
+    warn = "" if tl.get("coverage", 0) >= 374 else \
+        f" ⚠️ 当日快照不完整（{tl.get('coverage', 0)}/375）"
+    return (
+        "<div class='tlb-head'><div class='tlb-name'></div>" + head + "</div>"
+        + "".join(body_rows)
+        + f"<div class='dim' style='margin-top:8px'>最新快照覆盖 {tl.get('coverage', 0)}/375{warn}"
+        "；颜色深浅=当日涨停家数。research-only。</div>")
+
+
+def _northbound_section(nb: dict) -> str:
+    intra = nb.get("intraday")
+    if not intra:
+        return ("<div class='empty'>北向分钟字段未对齐（数据源已停更），"
+                "该面板保留占位。</div>")
+    return f"<div class='mono'>{intra}</div>"
+
+
 def render_terminal_html(ctx: dict, echarts_tag: str | None = None) -> str:
     meta = ctx.get("meta", {})
     breadth = ctx.get("breadth", {})
@@ -2095,25 +2641,67 @@ def render_terminal_html(ctx: dict, echarts_tag: str | None = None) -> str:
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
         f'<title>交易作战室 · {meta.get("trade_date","")}</title>',
         echarts_tag or _ECHARTS_CDN,
-        '<style>', _TERMINAL_CSS, '</style></head><body>',
+        '<style>', _TERMINAL_CSS, _TERMINAL_CSS_V2, '</style></head><body>',
         _cmd_bar(meta, breadth, ctx.get("readiness")),
+        _layer_nav("l0"),
+
+        # ---------- L0 决策层 ----------
+        '<section class="sec" id="l0"><div class="sec-head"><h2>L0 · 决策</h2></div>',
+        _phase_command_v2(ctx),
+        _core_band(ctx),
         _alerts_strip(ctx.get("alerts", [])),
+        '</section>',
+
+        # ---------- L1 市场结构层 ----------
+        '<section class="sec" id="l1"><div class="sec-head"><h2>L1 · 市场结构</h2></div>',
+        _cycle_band_dark(ctx.get("cycle_series", [])),
         _emotion_section(meta, breadth),
-        _candidates_section(ctx.get("candidates", {})),
-        _stage_section(ctx.get("stage_validation", {})),
-        _plan_console_section(ctx.get("plan_console", {})),
-        _flow_section(ctx),
+        '<div class="grid2">',
+        f'<div class="panel"><h3>溢价分层矩阵</h3>{_premium_matrix_section(ctx.get("premium_matrix", ("", [])))}</div>',
+        f'<div class="panel"><h3>亏钱效应</h3>{_loss_section_v2(ctx.get("loss_trend", []))}</div>',
+        '</div>',
+        _promotion_section(ctx.get("promotion", {})),
         _ladder_section(ctx.get("ladder", [])),
         _blown_section(ctx.get("blown_history", [])),
-        _promotion_section(ctx.get("promotion", {})),
+        '</section>',
+
+        # ---------- L2 资金题材层 ----------
+        '<section class="sec" id="l2"><div class="sec-head"><h2>L2 · 资金题材</h2></div>',
+        _flow_section(ctx),
+        _theme_timeline_html(ctx),
         _concepts_section(ctx.get("concepts", [])),
-        _index_section(ctx.get("index_kline", {}), meta.get("trade_date")),
-        _auction_section(ctx.get("auction", {}), meta.get("trade_date")),
-        _auction_confirmation_section(ctx.get("auction_confirmation", {})),
+        _northbound_section(ctx.get("northbound", {})),
         _lhb_section(ctx.get("lhb", []), meta.get("trade_date")),
+        '</section>',
+
+        # ---------- L3 执行参考层 ----------
+        '<section class="sec" id="l3"><div class="sec-head"><h2>L3 · 执行参考</h2></div>',
+        f'<div class="panel"><h3>昨日计划 × 今日实际</h3>'
+        f'{_plan_vs_actual_section_v2(ctx.get("plan_vs_actual", []))}</div>',
+        _candidates_section(ctx.get("candidates", {})),
+        _picks_section_v2(ctx.get("picks_top", [])),
+        _auction_confirmation_section(ctx.get("auction_confirmation", {})),
+        _auction_section(ctx.get("auction", {}), meta.get("trade_date")),
+        _first_seal_section_v2(ctx.get("first_seal", [])),
+        _plan_console_section(ctx.get("plan_console", {})),
+        '</section>',
+
+        # ---------- L4 复盘沉淀层 ----------
+        '<section class="sec" id="l4"><div class="sec-head"><h2>L4 · 复盘沉淀</h2></div>',
+        _stats_section_v2(ctx.get("operator_stats", {})),
+        _journal_section_v2(ctx.get("journal", [])),
+        _qlib_screen_section_v2(ctx.get("qlib_screen", ("", "", []))),
+        _index_section(ctx.get("index_kline", {}), meta.get("trade_date")),
+        '</section>',
+
+        # ---------- 附录（运维细节折叠）----------
+        '<details class="appendix"><summary>附录 · 系统运维细节</summary>',
+        _stage_section(ctx.get("stage_validation", {})),
         _coverage_section(ctx.get("flow_coverage", {})),
         _matrix_section(ctx.get("pipeline_matrix", {})),
         _health_section(ctx.get("data_health", {}), meta.get("trade_date")),
+        '</details>',
+
         '<script>', 'const DATA=', json.dumps(ctx, ensure_ascii=False), ';',
         _TERMINAL_JS, '</script></body></html>',
     ]

@@ -1671,6 +1671,8 @@ def _top_nav(active: str) -> str:
 
 
 _TRAIL_PAGE_CSS = """
+/* standalone overrides on top of the main design system (_CSS loads first) */
+.wrap{max-width:1840px}
 body{background:#0f1420;color:#dfe6f2;font-family:'Segoe UI','Microsoft YaHei',sans-serif;margin:0}
 .topnav{display:flex;gap:18px;align-items:center;padding:14px 28px;background:#131a2a;
 position:sticky;top:0;z-index:50;border-bottom:1px solid #26304a}
@@ -1719,6 +1721,7 @@ def _render_sector_trail_standalone(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>板块轨迹 · {_e(trade_date)}</title>
+<style>{_CSS}</style>
 <style>{_TRAIL_PAGE_CSS}</style>
 </head>
 <body>

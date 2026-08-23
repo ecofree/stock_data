@@ -1,4 +1,4 @@
-"""Extra review-page sections: cycle band, plan-vs-actual, loss panel,
+﻿"""Extra review-page sections: cycle band, plan-vs-actual, loss panel,
 operator stats card, and the market journal note.
 
 Each renderer opens its own read-only connection (the page is generated
@@ -293,6 +293,103 @@ def render_daily_picks(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
     )
 
 
+# ------------------------------------------------- ⑧ 题材生命周期时间线
+def render_theme_timeline(con: duckdb.DuckDBPyConnection, trade_date: str,
+                          days: int = 20, top_n: int = 12) -> str:
+    """Per-theme daily limit-up intensity over the recent window.
+
+    Reads ``ths_concept_stock_history`` directly (bypasses the 374-concept
+    completeness gate) and honestly annotates snapshot coverage.
+    """
+    has_table = bool(con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_name='ths_concept_stock_history'").fetchone()[0])
+    if not has_table:
+        return ""
+    dates = [str(r[0]) for r in con.execute(
+        """SELECT DISTINCT CAST(trade_date AS DATE) FROM ths_concept_stock_history
+           WHERE date_verified AND CAST(trade_date AS DATE) <= ?
+           ORDER BY 1 DESC LIMIT ?""",
+        [trade_date, days]).fetchall()]
+    if not dates:
+        return ""
+    coverage = con.execute(
+        "SELECT count(DISTINCT concept_code) FROM ths_concept_daily "
+        "WHERE CAST(trade_date AS DATE) = ?", [dates[0]]).fetchone()[0]
+    rows = con.execute(
+        f"""
+        SELECT concept_name, CAST(trade_date AS VARCHAR), count(*) AS zt
+        FROM ths_concept_stock_history
+        WHERE date_verified AND CAST(trade_date AS DATE) IN
+              ({','.join('?' * len(dates))})
+        GROUP BY 1, 2
+        """,
+        dates,
+    ).fetchall()
+    if not rows:
+        return ""
+    by_theme: dict[str, dict[str, int]] = {}
+    for name, d, zt in rows:
+        by_theme.setdefault(name, {})[d] = zt
+    totals = {name: sum(v.values()) for name, v in by_theme.items()}
+    top = sorted(totals, key=lambda n: -totals[n])[:top_n]
+    max_zt = max((by_theme[n].get(d, 0) for n in top for d in dates), default=1)
+    head_cells = "".join(
+        f"<div class='tl-date'>{d[5:]}</div>" for d in reversed(dates))
+    body_rows = []
+    for name in top:
+        cells = "".join(
+            f"<div class='tl-cell' title='{_esc(name)} {d[5:]}：{by_theme[name].get(d, 0)} 只涨停'"
+            f" style='background:rgba(214,69,69,{0.15 + 0.85 * by_theme[name].get(d, 0) / max_zt:.2f})'>"
+            f"{by_theme[name].get(d, 0) or ''}</div>"
+            for d in reversed(dates))
+        body_rows.append(
+            f"<div class='tl-row'><div class='tl-name'>{_esc(name)}</div>{cells}</div>")
+    warn = (" ⚠️ 当日快照不完整" if coverage < 374 else "")
+    return (
+        "<div class='sec-title'><strong>题材生命周期时间线</strong>"
+        "<span class='sec-kicker'>近 "
+        f"{len(dates)} 日 · 颜色深浅=当日涨停家数 · Top{top_n} 题材</span></div>"
+        f"<div class='tl-head'><div class='tl-name'></div>{head_cells}</div>"
+        + "".join(body_rows)
+        + f"<div class='concept-footnote'>最新快照概念覆盖 {coverage}/375{warn}；"
+          "一只股票可属多个题材。research-only。</div>"
+    )
+
+
+# ------------------------------------------------- ⑨ 首次涨停时点分布
+def render_first_seal_distribution(con: duckdb.DuckDBPyConnection,
+                                   trade_date: str) -> str:
+    buckets = [
+        ("集合竞价秒板", 925, 926),
+        ("早盘抢板", 926, 1000),
+        ("上午中段", 1000, 1130),
+        ("午后", 1300, 1400),
+        ("尾盘偷袭", 1400, 1500),
+    ]
+    counts = []
+    for label, lo, hi in buckets:
+        n = con.execute(
+            """SELECT count(*) FROM official_limit_pool
+               WHERE trade_date=? AND continue_day_cnt IS NOT NULL
+                 AND CAST(replace(limit_up_time,':','') AS INTEGER) BETWEEN ? AND ?""",
+            [trade_date, lo, hi],
+        ).fetchone()[0]
+        counts.append((label, int(n)))
+    total = sum(n for _, n in counts) or 1
+    bars = "".join(
+        f"<div class='fs-item' title='{_esc(label)} {_esc(n)}只({_esc(round(n / total * 100))}%)'>"
+        f"<i style='height:{max(6, int(n / total * 90))}px'></i>"
+        f"<span>{_esc(label)}<br><b>{n}</b></span></div>"
+        for label, n in counts
+    )
+    return (
+        "<div class='sec-title'><strong>首次涨停时点分布</strong>"
+        "<span class='sec-kicker'>越早封板越强，尾盘板次日溢价通常最差</span></div>"
+        f"<div class='fs-strip'>{bars}</div>"
+    )
+
+
 # ------------------------------------------------------------------ all
 def render_all(db_path: str | Path, trade_date: str) -> str:
     con = _connect(db_path)
@@ -304,6 +401,8 @@ def render_all(db_path: str | Path, trade_date: str) -> str:
             "loss_panel": render_loss_panel(con, trade_date),
             "market_note": render_market_note(con, trade_date),
             "daily_picks": render_daily_picks(con, trade_date),
+            "theme_timeline": render_theme_timeline(con, trade_date),
+            "first_seal": render_first_seal_distribution(con, trade_date),
             "qlib_screen": render_qlib_screen(con),
         }
     finally:
@@ -323,6 +422,19 @@ align-items:flex-end;justify-content:center}
 .lp-col i{display:block;width:100%;background:#3a6fd8;border-radius:3px 3px 0 0}
 .mj-list{list-style:none;padding:0}
 .mj-list li{padding:6px 0;border-bottom:1px dashed #e5e5e5}
+.tl-head,.tl-row{display:grid;grid-template-columns:150px repeat(20,1fr);gap:2px;
+margin-bottom:2px;font-size:10px}
+.tl-date{color:#888;text-align:center}
+.tl-name{font-weight:600;color:#33415c;overflow:hidden;text-overflow:ellipsis;
+white-space:nowrap}
+.tl-cell{min-height:22px;border-radius:3px;color:#fff;text-align:center;
+line-height:22px;font-size:10px}
+.fs-strip{display:flex;gap:14px;align-items:flex-end;height:130px}
+.fs-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:
+flex-end;height:100%}
+.fs-item i{display:block;width:70%;background:linear-gradient(180deg,#e8804c,#d64545);
+border-radius:4px 4px 0 0}
+.fs-item span{font-size:10px;color:#666;text-align:center;margin-top:4px;line-height:1.5}
 </style>
 """
     blocks = "".join(

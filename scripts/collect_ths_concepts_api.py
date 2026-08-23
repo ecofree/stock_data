@@ -111,6 +111,9 @@ def main() -> int:
                     ticker = str(m.get("ticker") or "")
                     if not ticker.isdigit():
                         continue
+                    enriched = dict(m)
+                    enriched["fetched_date"] = snap
+                    enriched["provider"] = "hithink_index_api"
                     con.execute(
                         """INSERT INTO ths_concept_stock_history
                            (trade_date, concept_code, concept_name, stock_code,
@@ -120,7 +123,7 @@ def main() -> int:
                                    ?, true, now())
                            ON CONFLICT DO NOTHING""",
                         [snap, concept_code, name, ticker, m.get("name"),
-                         json.dumps(m, ensure_ascii=False)],
+                         json.dumps(enriched, ensure_ascii=False)],
                     )
                     written_m += 1
                 con.execute("COMMIT")

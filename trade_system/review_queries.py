@@ -422,15 +422,22 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
     try:
         member_date_row = con.execute(
             "SELECT max(trade_date) FROM v_default_concept_stock_history "
-            "WHERE trade_date<=CAST(? AS DATE)",
-            [trade_date],
+            "WHERE CAST(trade_date AS DATE) "
+            "BETWEEN CAST(? AS DATE) - INTERVAL 7 DAY "
+            "AND CAST(? AS DATE) + INTERVAL 3 DAY",
+            [trade_date, trade_date],
         ).fetchone()
         member_date = member_date_row[0] if member_date_row else None
         if not member_date:
-            result["message"] = "no THS membership snapshot not later than the review date"
+            result["message"] = "no THS membership snapshot within [-7, +3] days of the review date"
             return result
         result["membership_date"] = str(member_date)
-        membership_age = (date.fromisoformat(str(trade_date)[:10]) - date.fromisoformat(str(member_date)[:10])).days
+        # Weekend/post-close snapshots taken the next morning still describe
+        # the review date's membership, so age uses absolute distance.
+        membership_age = abs(
+            (date.fromisoformat(str(trade_date)[:10])
+             - date.fromisoformat(str(member_date)[:10])).days
+        )
         result["membership_age_days"] = membership_age
         if membership_age > 7:
             result["message"] = f"THS membership snapshot is stale by {membership_age} days"
