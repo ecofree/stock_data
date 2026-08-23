@@ -56,6 +56,15 @@ def _e(v: Any) -> str:
     return html.escape(str(v), quote=True)
 
 
+def _slk(code: str) -> str:
+    """Wrap a stock code as a link to its detail page."""
+    if not code:
+        return "—"
+    c = str(code).strip()
+    return (f"<a class='mono' href='stocks/{c}.html' "
+            f"style='color:inherit;text-decoration:none'>{_e(c)}</a>")
+
+
 def _fmt(v: Any, default: str = "—") -> str:
     if v is None:
         return default
@@ -165,6 +174,19 @@ body{
 .g-main{grid-template-columns:minmax(0,1fr) 320px}
 .flow-block{min-width:0}
 @media (max-width:1100px){.g-main{grid-template-columns:1fr}}
+@media (max-width:768px){
+  .wrap{padding:12px}
+  .coreband{grid-template-columns:repeat(3,1fr)}
+  .grid2{grid-template-columns:1fr}
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{min-width:640px}
+  .pcard{flex-direction:column;padding:14px}
+  .pc-right{grid-template-columns:1fr}
+  .topnav{gap:8px;flex-wrap:wrap;padding:10px 12px}
+  .tlb-head,.tlb-row{grid-template-columns:100px repeat(10,1fr)}
+  .cb-cell{min-width:22px}
+  h1{font-size:18px}
+}
 
 section, .ledger{padding:22px 0; border-top:1px solid var(--line); scroll-margin-top:64px}
 .sec-title{display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:14px}
@@ -488,7 +510,7 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         rows = []
         for plan in plans[:12]:
             rows.append(
-                f"<tr><td class='mono'>{_e(plan.get('stock_code'))}</td><td>{_e(plan.get('stock_name'))}</td>"
+                f"<tr><td class='mono'>{_slk(plan.get('stock_code'))}</td><td>{_e(plan.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, plan.get('setup_type')))}</td><td class='num'>{_pct(plan.get('max_position_pct'))}</td>"
                 f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, plan.get('status'))))}</td>"
                 f"<td class='dim'>{_e(zh_text(plan.get('entry_condition')) or '—')}</td>"
@@ -504,7 +526,7 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         rows = []
         for row in watchlist[:10]:
             rows.append(
-                f"<tr><td class='mono'>{_e(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
+                f"<tr><td class='mono'>{_slk(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
                 f"<td class='dim'>{_e(zh_text(row.get('thesis')) or '—')}</td>"
                 f"<td class='dim'>{_e(zh_text(row.get('invalidation')) or '—')}</td>"
                 f"<td>{_e(zh_text(cn(WATCHLIST_STATUS_CN, row.get('status'))))}</td></tr>"
@@ -535,7 +557,7 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         rows = []
         for row in picks[:10]:
             rows.append(
-                f"<tr><td class='mono'>{_e(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
+                f"<tr><td class='mono'>{_slk(row.get('stock_code'))}</td><td>{_e(row.get('stock_name'))}</td>"
                 f"<td class='num'>{_fmt(row.get('score'))}</td>"
                 f"<td class='num {_sign_class(row.get('main_net'))}'>{_fmt(row.get('main_net'))}</td>"
                 f"<td>{_e(zh_text(cn(SELECTION_STATUS_CN, row.get('selection_status'))))}</td></tr>"
@@ -1031,7 +1053,7 @@ def _render_plans(ctx: dict[str, Any]) -> str:
         rows = []
         for p in plans[:15]:
             rows.append(
-                f"<tr><td class='mono'>{_e(p.get('stock_code'))}</td><td>{_e(p.get('stock_name'))}</td>"
+                f"<tr><td class='mono'>{_slk(p.get('stock_code'))}</td><td>{_e(p.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, p.get('setup_type')))}</td><td class='num'>{_pct(p.get('max_position_pct'))}</td>"
                 f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, p.get('status'))))}</td>"
                 f"<td class='dim'>{_e(zh_text(p.get('entry_condition')) or '—')}</td>"

@@ -7,25 +7,50 @@ the ``market_cycle_phase`` / ``limit_premium_matrix`` /
 The v1 classifier is deliberately rule-based and explainable: every output
 row carries its ``rationale``.  Constants below are tuning knobs, not laws.
 """
-from __future__ import annotations
-
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import duckdb
 
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "phase_thresholds.json"
+
+
+def _load_thresholds() -> dict:
+    """Load tunable thresholds from config/phase_thresholds.json (fallback: defaults)."""
+    defaults = {
+        "ice_limit_up": 30, "ice_limit_up_soft": 45,
+        "ice_premium_pct": -2.0,
+        "climax_premium_pct": 3.0, "climax_min_board": 5,
+        "climax_max_blown_rate": 25.0,
+        "retreat_premium_pct": -1.5, "retreat_blown_rate": 35.0,
+        "retreat_max_promotion": 0.20,
+        "ferment_premium_pct": 1.0, "ferment_min_board": 4,
+    }
+    try:
+        overrides = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        defaults.update({k: v for k, v in overrides.items() if not k.startswith("_")})
+    except Exception:
+        pass
+    return defaults
+
+
+_T = _load_thresholds()
+
 # ---------------------------------------------------------------- constants
-ICE_LIMIT_UP = 30
-ICE_LIMIT_UP_SOFT = 45
-ICE_PREMIUM_PCT = -2.0
-CLIMAX_PREMIUM_PCT = 3.0
-CLIMAX_MIN_BOARD = 5
-CLIMAX_MAX_BLOWN_RATE = 25.0
-RETREAT_PREMIUM_PCT = -1.5
-RETREAT_BLOWN_RATE = 35.0
-RETREAT_MAX_PROMOTION = 0.20
-FERMENT_PREMIUM_PCT = 1.0
-FERMENT_MIN_BOARD = 4
+# Thresholds are loaded from config/phase_thresholds.json (see _T above).
+ICE_LIMIT_UP = _T["ice_limit_up"]
+ICE_LIMIT_UP_SOFT = _T["ice_limit_up_soft"]
+ICE_PREMIUM_PCT = _T["ice_premium_pct"]
+CLIMAX_PREMIUM_PCT = _T["climax_premium_pct"]
+CLIMAX_MIN_BOARD = _T["climax_min_board"]
+CLIMAX_MAX_BLOWN_RATE = _T["climax_max_blown_rate"]
+RETREAT_PREMIUM_PCT = _T["retreat_premium_pct"]
+RETREAT_BLOWN_RATE = _T["retreat_blown_rate"]
+RETREAT_MAX_PROMOTION = _T["retreat_max_promotion"]
+FERMENT_PREMIUM_PCT = _T["ferment_premium_pct"]
+FERMENT_MIN_BOARD = _T["ferment_min_board"]
 
 PHASES = ("ice", "recovery", "ferment", "climax", "divergence", "retreat")
 PHASE_CN = {

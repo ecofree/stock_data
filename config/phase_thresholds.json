@@ -1,0 +1,14 @@
+{
+  "ice_limit_up": 30,
+  "ice_limit_up_soft": 45,
+  "ice_premium_pct": -2.0,
+  "climax_premium_pct": 3.0,
+  "climax_min_board": 5,
+  "climax_max_blown_rate": 25.0,
+  "retreat_premium_pct": -1.5,
+  "retreat_blown_rate": 35.0,
+  "retreat_max_promotion": 0.20,
+  "ferment_premium_pct": 1.0,
+  "ferment_min_board": 4,
+  "_comment": "调整后重跑 generate_cycle_analytics.py 即生效。数值含义见 trade_system/cycle.py 注释。"
+}
