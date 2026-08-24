@@ -106,16 +106,27 @@ def _object_row_counts(
     return counts, latest_dates
 
 
-def assess_data_chains(db_path: str | Path, trade_date: str | None = None) -> list[dict]:
-    if connect_duckdb is not None:
-        con = connect_duckdb(str(db_path), read_only=True)
-    else:
-        con = duckdb.connect(str(db_path), read_only=True)
+def assess_data_chains(
+    db_path: str | Path,
+    trade_date: str | None = None,
+    con: "duckdb.DuckDBPyConnection | None" = None,
+) -> list[dict]:
+    # Reuse an existing connection when given: DuckDB forbids two
+    # connections to the same file with different configurations in one
+    # process, so opening read_only here would fail next to a live
+    # read-write connection (e.g. build_terminal_context).
+    owns_connection = con is None
+    if owns_connection:
+        if connect_duckdb is not None:
+            con = connect_duckdb(str(db_path), read_only=True)
+        else:
+            con = duckdb.connect(str(db_path), read_only=True)
     try:
         existing = _table_or_view_names(con)
         row_counts, latest_dates = _object_row_counts(con, existing, trade_date)
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
     results = []
     for chain in DATA_CHAINS:

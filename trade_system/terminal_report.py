@@ -473,7 +473,10 @@ def _concepts_today(con, trade_date: str, lu_map: dict | None = None,
     rows = _q(con,
         "SELECT sector_code, sector_name, mainline_score, strength_value, limit_up_count, "
         "main_net_inflow, component_count, boom_reason FROM v_theme_mainline_evidence "
-        "WHERE CAST(trade_date AS VARCHAR)=? ORDER BY mainline_score DESC NULLS LAST LIMIT ?",
+        "WHERE CAST(trade_date AS DATE) = ("
+        "  SELECT max(CAST(trade_date AS DATE)) FROM v_theme_mainline_evidence"
+        "  WHERE CAST(trade_date AS DATE) <= ?"
+        ") ORDER BY mainline_score DESC NULLS LAST LIMIT ?",
         [trade_date, top_n])
     # limit_up_count is normally NULL (v_sector_capital hardcodes NULL); the
     # membership ∩ limit-up-pool map is computed once in build_terminal_context
@@ -575,7 +578,7 @@ def _data_health(con, trade_date: str, db_path) -> dict:
     out = {"chains": [], "gaps": [], "reconciliation": {}, "freshness": []}
     try:
         from trade_system.data_chain import assess_data_chains
-        out["chains"] = assess_data_chains(db_path)
+        out["chains"] = assess_data_chains(db_path, con=con)
     except Exception as exc:
         logger.warning("assess_data_chains failed; data-health panel degraded: %s", exc)
     recon = _q(con,
@@ -1052,7 +1055,6 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
             "lhb": _lhb(con, trade_date),
             "data_health": _data_health(con, trade_date, db_path),
             "alerts": _alerts(con, trade_date),
-            "stage_validation": _stage_validation(db_path),
             "plan_console": _plan_console(con, trade_date),
             "blown_history": _blown_history(con, trade_date),
             "promotion": _promotion_stats(con, trade_date),
@@ -1103,6 +1105,9 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
     ctx["auction_confirmation"] = _auction_confirmation(db_path, trade_date, names)
     ctx["flow_coverage"] = _flow_coverage(db_path, trade_date)
     ctx["pipeline_matrix"] = _pipeline_matrix(db_path, trade_date)
+    # Owns its DuckDB connections (review_statistics opens read_only);
+    # must run after the plain connection is closed (see comment above).
+    ctx["stage_validation"] = _stage_validation(db_path)
     return ctx
 
 
@@ -2626,11 +2631,19 @@ def _theme_timeline_html(ctx: dict) -> str:
 
 
 def _northbound_section(nb: dict) -> str:
+    """Render northbound flow as a compact summary (not raw JSON dump)."""
     intra = nb.get("intraday")
-    if not intra:
-        return ("<div class='empty'>北向分钟字段未对齐（数据源已停更），"
-                "该面板保留占位。</div>")
-    return f"<div class='mono'>{intra}</div>"
+    if not intra or not isinstance(intra, dict):
+        return ("<div class='empty'>北向资金分钟数据未对齐（数据源已停更）</div>")
+    latest_total = intra.get("latest_total")
+    if latest_total is not None:
+        color = "#ff5b6a" if latest_total > 0 else "#2ebd85"
+        val = f"{latest_total:.1f} 亿"
+        return (f"<div style='padding:12px'>"
+                f"<span class='dim'>当日北向净流入：</span>"
+                f"<b class='mono' style='font-size:20px;color:{color}'>{val}</b> "
+                f"<span class='dim'>亿元</span></div>")
+    return "<div class='empty'>北向数据不可用</div>"
 
 
 def render_terminal_html(ctx: dict, echarts_tag: str | None = None) -> str:
