@@ -32,6 +32,7 @@ _DINGTALK_SECRET_ENV = "KPL_NOTIFY_DINGTALK_SECRET"
 _TELEGRAM_TOKEN_ENV = "KPL_NOTIFY_TELEGRAM_TOKEN"
 _TELEGRAM_CHAT_ENV = "KPL_NOTIFY_TELEGRAM_CHAT_ID"
 _GENERIC_WEBHOOK_ENV = "KPL_NOTIFY_GENERIC_WEBHOOK"
+_FEISHU_WEBHOOK_ENV = "KPL_NOTIFY_FEISHU_WEBHOOK"
 
 _TIMEOUT_SECONDS = 10
 
@@ -70,32 +71,48 @@ def _dingtalk_signed_url(webhook: str, secret: str) -> str:
     return f"{webhook}{sep}timestamp={timestamp}&sign={sign}"
 
 
+def _env(key: str) -> str:
+    """Read from os.environ first, then from .env-loaded config.SETTINGS."""
+    val = os.environ.get(key, "").strip()
+    if val:
+        return val
+    try:
+        from trade_system.config import SETTINGS
+        return str(SETTINGS.get(key, "") or "").strip()
+    except Exception:
+        return ""
+
+
 def channel_payloads(title: str, body: str) -> dict[str, tuple[str, dict[str, Any]]]:
     """Build (url, payload) per configured channel. Exposed for unit tests."""
     text = f"{title}\n{body}".strip()
     out: dict[str, tuple[str, dict[str, Any]]] = {}
 
-    wechat = os.environ.get(_WECHAT_WEBHOOK_ENV, "").strip()
+    wechat = _env(_WECHAT_WEBHOOK_ENV)
     if wechat:
         out["wechat_work"] = (wechat, {"msgtype": "text", "text": {"content": text[:2000]}})
 
-    dingtalk = os.environ.get(_DINGTALK_WEBHOOK_ENV, "").strip()
+    dingtalk = _env(_DINGTALK_WEBHOOK_ENV)
     if dingtalk:
-        secret = os.environ.get(_DINGTALK_SECRET_ENV, "").strip()
+        secret = _env(_DINGTALK_SECRET_ENV)
         url = _dingtalk_signed_url(dingtalk, secret) if secret else dingtalk
-        out["dingtalk"] = (url, {"msgtype": "text", "text": {"content": text[:2000]}})
+        out["dingtalk"] = (url, {"msgtype": "text", "content": {"text": text[:2000]}})
 
-    tg_token = os.environ.get(_TELEGRAM_TOKEN_ENV, "").strip()
-    tg_chat = os.environ.get(_TELEGRAM_CHAT_ENV, "").strip()
+    tg_token = _env(_TELEGRAM_TOKEN_ENV)
+    tg_chat = _env(_TELEGRAM_CHAT_ENV)
     if tg_token and tg_chat:
         out["telegram"] = (
             f"https://api.telegram.org/bot{tg_token}/sendMessage",
             {"chat_id": tg_chat, "text": text[:4000]},
         )
 
-    generic = os.environ.get(_GENERIC_WEBHOOK_ENV, "").strip()
+    generic = _env(_GENERIC_WEBHOOK_ENV)
     if generic:
         out["generic"] = (generic, {"title": title, "body": body})
+
+    feishu = _env(_FEISHU_WEBHOOK_ENV)
+    if feishu:
+        out["feishu"] = (feishu, {"msg_type": "text", "content": {"text": text[:4000]}})
 
     return out
 
