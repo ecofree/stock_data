@@ -43,8 +43,11 @@ def _market_of(code: str):
 def _universe(con: duckdb.DuckDBPyConnection, day: str, source: str,
               max_stocks: int) -> list[str]:
     if source == "limit-pool":
+        # Use v_limit_pool (unified view) which falls back to derived pool
+        # when official backfill hasn't run yet for today.
         rows = con.execute(
-            "SELECT DISTINCT stock_code FROM official_limit_pool WHERE trade_date = ?",
+            """SELECT DISTINCT stock_code FROM v_limit_pool
+               WHERE CAST(trade_date AS DATE) = ?""",
             [day],
         ).fetchall()
     elif source == "watchlist":

@@ -1980,6 +1980,20 @@ def _render_review_bundle(
             rotation,
             lazy_asset_name=lazy_asset_name,
         ).replace("<!--EXTRAS-->", ctx.get("extras_sections") or "")
+
+        # Final-pass i18n: replace internal field names with Chinese labels
+        # regardless of which module generated them.
+        _FIELD_CN_MAP = {
+            "sector_capital_flow": "板块资金流",
+            "stock_flow": "个股资金流",
+            "kline_data": "K线数据",
+            "auction_evidence": "竞价证据",
+            "lhb_review_evidence": "龙虎榜",
+            "readiness_snapshot": "就绪快照",
+        }
+        for _en, _cn in _FIELD_CN_MAP.items():
+            html_out = html_out.replace(_en, _cn)
+
         lazy_out = _build_review_lazy_asset(ctx) if lazy_asset_name else None
         if trail_out:
             from trade_system.cycle import PHASE_CN  # noqa: F401 (page CSS/JS refs)

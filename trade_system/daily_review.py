@@ -129,7 +129,12 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
         stance = "blocked"
         stance_label = "仅可复盘"
         if missing:
-            headline = f"{regime_name}格局，{top_concept or '主线不明'}，但{missing[0]}未齐"
+            _miss_cn = missing[0]
+            for _en, _cn in [("sector_capital_flow","板块资金流"),("stock_flow","个股资金流"),("kline","K线"),("auction_evidence","竞价证据"),("lhb_review","龙虎榜")]:
+                if _en in _miss_cn:
+                    _miss_cn = _cn + "数据"
+                    break
+            headline = f"{regime_name}格局，{top_concept or '主线不明'}，但{_miss_cn}未齐"
         else:
             headline = f"{regime_name}格局，数据门禁未开放"
         lede = "收盘源或链路尚未完成。本页只作复盘，不能把候选、分数或影子模型当成开仓依据。"
