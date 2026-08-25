@@ -17,12 +17,13 @@ from typing import Any
 
 # factor weights (sum = 100 before phase adjustment)
 WEIGHTS = {
-    "qlib": 25,
-    "flow": 18,
-    "seal": 18,
-    "heat": 12,
-    "valuation": 15,
-    "earnings": 12,
+    "qlib": 22,
+    "flow": 16,
+    "seal": 16,
+    "heat": 10,
+    "valuation": 12,
+    "earnings": 10,
+    "chip": 14,
 }
 
 PHASE_BOARD_ADJUST = {
@@ -56,7 +57,10 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
       stock_code, stock_name, limit_up_reason, board,
       qlib_score (float|None), flow_rank_pct (float|None, 0..1 higher=better),
       seal_money (float|None), max_seal_money (float|None), open_times (int|None),
-      concept_heat (float|None 0..1)
+      concept_heat (float|None 0..1),
+      pe_ttm (float|None), revenue_yoy (float|None),
+      winner_pct (float|None 0..100 lower=more chips below price),
+      scr_90 (float|None 0..100 lower=more concentrated)
     """
     q_qlib = _percentile_ranks([r.get("qlib_score") for r in rows])
     q_flow = _percentile_ranks([r.get("flow_rank_pct") for r in rows])
@@ -88,6 +92,17 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
     ]
     q_earn = _percentile_ranks(earn_vals)
 
+    # chip score: low winner_pct = chips at bottom = safe entry
+    #             low scr_90 = concentrated = main force control
+    win_inverted = [
+        (100 - r["winner_pct"]) if isinstance(r.get("winner_pct"), (int, float)) else None
+        for r in rows
+    ]
+    scr_vals = [r.get("scr_90") for r in rows]
+    q_win = _percentile_ranks(win_inverted)
+    q_scr = _percentile_ranks(scr_vals)
+    q_chip = [0.6 * w + 0.4 * s for w, s in zip(q_win, q_scr)]
+
     thr, penalty, first_bonus = PHASE_BOARD_ADJUST.get(
         phase, (None, 0.0, 0.0))
 
@@ -104,6 +119,8 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
                 if pe_ttm_vals[i] is not None else 0,
             "earnings": round(q_earn[i] * WEIGHTS["earnings"], 2)
                 if earn_vals[i] is not None else 0,
+            "chip": round(q_chip[i] * WEIGHTS["chip"], 2)
+                if win_inverted[i] is not None else 0,
         }
         total = sum(factor_scores.values())
         notes: list[str] = []
