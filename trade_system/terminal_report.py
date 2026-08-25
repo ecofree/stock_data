@@ -29,6 +29,7 @@ from trade_system.i18n_labels import (
     zh_text,
 )
 from trade_system.cycle import PHASE_CN
+from trade_system import trader_signals as _ts
 
 logger = get_logger(__name__)
 
@@ -1085,6 +1086,25 @@ def build_terminal_context(db_path: str | Path, trade_date: str | None = None) -
             ctx["first_seal"] = _first_seal_buckets(con, trade_date)
             ctx["loss_trend"] = _loss_trend(con, trade_date)
             ctx["cycle_series"] = _cycle_series(con, trade_date)
+
+            # Trader decision signals (P0)
+            prev_day_row = con.execute(
+                "SELECT max(CAST(trade_date AS DATE)) FROM market_cycle_phase WHERE trade_date < ?",
+                [trade_date]).fetchone()
+            prev_max_board = None
+            if prev_day_row and prev_day_row[0]:
+                pm = con.execute(
+                    """SELECT max(board_level) FROM v_limit_pool
+                       WHERE CAST(trade_date AS DATE) = ?""",
+                    [prev_day_row[0]]).fetchone()
+                prev_max_board = pm[0] if pm else None
+            today_board = con.execute(
+                "SELECT max(board_level) FROM v_limit_pool WHERE CAST(trade_date AS DATE) = ?",
+                [trade_date]).fetchone()
+            ctx["signal_premium"] = _ts.premium_traffic_light(
+                cycle.get("premium_pct") if isinstance(cycle.get("premium_pct"), (int, float)) else None)
+            ctx["signal_ladder"] = _ts.ladder_break_detector(
+                today_board[0] if today_board else None, prev_max_board)
         except duckdb.Error:
             # Maintenance/test databases may miss the analytics tables.
             cycle = {}
@@ -1188,7 +1208,20 @@ def _fb_badge(fb) -> str:
     return _badge("回退", "b-warn") if fb else _badge("实时", "b-ok")
 
 
-def _cmd_bar(meta: dict, breadth: dict, readiness: dict | None = None) -> str:
+def _cmd_bar(meta: dict, breadth: dict, readiness: dict | None = None,
+             signals: dict | None = None) -> str:
+    signal_html = ""
+    if signals:
+        for key in ("signal_premium", "signal_ladder"):
+            sig = signals.get(key)
+            if not sig or sig.get("status") == "nodata":
+                continue
+            color = {"good": "var(--up)", "warn": "var(--amber)",
+                     "danger": "var(--up)", "info": "var(--cyan)"}.get(sig["status"], "var(--muted)")
+            signal_html += (
+                f"<div style='display:flex;align-items:center;gap:6px'>"
+                f"<span style='font-size:10px;color:var(--muted)'>{sig['label']}</span>"
+                f"<b style='color:{color};font-size:14px'>{sig['value']}</b></div>")
     regime = meta.get("regime") or "—"
     rcolor = REGIME_COLORS.get(regime, "#8fa3c0")
     readiness = readiness or {}
@@ -1221,7 +1254,10 @@ def _cmd_bar(meta: dict, breadth: dict, readiness: dict | None = None) -> str:
         f'<span class="cm-value down">{_fmt_num(breadth.get("limit_down"))}</span></div>'
         f'<div class="cmd-metric"><span class="cm-label">炸板率</span>'
         f'<span class="cm-value">{_fmt_pct(breadth.get("blown_rate")) if breadth.get("blown_rate") is not None else "—"}</span></div>'
-        '</div></div>'
+        + (f'<div style="display:flex;gap:12px;align-items:center;padding:0 8px;'
+           f'border-left:1px solid var(--line2);margin-left:4px">{signal_html}</div>'
+           if signal_html else '')
+        + '</div></div>'
     )
 
 
@@ -2655,7 +2691,9 @@ def render_terminal_html(ctx: dict, echarts_tag: str | None = None) -> str:
         f'<title>交易作战室 · {meta.get("trade_date","")}</title>',
         echarts_tag or _ECHARTS_CDN,
         '<style>', _TERMINAL_CSS, _TERMINAL_CSS_V2, '</style></head><body>',
-        _cmd_bar(meta, breadth, ctx.get("readiness")),
+        _cmd_bar(meta, breadth, ctx.get("readiness"),
+                 signals={"signal_premium": ctx.get("signal_premium"),
+                          "signal_ladder": ctx.get("signal_ladder")}),
         _layer_nav("l0"),
 
         # ---------- L0 决策层 ----------
