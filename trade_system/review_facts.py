@@ -154,7 +154,10 @@ def _theme_mainline(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dic
             SELECT sector_code, sector_name, strength_value, limit_up_count, seal_rate,
                    main_net_inflow, component_count, boom_reason, mainline_score
             FROM v_theme_mainline_evidence
-            WHERE trade_date = CAST(? AS DATE)
+            WHERE CAST(trade_date AS DATE) = (
+                SELECT max(CAST(trade_date AS DATE)) FROM v_theme_mainline_evidence
+                WHERE CAST(trade_date AS DATE) <= ?
+            )
             ORDER BY mainline_score DESC NULLS LAST
             LIMIT 12
             """,

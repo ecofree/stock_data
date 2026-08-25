@@ -470,7 +470,10 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
                        max(main_net_inflow) AS main_net_inflow,
                        max(mainline_score) AS mainline_score
                 FROM v_theme_mainline_evidence
-                WHERE CAST(trade_date AS DATE) = CAST(? AS DATE)
+                WHERE CAST(trade_date AS DATE) = (
+                    SELECT max(CAST(trade_date AS DATE)) FROM v_theme_mainline_evidence
+                    WHERE CAST(trade_date AS DATE) <= CAST(? AS DATE)
+                )
                   AND sector_code LIKE 'THS-%'
                 GROUP BY sector_code
                 """,

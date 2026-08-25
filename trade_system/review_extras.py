@@ -266,7 +266,9 @@ def render_daily_picks(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
         SELECT rank, stock_code, stock_name, board, total_score,
                limit_up_reason, llm_bull_case, llm_risk, llm_watch_condition,
                factor_json
-        FROM daily_stock_picks WHERE trade_date = ? ORDER BY rank LIMIT 10
+        FROM daily_stock_picks WHERE trade_date = (
+            SELECT max(trade_date) FROM daily_stock_picks WHERE trade_date <= ?
+        ) ORDER BY rank LIMIT 10
         """,
         [trade_date],
     ).fetchall()
