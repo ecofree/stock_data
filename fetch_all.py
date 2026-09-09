@@ -12,27 +12,6 @@ from base import KPLClient, DuckDBStore, logger
 from schema import init_schema
 
 # Import all collectors
-from collect_market import collect_all_market
-from collect_ladder import collect_all_ladder
-from collect_sector import collect_all_sector
-from collect_daily import collect_all_daily
-from collect_dingpan import collect_all_dingpan
-from collect_fengk import collect_all_fengk
-from collect_misc import collect_all_misc
-from collect_news import collect_all_news
-from collect_stock import collect_all_stock
-from collect_l2 import collect_all_l2
-from collect_index import collect_all_index
-# Optional collectors (finance, index removed to slim deps)
-try:
-    from collect_finance import collect_all_finance
-    HAS_FINANCE = True
-except ImportError:
-    HAS_FINANCE = False
-from collect_advanced import collect_all_advanced
-from collect_advanced_stock import collect_all_advanced_stock
-
-
 def should_collect_finance(skip_finance: bool, only_market: bool, has_finance: bool) -> bool:
     return (not skip_finance) and (not only_market) and has_finance
 
@@ -55,6 +34,13 @@ def main():
         help="finance gap-fill batch size; 0 keeps finance collection off in the broad daily run",
     )
     args = parser.parse_args()
+
+    # ``--only-market`` is the high-frequency canonical path.  Importing all
+    # historical collectors here used to load the complete compatibility
+    # graph (and its optional dependencies) even though the process returned
+    # before any of those collectors ran.  Keep the broad entrypoint for
+    # recovery, but load its legacy chain only after the market-only exit.
+    from collect_market import collect_all_market
 
     date = args.date
     logger.info(f"=" * 80)
@@ -112,6 +98,25 @@ def main():
             logger.error(f"Strict market-only readiness failed: {', '.join(strict_missing)}")
             return 2
         return 0
+
+    from collect_advanced import collect_all_advanced
+    from collect_advanced_stock import collect_all_advanced_stock
+    from collect_daily import collect_all_daily
+    from collect_dingpan import collect_all_dingpan
+    from collect_fengk import collect_all_fengk
+    from collect_index import collect_all_index
+    from collect_l2 import collect_all_l2
+    from collect_misc import collect_all_misc
+    from collect_news import collect_all_news
+    from collect_sector import collect_all_sector
+    from collect_stock import collect_all_stock
+    from collect_ladder import collect_all_ladder
+    try:
+        from collect_finance import collect_all_finance
+        has_finance = True
+    except ImportError:
+        collect_all_finance = None
+        has_finance = False
 
     logger.info("  采集连板梯队数据...")
     results.update(collect_all_ladder(client, store, date))
@@ -214,16 +219,17 @@ def main():
         logger.info(f"\n[Phase 6/6] 跳过L2数据")
 
     # Finance data (optional, very large)
-    if should_collect_finance(args.skip_finance, args.only_market, HAS_FINANCE) and args.finance_max_stocks > 0:
+    if should_collect_finance(args.skip_finance, args.only_market, has_finance) and args.finance_max_stocks > 0:
         logger.info(f"\n{'='*60}")
         logger.info(f"[Bonus] 财务数据 ({min(len(stock_codes), 200)} 只股票)")
         logger.info(f"{'='*60}")
 
         if stock_codes:
             logger.info("  采集财务报表数据...")
-            results.update(collect_all_finance(client, store, date, stock_codes[:args.finance_max_stocks]))
+            if collect_all_finance is not None:
+                results.update(collect_all_finance(client, store, date, stock_codes[:args.finance_max_stocks]))
     else:
-        if not HAS_FINANCE and not args.skip_finance and not args.only_market:
+        if not has_finance and not args.skip_finance and not args.only_market:
             logger.warning("\n[Bonus] 跳过财务数据: collect_finance.py 不存在")
         else:
             logger.info(f"\n[Bonus] 跳过财务数据")

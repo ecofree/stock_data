@@ -28,6 +28,10 @@ def test_operator_stage_backtest_applies_t1_fees_and_slippage(tmp_path):
         "INSERT INTO kline VALUES "
         "('2026-07-07', '000001', 10.0, 11.0, 9.8, 10.5, 1000, 10500, 5, 'D', '2026-07-07')"
     )
+    con.execute(
+        "INSERT INTO kline VALUES "
+        "('2026-07-08', '000001', 10.5, 10.6, 10.2, 10.5, 1000, 10500, 0, 'D', '2026-07-08')"
+    )
     con.close()
 
     result = run_operator_stage_backtest(db_path, fee_rate=0.001, slippage_bps=10)
@@ -50,6 +54,7 @@ def test_operator_stage_backtest_accepts_lowercase_daily_kline_type(tmp_path):
     con.execute("CREATE TABLE kline(date DATE, stock_code VARCHAR, open DOUBLE, close DOUBLE, ktype VARCHAR)")
     con.execute("INSERT INTO kline VALUES ('2026-07-06','000001',9.8,10,'d')")
     con.execute("INSERT INTO kline VALUES ('2026-07-07','000001',10.0,10.5,'d')")
+    con.execute("INSERT INTO kline VALUES ('2026-07-08','000001',10.5,10.5,'d')")
     con.close()
 
     result = run_operator_stage_backtest(db_path)

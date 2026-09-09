@@ -56,42 +56,26 @@ def _track_kpl_stale(store, requested_date: str, got_same_date: bool) -> int:
         return 0
 
 
-def _self_heal_daily_summary_bloat(store) -> None:
-    """One-time purge of the frozen oversized daily_summary.raw_json blob (WP0).
+def _require_daily_summary_schema(store) -> None:
+    """Validate the schema before collection without changing database state.
 
-    The old nesting bug grew a single raw_json value to multi-gigabyte scale.  A
-    value that large cannot be allocated in memory, so ANY query that materializes
-    it -- a ``SELECT raw_json``, a ``length(raw_json)`` filter, or an UPDATE that
-    reads the old value -- fails with "Out of Memory Error: Allocation failure".
-    We must therefore never read it.  Dropping and re-adding the column is a
-    columnar metadata operation that discards the column's data segments without
-    materializing the giant value (validated ~instant regardless of blob size), so
-    it purges the blob safely.  Runs once per database (guarded by a marker row);
-    future runs write a bounded raw_json (see collect_market_rise_fall).
+    A historical bloat workaround used ``DROP COLUMN``/``ADD COLUMN`` in the
+    collection path.  That made a normal market tick destructive and erased the
+    raw audit payload.  Schema repair now belongs to an explicit migration; the
+    production collector only checks that the required column exists and fails
+    clearly when an old database needs migration.
     """
-    try:
-        store.conn.execute(
-            "CREATE TABLE IF NOT EXISTS _bloat_cleanup_done ("
-            "id INTEGER PRIMARY KEY, done_at TIMESTAMP)"
+    columns = {
+        str(row[1])
+        for row in store.conn.execute("PRAGMA table_info('daily_summary')").fetchall()
+    }
+    required = {"date", "raw_json", "source_kind"}
+    missing = sorted(required - columns)
+    if missing:
+        raise RuntimeError(
+            "daily_summary schema is incomplete; run the explicit schema migration "
+            f"before collection (missing: {', '.join(missing)})"
         )
-        if store.conn.execute("SELECT 1 FROM _bloat_cleanup_done WHERE id=1").fetchone():
-            return
-        store.conn.execute("ALTER TABLE daily_summary DROP COLUMN raw_json")
-        store.conn.execute("ALTER TABLE daily_summary ADD COLUMN raw_json VARCHAR")
-        store.conn.execute("INSERT INTO _bloat_cleanup_done VALUES (1, current_timestamp)")
-        logger.warning(
-            "daily_summary bloat self-heal: dropped and recreated raw_json column "
-            "to purge the frozen oversized blob (audit history reset; scalar data intact)"
-        )
-    except Exception as exc:
-        logger.warning(f"daily_summary bloat self-heal skipped: {exc}")
-        # Best effort: guarantee raw_json exists so later inserts cannot fail.
-        try:
-            store.conn.execute(
-                "ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS raw_json VARCHAR"
-            )
-        except Exception:
-            pass
 
 
 def collect_market_mood(client: KPLClient, store: DuckDBStore, date: str) -> int:
@@ -412,9 +396,7 @@ def collect_emotion_money_detail(client: KPLClient, store: DuckDBStore, date: st
 
 def collect_all_market(client: KPLClient, store: DuckDBStore, date: str) -> dict:
     results = {}
-    # WP0 self-heal: trim any frozen oversized raw_json left by the old nesting bug
-    # BEFORE the per-row reads below, so this tick does not re-read a multi-MB blob.
-    _self_heal_daily_summary_bloat(store)
+    _require_daily_summary_schema(store)
     results["market_mood"] = collect_market_mood(client, store, date)
     results["market_rise_fall"] = collect_market_rise_fall(client, store, date)
     results["market_limit_up_down"] = collect_market_limit_up_down(client, store, date)

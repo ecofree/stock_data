@@ -68,7 +68,9 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
     mid = mid if mid is not None else net_pair("buy_md_amount", "sell_md_amount")
     large = large if large is not None else net_pair("buy_lg_amount", "sell_lg_amount")
     super_net = super_net if super_net is not None else net_pair("buy_elg_amount", "sell_elg_amount")
-    if tushare_moneyflow and row.get("amount_unit") not in {"yuan", "yuan_from_10000"}:
+    if tushare_moneyflow and row.get("amount_unit") not in {
+        "yuan", "yuan_from_10000", "yuan_from_100m_yuan"
+    }:
         # Raw TuShare order buckets are in 10,000 yuan.  Adapter-produced
         # canonical buckets declare yuan and bypass this conversion.
         small = small * 10000 if small is not None else None
@@ -89,7 +91,9 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
     if tushare_moneyflow:
         # ``net_total`` emitted by the adapters is already in yuan.  Only raw
         # TuShare ``net_mf_amount`` (10,000 yuan) needs this conversion.
-        if explicit_total is None and reported_total is not None and row.get("amount_unit") not in {"yuan", "yuan_from_10000"}:
+        if explicit_total is None and reported_total is not None and row.get("amount_unit") not in {
+            "yuan", "yuan_from_10000", "yuan_from_100m_yuan"
+        }:
             reported_total *= 10000.0
         buckets = [value for value in (small, mid, large, super_net) if value is not None]
         if buckets and any(value is not None for value in (large, super_net)):

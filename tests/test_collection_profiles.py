@@ -13,11 +13,19 @@ def test_phase_auto_resolves_market_windows():
     assert resolve_phase("auto", datetime(2026, 7, 15, 22, 0)) == "close"
 
 
+def test_retired_full_phase_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        resolve_phase("full")
+
+
 def test_intraday_plan_excludes_after_close_fanout():
     steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase="intraday")
     names = [name for name, _, _ in steps]
     assert names == [
         "collect_market_context",
+        "check_kpl_connectivity",
         "collect_realtime_limit_pool",
         "collect_intraday_stock_flow_market",
         "collect_l2_focus",
@@ -39,6 +47,14 @@ def test_intraday_plan_excludes_after_close_fanout():
     assert "collect_finance_gapfill" not in names
     assert "evaluate_qlib_shadow" not in names
     assert "run_news_radar" not in names
+    generate = next(command for name, command, _ in steps if name == "generate_signals")
+    assert generate[generate.index("--readiness-stage") + 1] == "intraday"
+
+
+def test_auction_generate_signals_uses_auction_readiness_stage():
+    steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase="auction")
+    generate = next(command for name, command, _ in steps if name == "generate_signals")
+    assert generate[generate.index("--readiness-stage") + 1] == "auction"
 
 
 def test_profile_declares_full_market_flow_sources():
@@ -63,7 +79,7 @@ def test_fresh_intraday_snapshots_are_not_due(tmp_path):
     assert task_due(db, "2026-07-15", "collect_intraday_sector_flow_full", now=now)[0] is False
 
 
-def test_close_priority_plan_keeps_incremental_tushare_and_weekly_ths():
+def test_close_priority_plan_keeps_incremental_tushare_and_official_ths():
     steps = command_plan(
         "sample.duckdb",
         "2026-07-15",
@@ -73,17 +89,18 @@ def test_close_priority_plan_keeps_incremental_tushare_and_weekly_ths():
     )
     names = [name for name, _, _ in steps]
 
-    assert names[:10] == [
+    assert names[:11] == [
         "collect_market_context",
+        "check_kpl_connectivity",
         "sync_tushare_close",
         "sync_tushare_ohlc_core",
-        "refresh_ths_weekly",
+        "collect_ths_concepts_api",
+        "collect_hithink_limit_pool_daily",
         "collect_realtime_limit_pool",
         "collect_kpl_stock_flow_focus",
         "collect_intraday_stock_flow_market",
         "collect_intraday_sector_flow_full",
         "derive_market_context",
-        "collect_finance_gapfill",
     ]
 
 
@@ -121,43 +138,15 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
     )[0] is True
 
 
-def test_ths_weekly_gate_uses_latest_attempt_status(tmp_path):
-    db = tmp_path / "ths-weekly.duckdb"
-    con = duckdb.connect(str(db))
-    con.execute(
-        "CREATE TABLE history_fetch_checkpoint("
-        "dataset VARCHAR, trade_date DATE, page_no INTEGER, status VARCHAR, "
-        "rows_written INTEGER, updated_at TIMESTAMP)"
+def test_legacy_weekly_web_refresh_is_not_a_close_task():
+    # The official HiThink collector is now the sole close-path concept
+    # producer.  The old web refresh remains available only as explicit
+    # historical recovery, so its failed checkpoint cannot suppress a close
+    # run or compete with the official snapshot.
+    assert not any(
+        task.name == "refresh_ths_weekly"
+        for task in phase_tasks("close")
     )
-    con.execute(
-        "INSERT INTO history_fetch_checkpoint VALUES "
-        "('ths_concept_snapshot', '2026-07-08', 0, 'success', 68000, '2026-07-08 17:00:00'), "
-        "('ths_concept_snapshot', '2026-07-15', 0, 'failed', 0, '2026-07-15 17:00:00')"
-    )
-    con.close()
-
-    due, reason = task_due(
-        db,
-        "2026-07-16",
-        "refresh_ths_weekly",
-        now=datetime(2026, 7, 16, 10, 0),
-    )
-    assert due is False
-    assert "status=failed" in reason
-    due_retry, retry_reason = task_due(
-        db,
-        "2026-07-16",
-        "refresh_ths_weekly",
-        now=datetime(2026, 7, 17, 10, 0),
-    )
-    assert due_retry is True
-    assert "expired" in retry_reason
-    assert task_due(
-        db,
-        "2026-07-16",
-        "refresh_ths_weekly",
-        now=datetime(2026, 7, 23, 10, 0),
-    )[0] is True
 
 
 def test_market_context_fallback_never_suppresses_real_retry(tmp_path):

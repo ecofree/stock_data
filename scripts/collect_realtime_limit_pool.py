@@ -24,33 +24,6 @@ from trade_system.stock_data_sources import _from_em_zt_pool
 def collect_realtime_limit_pool(db_path: str | Path, trade_date: str) -> dict:
     con = duckdb.connect(str(db_path))
     init_schema(con)
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS realtime_candidate_pool_snapshot (
-            trade_date DATE PRIMARY KEY,
-            source VARCHAR,
-            row_count INTEGER,
-            stock_count INTEGER,
-            status VARCHAR,
-            fetched_at TIMESTAMP DEFAULT current_timestamp,
-            error VARCHAR
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS eastmoney_limit_up_pool (
-            date DATE,
-            board_level INTEGER,
-            stock_code VARCHAR,
-            stock_name VARCHAR,
-            limit_up_time VARCHAR,
-            fetched_at TIMESTAMP DEFAULT current_timestamp,
-            raw_json VARCHAR,
-            PRIMARY KEY(date, stock_code)
-        )
-        """
-    )
     con.close()
     source = "l2_realtime_all_boards"
     errors = []

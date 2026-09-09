@@ -7,6 +7,7 @@ the database, move files, or infer that an empty relation is safe to retire.
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,8 @@ import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from trade_system.maintenance_registry import script_lifecycle
 
 
 def _q(name: str) -> str:
@@ -34,7 +37,16 @@ def _source_files(root: Path) -> list[Path]:
 
 
 def collect_script_catalog(root: Path) -> dict[str, Any]:
-    runner = (root / "scripts" / "run_integrated_daily.py").read_text(encoding="utf-8")
+    runner_source = (root / "scripts" / "run_integrated_daily.py").read_text(encoding="utf-8-sig")
+    runner_tree = ast.parse(runner_source, filename="run_integrated_daily.py")
+    runner_commands = {
+        Path(str(node.value).replace("\\", "/")).name
+        for node in ast.walk(runner_tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and str(node.value).replace("\\", "/").endswith(".py")
+        and "/" in str(node.value).replace("\\", "/")
+    }
     rows: list[dict[str, Any]] = []
     for path in sorted(root.glob("scripts/*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -64,7 +76,9 @@ def collect_script_catalog(root: Path) -> dict[str, Any]:
                 "name": name,
                 "category": category,
                 "imports_trade_system": "trade_system" in text,
-                "mentioned_by_integrated_runner": name in runner,
+                "mentioned_by_integrated_runner": name in runner_commands,
+                "runner_command_literal": name in runner_commands,
+                "lifecycle": script_lifecycle(name, mentioned_by_runner=name in runner_commands),
                 "lines": len(text.splitlines()),
             }
         )
@@ -198,14 +212,14 @@ def render_report(result: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "| Script | Category | Imports trade_system | Mentioned by integrated runner | Lines |",
-            "|---|---|---:|---:|---:|",
+            "| Script | Category | Lifecycle | Imports trade_system | Mentioned by integrated runner | Lines |",
+            "|---|---|---|---:|---:|---:|",
         ]
     )
     for row in scripts["rows"]:
         if row["category"] in {"canonical_pipeline", "audit", "backfill", "runner_or_research"}:
             lines.append(
-                f"| `{row['name']}` | {row['category']} | {row['imports_trade_system']} | "
+                f"| `{row['name']}` | {row['category']} | `{row['lifecycle']}` | {row['imports_trade_system']} | "
                 f"{row['mentioned_by_integrated_runner']} | {row['lines']} |"
             )
     empty = [row for row in relations if row["type"] == "BASE TABLE" and row["rows"] == 0]

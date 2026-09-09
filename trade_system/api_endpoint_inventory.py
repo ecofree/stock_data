@@ -174,8 +174,10 @@ SPECIAL_PARAMS = {
     "/sector/strength-ndays": {"code", "end_date", "days"},
     "/auction/bidding-anomaly": {"code", "date"},
     "/auction/tick": {"code", "date"},
+    "/auction/market": {"date"},
     "/kline": {"code", "ktype", "count"},
     "/lhb/detail": {"code", "date"},
+    "/index/zhishu-kline": {"code", "ktype", "index"},
     "/dingpan/radar": {"st"},
 }
 
@@ -633,9 +635,48 @@ def classify_probe_result(item: EndpointInventoryItem) -> tuple[str, str]:
     return "reachable_empty", "Endpoint is reachable but returned empty data."
 
 
-def install_endpoint_inventory(db_path: str | Path, items: list[EndpointInventoryItem]) -> int:
+def install_endpoint_inventory(
+    db_path: str | Path,
+    items: list[EndpointInventoryItem],
+    *,
+    api_base: str = "",
+    probe_date: str | None = None,
+    run_id: str | None = None,
+) -> int:
     con = duckdb.connect(str(db_path))
     try:
+        started_at = datetime.now()
+        effective_run_id = run_id or f"api_probe_{started_at.strftime('%Y%m%d_%H%M%S_%f')}"
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_endpoint_probe_run (
+                run_id VARCHAR PRIMARY KEY,
+                base_url VARCHAR,
+                probe_date DATE,
+                endpoint_count INTEGER,
+                status VARCHAR,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT current_timestamp
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO api_endpoint_probe_run(
+                run_id, base_url, probe_date, endpoint_count, status,
+                started_at, completed_at
+            ) VALUES (?, ?, CAST(? AS DATE), ?, 'completed', ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                base_url=excluded.base_url,
+                probe_date=excluded.probe_date,
+                endpoint_count=excluded.endpoint_count,
+                status=excluded.status,
+                started_at=excluded.started_at,
+                completed_at=excluded.completed_at
+            """,
+            [effective_run_id, api_base, probe_date, len(items), started_at, datetime.now()],
+        )
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS api_endpoint_inventory (
@@ -686,9 +727,12 @@ def install_endpoint_inventory(db_path: str | Path, items: list[EndpointInventor
         ]
         con.executemany(
             """
-            INSERT INTO api_endpoint_inventory VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
+            INSERT INTO api_endpoint_inventory(
+                endpoint, category, source_kinds, source_files, param_type,
+                param_names, probe_params, table_name, table_rows, probe_status,
+                response_type, item_key, item_count, top_level_keys, verdict,
+                usefulness, note, probed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

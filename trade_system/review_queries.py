@@ -15,6 +15,7 @@ import duckdb
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
 from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
+from trade_system.source_authority import provider_rank_sql
 
 logger = get_logger(__name__)
 
@@ -55,6 +56,8 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
         "sector_flow_persistence": [], "sector_flow_persistence_outflow": [],
         "lhb": [], "coverage_alerts": [],
     }
+    stock_provider_order = provider_rank_sql("stock_flow", "f.provider")
+    sector_provider_order = provider_rank_sql("sector_flow", "provider")
     if table_exists(con, "multi_source_stock_flow"):
         result["stock_flow_meta"] = _fetch_dicts(
             con,
@@ -112,15 +115,7 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
                        ) AS stock_name,
                        row_number() OVER (
                          PARTITION BY f.stock_code
-                          ORDER BY CASE f.provider
-                                     WHEN 'eastmoney_market' THEN 1
-                                     WHEN 'eastmoney_intraday_clist_delay' THEN 2
-                                     WHEN 'eastmoney_intraday_clist' THEN 3
-                                     WHEN 'tushare' THEN 4
-                                     WHEN 'tushare_relay' THEN 4
-                                     WHEN 'kpl' THEN 5
-                                     ELSE 9
-                                   END,
+                          ORDER BY {stock_provider_order} ASC,
                                   f.fetched_at DESC NULLS LAST
                        ) AS provider_rank
                 FROM multi_source_stock_flow f
@@ -153,24 +148,56 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
             """,
             [trade_date, trade_date, trade_date],
         )[0]
-        sector_sql = """
+        sector_sql = f"""
+            WITH ranked AS (
+                SELECT sector_code, sector_name, sector_type, main_net, change_pct,
+                       provider, fetched_at,
+                       row_number() OVER (
+                           PARTITION BY sector_code
+                           ORDER BY {sector_provider_order} ASC,
+                                    fetched_at DESC NULLS LAST
+                       ) AS provider_rank
+                FROM multi_source_sector_flow
+                WHERE source_date=CAST(? AS DATE)
+                  AND coalesce(is_stale,FALSE)=FALSE
+                  AND sector_type IN ('ths_concept','ths_concept_derived')
+                  AND (
+                        provider <> 'derived_ths_stock_aggregate'
+                        OR json_extract_string(raw_json, '$.raw.membership_snapshot_date') = (
+                            SELECT CAST(max(trade_date) AS VARCHAR)
+                            FROM v_default_concept_stock_history
+                            WHERE trade_date <= CAST(? AS DATE)
+                        )
+                      )
+            )
             SELECT sector_code, sector_name, sector_type, main_net, change_pct,
                    provider, fetched_at
-            FROM multi_source_sector_flow
-            WHERE source_date=CAST(? AS DATE)
-              AND coalesce(is_stale,FALSE)=FALSE
-              AND sector_type IN ('ths_concept','ths_concept_derived')
-            ORDER BY main_net {direction} NULLS LAST LIMIT 10
+            FROM ranked
+            WHERE provider_rank=1
+            ORDER BY main_net {{direction}} NULLS LAST LIMIT 10
         """
         try:
-            result["sector_inflow"] = _fetch_dicts(con, sector_sql.format(direction="DESC"), [trade_date])
-            result["sector_outflow"] = _fetch_dicts(con, sector_sql.format(direction="ASC"), [trade_date])
-            industry_sql = sector_sql.replace(
-                "sector_type IN ('ths_concept','ths_concept_derived')",
-                "sector_type = 'em_industry'",
+            result["sector_inflow"] = _fetch_dicts(
+                con, sector_sql.format(direction="DESC"), [trade_date, trade_date]
             )
-            result["industry_inflow"] = _fetch_dicts(con, industry_sql.format(direction="DESC"), [trade_date])
-            result["industry_outflow"] = _fetch_dicts(con, industry_sql.format(direction="ASC"), [trade_date])
+            result["sector_outflow"] = _fetch_dicts(
+                con, sector_sql.format(direction="ASC"), [trade_date, trade_date]
+            )
+            industry_sql = """
+                SELECT sector_code, sector_name, sector_type, main_net, change_pct,
+                       provider, fetched_at
+                FROM multi_source_sector_flow
+                WHERE source_date=CAST(? AS DATE)
+                  AND coalesce(is_stale,FALSE)=FALSE
+                  AND sector_type = 'em_industry'
+                ORDER BY main_net {direction} NULLS LAST LIMIT 10
+            """
+            result["industry_inflow"] = _fetch_dicts(
+                con, industry_sql.format(direction="DESC"), [trade_date]
+            )
+            result["industry_outflow"] = _fetch_dicts(
+                con, industry_sql.format(direction="ASC"), [trade_date]
+            )
         except Exception:
             pass
 
@@ -200,18 +227,11 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
         result["candidate_picks"] = _rows(
             con,
             "stock_candidate_score",
-            """
+            f"""
             WITH provider_ranked AS (
                 SELECT stock_code, main_net,
                        row_number() OVER (
-                         PARTITION BY stock_code ORDER BY CASE provider
-                           WHEN 'eastmoney_market' THEN 1
-                           WHEN 'eastmoney_intraday_clist_delay' THEN 2
-                           WHEN 'eastmoney_intraday_clist' THEN 3
-                           WHEN 'tushare' THEN 4
-                           WHEN 'tushare_relay' THEN 4
-                           WHEN 'kpl' THEN 5
-                           ELSE 9 END,
+                         PARTITION BY stock_code ORDER BY {stock_provider_order.replace('f.provider', 'provider')} ASC,
                          fetched_at DESC NULLS LAST
                        ) AS provider_rank
                 FROM multi_source_stock_flow
@@ -444,22 +464,6 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
             result["membership_stale"] = True
             return result
 
-        broad = list(_BROAD_TRAIL_CONCEPTS)
-        broad_ph = ",".join("?" for _ in broad)
-        members = _fetch_dicts(
-            con,
-            f"""
-            SELECT concept_code, max(concept_name) AS concept_name,
-                   regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
-                   max(stock_name) AS stock_name
-            FROM v_default_concept_stock_history
-            WHERE trade_date = CAST(? AS DATE)
-              AND concept_code LIKE 'THS-%'
-              AND coalesce(concept_name, '') NOT IN ({broad_ph})
-            GROUP BY concept_code, regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')
-            """,
-            [member_date, *broad],
-        )
         scores = []
         if table_exists(con, "v_theme_mainline_evidence"):
             scores = _fetch_dicts(
@@ -505,6 +509,75 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
             )
             if key in level_lookup:
                 item["board_level"] = level_lookup[key]
+
+        # Do not materialize the whole THS snapshot in Python.  On the current
+        # database this is close to a million membership rows and the old
+        # dict-of-sets implementation could consume multiple GB while the
+        # HTML renderer was already building charts.  First identify only the
+        # concepts touched by today's limit-up pool, then compute their full
+        # member counts in DuckDB and fetch only the limit-up drill-down rows.
+        candidate_concepts = _fetch_dicts(
+            con,
+            """
+            SELECT DISTINCT h.concept_code
+            FROM v_default_concept_stock_history h
+            JOIN v_limit_pool l
+              ON l.trade_date = CAST(? AS DATE)
+             AND regexp_replace(CAST(l.stock_code AS VARCHAR), '[.].*$', '') =
+                 regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
+            WHERE h.trade_date = CAST(? AS DATE)
+              AND h.concept_code LIKE 'THS-%'
+            """,
+            [trade_date, member_date],
+        )
+        candidate_codes = [
+            str(row.get("concept_code") or "")
+            for row in candidate_concepts
+            if str(row.get("concept_code") or "")
+        ]
+        if not candidate_codes:
+            result["message"] = "no candidate concept has same-date limit-up members"
+            return result
+        placeholders = ", ".join("?" for _ in candidate_codes)
+        member_count_rows = _fetch_dicts(
+            con,
+            f"""
+            SELECT concept_code,
+                   count(DISTINCT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', ''))
+                       AS member_count
+            FROM v_default_concept_stock_history
+            WHERE trade_date = CAST(? AS DATE)
+              AND concept_code IN ({placeholders})
+            GROUP BY concept_code
+            """,
+            [member_date, *candidate_codes],
+        )
+        member_count_by_concept = {
+            str(row.get("concept_code") or ""): int(row.get("member_count") or 0)
+            for row in member_count_rows
+        }
+        members = _fetch_dicts(
+            con,
+            f"""
+            SELECT h.concept_code,
+                   max(h.concept_name) AS concept_name,
+                   regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                   max(h.stock_name) AS stock_name,
+                   max(l.stock_name) AS limit_stock_name,
+                   max(l.board_level) AS board_level,
+                   max(l.limit_up_time) AS limit_up_time
+            FROM v_default_concept_stock_history h
+            JOIN v_limit_pool l
+              ON l.trade_date = CAST(? AS DATE)
+             AND regexp_replace(CAST(l.stock_code AS VARCHAR), '[.].*$', '') =
+                 regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
+            WHERE h.trade_date = CAST(? AS DATE)
+              AND h.concept_code IN ({placeholders})
+            GROUP BY h.concept_code,
+                     regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
+            """,
+            [trade_date, member_date, *candidate_codes],
+        )
     except Exception as exc:
         result["message"] = f"concept-limit-up join failed: {type(exc).__name__}"
         return result
@@ -512,7 +585,6 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
     score_by_code = {str(row["concept_code"]): dict(row) for row in scores}
     name_by_code: dict[str, str] = {}
     members_by_stock: dict[str, set[str]] = {}
-    member_counts: dict[str, set[str]] = {}
     for row in members:
         concept_code = str(row.get("concept_code") or "")
         stock_code = _code(row.get("stock_code"))
@@ -520,13 +592,12 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
             continue
         name_by_code[concept_code] = str(row.get("concept_name") or concept_code)
         members_by_stock.setdefault(stock_code, set()).add(concept_code)
-        member_counts.setdefault(concept_code, set()).add(stock_code)
 
     grouped: dict[str, dict[str, Any]] = {}
     for row in limits:
         stock_code = _code(row.get("stock_code"))
         for concept_code in members_by_stock.get(stock_code, set()):
-            size = len(member_counts.get(concept_code, set()))
+            size = member_count_by_concept.get(concept_code, 0)
             score = score_by_code.get(concept_code) or {}
             group = grouped.setdefault(
                 concept_code,
@@ -546,7 +617,7 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
                 group["limit_up_stocks"].append(
                     {
                         "stock_code": stock_code,
-                        "stock_name": row.get("stock_name") or row.get("stock_name") or "",
+                        "stock_name": row.get("limit_stock_name") or row.get("stock_name") or "",
                         "board_level": row.get("board_level"),
                         "limit_up_time": row.get("limit_up_time"),
                     }
@@ -568,8 +639,8 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
         groups.append(group)
 
     result["large_concepts"] = sum(
-        1 for code, names in member_counts.items()
-        if len(names) > 800
+        1 for code, count in member_count_by_concept.items()
+        if count > 800
     )
     groups.sort(
         key=lambda item: (
@@ -639,6 +710,7 @@ def _market_context_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> d
                 [trade_date],
             )
     if table_exists(con, "lhb_list"):
+        latest_lhb = con.execute("SELECT max(CAST(date AS DATE)) FROM lhb_list").fetchone()[0]
         row = con.execute(
             "SELECT count(*), count(DISTINCT stock_code), max(fetched_at) "
             "FROM lhb_list WHERE date=CAST(? AS DATE)", [trade_date]
@@ -646,6 +718,7 @@ def _market_context_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> d
         context["lhb_summary"] = {
             "rows": int(row[0] or 0), "stocks": int(row[1] or 0),
             "fetched_at": str(row[2]) if row and row[2] else None,
+            "latest_date": str(latest_lhb) if latest_lhb else None,
         }
     return context
 
@@ -668,23 +741,61 @@ def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict
         )
         expected_datasets = ("daily", "daily_basic", "adj_factor", "moneyflow", "industry_flow", "ths_concept_snapshot")
         found = {str(row.get("dataset")) for row in result["tushare"]}
-        result["tushare"].extend(
-            {"dataset": name, "status": "missing", "rows_written": 0, "attempts": 0,
-             "last_error": "no same-date checkpoint", "updated_at": None}
-            for name in expected_datasets if name not in found
-        )
+        # A fetch checkpoint is transport evidence, not the canonical data
+        # authority.  Recovery/import paths can populate the normalized table
+        # without creating a history checkpoint.  In that case reporting
+        # ``missing`` contradicts the same page's populated flow/concept
+        # sections.  Prefer same-date canonical evidence and retain the lack of
+        # a checkpoint as a note instead of a false data-gap claim.
+        canonical_evidence = {
+            "moneyflow": ("tushare_moneyflow", "date"),
+            "industry_flow": ("tushare_moneyflow_industry", "trade_date"),
+            "ths_concept_snapshot": ("v_default_concept_daily", "trade_date"),
+        }
+        for name in expected_datasets:
+            if name in found:
+                continue
+            relation_info = canonical_evidence.get(name)
+            same_date_rows = 0
+            relation = None
+            if relation_info and table_exists(con, relation_info[0]):
+                relation, date_col = relation_info
+                same_date_rows = int(con.execute(
+                    f"SELECT count(*) FROM {relation} "
+                    f"WHERE CAST({date_col} AS DATE)=CAST(? AS DATE)",
+                    [trade_date],
+                ).fetchone()[0] or 0)
+            result["tushare"].append({
+                "dataset": name,
+                "status": "canonical_available" if same_date_rows else "missing",
+                "rows_written": same_date_rows,
+                "attempts": 0,
+                "last_error": (
+                    "same-date canonical data exists; transport checkpoint absent"
+                    if same_date_rows else "no same-date checkpoint or canonical rows"
+                ),
+                "updated_at": None,
+                "evidence_relation": relation if same_date_rows else None,
+            })
         result["tushare"].sort(key=lambda row: str(row.get("dataset") or ""))
     for relation in ("kline", "v_kline_daily"):
         if table_exists(con, relation):
-            cols = set(table_columns(con, relation))
+            source_relation = (
+                "tushare_daily"
+                if relation == "v_kline_daily" and table_exists(con, "tushare_daily")
+                else relation
+            )
+            cols = set(table_columns(con, source_relation))
             date_col = "date" if "date" in cols else "trade_date" if "trade_date" in cols else None
             if date_col:
-                latest = con.execute(f"SELECT max({date_col}) FROM {relation}").fetchone()[0]
+                latest = con.execute(f"SELECT max({date_col}) FROM {source_relation}").fetchone()[0]
                 same_date = con.execute(
-                    f"SELECT count(*) FROM {relation} WHERE CAST({date_col} AS DATE)=CAST(? AS DATE)",
+                    f"SELECT count(*) FROM {source_relation} WHERE CAST({date_col} AS DATE)=CAST(? AS DATE)",
                     [trade_date],
                 ).fetchone()[0]
-                result["kline"].append({"relation": relation, "latest": str(latest) if latest else None, "same_date_rows": int(same_date or 0)})
+                result["kline"].append({"relation": relation, "source_relation": source_relation,
+                                        "latest": str(latest) if latest else None,
+                                        "same_date_rows": int(same_date or 0)})
     if table_exists(con, "ths_concept_member_checkpoint"):
         latest = con.execute(
             "SELECT max(trade_date) FROM ths_concept_member_checkpoint WHERE trade_date<=CAST(? AS DATE)",
@@ -1046,17 +1157,16 @@ def _sector_trail_review(
         if not dates:
             empty["message"] = "涨停池没有可对比的历史日期"
             return empty
-        broad = list(_BROAD_TRAIL_CONCEPTS)
-        broad_ph = ",".join("?" for _ in broad)
         date_ph = ",".join("?" for _ in dates)
         if table_exists(con, "multi_source_sector_flow"):
             flow_sql = f"""
                 flow AS (
                     SELECT CAST(source_date AS DATE) AS d,
                            CAST(sector_code AS VARCHAR) AS sector_code,
-                           change_pct, main_net
+                           change_pct, main_net, provider,
+                           json_extract_string(raw_json, '$.raw.membership_snapshot_date') AS membership_snapshot_date
                     FROM (
-                        SELECT source_date, sector_code, change_pct, main_net,
+                        SELECT source_date, sector_code, change_pct, main_net, provider, raw_json,
                                row_number() OVER (
                                    PARTITION BY source_date, sector_code
                                    ORDER BY fetched_at DESC NULLS LAST
@@ -1079,6 +1189,42 @@ def _sector_trail_review(
                     WHERE FALSE
                 )
             """
+        if table_exists(con, "tushare_daily"):
+            # The canonical close source can be filtered before deduplication.
+            # Going through v_kline_daily here forces DuckDB to evaluate the
+            # fallback union and its all-history window even for a 20-day
+            # review, which was the main source of post-QLib memory spikes.
+            kline_sql = """
+                kline AS (
+                    SELECT d, stock_code, close, change_pct, turnover
+                    FROM (
+                        SELECT CAST(k.date AS DATE) AS d,
+                               regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                               k.close, k.change_pct,
+                               CAST(k.turnover * 1000 AS DOUBLE) AS turnover,
+                               row_number() OVER (
+                                   PARTITION BY CAST(k.date AS DATE),
+                                       regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '')
+                                   ORDER BY k.fetched_at DESC NULLS LAST, k.rowid DESC
+                               ) AS rn
+                        FROM tushare_daily k
+                        JOIN requested_dates rd ON rd.d = CAST(k.date AS DATE)
+                        WHERE k.close IS NOT NULL
+                    ) ranked
+                    WHERE rn = 1
+                )
+            """
+        else:
+            kline_sql = """
+                kline AS (
+                    SELECT CAST(k.trade_date AS DATE) AS d,
+                           regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                           k.close, k.change_pct, k.turnover
+                    FROM v_kline_daily k
+                    JOIN requested_dates rd ON rd.d = CAST(k.trade_date AS DATE)
+                    WHERE k.close IS NOT NULL
+                )
+            """
         rows = _fetch_dicts(
             con,
             f"""
@@ -1098,7 +1244,6 @@ def _sector_trail_review(
                  JOIN v_default_concept_stock_history h
                    ON CAST(h.trade_date AS DATE) <= rd.d
                   AND h.concept_code LIKE 'THS-%'
-                  AND coalesce(h.concept_name, '') NOT IN ({broad_ph})
                  GROUP BY rd.d, h.concept_code
              ), member_asof AS (
                  SELECT s.d, s.member_date, s.concept_code,
@@ -1115,7 +1260,7 @@ def _sector_trail_review(
                        count(DISTINCT stock_code) AS member_count
                 FROM member_asof
                 GROUP BY d, concept_code, member_date
-             ), {flow_sql}, counted AS (
+             ), {flow_sql}, {kline_sql}, counted AS (
                  SELECT m.d, m.concept_code, max(m.concept_name) AS concept_name,
                         m.member_date, z.member_count,
                         count(DISTINCT lu.stock_code) AS limit_up_count
@@ -1134,8 +1279,8 @@ def _sector_trail_review(
                  JOIN sizes z
                    ON z.d = m.d AND z.concept_code = m.concept_code
                    AND z.member_date = m.member_date
-                 LEFT JOIN v_kline_daily k
-                   ON CAST(k.trade_date AS DATE) = m.d
+                  LEFT JOIN kline k
+                   ON k.d = m.d
                   AND regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '') = m.stock_code
                  GROUP BY m.d, m.concept_code, z.member_count
              )
@@ -1143,21 +1288,38 @@ def _sector_trail_review(
                    c.concept_code, c.concept_name, c.limit_up_count,
                    c.member_count, s.valid_count, s.avg_pct, s.amount,
                    CAST(c.member_date AS VARCHAR) AS membership_date,
-                   coalesce(s.avg_pct, f.change_pct) AS change_pct,
+                    coalesce(f.change_pct, s.avg_pct) AS change_pct,
                    f.change_pct AS flow_pct_chg, f.main_net
             FROM counted c
             LEFT JOIN component_stats s
               ON s.d = c.d AND s.concept_code = c.concept_code
              LEFT JOIN flow f
                ON f.d = c.d AND f.sector_code = c.concept_code
+              AND (
+                    f.provider <> 'derived_ths_stock_aggregate'
+                    OR f.membership_snapshot_date = CAST(c.member_date AS VARCHAR)
+                  )
              WHERE coalesce(s.valid_count, 0) > 0 OR c.limit_up_count > 0
             """,
-            [*dates, *broad, *dates] if table_exists(con, "multi_source_sector_flow") else [*dates, *broad],
+            [*dates, *dates] if table_exists(con, "multi_source_sector_flow") else [*dates],
         )
     except Exception as exc:
         empty["message"] = f"sector trail failed: {type(exc).__name__}"
         return empty
 
+    # The displayed universe is the latest complete THS concept catalogue.
+    # Historical as-of membership may contain concepts that THS has since
+    # retired; keeping those rows produced concepts and stocks absent from the
+    # page's advertised current snapshot.
+    current_concept_rows = con.execute(
+        "SELECT DISTINCT CAST(concept_code AS VARCHAR) "
+        "FROM v_default_concept_daily WHERE CAST(trade_date AS DATE)=("
+        "SELECT max(CAST(trade_date AS DATE)) FROM v_default_concept_daily "
+        "WHERE CAST(trade_date AS DATE)<=CAST(? AS DATE))",
+        [trade_date],
+    ).fetchall()
+    current_concepts = {str(row[0]) for row in current_concept_rows}
+    rows = [row for row in rows if str(row.get("concept_code") or "") in current_concepts]
     member_dates = [str(row.get("membership_date") or "")[:10] for row in rows if row.get("membership_date")]
     member_date = max(member_dates) if member_dates else None
     if not member_date:
@@ -1251,13 +1413,7 @@ def _sector_trail_review(
                       ON CAST(h.trade_date AS DATE) = s.member_date
                      AND CAST(h.concept_code AS VARCHAR) = s.concept_code
                      AND regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '') = lu.stock_code
-                ), kline AS (
-                    SELECT CAST(trade_date AS DATE) AS d,
-                           regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
-                           close, change_pct, turnover
-                    FROM v_kline_daily
-                    WHERE CAST(trade_date AS DATE) IN ({date_ph})
-                ), daily_basic AS (
+                ), {kline_sql}, daily_basic AS (
                     SELECT CAST(date AS DATE) AS d,
                            regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
                            turnover_rate
@@ -1297,7 +1453,7 @@ def _sector_trail_review(
                  LEFT JOIN daily_basic
                    ON daily_basic.d = lu.d AND daily_basic.stock_code = lu.stock_code
                  """,
-                 [*dates, *keep_list, *dates, *dates, *dates],
+                 [*dates, *keep_list, *dates, *dates],
             )
         except Exception:
             stock_rows = []
@@ -1388,6 +1544,92 @@ def _sector_trail_review(
                 )
                 cell["stock_rows"] = len(stocks)
 
+    # Full constituent panel: per kept concept, the latest-asof member list
+    # plus a shared per-day return matrix.  Keeping the matrix once per stock
+    # (rather than once per concept) avoids duplicating overlapping THS
+    # memberships while retaining the offline drill-down semantics.
+    trail_stock_names: dict[str, str] = {}
+    if keep:
+        keep_list2 = sorted(keep)
+        keep_ph2 = ",".join("?" for _ in keep_list2)
+        date_ph2 = ",".join("?" for _ in dates)
+        latest_snap = member_date
+        try:
+            member_rows = con.execute(
+                f"""
+                SELECT CAST(concept_code AS VARCHAR) AS concept_code,
+                       regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                       max(concept_name) AS concept_name,
+                       max(stock_name) AS stock_name
+                FROM v_default_concept_stock_history
+                WHERE CAST(trade_date AS DATE) = ?
+                  AND concept_code IN ({keep_ph2})
+                GROUP BY 1, 2
+                """,
+                [latest_snap, *keep_list2],
+            ).fetchall()
+            # Small wide table instead of joining members x kline (~1.4M rows):
+            # one pct value per stock-day (~5.5k x 20), mapped in Python.
+            if table_exists(con, "tushare_daily"):
+                pct_rows = con.execute(
+                    f"""
+                    SELECT stock_code, CAST(trade_date AS VARCHAR) AS day,
+                           ROUND(change_pct, 2) AS pct
+                    FROM (
+                        SELECT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                               CAST(date AS DATE) AS trade_date, change_pct,
+                               row_number() OVER (
+                                   PARTITION BY CAST(date AS DATE),
+                                       regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')
+                                   ORDER BY fetched_at DESC NULLS LAST, rowid DESC
+                               ) AS rn
+                        FROM tushare_daily
+                        WHERE CAST(date AS DATE) IN ({date_ph2})
+                          AND close IS NOT NULL
+                    ) ranked
+                    WHERE rn = 1
+                    """,
+                    [*dates],
+                ).fetchall()
+            else:
+                pct_rows = con.execute(
+                    f"""
+                    SELECT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                           CAST(trade_date AS VARCHAR) AS day,
+                           ROUND(change_pct, 2) AS pct
+                    FROM v_kline_daily
+                    WHERE CAST(trade_date AS DATE) IN ({date_ph2})
+                    """,
+                    [*dates],
+                ).fetchall()
+        except Exception:
+            member_rows, pct_rows = [], []
+
+        stock_pct: dict[str, dict[str, int]] = {}
+        for stock_code, day, pct in pct_rows:
+            if pct is None:
+                continue
+            stock_pct.setdefault(day[:10], {})[stock_code] = int(round(pct * 100))
+
+        members_by_concept: dict[str, list[tuple[str, str]]] = {}
+        stock_names: dict[str, str] = {}
+        for concept_code, stock_code, _cname, stock_name in member_rows:
+            members_by_concept.setdefault(concept_code, []).append((stock_code, stock_name or stock_code))
+            if stock_name:
+                stock_names[stock_code] = stock_name
+
+        for sector in sectors:
+            sid = str(sector.get("id") or "")
+            members = members_by_concept.get(sid) or []
+            if not members:
+                continue
+            codes = [code for code, _name in members]
+            sector["members"] = {
+                "snapshot_date": str(latest_snap),
+                "codes": codes,
+            }
+        trail_stock_names = stock_names
+
     latest = dates[0] if dates else ""
     sectors.sort(
         key=lambda item: (
@@ -1400,7 +1642,9 @@ def _sector_trail_review(
         "status": "ready" if sectors else "degraded",
         "dates": dates,
         "sectors": sectors,
+        "stock_pct": stock_pct,
         "membership_date": str(member_date),
+        "stock_names": trail_stock_names,
         "concept_source": "THS完整成分快照（ths_index_blockrank优先，TuShare THS成员补齐）",
         "top_per_day": top_per_day,
     }
@@ -1484,17 +1728,16 @@ def _sector_period_review(
         dates = [str(row[0]) for row in date_rows]
         if not dates:
             return empty
-        broad = list(_BROAD_TRAIL_CONCEPTS)
-        broad_ph = ",".join("?" for _ in broad)
         date_ph = ",".join("?" for _ in dates)
         if table_exists(con, "multi_source_sector_flow"):
             flow_sql = f"""
                 flow AS (
                     SELECT CAST(source_date AS DATE) AS d,
                            CAST(sector_code AS VARCHAR) AS sector_code,
-                           change_pct, main_net
+                           change_pct, main_net, provider,
+                           json_extract_string(raw_json, '$.raw.membership_snapshot_date') AS membership_snapshot_date
                     FROM (
-                        SELECT source_date, sector_code, change_pct, main_net,
+                        SELECT source_date, sector_code, change_pct, main_net, provider, raw_json,
                                row_number() OVER (
                                    PARTITION BY source_date, sector_code
                                    ORDER BY fetched_at DESC NULLS LAST
@@ -1534,8 +1777,7 @@ def _sector_period_review(
                 JOIN v_default_concept_stock_history h
                   ON CAST(h.trade_date AS DATE) <= rd.d
                  AND h.concept_code LIKE 'THS-%'
-                 AND coalesce(h.concept_name, '') NOT IN ({broad_ph})
-                GROUP BY rd.d, h.concept_code
+                 GROUP BY rd.d, h.concept_code
             ), member_asof AS (
                 SELECT s.d, s.member_date, s.concept_code,
                        max(h.concept_name) AS concept_name,
@@ -1567,6 +1809,10 @@ def _sector_period_review(
                 FROM counted c
                 LEFT JOIN flow f
                   ON f.d = c.d AND f.sector_code = c.concept_code
+                 AND (
+                       f.provider <> 'derived_ths_stock_aggregate'
+                       OR f.membership_snapshot_date = CAST(c.member_date AS VARCHAR)
+                     )
             )
             SELECT CAST(d AS VARCHAR) AS trade_date,
                    concept_code, concept_name, limit_up_count,
@@ -1575,11 +1821,20 @@ def _sector_period_review(
                    change_pct, main_net
             FROM counted_rows
             """,
-            [*dates, *broad, *dates] if table_exists(con, "multi_source_sector_flow") else [*dates, *broad],
+            [*dates, *dates] if table_exists(con, "multi_source_sector_flow") else [*dates],
         )
     except Exception:
         return empty
 
+    current_concept_rows = con.execute(
+        "SELECT DISTINCT CAST(concept_code AS VARCHAR) "
+        "FROM v_default_concept_daily WHERE CAST(trade_date AS DATE)=("
+        "SELECT max(CAST(trade_date AS DATE)) FROM v_default_concept_daily "
+        "WHERE CAST(trade_date AS DATE)<=CAST(? AS DATE))",
+        [trade_date],
+    ).fetchall()
+    current_concepts = {str(row[0]) for row in current_concept_rows}
+    rows = [row for row in rows if str(row.get("concept_code") or "") in current_concepts]
     member_dates = [str(row.get("membership_date") or "")[:10] for row in rows if row.get("membership_date")]
     member_date = max(member_dates) if member_dates else None
     if not member_date:

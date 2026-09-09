@@ -84,8 +84,12 @@ CLI：
 本机运行可设环境变量 STOCK_DATA_LOCAL=1 启用东方财富 K 线源（沙箱默认关闭）。
 """
 from __future__ import annotations
+import logging
 import os, json, time, sqlite3, threading, datetime
 from concurrent.futures import ThreadPoolExecutor
+
+
+logger = logging.getLogger(__name__)
 
 # ---- 路径 / 环境 ----
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
@@ -153,10 +157,13 @@ class CacheStore:
 
     def __init__(self, db):
         self.db = db
-        self.lock = threading.Lock()
+        # RLock: record()/score() hold the lock and call _get(), which locks
+        # again — a plain Lock would self-deadlock.
+        self.lock = threading.RLock()
 
     def get(self, key):
-        r = self.db.execute("SELECT value,ts FROM cache WHERE key=?", (key,)).fetchone()
+        with self.lock:
+            r = self.db.execute("SELECT value,ts FROM cache WHERE key=?", (key,)).fetchone()
         if r:
             try:
                 return json.loads(r[0]), r[1]
@@ -173,7 +180,8 @@ class CacheStore:
             self.db.commit()
 
     def stat(self):
-        return self.db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
 
 
 class HealthRegistry:
@@ -181,12 +189,15 @@ class HealthRegistry:
 
     def __init__(self, db):
         self.db = db
-        self.lock = threading.Lock()
+        # RLock: record()/score() hold the lock and call _get(), which locks
+        # again — a plain Lock would self-deadlock.
+        self.lock = threading.RLock()
 
     def _get(self, source, datatype):
-        r = self.db.execute(
-            "SELECT success,fail,streak_fail,last_ok,last_fail FROM health WHERE source=? AND datatype=?",
-            (source, datatype)).fetchone()
+        with self.lock:
+            r = self.db.execute(
+                "SELECT success,fail,streak_fail,last_ok,last_fail FROM health WHERE source=? AND datatype=?",
+                (source, datatype)).fetchone()
         if r:
             return {"success": r[0], "fail": r[1], "streak_fail": r[2],
                     "last_ok": r[3], "last_fail": r[4]}
@@ -221,13 +232,14 @@ class HealthRegistry:
             self.db.commit()
 
     def score(self, source, datatype):
-        s = self._get(source, datatype)
         now = time.time()
-        recent = self.db.execute(
-            "SELECT coalesce(sum(ok),0), count(*), max(ts) FROM health_event "
-            "WHERE source=? AND datatype=? AND ts>=?",
-            (source, datatype, now - 3600),
-        ).fetchone()
+        with self.lock:
+            s = self._get(source, datatype)
+            recent = self.db.execute(
+                "SELECT coalesce(sum(ok),0), count(*), max(ts) FROM health_event "
+                "WHERE source=? AND datatype=? AND ts>=?",
+                (source, datatype, now - 3600),
+            ).fetchone()
         success, total, last_event = recent or (0, 0, 0)
         if total:
             base = float(success) / float(total)
@@ -253,8 +265,9 @@ class HealthRegistry:
         return sorted(sources, key=lambda x: self.score(x[0], datatype), reverse=True)
 
     def all_rows(self):
-        return self.db.execute(
-            "SELECT source,datatype,success,fail,streak_fail,last_ok FROM health").fetchall()
+        with self.lock:
+            return self.db.execute(
+                "SELECT source,datatype,success,fail,streak_fail,last_ok FROM health").fetchall()
 
     def force_cooldown(self, datatype=None):
         """测试用：把所有（或某类）源置为冷却，模拟"全部实时源阵亡"。
@@ -390,9 +403,12 @@ def _relay_daily_basic(code, trade_date=None):
     return {
         "code": pure, "name": None,
         "pe_ttm": g("pe_ttm"), "pe": g("pe"), "pb": g("pb"),
-        # daily_basic 的 total_mv/circ_mv 单位=千元 → 换算成 亿元
-        "total_mv": (g("total_mv") / 1e5) if g("total_mv") else None,
-        "circ_mv": (g("circ_mv") / 1e5) if g("circ_mv") else None,
+        # TuShare daily_basic 的 total_mv/circ_mv 单位=万元；本统一行情
+        # 结构以亿元表达，因此除以 1e4，而不是旧实现的 1e5。
+        "total_mv": (g("total_mv") / 1e4) if g("total_mv") else None,
+        "circ_mv": (g("circ_mv") / 1e4) if g("circ_mv") else None,
+        "total_mv_unit": "billion_yuan",
+        "circ_mv_unit": "billion_yuan",
         "turnover": g("turnover_rate"), "trade_date": td, "_src": "tushare_relay",
     }
 
@@ -891,6 +907,28 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
                        if isinstance(rows, list) else rows)
         fetch_kwargs = ({**kwargs, "start": "19900101", "end": "20500101"}
                         if full_history else kwargs)
+
+        expected_adjustment = {"qfq": "qfq", "hfq": "hfq", "": "none", "bfq": "none"}.get(
+            str(fq or "").strip().lower(), "unknown"
+        )
+
+        def _contract_matches(rows):
+            """Reject old cache/source rows whose adjustment is not explicit."""
+            if not isinstance(rows, list) or not rows:
+                return False
+            for row in rows:
+                if not isinstance(row, dict):
+                    return False
+                if str(row.get("adjustment") or "unknown").lower() != expected_adjustment:
+                    return False
+                if str(row.get("volume_unit") or "unknown").lower() == "unknown":
+                    return False
+                if str(row.get("amount_unit") or "unknown").lower() not in {"yuan", "thousand_yuan", "not_provided"}:
+                    # Some K-line providers legitimately do not expose
+                    # amount.  That fact is explicit; a zero placeholder
+                    # must not masquerade as an observed amount.
+                    return False
+            return True
     else:
         key = _cache_key(datatype, code, kwargs)
         post_filter = lambda x: x
@@ -898,7 +936,10 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
 
     # ① 缓存优先
     val, ts = cache.get(key) if cache_allowed else (None, 0)
-    if val is not None and (time.time() - ts) < ttl:
+    if val is not None and (time.time() - ts) < ttl and (
+        datatype not in {"kline", "index_kline", "etf_kline", "cb_kline"}
+        or _contract_matches(val)
+    ):
         return post_filter(val), {"source": "cache", "status": "fresh", "cached_at": ts}
 
     # ② 实时降级（按健康度动态排序）
@@ -920,6 +961,10 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
             rate.release(name)
         dt = time.time() - t0
         if out:
+            if datatype in {"kline", "index_kline", "etf_kline", "cb_kline"} and not _contract_matches(out):
+                health.record(name, datatype, False, dt)
+                logger.warning("%s returned rows without a verified K-line unit/adjustment contract", name)
+                continue
             if cache_allowed:
                 cache.put(key, out)
             health.record(name, datatype, True, dt)

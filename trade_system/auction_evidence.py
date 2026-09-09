@@ -8,7 +8,7 @@ from typing import Any
 
 import duckdb
 
-from trade_system.quality import table_exists
+from trade_system.quality import table_columns, table_exists
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
 
@@ -100,15 +100,27 @@ def ensure_auction_evidence_tables(db_path: str | Path) -> None:
 def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
     if _relation_count(con, "auction_tick", trade_date) == 0:
         return []
+    columns = set(table_columns(con, "auction_tick"))
+    unit_expr = "volume_unit" if "volume_unit" in columns else "'unknown'"
+    normalized_volume = (
+        f"CASE lower(coalesce(nullif({unit_expr}, ''), 'unknown')) "
+        "WHEN 'hands' THEN volume * 100 WHEN 'shares' THEN volume ELSE NULL END"
+    )
+    amount_expr = (
+        f"CASE lower(coalesce(nullif({unit_expr}, ''), 'unknown')) "
+        "WHEN 'hands' THEN price * volume * 100 "
+        "WHEN 'shares' THEN price * volume ELSE NULL END"
+    )
     return _fetch_dicts(
         con,
-        """
+        f"""
         SELECT
             CAST(date AS VARCHAR) AS trade_date,
             stock_code,
             count(*) AS tick_rows,
-            sum(price * volume) AS auction_amount,
-            sum(volume) AS tick_volume,
+            sum({amount_expr}) AS auction_amount,
+            sum({normalized_volume}) AS tick_volume,
+            max({unit_expr}) AS tick_volume_unit,
             max(time) AS last_tick_time
         FROM auction_tick
         WHERE CAST(date AS VARCHAR)=?
@@ -145,15 +157,18 @@ def _quote_rows(
 ) -> list[dict]:
     if _relation_count(con, "auction_quote_snapshot", trade_date) == 0:
         return []
+    columns = set(table_columns(con, "auction_quote_snapshot"))
+    unit_expr = "volume_unit" if "volume_unit" in columns else "'unknown'"
     rows = _fetch_dicts(
         con,
-        """
+        f"""
         SELECT
             CAST(date AS VARCHAR) AS trade_date,
             stock_code,
             count(*) AS quote_rows,
             max(indicative_price) AS indicative_price,
             max(cumulative_volume) AS cumulative_volume,
+            max({unit_expr}) AS volume_unit,
             arg_max(order_imbalance, fetched_at) AS order_imbalance,
             max(quote_time) AS last_quote_time,
             string_agg(DISTINCT provider, ',') AS providers
@@ -227,13 +242,18 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
         for row in _quote_rows(con, trade_date, tick_codes):
             quote_codes.add(str(row["stock_code"]))
             volume = float(row.get("cumulative_volume") or 0)
+            volume_unit = str(row.get("volume_unit") or "unknown").lower()
             imbalance = float(row.get("order_imbalance") or 0)
             price = float(row.get("indicative_price") or 0)
             # Tencent volume is reported in board lots.  Keep the amount
             # estimate explicit in evidence_json rather than presenting it as
             # exchange transaction turnover.
-            amount_estimate = price * volume * 100 if price and volume else None
-            strength = round(imbalance * 100 + min(volume / 100000.0, 20), 4)
+            if price and volume and volume_unit in {"hands", "shares"}:
+                amount_estimate = price * volume * (100 if volume_unit == "hands" else 1)
+            else:
+                amount_estimate = None
+            normalized_volume = volume * (100 if volume_unit == "hands" else 1) if volume_unit in {"hands", "shares"} else 0
+            strength = round(imbalance * 100 + min(normalized_volume / 100000.0, 20), 4)
             evidence = {
                 **row, "source_priority": 2, "counts": counts,
                 "semantic": "auction_order_book_snapshot_not_trade_tick",
@@ -303,6 +323,7 @@ def persist_auction_evidence_snapshot(db_path: str | Path, rows: list[dict[str, 
     ensure_auction_evidence_tables(db_path)
     con = duckdb.connect(str(db_path))
     try:
+        con.execute("BEGIN TRANSACTION")
         for row in rows:
             con.execute(
                 """
@@ -315,7 +336,14 @@ def persist_auction_evidence_snapshot(db_path: str | Path, rows: list[dict[str, 
             placeholders = ", ".join(["?"] * len(EVIDENCE_COLUMNS))
             column_sql = ", ".join(f'"{column}"' for column in EVIDENCE_COLUMNS)
             con.execute(f"INSERT INTO auction_evidence_snapshot ({column_sql}) VALUES ({placeholders})", values)
+        con.commit()
         return len(rows)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()
 

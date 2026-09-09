@@ -382,7 +382,8 @@ def collect_sector_bk_fenshi_zhibo(client: KPLClient, store: DuckDBStore, date: 
                 ))
         if rows:
             n = store.insert_rows("sector_bk_fenshi_zhibo", rows,
-                ["date", "sector_code", "time", "price", "volume"])
+                ["date", "sector_code", "time", "price", "volume"],
+                replace_on=["date", "sector_code", "time"])
             total += n
     if total:
         store.log_collect("sector_bk_fenshi_zhibo", "/sector/bk-fenshi-zhibo", total, "ok")

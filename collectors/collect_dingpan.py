@@ -156,7 +156,8 @@ def collect_dingpan_jijin(client: KPLClient, store: DuckDBStore, date: str) -> i
                          s[3] if len(s) > 3 else 0))
     if rows:
         n = store.insert_rows("dingpan_jijin", rows,
-            ["date", "stock_code", "stock_name", "fund_name", "shares"])
+            ["date", "stock_code", "stock_name", "fund_name", "shares"],
+            replace_on=["date", "stock_code", "fund_name"])
         store.log_collect("dingpan_jijin", "/dingpan/jijin", n, "ok")
         return n
     store.insert_raw("/dingpan/jijin", data)

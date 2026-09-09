@@ -170,7 +170,7 @@ def test_generate_signals_builds_context_without_rewriting_stage_signals(tmp_pat
     con.execute("INSERT INTO advanced_pankou VALUES ('2026-07-06', '000001', 9.99, 9000, 10.0, 4000, '2026-07-06 10:32:00')")
     con.close()
 
-    result = generate_signals(str(db_path), "2026-07-06")
+    result = generate_signals(str(db_path), "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path))
     stage_count = con.execute("SELECT count(*) FROM stock_candidate_stage_signal").fetchone()[0]
@@ -202,6 +202,7 @@ def test_stage_candidate_backtest_returns_stage_statistics(tmp_path):
     )
     con.execute("INSERT INTO kline VALUES ('2026-07-06', '000001', 9.5, 10.1, 9.4, 10.0, 100000, 1000000, 5.5, 'D', '2026-07-06 15:00:00')")
     con.execute("INSERT INTO kline VALUES ('2026-07-07', '000001', 10.0, 10.8, 9.9, 10.5, 110000, 1200000, 5.0, 'D', '2026-07-07 15:00:00')")
+    con.execute("INSERT INTO kline VALUES ('2026-07-08', '000001', 10.5, 10.7, 10.3, 10.6, 110000, 1200000, 0.95, 'D', '2026-07-08 15:00:00')")
     con.close()
     build_normalized_views(str(db_path))
 
@@ -210,7 +211,7 @@ def test_stage_candidate_backtest_returns_stage_statistics(tmp_path):
     assert result["sample_count"] == 4
     assert result["stage_counts"]["premarket_pool"] == 1
     assert result["stage_stats"]["auction_confirmation"]["hit_count"] == 1
-    assert result["rows"][0]["forward_return_pct"] == 5.26
+    assert result["rows"][0]["forward_return_pct"] == 10.53
     assert result["return_sample_count"] == 3
     assert result["independent_sample_count"] == 1
     assert result["excluded_count"] == 1

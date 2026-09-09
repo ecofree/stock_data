@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 
+import duckdb
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,19 +59,56 @@ class QlibFrameDataset:
 
 
 def _load_features(path: Path, features: list[str], max_rows: int) -> pd.DataFrame:
-    if path.suffix.lower() == ".parquet":
+    required = ["datetime", "instrument", "label_next_ret", *features]
+    if path.suffix.lower() == ".parquet" and path.is_dir():
+        # The daily exporter deliberately creates a partitioned dataset.  Do
+        # not make training materialise the whole multi-million-row history in
+        # pandas just to apply max_rows afterwards.  DuckDB scans the dataset,
+        # samples a stable cross-section per date, and fetches only the bounded
+        # result into pandas.
+        dataset_path = str(path / "*.parquet").replace("\\", "/").replace("'", "''")
+        columns_sql = ", ".join(
+            '"' + column.replace('"', '""') + '"' for column in required
+        )
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"CREATE TEMP VIEW qlib_features AS "
+                f"SELECT {columns_sql} FROM read_parquet('{dataset_path}') "
+                "WHERE label_next_ret IS NOT NULL"
+            )
+            if max_rows > 0:
+                date_count = int(con.execute(
+                    "SELECT count(DISTINCT datetime) FROM qlib_features"
+                ).fetchone()[0] or 0)
+                per_day = max(1, max_rows // max(1, date_count))
+                frame = con.execute(
+                    f"SELECT {columns_sql} FROM ("
+                    f"SELECT {columns_sql}, row_number() OVER ("
+                    "PARTITION BY datetime ORDER BY hash(datetime, instrument), instrument"
+                    f") AS _sample_rank FROM qlib_features"
+                    ") sampled WHERE _sample_rank <= ? "
+                    "ORDER BY datetime, instrument",
+                    [per_day],
+                ).fetchdf()
+            else:
+                frame = con.execute(
+                    f"SELECT {columns_sql} FROM qlib_features ORDER BY datetime, instrument"
+                ).fetchdf()
+        finally:
+            con.close()
+    elif path.suffix.lower() == ".parquet":
         frame = pd.read_parquet(path)
     else:
         frame = pd.read_csv(path, parse_dates=["datetime"])
     frame["datetime"] = pd.to_datetime(frame["datetime"]).dt.strftime("%Y-%m-%d")
-    required = ["datetime", "instrument", "label_next_ret", *features]
     frame = frame[[c for c in required if c in frame.columns]].copy()
     frame = frame.dropna(subset=["label_next_ret"])
     frame["instrument"] = frame["instrument"].astype(str)
     for column in features + ["label_next_ret"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["label_next_ret"])
-    if max_rows > 0 and len(frame) > max_rows:
+    if max_rows > 0 and len(frame) > max_rows and not (path.suffix.lower() == ".parquet" and path.is_dir()):
         per_day = max(1, max_rows // max(1, frame["datetime"].nunique()))
         # A plain ``head(per_day)`` systematically keeps the lowest stock
         # codes and silently removes much of the cross-section.  Use a stable

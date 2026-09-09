@@ -96,6 +96,7 @@ def ensure_qlib_shadow_tables(db_path: str | Path) -> None:
             ("daily_top_hit_rate", "DOUBLE"),
             ("evaluation_method", "VARCHAR"),
             ("quantile", "DOUBLE"),
+            ("round_trip_cost_bps", "DOUBLE"),
             ("updated_at", "TIMESTAMP"),
         ):
             con.execute(
@@ -164,6 +165,7 @@ def import_qlib_predictions(
     ensure_qlib_shadow_tables(db_path)
     con = duckdb.connect(str(db_path))
     try:
+        con.execute("BEGIN TRANSACTION")
         con.execute("DELETE FROM qlib_model_registry WHERE model_id = ?", [model_id])
         con.execute(
             """
@@ -219,12 +221,20 @@ def import_qlib_predictions(
         # Do not open a second DuckDB connection while ``con`` is still
         # active.  DuckDB serializes writers and the previous nested call
         # could wait forever after the model file had already been written.
-        return {
+        result = {
             "qlib_model_registry": int(con.execute("SELECT count(*) FROM qlib_model_registry").fetchone()[0]),
             "qlib_prediction": int(
                 con.execute("SELECT count(*) FROM qlib_prediction WHERE model_id = ?", [model_id]).fetchone()[0]
             ),
         }
+        con.commit()
+        return result
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()
 
@@ -245,6 +255,7 @@ def import_qlib_predictions_for_date(
     ensure_qlib_shadow_tables(db_path)
     con = duckdb.connect(str(db_path))
     try:
+        con.execute("BEGIN TRANSACTION")
         con.execute(
             "DELETE FROM qlib_prediction WHERE model_id = ? AND trade_date = ?",
             [model_id, str(trade_date)],
@@ -274,6 +285,13 @@ def import_qlib_predictions_for_date(
                 )
             finally:
                 con.unregister("_qlib_prediction_daily_batch")
+        con.commit()
         return len(values)
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()

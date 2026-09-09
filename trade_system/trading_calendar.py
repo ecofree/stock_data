@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -18,6 +19,14 @@ class TradingSessionStatus:
     @property
     def is_open(self) -> bool:
         return self.state == "open"
+
+
+def _calendar_date(value: str | date) -> str:
+    """Normalize ISO and compact YYYYMMDD inputs for DuckDB date casts."""
+    text = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(text) >= 8:
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return str(value)
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -36,6 +45,7 @@ def trading_session_status(
     Missing, malformed, or contradictory rows are ``unverified``.  The caller
     must not infer an open session from the weekday.
     """
+    trade_date = _calendar_date(trade_date)
     try:
         con = duckdb.connect(str(db_path), read_only=True)
     except Exception as exc:
@@ -108,3 +118,82 @@ def ensure_trading_session_status(
             f"{status.reason}; refresh failed: {exc}",
         )
     return trading_session_status(db_path, trade_date)
+
+
+def previous_open_session(
+    con: duckdb.DuckDBPyConnection,
+    trade_date: str,
+) -> str | None:
+    """Return the prior verified SSE session; never infer it from weekday."""
+    trade_date = _calendar_date(trade_date)
+    try:
+        if not _table_exists(con, "tushare_trade_cal"):
+            return None
+        columns = {
+            str(row[1]).lower()
+            for row in con.execute("PRAGMA table_info('tushare_trade_cal')").fetchall()
+        }
+        exchange_filter = "AND exchange='SSE'" if "exchange" in columns else ""
+        row = con.execute(
+            f"""
+            SELECT max(CAST(cal_date AS DATE))
+            FROM tushare_trade_cal
+            WHERE coalesce(CAST(is_open AS BOOLEAN), false)
+              {exchange_filter}
+              AND CAST(cal_date AS DATE) < CAST(? AS DATE)
+            """,
+            [trade_date],
+        ).fetchone()
+        return str(row[0])[:10] if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def open_session_dates(
+    con: duckdb.DuckDBPyConnection,
+    start_date: str,
+    end_date: str,
+) -> list[str]:
+    """Return verified open sessions, or an empty list when calendar is absent."""
+    start_date = _calendar_date(start_date)
+    end_date = _calendar_date(end_date)
+    try:
+        if not _table_exists(con, "tushare_trade_cal"):
+            return []
+        columns = {
+            str(row[1]).lower()
+            for row in con.execute("PRAGMA table_info('tushare_trade_cal')").fetchall()
+        }
+        exchange_filter = "AND exchange='SSE'" if "exchange" in columns else ""
+        rows = con.execute(
+            f"""
+            SELECT CAST(cal_date AS DATE)
+            FROM tushare_trade_cal
+            WHERE coalesce(CAST(is_open AS BOOLEAN), false)
+              {exchange_filter}
+              AND CAST(cal_date AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            GROUP BY cal_date
+            ORDER BY cal_date
+            """,
+            [start_date, end_date],
+        ).fetchall()
+        return [str(row[0])[:10] for row in rows]
+    except Exception:
+        return []
+
+
+def latest_open_session(
+    db_path: str | Path,
+    as_of: str | None = None,
+) -> str | None:
+    """Return the latest verified session on or before ``as_of``."""
+    upper = _calendar_date(as_of or date.today().isoformat())
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return None
+    try:
+        dates = open_session_dates(con, "1900-01-01", upper)
+        return dates[-1] if dates else None
+    finally:
+        con.close()

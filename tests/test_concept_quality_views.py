@@ -7,6 +7,11 @@ def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):
     db_path = tmp_path / "quality_views.duckdb"
     con = duckdb.connect(str(db_path))
     init_schema(con)
+    con.execute(
+        "INSERT INTO ths_concept_snapshot_expectation "
+        "(trade_date, expected_concepts, provider, catalog_hash) "
+        "VALUES ('2026-08-07', 374, 'test_catalog', 'test')"
+    )
     # The production contract requires a complete 374-board snapshot.  Keep
     # three negative rows in the same date to prove they are excluded while
     # the 374 verified rows remain eligible.
@@ -66,7 +71,7 @@ def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):
     assert members[0] == ("THS-001", "000001")
 
 
-def test_default_concept_views_use_kpl_only_when_no_valid_ths_snapshot(tmp_path):
+def test_default_concept_views_reject_unchecked_kpl_snapshot(tmp_path):
     db_path = tmp_path / "kpl_fallback.duckdb"
     con = duckdb.connect(str(db_path))
     init_schema(con)
@@ -83,8 +88,8 @@ def test_default_concept_views_use_kpl_only_when_no_valid_ths_snapshot(tmp_path)
     con = duckdb.connect(str(db_path), read_only=True)
     assert con.execute(
         "SELECT concept_code FROM v_default_concept_daily WHERE trade_date='2026-08-06'"
-    ).fetchall() == [("KPL-1",)]
+    ).fetchall() == []
     assert con.execute(
         "SELECT concept_code, stock_code FROM v_default_concept_stock_history WHERE trade_date='2026-08-06'"
-    ).fetchall() == [("KPL-1", "000001")]
+    ).fetchall() == []
     con.close()

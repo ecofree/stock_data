@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 import pickle
 from pathlib import Path
@@ -17,10 +18,23 @@ from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables, import_qlib_p
 import duckdb
 
 
-def _load_frame(path: Path) -> tuple[pd.DataFrame, dict]:
+def _load_frame(path: Path, selected_date: str | None = None) -> tuple[pd.DataFrame, dict]:
     metadata_path = path.with_suffix(".metadata.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-    frame = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
+    if path.suffix.lower() == ".parquet" and selected_date:
+        # The daily research runner stores a partitioned Parquet dataset.  A
+        # full pandas read would materialise millions of historical rows just
+        # to score one session and can exhaust the desktop process.  PyArrow
+        # pushes this predicate into the dataset scan and keeps the inference
+        # memory bounded.  A single-file Parquet export also accepts filters.
+        frame = pd.read_parquet(
+            path,
+            filters=[("datetime", "=", date.fromisoformat(selected_date))],
+        )
+    elif path.suffix.lower() == ".parquet":
+        frame = pd.read_parquet(path)
+    else:
+        frame = pd.read_csv(path)
     frame["datetime"] = pd.to_datetime(frame["datetime"]).dt.strftime("%Y-%m-%d")
     frame["instrument"] = frame["instrument"].astype(str)
     return frame, metadata
@@ -54,14 +68,15 @@ def predict_daily(
     if status == "shadow" and not allow_shadow:
         raise RuntimeError("shadow model prediction is disabled by policy")
     path = Path(feature_file)
-    frame, metadata = _load_frame(path)
+    requested_date = str(trade_date)[:10] if trade_date else None
+    frame, metadata = _load_frame(path, requested_date)
     features = list(metadata.get("feature_columns") or [])
     if not features:
         raise RuntimeError("feature metadata has no feature_columns")
     missing = [column for column in features if column not in frame.columns]
     if missing:
         raise RuntimeError("feature file missing columns: " + ", ".join(missing[:10]))
-    selected_date = str(trade_date or frame["datetime"].max())[:10]
+    selected_date = requested_date or str(frame["datetime"].max())[:10]
     daily = frame[frame["datetime"] == selected_date].copy()
     if daily.empty:
         raise RuntimeError(f"no feature rows for trade_date={selected_date}")

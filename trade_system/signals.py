@@ -13,6 +13,7 @@ from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.stage_signals import ensure_stage_signal_schema
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
+from trade_system.kline_access import canonical_daily_kline_relation
 
 
 _SIGNAL_INDEX_SPECS = (
@@ -113,6 +114,12 @@ def _sample_stats(
     extra_where: str = "",
     extra_params: list | None = None,
 ) -> dict:
+    if relation_name == "v_kline_daily" and table_exists(con, "tushare_daily"):
+        # This function runs inside signal generation's write transaction. An
+        # OOM while expanding the all-history compatibility view would abort
+        # that transaction before the candidate INSERTs are attempted.
+        relation_name = "tushare_daily"
+        date_column = "date"
     params = [trade_date] + list(extra_params or [])
     try:
         row = con.execute(
@@ -423,12 +430,14 @@ def _generate_sectors(con: duckdb.DuckDBPyConnection, trade_date: str) -> int:
 
 
 def _candidate_gate(item: dict, *, allow_fallback: bool = False, regime_penalty: float = 0.0) -> bool:
-    """Require complete same-day evidence before a candidate is executable."""
+    """Require complete same-day evidence before a candidate is executable.
+
+    情绪只降分降仓，不整批否决：regime_penalty 进入 score 与 risk_points，
+    不再以 `penalty < 0` 全批 research_only。回滚：恢复下两行即回硬切换。
+    """
     if item.get("candidate_pool_status") not in (None, "success"):
         return False
     if not allow_fallback and item.get("candidate_pool_fallback"):
-        return False
-    if regime_penalty < 0:
         return False
     return bool(
         item.get("kline_source_table")
@@ -450,9 +459,10 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
             [trade_date],
         ).fetchone()
         candidate_pool_status = str(row[0] or "unverified").lower() if row else "unverified"
+    kline_relation = canonical_daily_kline_relation(con)
     rows = _fetch_dicts(
         con,
-        """
+        f"""
         SELECT
             l.trade_date,
             l.stock_code,
@@ -473,7 +483,7 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
           ON l.trade_date = s.trade_date AND l.stock_code = s.stock_code
         LEFT JOIN sector_rotation_score sr
           ON l.trade_date = sr.trade_date AND s.sector_code = sr.sector_code
-        LEFT JOIN v_kline_daily k
+        LEFT JOIN {kline_relation} k
           ON l.trade_date = k.trade_date AND l.stock_code = k.stock_code
         LEFT JOIN v_auction_status a
           ON l.trade_date = a.trade_date AND l.stock_code = a.stock_code
@@ -490,7 +500,7 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
         # readiness remains blocked because this is not a real limit-up pool.
         rows = _fetch_dicts(
             con,
-            """
+            f"""
             WITH ranked_members AS (
                 SELECT h.trade_date,
                        regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
@@ -504,8 +514,8 @@ def _generate_candidates(con: duckdb.DuckDBPyConnection, trade_date: str) -> int
                 LIMIT 100
             ), prior_kline AS (
                 SELECT stock_code, source_table, is_fallback, change_pct, close
-                FROM v_kline_daily
-                WHERE trade_date = (SELECT max(trade_date) FROM v_kline_daily WHERE trade_date < ?)
+                FROM {kline_relation}
+                WHERE trade_date = (SELECT max(trade_date) FROM {kline_relation} WHERE trade_date < ?)
                 QUALIFY row_number() OVER (PARTITION BY stock_code ORDER BY fetched_at DESC NULLS LAST) = 1
             )
             SELECT r.trade_date, r.stock_code, r.stock_name,
@@ -608,9 +618,10 @@ def _generate_candidates_enriched(con: duckdb.DuckDBPyConnection, trade_date: st
         regime_penalty -= 12.0
     elif acute_drop_risk >= 45:
         regime_penalty -= 6.0
+    kline_relation = canonical_daily_kline_relation(con)
     rows = _fetch_dicts(
         con,
-        """
+        f"""
         SELECT
             l.trade_date,
             l.stock_code,
@@ -631,7 +642,7 @@ def _generate_candidates_enriched(con: duckdb.DuckDBPyConnection, trade_date: st
           ON l.trade_date = s.trade_date AND l.stock_code = s.stock_code
         LEFT JOIN sector_rotation_score sr
           ON l.trade_date = sr.trade_date AND s.sector_code = sr.sector_code
-        LEFT JOIN v_kline_daily k
+        LEFT JOIN {kline_relation} k
           ON l.trade_date = k.trade_date AND l.stock_code = k.stock_code
              AND (k.ktype = 'D' OR k.ktype IS NULL)
         LEFT JOIN v_auction_status a
@@ -784,7 +795,7 @@ def generate_signals(
     db_path: str | Path,
     trade_date: str | None = None,
     *,
-    require_ready: bool = False,
+    require_ready: bool = True,
     readiness_stage: str = "close",
 ) -> dict:
     build_normalized_views(db_path)
@@ -832,7 +843,10 @@ def _generate_signals_once(
         if not selected_date:
             raise ValueError("No trade_date available from v_market_daily")
         readiness = assess_trade_date_readiness(con, selected_date, readiness_stage)
-        if require_ready and not readiness.get("source_ready", readiness["ready"]):
+        if require_ready and not readiness.get(
+            "data_certified_ready",
+            readiness.get("source_ready", readiness["ready"]),
+        ):
             missing = ", ".join(readiness["missing_groups"])
             raise ValueError(
                 f"Trade date {selected_date} is not actionable for {readiness_stage}; "

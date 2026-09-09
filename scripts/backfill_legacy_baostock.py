@@ -199,7 +199,16 @@ def main() -> int:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=300)
+    parser.add_argument(
+        "--allow-unverified-units", action="store_true",
+        help="允许旧版BaoStock脚本写入未统一单位的核心表（仅用于受控迁移）",
+    )
     args = parser.parse_args()
+    if not args.allow_unverified_units:
+        parser.error(
+            "legacy BaoStock backfill is frozen: it writes legacy units into "
+            "tushare_daily; pass --allow-unverified-units only for a controlled migration"
+        )
     result = backfill(args.db, start_date=args.start_date, end_date=args.end_date,
                       max_stocks=args.max_stocks, offset=args.offset,
                       force=args.force, timeout_seconds=args.timeout_seconds)

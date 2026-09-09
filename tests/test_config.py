@@ -52,7 +52,7 @@ def test_config_does_not_read_env_example_as_active_config(monkeypatch, tmp_path
         dotenv_example_text="KPL_API_KEY=example-key\nKPL_API_BASE=https://example-fallback.test/api\n",
     )
     assert cfg.API_KEY == ""
-    assert cfg.API_BASE == "https://kpl.liuhepc.cn/api"
+    assert cfg.API_BASE == "https://www.kpl-api.cn/api"
 
 
 def test_config_prefers_dotenv_over_env_example(monkeypatch, tmp_path):

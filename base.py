@@ -4,6 +4,7 @@ import json
 import time
 import logging
 import os
+import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -18,6 +19,11 @@ from config import (
     DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS, DUCKDB_TEMP_DIR,
 )
 from trade_system.host_limiter import shared_host_limiter
+from trade_system.http_transport import (
+    classify_transport_error,
+    open_verified,
+    ssl_context_note,
+)
 from trade_system.source_validation import validate_kpl
 
 logger = logging.getLogger("kpl_collector")
@@ -110,6 +116,8 @@ class KPLClient:
             "rate_limited": 0,
             "skipped": 0,
             "circuit_open": 0,
+            "route_error": 0,
+            "auth_error": 0,
         }
 
     def _remaining_budget(self):
@@ -217,7 +225,7 @@ class KPLClient:
                 timeout = self.request_timeout
                 if remaining is not None:
                     timeout = max(0.1, min(timeout, remaining))
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with open_verified(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     semantic = validate_kpl(endpoint, params, data)
                     empty = self._is_empty_response(data)
@@ -289,6 +297,29 @@ class KPLClient:
                     logger.debug(f"422 {endpoint}: {body}")
                     self.stats["error"] += 1
                     return None
+                if e.code in (401, 403):
+                    self.stats["error"] += 1
+                    self.stats["auth_error"] += 1
+                    # Permission can be scoped to LV2/advanced routes. Do
+                    # not poison the whole client: a forbidden optional route
+                    # must not prevent core market/klines from being fetched.
+                    logger.warning(
+                        "KPL authentication rejected for %s: HTTP %s",
+                        endpoint,
+                        e.code,
+                    )
+                    return None
+                if e.code == 404:
+                    # A missing route is deterministic.  Do not retry it as a
+                    # transient provider failure; leave the client usable for
+                    # other documented routes and let the fallback layer act.
+                    self.stats["error"] += 1
+                    self.stats["route_error"] += 1
+                    logger.warning(
+                        "KPL route not found for %s: HTTP 404; verify KPL_API_BASE",
+                        endpoint,
+                    )
+                    return None
                 if e.code == 429:
                     # Rate limited — hard backoff
                     backoff = 30 * (attempt + 1)
@@ -312,6 +343,16 @@ class KPLClient:
                     self.stats["error"] += 1
                     self._open_circuit(f"network_permission_denied:{winerror or 'permission'}")
                     logger.warning(f"Error {endpoint}: {e}")
+                    return None
+                transport_error = classify_transport_error(e)
+                if transport_error == "tls_certificate_untrusted":
+                    self.stats["error"] += 1
+                    self._open_circuit("tls_certificate_untrusted")
+                    logger.warning(
+                        "TLS verification failed for %s (%s); install the provider/root "
+                        "CA for the SYSTEM account or set KPL_SSL_CA_BUNDLE; transport=%s",
+                        endpoint, e, ssl_context_note(),
+                    )
                     return None
                 if attempt < self.max_attempts - 1:
                     self._sleep_retry(RETRY_DELAY * (attempt + 1))
@@ -383,6 +424,12 @@ class DuckDBStore:
         self._init_meta()
 
     def _init_meta(self):
+        # The scheduled canonical path has already applied schema migrations
+        # before starting this child process.  Do not recreate the metadata
+        # table while the process-wide pipeline lock is held; standalone and
+        # recovery callers keep the legacy lazy bootstrap behavior.
+        if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() == "1":
+            return
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS _collect_log (
                 table_name VARCHAR,

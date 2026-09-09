@@ -19,11 +19,6 @@ def main() -> int:
         help="Generate research-only signals even when same-date readiness fails.",
     )
     parser.add_argument(
-        "--require-ready",
-        action="store_true",
-        help="Fail unless the selected trade date is actionable for the requested stage.",
-    )
-    parser.add_argument(
         "--readiness-stage",
         choices=("premarket", "auction", "intraday", "close", "postmarket"),
         default="intraday",
@@ -32,7 +27,9 @@ def main() -> int:
     result = generate_signals(
         args.db,
         args.trade_date,
-        require_ready=args.require_ready and not args.allow_partial,
+        # Readiness is the default gate now; --allow-partial is the explicit
+        # research-only escape hatch.
+        require_ready=not args.allow_partial,
         readiness_stage=args.readiness_stage,
     )
     print(

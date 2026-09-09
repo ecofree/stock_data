@@ -109,6 +109,7 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="Run all migrated data types (bounded by code limits).")
     parser.add_argument("--offline", action="store_true", help="Use resilient cache only; never call the network.")
     parser.add_argument("--no-sync-core", action="store_true", help="Do not copy fresh sector flow into sector_capital.")
+    parser.add_argument("--allow-core-sync", action="store_true", help="Explicitly allow this compatibility collector to promote rows into core tables.")
     parser.add_argument("--report", default="reports/multisource_collection_latest.md")
     args = parser.parse_args()
 
@@ -146,9 +147,11 @@ def main() -> int:
                 except Exception as exc:
                     results.append({"data_type": data_type, "scope": code or "<market>", "status": "failed",
                                     "provider": "", "rows": 0, "warning": str(exc).replace("|", "/")[:160]})
-        if "sector_flow" in types and not args.no_sync_core:
+        # Compatibility collectors keep provider evidence separate. Core
+        # promotion is opt-in; the integrated phase owns canonical writes.
+        if "sector_flow" in types and args.allow_core_sync and not args.no_sync_core:
             store.sync_sector_capital(args.date)
-        if not args.no_sync_core and ("kline" in types or INDEX_TYPES.intersection(types)):
+        if args.allow_core_sync and not args.no_sync_core and ("kline" in types or INDEX_TYPES.intersection(types)):
             store.sync_core_klines()
         finished = datetime.now()
         for data_type in types:

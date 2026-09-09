@@ -22,6 +22,11 @@ def con():
         " turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, source_table VARCHAR,"
         " is_fallback BOOLEAN, fetched_at TIMESTAMP)"
     )
+    conn.execute(
+        "CREATE TABLE ths_concept_member_checkpoint("
+        "trade_date DATE, concept_code VARCHAR, status VARCHAR,"
+        "updated_at TIMESTAMP)"
+    )
     apply_pending(conn)
     # Sessions 2026-08-03 .. 08-07 for stock A: closes 10 -> 11 -> 12 -> 13 -> 14
     closes = {"2026-08-03": 10.0, "2026-08-04": 11.0, "2026-08-05": 12.0,

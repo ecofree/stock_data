@@ -1,7 +1,7 @@
 import duckdb
 from datetime import datetime
 
-from trade_system.readiness import assess_trade_date_readiness
+from trade_system.readiness import assess_trade_date_readiness, relation_freshness
 
 
 def test_historical_as_of_rejects_rows_written_after_the_audit_time(tmp_path):
@@ -49,6 +49,30 @@ def test_readiness_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
     )
     assert result["ready"] is True
     assert result["as_of"] == "2026-07-31 18:00:00"
+
+
+def test_relation_freshness_casts_legacy_varchar_timestamp(tmp_path):
+    db_path = tmp_path / "varchar-time.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE multi_source_stock_flow("
+        "source_date DATE,stock_code VARCHAR,main_net DOUBLE,fetched_at VARCHAR)"
+    )
+    con.execute(
+        "INSERT INTO multi_source_stock_flow VALUES "
+        "('2026-07-31','000001',100,'2026-07-31 17:45:00')"
+    )
+    result = relation_freshness(
+        con,
+        "multi_source_stock_flow",
+        "2026-07-31",
+        max_age_seconds=3600,
+        now=datetime.fromisoformat("2026-07-31T18:00:00"),
+    )
+    con.close()
+
+    assert result["rows"] == 1
+    assert result["status"] == "ready"
 
 
 def test_close_readiness_requires_same_date_capital_flows(tmp_path):

@@ -16,6 +16,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = "D:\anaconda\python.exe"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
@@ -52,6 +58,9 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $backup = Join-Path $BackupDir ("kpl_data_pre_daily_{0}.duckdb" -f $stamp)
 $Log = Join-Path $LogDir ("scheduled_close_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
+$backupStatus = "not_attempted"
+$backupError = ""
+$compressed = ""
 
 function Compress-VerifiedBackup {
     param([string]$Path)
@@ -114,23 +123,37 @@ try {
     $ErrorActionPreference = "Continue"
     & $Python $NotifyHelper --event start 2>&1 | Tee-Object -FilePath $Log -Append
     $ErrorActionPreference = $prevEAP0
-    Copy-Item -LiteralPath $DbPath -Destination $backup
-    # Python writes its logging to stderr.  Under $ErrorActionPreference='Stop' that
-    # stderr is turned into a terminating NativeCommandError even when the process
-    # exits 0, which previously killed the whole close run.  Scope the native call to
-    # 'Continue' and judge success by the real process exit code instead.
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $verifyOutput = & $Python -c "import duckdb; c=duckdb.connect(r'$backup', read_only=True); c.execute('select 1').fetchone(); c.close()" 2>&1
-    $verifyCode = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
-    $verifyOutput | Tee-Object -FilePath $Log -Append
-    if ($verifyCode -ne 0) {
-        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-        throw "Backup verification failed: $backup"
+    # A rollback backup is valuable, but it must not prevent the close pipeline
+    # from publishing the review. Windows may reject a large Copy-Item with
+    # ERROR_NOT_ENOUGH_QUOTA even when the volume has plenty of free space.
+    # Record the failure and continue; the integrated runner is the source of
+    # truth for the close result.
+    try {
+        Copy-Item -LiteralPath $DbPath -Destination $backup
+        # Python writes its logging to stderr. Under $ErrorActionPreference='Stop'
+        # that stderr becomes a terminating NativeCommandError even when the
+        # process exits 0, so judge verification by the real process exit code.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $verifyOutput = & $Python -c "import duckdb; c=duckdb.connect(r'$backup', read_only=True); c.execute('select 1').fetchone(); c.close()" 2>&1
+        $verifyCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        $verifyOutput | Tee-Object -FilePath $Log -Append
+        if ($verifyCode -ne 0) {
+            throw "Backup verification failed: $backup"
+        }
+        $compressed = Compress-VerifiedBackup -Path $backup
+        $backupStatus = "ok"
+        "BACKUP_COMPLETE path=$compressed" | Tee-Object -FilePath $Log -Append
+    } catch {
+        $backupStatus = "failed"
+        $backupError = $_.Exception.Message
+        if (Test-Path -LiteralPath $backup) {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        "BACKUP_FAILED error=$backupError; continuing close pipeline" |
+            Tee-Object -FilePath $Log -Append
     }
-    $compressed = Compress-VerifiedBackup -Path $backup
-    "backup compressed: $compressed" | Tee-Object -FilePath $Log -Append
 
     $args = @(
         $IntegratedRunner,
@@ -151,12 +174,13 @@ try {
     $ErrorActionPreference = $prevEAP
     $output | Tee-Object -FilePath $Log -Append
     if ($code -ne 0) {
-        throw "Integrated daily run failed with exit code $code. Backup: $backup"
+        throw "Integrated daily run failed with exit code $code. backup_status=$backupStatus"
     }
-    "DAILY_RUN_COMPLETE backup=$compressed" | Tee-Object -FilePath $Log -Append
+    "DAILY_RUN_COMPLETE backup_status=$backupStatus backup=$compressed" |
+        Tee-Object -FilePath $Log -Append
     $prevEAP0 = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & $Python $NotifyHelper --event success --message "close run ok; backup=$compressed" 2>&1 |
+    & $Python $NotifyHelper --event success --message "close run ok; backup_status=$backupStatus; backup=$compressed" 2>&1 |
         Tee-Object -FilePath $Log -Append
     $ErrorActionPreference = $prevEAP0
 } catch {
@@ -186,23 +210,6 @@ try {
         }
     } catch {
         "P0_OBSERVATION_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
-    }
-    try {
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        & $Python (Join-Path $Root "scripts\generate_health_trend.py") --db $DbPath 2>&1 |
-            Tee-Object -FilePath $Log -Append
-        & $Python (Join-Path $Root "scripts\generate_cycle_analytics.py") --db $DbPath 2>&1 |
-            Tee-Object -FilePath $Log -Append
-        & $Python (Join-Path $Root "scripts\generate_signal_attribution.py") --db $DbPath 2>&1 |
-            Tee-Object -FilePath $Log -Append
-        # Minute snapshots must run daily: TDX servers only keep recent
-        # sessions, so the replay-axis history accumulates day by day.
-        & $Python (Join-Path $Root "scripts\collect_minute_snapshots.py") --db $DbPath `
-            --source limit-pool 2>&1 | Tee-Object -FilePath $Log -Append
-        $ErrorActionPreference = $prevEAP
-    } catch {
-        "HEALTH_TREND_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
     }
     Remove-OldBackups
     Pop-Location

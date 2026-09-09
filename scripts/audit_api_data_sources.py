@@ -9,7 +9,11 @@ import duckdb
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import API_BASE, API_KEY, DB_PATH, TODAY
-from trade_system.api_data_audit import audit_requirements, render_api_data_audit_report
+from trade_system.api_data_audit import (
+    audit_requirements,
+    latest_local_trade_date,
+    render_api_data_audit_report,
+)
 
 
 def _first_value(db_path: str | Path, queries: list[tuple[str, list]]) -> str:
@@ -71,11 +75,24 @@ def infer_sector_code(db_path: str | Path, date: str) -> str:
     return _first_value(
         db_path,
         [
+            # KPL/HiThink sector routes use the 801xxx universe.  The newer
+            # Eastmoney-normalized BKxxxx.DC codes are valid for the fallback
+            # adapters but return misleading empty objects when sent to KPL.
+            (
+                """
+                SELECT sector_code
+                FROM sector_plates
+                WHERE sector_code LIKE '801%' AND sector_code != '0'
+                ORDER BY sector_code
+                LIMIT 1
+                """,
+                [],
+            ),
             (
                 """
                 SELECT sector_code
                 FROM sector_ranking
-                WHERE CAST(date AS VARCHAR) = ? AND sector_code != '' AND sector_code != '0'
+                WHERE CAST(date AS VARCHAR) = ? AND sector_code LIKE '801%'
                 ORDER BY sector_code
                 LIMIT 1
                 """,
@@ -85,7 +102,7 @@ def infer_sector_code(db_path: str | Path, date: str) -> str:
                 """
                 SELECT sector_code
                 FROM sector_capital
-                WHERE CAST(date AS VARCHAR) = ? AND sector_code != '' AND sector_code != '0'
+                WHERE CAST(date AS VARCHAR) = ? AND sector_code LIKE '801%'
                 ORDER BY sector_code
                 LIMIT 1
                 """,
@@ -109,33 +126,40 @@ def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Audit which professional data sources are obtainable from the configured API.")
     parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--date", default=TODAY)
+    parser.add_argument("--date", default="", help="Probe date; defaults to newest local trading snapshot.")
     parser.add_argument("--stock-code", default="")
     parser.add_argument("--sector-code", default="")
     parser.add_argument("--out", default=str(project_root / "reports" / "api_data_source_audit_latest.md"))
     parser.add_argument("--docs-out", default=str(project_root / "docs" / "integration" / "api_data_gap_matrix.md"))
     parser.add_argument("--timeout", type=int, default=12)
     parser.add_argument("--no-live", action="store_true")
+    parser.add_argument(
+        "--include-compatibility",
+        action="store_true",
+        help="Also probe retired compatibility routes; excluded from the default inventory.",
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db)
-    stock_code = args.stock_code or infer_stock_code(db_path, args.date)
-    sector_code = args.sector_code or infer_sector_code(db_path, args.date)
+    selected_date = args.date or latest_local_trade_date(db_path, TODAY)
+    stock_code = args.stock_code or infer_stock_code(db_path, selected_date)
+    sector_code = args.sector_code or infer_sector_code(db_path, selected_date)
     live_probe = not args.no_live
 
     summaries = audit_requirements(
         db_path=db_path,
         api_base=API_BASE,
         api_key=API_KEY,
-        date=args.date,
+        date=selected_date,
         stock_code=stock_code,
         sector_code=sector_code,
         live_probe=live_probe,
         timeout=args.timeout,
+        include_compatibility=args.include_compatibility,
     )
     report = render_api_data_audit_report(
         summaries,
-        date=args.date,
+        date=selected_date,
         stock_code=stock_code,
         sector_code=sector_code,
         live_probe=live_probe,
@@ -151,7 +175,7 @@ def main() -> int:
 
     print(f"api_data_source_audit={out}")
     print(f"api_data_gap_matrix={docs_out}")
-    print(f"date={args.date} stock_code={stock_code} sector_code={sector_code} live_probe={str(live_probe).lower()}")
+    print(f"date={selected_date} stock_code={stock_code} sector_code={sector_code} live_probe={str(live_probe).lower()}")
     for verdict in sorted({item.verdict for item in summaries}):
         count = sum(1 for item in summaries if item.verdict == verdict)
         print(f"{verdict}={count}")

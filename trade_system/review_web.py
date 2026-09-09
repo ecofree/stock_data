@@ -27,6 +27,7 @@ from trade_system.daily_review import (
     _latest_date,
 )
 from trade_system.review_facts import build_review_page_facts
+from trade_system.review_metrics import COMPOSITE_SCORE_STATUS
 from trade_system.i18n_labels import (
     CATEGORY_CN,
     PROVIDER_CN,
@@ -57,10 +58,13 @@ def _e(v: Any) -> str:
 
 
 def _slk(code: str) -> str:
-    """Wrap a stock code as a link to its detail page."""
+    """Wrap a stock code as a link only when the target artifact exists."""
     if not code:
         return "—"
     c = str(code).strip()
+    detail_path = Path(__file__).resolve().parents[1] / "reports" / "stocks" / f"{c}.html"
+    if not detail_path.is_file():
+        return _e(c)
     return (f"<a class='mono' href='stocks/{c}.html' "
             f"style='color:inherit;text-decoration:none'>{_e(c)}</a>")
 
@@ -271,6 +275,8 @@ td.mono{font-family:var(--mono)}
 .appendix[open] > summary{margin-bottom:16px}
 
 .notice{color:var(--muted); font-size:13px; line-height:1.7; max-width:50em}
+.metric-note{margin:0 0 10px; padding:8px 10px; border-left:2px solid var(--warn);
+  color:var(--muted); font-size:11px; line-height:1.6; background:rgba(212,160,23,.05)}
  .concept-review{display:grid; grid-template-columns:minmax(280px,320px) minmax(0,1fr); gap:24px; min-height:320px; align-items:stretch}
  .concept-list{display:flex; flex-direction:column; gap:0; max-height:480px; overflow:auto}
 .concept-tab{display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:8px; align-items:center;
@@ -331,6 +337,12 @@ td.mono{font-family:var(--mono)}
    .day-head.cols5.stock-detail-head,.day-row.cols5.stock-detail-row{grid-template-columns:26px minmax(0,1fr) 48px 60px 76px; gap:5px}
 }
 .footer{margin-top:36px; text-align:center; color:var(--dim); font-size:11px; letter-spacing:.08em}
+.review-band{margin:18px 0 0; padding:0 18px; border:1px solid rgba(58,50,38,.72);
+  border-radius:10px; background:rgba(28,24,18,.22)}
+.band-label{padding:14px 0 0; color:var(--rule); font:11px var(--mono); letter-spacing:.14em}
+.review-band > section{border-top:1px solid var(--line)}
+.review-band > section:first-of-type{border-top:0}
+@media (max-width:768px){.review-band{padding:0 10px}}
 """
 
 
@@ -481,6 +493,8 @@ def _render_loop(ctx: dict[str, Any]) -> str:
     journal = ctx.get("journal") or []
     watchlist = ctx.get("watchlist") or []
     picks = (ctx.get("capital_flow") or {}).get("candidate_picks") or []
+    execution_ready = bool((ctx.get("execution_control") or {}).get("execution_ready"))
+    plans_blocked = not execution_ready
     parts: list[str] = []
 
     if outcomes:
@@ -509,17 +523,25 @@ def _render_loop(ctx: dict[str, Any]) -> str:
     if plans:
         rows = []
         for plan in plans[:12]:
+            plan_status = (
+                "研究草案（门禁未开放）"
+                if plans_blocked
+                else zh_text(cn(PLAN_STATUS_CN, plan.get("status")))
+            )
             rows.append(
                 f"<tr><td class='mono'>{_slk(plan.get('stock_code'))}</td><td>{_e(plan.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, plan.get('setup_type')))}</td><td class='num'>{_pct(plan.get('max_position_pct'))}</td>"
-                f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, plan.get('status'))))}</td>"
+                f"<td>{_status_pill(plan_status)}</td>"
                 f"<td class='dim'>{_e(zh_text(plan.get('entry_condition')) or '—')}</td>"
                 f"<td class='dim'>{_e(zh_text(plan.get('stop_condition')) or '—')}</td></tr>"
             )
+        plan_title = "今日执行计划" if execution_ready else "研究计划草案"
+        plan_note = "已通过当前执行门禁" if execution_ready else "门禁开放后才可能进入执行计划"
         parts.append(
-            "<div class='sec-title'><strong>今日计划</strong></div>"
+            f"<div class='sec-title'><strong>{plan_title}</strong>"
+            f"<span class='dim'>{plan_note}</span></div>"
             "<div class='table-scroll'><table><thead><tr><th>代码</th><th>名称</th><th>类型</th>"
-            "<th class='num'>仓位</th><th>状态</th><th>买入条件</th><th>止损条件</th></tr></thead>"
+            "<th class='num'>研究上限</th><th>状态</th><th>观察条件</th><th>失效条件</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
     if watchlist:
@@ -571,7 +593,11 @@ def _render_loop(ctx: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _render_sector_trail(ctx: dict[str, Any], external_lazy: bool = False) -> str:
+def _render_sector_trail(
+    ctx: dict[str, Any],
+    external_lazy: bool = False,
+    compact_overview: bool = False,
+) -> str:
     trail = ctx.get("sector_trail") or {}
     periods = ctx.get("sector_periods") or {}
     dates = trail.get("dates") or []
@@ -580,7 +606,53 @@ def _render_sector_trail(ctx: dict[str, Any], external_lazy: bool = False) -> st
         message = trail.get("message") or "暂无板块轨迹"
         return f"<div class='empty'>{_e(message)}</div>"
     cards = []
-    for day in dates:
+    if compact_overview:
+        # The daily page is a decision surface. Keep only the latest 50 theme
+        # rows in HTML and send historical/member drill-down users to the
+        # dedicated static sector page. Embedding stock_pct plus all dates
+        # here previously made one daily page nearly 10 MB.
+        day = dates[0]
+        ranked = []
+        for sector in sectors:
+            cell = (sector.get("daily") or {}).get(day)
+            if cell:
+                ranked.append((sector, cell))
+        ranked.sort(
+            key=lambda item: (
+                -int(item[1].get("limit_up") or 0),
+                -float(item[1].get("strength") or -999),
+                -float(item[1].get("main_net") or 0),
+            )
+        )
+        rows = []
+        for index, (sector, cell) in enumerate(ranked[:50], start=1):
+            rows.append(
+                f"<div class='day-row cols5'>"
+                f"<span class='dim'>{index}</span>"
+                f"<span class='n'>{_e(sector.get('name'))}</span>"
+                f"<span class='num {_sign_class(cell.get('strength'))}'>{_pct(cell.get('strength'))}</span>"
+                f"<span class='num up'>{_e(cell.get('limit_up') if cell.get('limit_up') is not None else '—')}</span>"
+                f"<span class='num {_sign_class(cell.get('pct_chg'))}'>{_pct(cell.get('pct_chg'))}</span>"
+                "</div>"
+            )
+        remainder = max(0, len(ranked) - 50)
+        empty = "<div class='empty'>暂无概念数据</div>"
+        return (
+            f"<div class='trail-source-note'>概念源：{_e(trail.get('concept_source') or 'THS完整质量门控快照')}；"
+            f"最新可用成分快照：{_e(trail.get('membership_date') or '—')}。"
+            "日页只保留最新交易日的前50个概念，历史和个股明细进入全宽专页。</div>"
+            f"<div class='trail-window-note'>当前日：{_e(day)} · 共 {len(ranked)} 个可用概念"
+            f"{' · 另有 ' + str(remainder) + ' 个概念请进入全宽专页' if remainder else ''}</div>"
+            "<div class='trail-scroll compact-trail'><div class='day-card'>"
+            f"<div class='day-title'>{_e(day)}</div>"
+            "<div class='day-head cols5'><span>#</span><span>概念</span><span class='num'>强度</span>"
+            "<span class='num'>涨停</span><span class='num'>涨幅</span></div>"
+            f"<div class='day-rows'>{''.join(rows) or empty}</div>"
+            "</div></div>"
+        )
+    # Keep the full summary inline for offline drill-down, but limit the
+    # initial HTML to the latest day. Older days are rendered after expansion.
+    for day in dates[:1]:
         ranked = []
         for sector in sectors:
             cell = (sector.get("daily") or {}).get(day)
@@ -614,31 +686,56 @@ def _render_sector_trail(ctx: dict[str, Any], external_lazy: bool = False) -> st
             f"<div class='day-head cols5'><span>#</span><span>概念</span><span class='num'>强度</span><span class='num'>涨停</span><span class='num'>涨幅</span></div>"
             f"<div class='day-rows'>{''.join(rows)}{extra}</div></div>"
         )
-    def _lazy_key(value: Any) -> str:
-        return "".join(char if (char.isalnum() or char in "-_") else "_" for char in str(value or ""))
-
     summary_sectors = []
-    lazy_detail_scripts = []
+    daily_details: dict[str, Any] = {}
+    period_details: dict[str, dict[str, Any]] = {"week": {}, "month": {}, "quarter": {}}
+    stock_names = trail.get("stock_names") or {}
+    slim_day_stock = lambda st: {
+        "stock_code": st.get("stock_code"),
+        "stock_name": st.get("stock_name"),
+        "board_level": st.get("board_level"),
+        "limit_up_time": st.get("limit_up_time"),
+        "pct_chg": st.get("pct_chg"),
+    }
+    slim_period_stock = lambda st: {
+        "stock_code": st.get("stock_code"),
+        "stock_name": st.get("stock_name"),
+        "limit_up": st.get("limit_up"),
+        "pct_chg": st.get("pct_chg"),
+        "board_level": st.get("board_level"),
+    }
     for sector in sectors:
         daily_summary = {}
         daily_detail = {}
         for day, cell in (sector.get("daily") or {}).items():
             daily_summary[day] = {key: value for key, value in cell.items() if key != "stocks"}
-            daily_detail[day] = {"stocks": cell.get("stocks") or []}
+            daily_detail[day] = {
+                "stocks": [slim_day_stock(st) for st in (cell.get("stocks") or [])]
+            }
+        members = sector.get("members")
         summary_sectors.append(
-            {"id": sector.get("id"), "name": sector.get("name"), "daily": daily_summary}
+            {
+                "id": sector.get("id"),
+                "name": sector.get("name"),
+                "daily": daily_summary,
+                "members": {
+                    "snapshot_date": members.get("snapshot_date"),
+                    "codes": members.get("codes"),
+                } if members else None,
+            }
         )
-        detail_payload = json.dumps(
-            {"window_stocks": sector.get("window_stocks") or [], "daily": daily_detail},
-            ensure_ascii=False,
-        ).replace("</", "<\\/")
-        lazy_detail_scripts.append(
-            f"<script type='application/json' id='trail-detail-{_lazy_key(sector.get('id'))}'>"
-            f"{detail_payload}</script>"
-        )
+        daily_details[str(sector.get("id"))] = {"daily": daily_detail}
     daily_payload = json.dumps(
-        {"dates": dates, "sectors": summary_sectors},
+        {
+            "dates": dates,
+            "sectors": summary_sectors,
+            "stock_names": stock_names,
+            # Shared by every concept so overlapping memberships do not
+            # duplicate the same stock/date return arrays in the HTML.
+            "stock_pct": trail.get("stock_pct") or {},
+        },
         ensure_ascii=False,
+        separators=(",", ":"),
     ).replace("</", "<\\/")
 
     period_summary = {}
@@ -654,19 +751,27 @@ def _render_sector_trail(ctx: dict[str, Any], external_lazy: bool = False) -> st
             summary_period_sectors.append(
                 {"id": sector.get("id"), "name": sector.get("name"), "periods": period_summary_cells}
             )
-            period_payload_detail = json.dumps(
-                {"periods": period_detail_cells}, ensure_ascii=False
-            ).replace("</", "<\\/")
-            lazy_detail_scripts.append(
-                f"<script type='application/json' id='trail-period-detail-{kind}-{_lazy_key(sector.get('id'))}'>"
-                f"{period_payload_detail}</script>"
-            )
+            period_details[kind][str(sector.get("id"))] = {"periods": {
+                    label: {"stocks": [slim_period_stock(st) for st in (cell.get("stocks") or [])]}
+                    for label, cell in (sector.get("periods") or {}).items()
+                }} if not compact_overview else {"periods": {}}
         period_summary[kind] = {
             "periods": pack.get("periods") or [],
             "sectors": summary_period_sectors,
         }
     period_payload = json.dumps(period_summary, ensure_ascii=False).replace("</", "<\\/")
-    detail_scripts = "" if external_lazy else "".join(lazy_detail_scripts)
+    detail_payload = json.dumps(
+        {
+            "daily": daily_details,
+            "periods": period_details,
+            "compact_overview": compact_overview,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+    detail_scripts = "" if external_lazy else (
+        f"<script type='application/json' id='trail-details'>{detail_payload}</script>"
+    )
     return (
         "<div class='tabs' id='trail-mode-tabs'>"
         "<button type='button' class='active' data-trail-mode='day'>日</button>"
@@ -762,7 +867,12 @@ def _render_tomorrow(ctx: dict[str, Any]) -> str:
 def _render_lhb(ctx: dict[str, Any]) -> str:
     rows = (ctx.get("capital_flow") or {}).get("lhb") or []
     if not rows:
-        return "<div class='empty'>当日无龙虎榜记录</div>"
+        summary = (ctx.get("market_context") or {}).get("lhb_summary") or {}
+        latest = summary.get("latest_date") or "无历史批次"
+        return (
+            "<div class='empty'>当日龙虎榜不可用（不解读为 0 条）；"
+            f"本地最新批次 { _e(latest) }</div>"
+        )
     body = []
     for row in rows[:12]:
         body.append(
@@ -884,6 +994,8 @@ def _render_themes(ctx: dict[str, Any]) -> str:
             f"<td class='dim'>{_e(t.get('reason') or '—')}</td></tr>"
         )
     return (
+        "<div class='metric-note'>题材综合分当前仅作实验排序，状态："
+        f"{_e(COMPOSITE_SCORE_STATUS)}；未完成历史验证前，不作为正式口径或交易依据。</div>"
         "<div class='table-scroll'><table><thead><tr>"
         "<th>代码</th><th>题材</th><th class='num'>主线分</th><th class='num'>涨停数</th>"
         "<th class='num'>封板率</th><th class='num'>主力净额</th><th class='num'>成分数</th>"
@@ -904,11 +1016,10 @@ def _render_concept_limit_up(ctx: dict[str, Any], inline_stock_limit: int | None
             )
         return f"<div class='empty'>{_e(message)}</div>"
     tabs = []
-    for index, group in enumerate(groups):
+    for index, group in enumerate(groups[:50]):
         active = " active" if index == 0 else ""
-        hidden = " hidden data-hidden-concept" if index >= 50 else ""
         tabs.append(
-            f"<button type='button' class='concept-tab{active}' data-concept-index='{index}'{hidden}>"
+            f"<button type='button' class='concept-tab{active}' data-concept-index='{index}'>"
             f"<span class='concept-rank'>{index + 1:02d}</span>"
             f"<span class='concept-name'>{_e(group.get('concept_name') or '—')}</span>"
             f"<span class='concept-lu'>{_e(group.get('limit_up_count') or 0)}</span>"
@@ -1040,6 +1151,7 @@ def _render_plans(ctx: dict[str, Any]) -> str:
     plans = ctx.get("plans", [])
     journal = ctx.get("journal", [])
     risk = ctx.get("risk", {})
+    execution_ready = bool((ctx.get("execution_control") or {}).get("execution_ready"))
     parts: list[str] = []
     parts.append(
         "<div class='detail-grid'>"
@@ -1052,17 +1164,25 @@ def _render_plans(ctx: dict[str, Any]) -> str:
     if plans:
         rows = []
         for p in plans[:15]:
+            plan_status = (
+                "研究草案（门禁未开放）"
+                if not execution_ready
+                else zh_text(cn(PLAN_STATUS_CN, p.get("status")))
+            )
             rows.append(
                 f"<tr><td class='mono'>{_slk(p.get('stock_code'))}</td><td>{_e(p.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, p.get('setup_type')))}</td><td class='num'>{_pct(p.get('max_position_pct'))}</td>"
-                f"<td>{_status_pill(zh_text(cn(PLAN_STATUS_CN, p.get('status'))))}</td>"
+                f"<td>{_status_pill(plan_status)}</td>"
                 f"<td class='dim'>{_e(zh_text(p.get('entry_condition')) or '—')}</td>"
                 f"<td class='dim'>{_e(zh_text(p.get('stop_condition')) or '—')}</td></tr>"
             )
+        plan_title = "今日执行计划" if execution_ready else "研究计划草案"
+        plan_note = "已通过当前执行门禁" if execution_ready else "execution_ready=false 时不是订单"
         parts.append(
-            "<div class='sec-title'><strong>今日交易计划</strong></div>"
+            f"<div class='sec-title'><strong>{plan_title}</strong>"
+            f"<span class='dim'>{plan_note}</span></div>"
             "<div class='table-scroll'><table><thead><tr><th>代码</th><th>名称</th><th>类型</th>"
-            "<th class='num'>仓位</th><th>状态</th><th>买入条件</th><th>止损条件</th></tr></thead>"
+            "<th class='num'>研究上限</th><th>状态</th><th>观察条件</th><th>失效条件</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
     if journal:
@@ -1285,14 +1405,34 @@ window.addEventListener('DOMContentLoaded', () => {{
     chart.setOption(c.opt);
     window.addEventListener('resize', () => chart.resize());
   }}
-  const tabs = [...document.querySelectorAll('.concept-tab')];
+  let tabs = [...document.querySelectorAll('.concept-tab')];
   const conceptMore = document.getElementById('concept-more');
   const title = document.getElementById('concept-detail-title');
   const sub = document.getElementById('concept-detail-sub');
   const grid = document.getElementById('concept-stock-grid');
+  const escHtml = value => String(value == null ? '' : value)
+    .replace(/[&<>\"']/g, char => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[char]));
+  const conceptTab = (item, index) => `<button type="button" class="concept-tab" data-concept-index="${{index}}">`
+    + `<span class="concept-rank">${{String(index + 1).padStart(2, '0')}}</span>`
+    + `<span class="concept-name">${{escHtml(item.concept_name || '—')}}</span>`
+    + `<span class="concept-lu">${{item.limit_up_count || 0}}</span>`
+    + `<span class="concept-meta">最高 ${{item.max_board == null ? '—' : item.max_board}}板 · 成分 ${{item.member_count || 0}}</span></button>`;
   let lazyReviewData = window.__REVIEW_LAZY_DATA__ || null;
   let lazyLoadPromise = null;
   let lazyLoadError = '';
+  let fullConceptData = null;
+  const loadFullConceptData = () => {{
+    if (fullConceptData) return fullConceptData;
+    const payload = document.getElementById('review-concept-data');
+    if (!payload) return conceptData;
+    try {{
+      const parsed = JSON.parse(payload.textContent || '[]');
+      if (Array.isArray(parsed)) fullConceptData = parsed;
+    }} catch (err) {{
+      lazyLoadError = '概念详情数据损坏，当前仅显示首屏';
+    }}
+    return fullConceptData || conceptData;
+  }};
   const loadLazyData = () => {{
     if (!lazyAsset) return Promise.resolve(lazyReviewData);
     if (lazyReviewData) return Promise.resolve(lazyReviewData);
@@ -1329,38 +1469,48 @@ window.addEventListener('DOMContentLoaded', () => {{
     return String(v);
   }};
   const renderConcept = async (index, expand = false) => {{
-    if (lazyAsset && (expand || index > 0)) {{
-      try {{
-        const loaded = await loadLazyData();
-        if (loaded && loaded.concept_groups) conceptData = loaded.concept_groups;
-      }} catch (err) {{
-        if (grid) grid.innerHTML = `<div class="empty">${{lazyLoadError || '详情数据未加载'}}</div>`;
-      }}
+    if (expand || index > 0) {{
+      conceptData = loadFullConceptData();
     }}
     const item = conceptData[index];
     if (!item || !title || !sub || !grid) return;
     tabs.forEach((tab, i) => tab.classList.toggle('active', i === index));
     title.textContent = item.concept_name || '—';
     sub.textContent = `涨停 ${{item.limit_up_count || 0}} 只 · 成分 ${{item.member_count || 0}} 只 · 主线分 ${{money(item.mainline_score)}}`;
-    const stocks = item.limit_up_stocks || [];
-    const cards = stocks.length ? stocks.map(stock => `
+    const allStocks = item.limit_up_stocks || [];
+    const shown = expand ? allStocks : allStocks.slice(0, 50);
+    const cards = shown.length ? shown.map(stock => `
       <div class="concept-stock-card">
         <span class="stock-name">${{stock.stock_name || '—'}}</span>
         <span class="stock-board">${{stock.board_level == null ? '—' : stock.board_level + '板'}}</span>
         <span class="stock-code">${{stock.stock_code || '—'}}</span>
         <span class="stock-time">${{fmtTime(stock.limit_up_time)}}</span>
        </div>`).join('') : '<div class="empty">该概念暂无同日涨停个股</div>';
-    const hasMore = Boolean(lazyAsset && item.limit_up_count > stocks.length);
-    const more = hasMore
-      ? `<button type="button" class="trail-more" id="concept-stock-more">加载该概念全部个股（剩余 ${{item.limit_up_count - stocks.length}} 只）</button>`
+    const hiddenCount = allStocks.length - shown.length;
+    const more = hiddenCount > 0
+      ? `<button type="button" class="trail-more" id="concept-stock-more">加载全部个股（剩余 ${{hiddenCount}} 只）</button>`
       : '';
     grid.innerHTML = cards + more;
     const moreButton = document.getElementById('concept-stock-more');
     if (moreButton) moreButton.addEventListener('click', () => renderConcept(index, true));
   }};
-  tabs.forEach(tab => tab.addEventListener('click', () => renderConcept(Number(tab.dataset.conceptIndex))));
+  const bindConceptTabs = () => {{
+    tabs = [...document.querySelectorAll('.concept-tab')];
+    tabs.forEach(tab => {{
+      if (tab.dataset.bound) return;
+      tab.dataset.bound = '1';
+      tab.addEventListener('click', () => renderConcept(Number(tab.dataset.conceptIndex)));
+    }});
+  }};
+  bindConceptTabs();
   if (conceptMore) conceptMore.addEventListener('click', () => {{
-    document.querySelectorAll('[data-hidden-concept]').forEach(tab => tab.hidden = false);
+    const all = loadFullConceptData();
+    const list = document.getElementById('concept-list');
+    const current = tabs.length;
+    if (list && all.length > current) {{
+      list.insertAdjacentHTML('beforeend', all.slice(current).map((item, offset) => conceptTab(item, current + offset)).join(''));
+      bindConceptTabs();
+    }}
     conceptMore.remove();
   }});
   if (tabs.length) renderConcept(0);
@@ -1369,15 +1519,20 @@ window.addEventListener('DOMContentLoaded', () => {{
   const trailPeriodEl = document.getElementById('trail-periods');
   const trailBoard = document.getElementById('trail-board');
   const trailDetail = document.getElementById('trail-detail');
+  const trailDetailsEl = document.getElementById('trail-details');
   let trailData = {{dates: [], sectors: []}};
   let trailPeriods = {{week: {{}}, month: {{}}, quarter: {{}}}};
+  let trailDetails = {{daily: {{}}, periods: {{week: {{}}, month: {{}}, quarter: {{}}}}, compact_overview: false}};
   if (trailDataEl) {{
     try {{ trailData = JSON.parse(trailDataEl.textContent || '{{}}'); }} catch (err) {{ trailData = {{dates: [], sectors: []}}; }}
   }}
   if (trailPeriodEl) {{
     try {{ trailPeriods = JSON.parse(trailPeriodEl.textContent || '{{}}'); }} catch (err) {{ trailPeriods = {{week: {{}}, month: {{}}, quarter: {{}}}}; }}
   }}
-  const lazyKey = id => String(id || '').replace(/[^A-Za-z0-9_-]/g, '_');
+  if (trailDetailsEl) {{
+    try {{ trailDetails = JSON.parse(trailDetailsEl.textContent || '{{}}'); }} catch (err) {{ trailDetails = {{daily: {{}}, periods: {{week: {{}}, month: {{}}, quarter: {{}}}}}}; }}
+  }}
+  const trailCompact = Boolean(trailDetails.compact_overview);
   const hydrateTrailSector = sector => {{
     if (!sector || sector.__trailDetailsLoaded) return sector;
     const sidecarDetail = lazyReviewData && lazyReviewData.trail_details
@@ -1391,10 +1546,9 @@ window.addEventListener('DOMContentLoaded', () => {{
       sector.__trailDetailsLoaded = true;
       return sector;
     }}
-    const el = document.getElementById(`trail-detail-${{lazyKey(sector.id)}}`);
-    if (!el) return sector;
+    const detail = (trailDetails.daily || {{}})[String(sector.id || '')];
+    if (!detail) return sector;
     try {{
-      const detail = JSON.parse(el.textContent || '{{}}');
       sector.window_stocks = detail.window_stocks || [];
       for (const [day, cell] of Object.entries(detail.daily || {{}})) {{
         sector.daily = sector.daily || {{}};
@@ -1417,10 +1571,9 @@ window.addEventListener('DOMContentLoaded', () => {{
       sector.__periodDetailsLoaded = true;
       return sector;
     }}
-    const el = document.getElementById(`trail-period-detail-${{kind}}-${{lazyKey(sector.id)}}`);
-    if (!el) return sector;
+    const detail = ((trailDetails.periods || {{}})[kind] || {{}})[String(sector.id || '')];
+    if (!detail) return sector;
     try {{
-      const detail = JSON.parse(el.textContent || '{{}}');
       for (const [label, cell] of Object.entries(detail.periods || {{}})) {{
         sector.periods = sector.periods || {{}};
         sector.periods[label] = Object.assign(sector.periods[label] || {{}}, cell);
@@ -1430,6 +1583,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     return sector;
   }};
   let trailMode = 'day';
+  let trailHistoryExpanded = false;
   let trailSelected = '';
   const trailSort = {{}};
   const TOPN = 50;
@@ -1481,7 +1635,7 @@ window.addEventListener('DOMContentLoaded', () => {{
           ? rankedTrail((trailData.sectors || []).map(sector => ({{sector, cell: (sector.daily || {{}})[day]}})).filter(item => item.cell), day)
           : [];
         if (ranked.length > TOPN) {{
-          rows.insertAdjacentHTML('afterbegin', ranked.slice(TOPN).map((item, i) => conceptRow(item.sector, item.cell, TOPN + i + 1, false)).join(''));
+          rows.insertAdjacentHTML('beforeend', ranked.slice(TOPN).map((item, i) => conceptRow(item.sector, item.cell, TOPN + i + 1, false, true)).join(''));
         }}
         btn.remove();
       }});
@@ -1495,8 +1649,8 @@ window.addEventListener('DOMContentLoaded', () => {{
       }});
     }});
   }};
-  const conceptRow = (sector, cell, index, wide) => {{
-    const hidden = index > TOPN ? ' hidden data-hidden-row' : '';
+  const conceptRow = (sector, cell, index, wide, forceVisible = false) => {{
+    const hidden = index > TOPN && !forceVisible ? ' hidden data-hidden-row' : '';
     const coverage = cell.coverage_pct == null ? '' : ` · 覆盖 ${{fmtRateJs(cell.coverage_pct)}}`;
     const extra = wide
       ? `<span class="num ${{signCls(cell.main_net)}}">${{fmtFlowJs(cell.main_net)}}</span>`
@@ -1511,17 +1665,21 @@ window.addEventListener('DOMContentLoaded', () => {{
   const renderTrailBoard = () => {{
     if (!trailBoard) return;
     if (trailMode === 'day') {{
-      trailBoard.innerHTML = (trailData.dates || []).map(day => {{
+      const days = trailHistoryExpanded
+        ? (trailData.dates || [])
+        : (trailData.dates || []).slice(0, 1);
+      trailBoard.innerHTML = days.map(day => {{
         const ranked = rankedTrail((trailData.sectors || []).map(sector => ({{sector, cell: (sector.daily || {{}})[day]}}))
           .filter(item => item.cell)
           , day);
-        const rows = ranked.map((item, i) => conceptRow(item.sector, item.cell, i + 1, false)).join('');
+        const rows = ranked.slice(0, TOPN).map((item, i) => conceptRow(item.sector, item.cell, i + 1, false)).join('');
         const more = ranked.length > TOPN
           ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{ranked.length - TOPN}} 个）</button>` : '';
-        return `<div class="day-card"><div class="day-title">${{day}}</div>`
+        return `<div class="day-card" data-trail-day="${{day}}"><div class="day-title">${{day}}</div>`
           + `<div class="day-head cols5"><span>#</span><span>概念</span><span class="num">强度</span><span class="num">涨停</span><span class="num sort-head" data-trail-sort="${{day}}">${{sortTitle(day)}}</span></div>`
           + `<div class="day-rows">${{rows}}${{more}}</div></div>`;
-      }}).join('');
+      }}).join('') + (!trailHistoryExpanded && (trailData.dates || []).length > 1
+        ? '<button type="button" class="trail-more" id="trail-history-more">加载历史交易日</button>' : '');
     }} else {{
       const pack = trailPeriods[trailMode] || {{}};
       const frames = pack.periods || [];
@@ -1530,7 +1688,7 @@ window.addEventListener('DOMContentLoaded', () => {{
         const ranked = rankedTrail(sectors.map(sector => ({{sector, cell: (sector.periods || {{}})[frame.label]}}))
           .filter(item => item.cell)
           , frame.label);
-        const rows = ranked.map((item, i) => conceptRow(item.sector, item.cell, i + 1, true)).join('');
+        const rows = ranked.slice(0, TOPN).map((item, i) => conceptRow(item.sector, item.cell, i + 1, true)).join('');
         const more = ranked.length > TOPN
           ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{ranked.length - TOPN}} 个）</button>` : '';
         return `<div class="day-card wide"><div class="day-title">${{frame.label}}`
@@ -1540,6 +1698,11 @@ window.addEventListener('DOMContentLoaded', () => {{
       }}).join('') || '<div class="empty">暂无期间数据</div>';
     }}
     bindTrailRows();
+    const historyMore = document.getElementById('trail-history-more');
+    if (historyMore) historyMore.addEventListener('click', () => {{
+      trailHistoryExpanded = true;
+      renderTrailBoard();
+    }});
     if (trailSelected) paintTrail(trailSelected);
   }};
   const paintTrail = async id => {{
@@ -1557,56 +1720,70 @@ window.addEventListener('DOMContentLoaded', () => {{
       const sector = (trailData.sectors || []).find(item => item.id === id);
       if (!sector) return;
       hydrateTrailSector(sector);
-      const windowStocks = [...(sector.window_stocks || [])];
-      const renderWindowRows = (limit = windowStocks.length) => windowStocks.slice(0, limit).map((stock, index) => {{
-        const dates = (stock.limit_up_dates || []).join('、');
-        const board = stock.max_board == null ? '—' : stock.max_board + '板';
+      // A stock may hit limit-up on multiple dates in the review window.
+      // Keying by stock_code alone let a later date overwrite the current
+      // day's board/time annotation and rendered a valid value as "—".
+      const luByDateCode = {{}};
+      for (const [day, cell] of Object.entries(sector.daily || {{}})) {{
+        for (const st of (cell.stocks || [])) {{
+          luByDateCode[`${{day}}|${{st.stock_code}}`] = {{ board: st.board_level, time: st.limit_up_time }};
+        }}
+      }}
+      const panel = sector.members;
+      const renderDetailRows = (day, stocks) => stocks.map((stock, index) => {{
+        const lu = luByDateCode[`${{day}}|${{stock.code}}`] || null;
+        const board = lu && lu.board != null ? lu.board + '板' : '—';
+        const time = lu && lu.time ? lu.time : '—';
         return `<div class="day-row cols5 stock-detail-row" style="cursor:default"><span class="dim">${{index + 1}}</span>`
-          + `<span class="n">${{stock.stock_name || stock.stock_code || '—'}} <span class="dim">${{stock.stock_code || ''}}</span></span>`
-          + `<span class="num">${{stock.limit_up_days || 0}}</span>`
-          + `<span class="num ${{signCls(stock.latest_pct_chg)}}">${{fmtPctJs(stock.latest_pct_chg)}}</span>`
-          + `<span class="num">${{board}} <small class="dim">${{dates}}</small></span></div>`;
-      }}).join('') || '<div class="empty">窗口内无涨停成分股</div>';
-      const windowMore = windowStocks.length > TOPN
-        ? `<button type="button" class="trail-more" id="trail-window-more">加载全部（剩余 ${{windowStocks.length - TOPN}} 个）</button>` : '';
-      const windowPanel = `<div class="day-card wide"><div class="day-title">窗口涨停成分 · ${{windowStocks.length}}只</div>`
-        + `<div class="day-head cols5 stock-detail-head"><span>#</span><span>个股</span><span class="num">涨停天数</span><span class="num">最新涨幅</span><span class="num">最高板/日期</span></div>`
-        + `<div class="day-rows" id="trail-window-rows">${{renderWindowRows(TOPN)}}${{windowMore}}</div></div>`;
-      const renderDetailRows = stocks => stocks.map((stock, index) => {{
-        const board = stock.board_level == null ? '—' : stock.board_level + '板';
-        return `<div class="day-row cols5 stock-detail-row" style="cursor:default"><span class="dim">${{index + 1}}</span>`
-          + `<span class="n">${{stock.stock_name || stock.stock_code || '—'}} <span class="dim">${{stock.stock_code || ''}}</span></span>`
+          + `<span class="n">${{stock.name || stock.code || '—'}} <span class="dim">${{stock.code || ''}}</span></span>`
+          + `<span class="num ${{signCls(stock.pct)}}">${{fmtPctJs(stock.pct)}}</span>`
           + `<span class="num">${{board}}</span>`
-          + `<span class="num ${{signCls(stock.pct_chg)}}">${{fmtPctJs(stock.pct_chg)}}</span>`
-          + `<span class="num">${{fmtRateJs(stock.turnover)}}</span></div>`;
-      }}).join('') || '<div class="empty">当日无涨停</div>';
+          + `<span class="num">${{time}}</span></div>`;
+      }}).join('') || '<div class="empty">当日无成分数据</div>';
+      const memberPanel = panel ? {{
+        codes: panel.codes || [],
+        pct: trailData.stock_pct || {{}},
+      }} : null;
+      const namesMap = trailData.stock_names || {{}};
+      const dayStocks = day => {{
+        if (!memberPanel) return ((sector.daily || {{}})[day] || {{}}).stocks || [];
+        if (!Object.prototype.hasOwnProperty.call(memberPanel.pct, day)) {{
+          return (((sector.daily || {{}})[day] || {{}}).stocks || []).map(stock => ({{
+            code: stock.stock_code,
+            name: stock.stock_name || stock.stock_code,
+            pct: stock.pct_chg,
+          }}));
+        }}
+        const col = memberPanel.pct[day] || {{}};
+        return memberPanel.codes.map(code => ({{
+          code,
+          name: namesMap[code] || code,
+          pct: col[code] == null ? null : col[code] / 100,
+        }})).sort((a, b) => (b.pct == null ? -9999 : b.pct) - (a.pct == null ? -9999 : a.pct));
+      }};
       const cards = (trailData.dates || []).map(day => {{
         const cell = (sector.daily || {{}})[day] || {{}};
-        const stocks = [...(cell.stocks || [])];
-        const limitUpCount = cell.limit_up == null ? stocks.length : cell.limit_up;
-        const rows = renderDetailRows(stocks.slice(0, TOPN));
+        const stocks = dayStocks(day);
+        const limitUpCount = cell.limit_up == null ? ((cell.stocks || []).length) : cell.limit_up;
+        const rows = renderDetailRows(day, stocks.slice(0, TOPN));
         const more = stocks.length > TOPN
           ? `<button type="button" class="trail-more" data-day-more="${{day}}">加载全部（剩余 ${{stocks.length - TOPN}} 个）</button>` : '';
-        return `<div class="day-card"><div class="day-title">${{day}} · ${{limitUpCount}}只${{stocks.length !== Number(limitUpCount) ? ` · 明细 ${{stocks.length}}只` : ''}}</div>`
-          + `<div class="day-head cols5 stock-detail-head"><span>#</span><span>个股</span><span class="num">连板</span><span class="num">涨幅</span><span class="num">换手</span></div>`
+        return `<div class="day-card"><div class="day-title">${{day}} · 全部成分 ${{stocks.length}}只 · 涨停 ${{limitUpCount}}只</div>`
+          + `<div class="day-head cols5 stock-detail-head"><span>#</span><span>个股</span><span class="num">涨幅</span><span class="num">连板</span><span class="num">封板时间</span></div>`
           + `<div class="day-rows" data-day-rows="${{day}}">${{rows}}${{more}}</div></div>`;
       }}).join('');
       const latestCell = (sector.daily || {{}})[(trailData.dates || [])[0]] || {{}};
       const coverage = latestCell.coverage_pct == null ? '' : ` · 成分 K 线覆盖 ${{fmtRateJs(latestCell.coverage_pct)}}`;
+      const snapNote = memberPanel ? ` · 成分快照 ${{panel.snapshot_date || '—'}}` : '';
+      const compactNote = trailCompact ? ' · 总览仅内嵌最新日全部成分，历史日保留涨停明细；全量成分请进入全宽专页' : '';
       trailDetail.innerHTML = `<div class="sec-title"><strong>${{sector.name || id}}</strong>`
-        + `<span class="dim">各日涨停个股 · 一只票可以同时属于多个概念${{coverage}}</span></div>`
-        + `<div class="trail-scroll">${{windowPanel}}${{cards}}</div>`;
-      const windowMoreButton = document.getElementById('trail-window-more');
-      if (windowMoreButton) windowMoreButton.addEventListener('click', () => {{
-        const rows = document.getElementById('trail-window-rows');
-        if (rows) rows.innerHTML = renderWindowRows();
-        windowMoreButton.remove();
-      }});
+        + `<span class="dim">成分按涨幅排序，涨停股标注连板与封板时间 · 一只票可以同时属于多个概念${{coverage}}${{snapNote}}${{compactNote}}</span></div>`
+        + `<div class="trail-scroll">${{cards}}</div>`;
       document.querySelectorAll('#trail-detail [data-day-more]').forEach(button => button.addEventListener('click', () => {{
         const day = button.dataset.dayMore;
-        const cell = (sector.daily || {{}})[day] || {{}};
+        const stocks = dayStocks(day);
         const rows = document.querySelector(`#trail-detail [data-day-rows="${{day}}"]`);
-        if (rows) rows.innerHTML = renderDetailRows(cell.stocks || []);
+        if (rows) rows.innerHTML = renderDetailRows(day, stocks);
         button.remove();
       }}));
       return;
@@ -1628,7 +1805,9 @@ window.addEventListener('DOMContentLoaded', () => {{
           + `<span class="num">${{stock.limit_up ?? '—'}}</span>`
           + `<span class="num ${{signCls(stock.pct_chg)}}">${{fmtPctJs(stock.pct_chg)}}</span>`
           + `<span class="num">${{stock.board_level == null ? '—' : stock.board_level + '板'}}</span></div>`;
-      }}).join('') : '<div class="empty">该期无涨停</div>';
+      }}).join('') : (trailCompact
+        ? '<div class="empty">总览页仅保留周/月/季汇总；期间个股明细请点击上方“进入全宽专页”。</div>'
+        : '<div class="empty">该期无涨停</div>');
       const more = stocks.length > TOPN
         ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{stocks.length - TOPN}} 个）</button>` : '';
       return `<div class="day-card wide"><div class="day-title">${{frame.label}} · ${{cell.limit_up || 0}}次`
@@ -1654,6 +1833,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     }});
   }});
   bindTrailRows();
+  renderTrailBoard();
 
   document.querySelectorAll('[data-tabs]').forEach(group => {{
     const buttons = [...group.querySelectorAll('[data-tab]')];
@@ -1764,33 +1944,156 @@ def _render_sector_trail_standalone(
 """
 
 
+def _render_support_page(
+    ctx: dict[str, Any],
+    trade_date: str,
+    extras_html: str,
+    staleness_banner: str = "",
+) -> str:
+    """Render machine-facing evidence and historical support sections.
+
+    The daily page is intentionally small and decision-oriented.  This page
+    keeps the detailed tables, QLib shadow output, source checkpoints and
+    auxiliary history available as a separate self-contained artifact.
+    """
+    lhb = _render_lhb(ctx)
+    tables = _render_tables(ctx)
+    qlib_research = _render_qlib_research(ctx)
+    gates = _render_data_gates(ctx)
+    plans = _render_plans(ctx)
+    generated = str(ctx.get("page_generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    data_as_of = str(
+        ctx.get("data_as_of")
+        or (ctx.get("readiness") or {}).get("as_of")
+        or trade_date
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>复盘证据与系统附录 · {_e(trade_date)}</title>
+<style>{_CSS}</style>
+</head>
+<body>
+{_top_nav("support")}
+<main class="wrap">
+  <header class="support-head">
+    <div class="page-title">复盘证据与系统附录 · {_e(trade_date)}</div>
+    <div class="page-sub">生成 { _e(generated) } · 数据截止 { _e(data_as_of) } · 详细证据不直接参与交易门禁</div>
+  </header>
+  {staleness_banner}
+  <div class="notice">本页用于核对数据来源、辅助历史、QLib shadow、龙虎榜和操作记录。若与日复盘摘要冲突，以当前日期、来源和门禁状态为准。</div>
+  <section><div class="sec-title"><strong>龙虎榜</strong></div>{lhb}</section>
+  <section><div class="sec-title"><strong>资金明细</strong><span class="dim">个股 / 板块 / 行业 / 持续性</span></div>{tables}</section>
+  <section><div class="sec-title"><strong>QLib 研究区</strong><span class="dim">shadow / research-only</span></div>{qlib_research}</section>
+  <section><div class="sec-title"><strong>数据门禁</strong></div>{gates}</section>
+  <section><div class="sec-title"><strong>操作计划</strong></div>{plans}</section>
+  {extras_html}
+  <div class="footer">复盘证据与系统附录 · {_e(trade_date)} · 静态自包含 HTML</div>
+</main>
+</body>
+</html>
+"""
+
+
+def _staleness_banner(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
+    """Red banner when core sources lag the review date.
+
+    A missing block must never look like a quiet zero.  This is the page's
+    single place where stale/missing upstream data is made loud.
+    """
+    core_checks = [
+        ("涨停池", "v_limit_pool", "trade_date"),
+        ("K线", "v_kline_daily", "trade_date"),
+        ("个股资金流", "multi_source_stock_flow", "source_date"),
+        ("板块资金流", "multi_source_sector_flow", "source_date"),
+        ("同花顺概念快照", "v_default_concept_daily", "trade_date"),
+    ]
+    supplemental_checks = [
+        ("竞价证据", "auction_evidence_snapshot", "trade_date"),
+        ("龙虎榜", "v_lhb_daily", "trade_date"),
+        ("指数行情", "v_index_state", "trade_date"),
+        ("官方筹码", "xdf_cyq_perf", "trade_date"),
+        ("两融", "xdf_margin_summary", "trade_date"),
+        ("盘前数据", "xdf_stk_premarket", "trade_date"),
+    ]
+    def stale_items(checks: list[tuple[str, str, str]]) -> list[str]:
+        stale: list[str] = []
+        for label, table, col in checks:
+            try:
+                row = con.execute(
+                    f"SELECT max(CAST({col} AS DATE)) FROM {table}"
+                ).fetchone()
+                latest = row[0] if row else None
+                if latest is None or str(latest) < trade_date:
+                    have = str(latest) if latest else "无数据"
+                    stale.append(f"{label}（最新 {have}）")
+            except Exception:
+                stale.append(f"{label}（表缺失）")
+        return stale
+
+    core_stale = stale_items(core_checks)
+    supplemental_stale = stale_items(supplemental_checks)
+    banners: list[str] = []
+    if core_stale:
+        items = "、".join(core_stale)
+        banners.append(
+            "<div class='stale-banner' style='background:#5a1a1a;border:1px solid #d64545;"
+            "color:#ffd7d7;border-radius:8px;padding:10px 14px;margin:14px 0;font-size:13px'>"
+            "<strong>⚠ 核心数据断档：</strong>以下数据未覆盖复盘日，相关结论不可作为当日事实"
+            f" —— {items}</div>"
+        )
+    if supplemental_stale:
+        items = "、".join(supplemental_stale)
+        banners.append(
+            "<div class='stale-banner' style='background:#4a3512;border:1px solid #b7832f;"
+            "color:#ffe3ad;border-radius:8px;padding:10px 14px;margin:14px 0;font-size:13px'>"
+            "<strong>△ 补充模块降级：</strong>下列模块仅展示其最新已持久化批次，不参与当日执行门禁"
+            f" —— {items}</div>"
+        )
+    return "".join(banners)
+
+
 def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
                trend: dict[str, Any], ladder: list[dict[str, Any]],
                rotation: list[dict[str, Any]],
-               lazy_asset_name: str | None = None) -> str:
+               lazy_asset_name: str | None = None,
+               staleness_banner: str = "") -> str:
     ctx["narrative"] = ctx.get("narrative") or build_review_narrative(ctx)
     kpis = _render_kpis(ctx)
     verdict = _render_command_summary(ctx)
-    tables = _render_tables(ctx)
     themes = _render_themes(ctx)
     concept_limit_up = ctx.get("concept_limit_up") or {}
-    concept_drilldown = _render_concept_limit_up(
-        ctx,
-        inline_stock_limit=50 if lazy_asset_name else None,
-    )
-    qlib_research = _render_qlib_research(ctx)
+    concept_drilldown = _render_concept_limit_up(ctx, inline_stock_limit=50)
     stages = _render_stages(ctx)
     alerts = _render_alerts(ctx)
     loop = _render_loop(ctx)
-    gates = _render_data_gates(ctx)
     flow_compact = _render_flow_compact(ctx)
     tomorrow = _render_tomorrow(ctx)
-    lhb = _render_lhb(ctx)
     named_ladder = _render_named_ladder(ctx)
     yday_limitup = _render_yday_limitup(ctx)
     broken = _render_broken(ctx)
-    sector_trail = _render_sector_trail(ctx, external_lazy=bool(lazy_asset_name))
-    concept_data = _concept_inline_data(ctx, stock_limit=50) if lazy_asset_name else None
+    sector_trail = _render_sector_trail(
+        ctx,
+        external_lazy=bool(lazy_asset_name),
+        compact_overview=True,
+    )
+    # Keep only the first 50 members in the live JS object.  The complete
+    # concept catalogue is embedded as inert JSON below and parsed only when
+    # the user opens a later concept or clicks "加载全部个股".  This preserves
+    # the self-contained-file contract without building hundreds of cards at
+    # initial load.
+    # The server-rendered first card is enough for the initial JS state. The
+    # complete concept payload remains inert and is parsed only after the user
+    # switches concepts, so metadata is not duplicated in executable JS.
+    concept_data = _concept_inline_data(ctx, stock_limit=50)[:1]
+    concept_payload_json = json.dumps(
+        concept_limit_up.get("groups") or [],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).replace("</", "<\\/")
     consecutive = ctx.get("consecutive")
     generated = str(ctx.get("page_generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     data_as_of = str(
@@ -1813,14 +2116,10 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
 <header class="masthead">
   <div class="mast-mark">盘后复盘</div>
   <nav class="toc">
-    <a href="#s-verdict">裁决</a>
-    <a href="#s-weather">天气</a>
-    <a href="#s-ladder">连板</a>
-    <a href="#s-trail">板块</a>
-    <a href="#s-yday">溢价</a>
-    <a href="#s-mainline">主线</a>
-    <a href="#s-flow">资金</a>
-    <a href="#s-loop">闭环</a>
+    <a href="#s-decision">结论</a>
+    <a href="#s-market">市场</a>
+    <a href="#s-themes">题材</a>
+    <a href="#s-confirm">确认</a>
     <a href="#s-next">次日</a>
     <a href="#s-appendix">附录</a>
   </nav>
@@ -1829,8 +2128,15 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
 
 <main class="wrap">
 
-  {verdict}
+  {staleness_banner}
 
+  <div class="review-band" id="s-decision" data-band-title="结论">
+    <div class="band-label">01 · 结论</div>
+    {verdict}
+  </div>
+
+  <div class="review-band" id="s-market" data-band-title="市场">
+    <div class="band-label">02 · 市场</div>
   <section id="s-weather" data-screen-label="weather">
     <div class="sec-title"><strong>市场天气</strong><span class="sec-kicker">宽度 · 情绪 · 连板</span></div>
     <div class="ticker">{kpis}</div>
@@ -1854,6 +2160,16 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     </div>
   </section>
 
+  <section id="s-yday" data-screen-label="yday">
+    <div class="sec-title"><strong>昨日涨停今日表现</strong><span class="sec-kicker">打板环境 · 亏钱来源</span></div>
+    {yday_limitup}
+    <div class="sec-title" style="margin-top:22px"><strong>接力失败</strong><span class="dim">昨 2 板+ 今日未封</span></div>
+    {broken}
+  </section>
+  </div>
+
+  <div class="review-band" id="s-themes" data-band-title="题材">
+    <div class="band-label">03 · 题材</div>
   <section id="s-trail" data-screen-label="trail">
     <div class="sec-title"><strong>板块轨迹</strong><span class="sec-kicker">日 / 周 / 月 / 季 · 四个窗口看轮动</span>
       <a href="sector_trail_latest.html" target="_blank" rel="noopener"
@@ -1861,13 +2177,6 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
         ↗ 进入全宽专页（桌面布局）</a></div>
     {sector_trail}
     <div class="concept-footnote">日：当日涨停只数。周/月/季：窗口内涨停次数、概念资金涨幅、资金净流入合计；下方个股区间收益为窗口首收至末收。一只票可以同时属于多个概念。过宽概念已排除。</div>
-  </section>
-
-  <section id="s-yday" data-screen-label="yday">
-    <div class="sec-title"><strong>昨日涨停今日表现</strong><span class="sec-kicker">打板环境 · 亏钱来源</span></div>
-    {yday_limitup}
-    <div class="sec-title" style="margin-top:22px"><strong>接力失败</strong><span class="dim">昨 2 板+ 今日未封</span></div>
-    {broken}
   </section>
 
   <section id="s-mainline" data-screen-label="mainline">
@@ -1885,7 +2194,10 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
       </div>
     </div>
   </section>
+  </div>
 
+  <div class="review-band" id="s-confirm" data-band-title="确认">
+    <div class="band-label">04 · 确认</div>
   <section id="s-flow" data-screen-label="flow">
     <div class="sec-title"><strong>资金确认</strong><span class="sec-kicker">只看确认，不看全表</span></div>
     {flow_compact}
@@ -1897,8 +2209,10 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     <div class="sec-title" style="margin-top:22px"><strong>四阶段漏斗</strong></div>
     {stages}
   </section>
+  </div>
 
     <section id="s-next" class="tomorrow" data-screen-label="tomorrow">
+    <div class="band-label">05 · 次日</div>
     <div class="sec-title"><strong>明天只看这几件事</strong><span class="sec-kicker">约法三章，防止乱开仓</span></div>
     {tomorrow}
     <div class="sec-title" style="margin-top:22px"><strong>风险告警</strong></div>
@@ -1908,22 +2222,10 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
   <!--EXTRAS-->
 
   <details class="appendix" id="s-appendix">
-    <summary>附录<span>龙虎榜 · 全表资金 · QLib · 门禁 · 研究接口</span></summary>
-    <div class="sec-title"><strong>龙虎榜</strong></div>
-    {lhb}
-    <div class="sec-title"><strong>资金全表</strong><span class="dim">个股 / 板块 / 行业 / 持续性</span></div>
-    {tables}
-    <div class="sec-title" id="s-qlib"><strong>QLib 研究区</strong><span class="dim">shadow / research-only</span></div>
-    {qlib_research}
-    <div class="sec-title" id="s-gate"><strong>数据质量门禁</strong></div>
-    {gates}
-    <div class="sec-title" id="s-ai"><strong>AI 复盘接口</strong><span class="dim">facts-only / shadow</span></div>
-    <div class="notice">
-      结构化事实已写入 <span class="mono">reports/ai_review_facts_latest.json</span>。
-      可选模型只能总结、解释和标注风险，不能补造数据、修改门禁或生成订单。
-    </div>
-    <div class="sec-title"><strong>计划原文</strong></div>
-    {_render_plans(ctx)}
+    <summary>证据与系统附录<span>龙虎榜 · 资金全表 · QLib · 门禁 · 辅助历史</span></summary>
+    <div class="notice">详细证据已从日页移出，避免陈旧辅助数据与当日结论混排。</div>
+    <p style="margin-top:10px"><a href="review_support_latest.html" target="_blank" rel="noopener"
+      style="color:#7fb2ff;text-decoration:none">↗ 打开复盘证据与系统附录</a></p>
   </details>
 
   <div class="footer">
@@ -1932,6 +2234,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
 </main>
 
 <script>{echarts_src}</script>
+<script type="application/json" id="review-concept-data">{concept_payload_json}</script>
 <script>{_chart_js(ctx, trend, ladder, rotation, concept_limit_up, lazy_asset_name=lazy_asset_name, concept_data=concept_data)}</script>
 <script>document.getElementById('gen-note').textContent = '生成 {generated}';</script>
 </body>
@@ -1945,6 +2248,8 @@ def _render_review_bundle(
     echarts_path: str | Path | None = None,
     lazy_asset_name: str | None = None,
     trail_out: str | Path | None = None,
+    context: dict[str, Any] | None = None,
+    as_of: datetime | str | None = None,
 ) -> tuple[str, str, str | None]:
     """Build HTML and, when requested, the optional same-directory sidecar."""
     if echarts_path is None:
@@ -1955,8 +2260,12 @@ def _render_review_bundle(
         echarts_src = "/* echarts unavailable */"
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        selected = trade_date or _latest_date(con)
-        ctx = build_daily_review_context(db_path, selected, con=con)
+        selected = trade_date or (context or {}).get("trade_date") or _latest_date(con)
+        ctx = (
+            dict(context)
+            if context is not None
+            else build_daily_review_context(db_path, selected, con=con, as_of=as_of)
+        )
         from trade_system import review_extras
         ctx["extras_sections"] = review_extras.render_all(db_path, selected)
         ctx["page_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1970,6 +2279,7 @@ def _render_review_bundle(
             "candidate_flow": page_facts["candidate_flow"],
             "emotion_rows": page_facts["emotion_rows"],
             "consecutive": page_facts["consecutive"],
+            "metric_contract": page_facts["metric_contract"],
         })
         html_out = _page_html(
             ctx,
@@ -1979,7 +2289,8 @@ def _render_review_bundle(
             ladder,
             rotation,
             lazy_asset_name=lazy_asset_name,
-        ).replace("<!--EXTRAS-->", ctx.get("extras_sections") or "")
+            staleness_banner=_staleness_banner(con, selected),
+        ).replace("<!--EXTRAS-->", "")
 
         # Final-pass i18n: replace internal field names with Chinese labels
         # regardless of which module generated them.
@@ -1996,6 +2307,14 @@ def _render_review_bundle(
 
         lazy_out = _build_review_lazy_asset(ctx) if lazy_asset_name else None
         if trail_out:
+            support_page = _render_support_page(
+                ctx,
+                selected,
+                ctx.get("extras_sections") or "",
+                _staleness_banner(con, selected),
+            )
+            support_path = Path(trail_out).parent / "review_support_latest.html"
+            support_path.write_text(support_page, encoding="utf-8")
             from trade_system.cycle import PHASE_CN  # noqa: F401 (page CSS/JS refs)
 
             phase_row = con.execute(
@@ -2028,18 +2347,37 @@ def render_review_web(db_path: str | Path, trade_date: str | None = None,
 
 
 def write_review_web(db_path: str | Path, out_path: str | Path,
-                     trade_date: str | None = None) -> Path:
-    """Render the review page and write it to ``out_path``. Returns the path."""
+                     trade_date: str | None = None,
+                     *, allow_direct_publish: bool = False,
+                     context: dict[str, Any] | None = None,
+                     as_of: datetime | str | None = None) -> Path:
+    """Render the review page and write it to ``out_path``. Returns the path.
+
+    The page is fully self-contained: trail/concept drill-down details are
+    inlined instead of loaded from a sidecar script.  The dynamic sidecar
+    injection silently blanked the 板块轨迹 stock panel whenever the extra
+    file was missing, blocked, or slow — a static local report must not
+    depend on a second fetch to render its core sections.
+    """
     out = Path(out_path)
+    project_reports = Path(__file__).resolve().parents[1] / "reports"
+    if (
+        not allow_direct_publish
+        and out.resolve().parent == project_reports.resolve()
+        and out.name in {"daily_review_latest.html", "sector_trail_latest.html"}
+    ):
+        raise ValueError(
+            "latest review files must be written through the integrated pipeline; "
+            "use a staging/preview path or explicitly allow direct publish"
+        )
     out.parent.mkdir(parents=True, exist_ok=True)
-    lazy_name = f"{out.stem}.lazy.js"
-    html_out, selected, lazy_out = _render_review_bundle(
+    html_out, selected, _lazy_out = _render_review_bundle(
         db_path,
         trade_date,
-        lazy_asset_name=lazy_name,
+        lazy_asset_name=None,
         trail_out=out.parent / "sector_trail_latest.html",
+        context=context,
+        as_of=as_of,
     )
     out.write_text(html_out, encoding="utf-8")
-    if lazy_out is not None:
-        out.with_name(lazy_name).write_text(lazy_out, encoding="utf-8")
     return out

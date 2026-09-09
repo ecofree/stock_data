@@ -21,6 +21,16 @@ def test_empty_table_catalog_classifies_empty_tables_by_endpoint_status(tmp_path
         "('/auction/tick','auction_tick',0,'needs_trading_session','professional_core'),"
         "('/news/theme','news_theme',0,'api_available','professional_useful')"
     )
+    con.execute(
+        "CREATE TABLE api_endpoint_probe_run("
+        "run_id VARCHAR PRIMARY KEY,base_url VARCHAR,probe_date DATE,"
+        "endpoint_count INTEGER,status VARCHAR,started_at TIMESTAMP,"
+        "completed_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO api_endpoint_probe_run VALUES "
+        "('test-run','https://kpl-api.cn', '2026-07-06', 2, 'completed', now(), now())"
+    )
     con.close()
 
     catalog = build_empty_table_catalog(db_path)

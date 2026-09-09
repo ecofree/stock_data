@@ -25,6 +25,7 @@ from trade_system.tushare_relay import (
     sync_tushare_ohlc_to_core_tables,
     ts_code_to_index_code,
 )
+from trade_system.trading_calendar import open_session_dates
 
 
 DATA_KIND_SPECS = {
@@ -61,20 +62,7 @@ def _date_range(start_date: str, end_date: str) -> list[str]:
 def _open_dates(con: duckdb.DuckDBPyConnection, start_date: str, end_date: str) -> list[str]:
     start = _iso_date(start_date)
     end = _iso_date(end_date)
-    try:
-        rows = con.execute(
-            """
-            SELECT CAST(cal_date AS VARCHAR)
-            FROM tushare_trade_cal
-            WHERE cal_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-              AND is_open = TRUE
-            ORDER BY cal_date
-            """,
-            [start, end],
-        ).fetchall()
-    except Exception:
-        rows = []
-    return [str(row[0])[:10] for row in rows] or _date_range(start, end)
+    return open_session_dates(con, start, end)
 
 
 def _normalize_code(data_kind: str, code: str) -> str:

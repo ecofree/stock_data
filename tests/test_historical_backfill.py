@@ -155,6 +155,13 @@ def test_kpl_ranking_history_keeps_concepts_and_members(tmp_path):
     db = tmp_path / "kpl_history.duckdb"
     with KPLHistoryCollector(db) as collector:
         collector.client = FakeKPL()
+        # Historical collectors require an explicitly verified session list;
+        # they must not manufacture weekdays when the calendar is absent.
+        collector.store.conn.execute(
+            "INSERT INTO tushare_trade_cal(exchange,cal_date,is_open) "
+            "VALUES ('SSE','2026-07-10',true)"
+        )
+        collector.store.conn.commit()
         result = collector.run("20260710", "20260710", max_days=1)
         assert result["results"][0]["status"] == "success"
         assert collector.store.conn.execute("select concept_code,concept_name from kpl_concept_daily").fetchone() == ("C001", "银行概念")

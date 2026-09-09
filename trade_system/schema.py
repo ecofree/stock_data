@@ -1,6 +1,9 @@
 """Database schema definitions for KPL data storage."""
+import os
 import duckdb
 from datetime import datetime
+
+from trade_system.source_authority import provider_rank_sql
 
 
 def _ensure_business_indexes(db: duckdb.DuckDBPyConnection) -> None:
@@ -43,6 +46,7 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
         "ths_concept_daily",
         "ths_concept_stock_history",
         "ths_concept_member_checkpoint",
+        "ths_concept_snapshot_expectation",
         "kpl_concept_daily",
         "kpl_concept_stock_history",
     )
@@ -54,7 +58,8 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
         for name in required
     ):
         return
-    db.execute("""
+    concept_provider_order = provider_rank_sql("ths_concept", "provider")
+    db.execute(f"""
         CREATE OR REPLACE VIEW v_default_concept_daily AS
         WITH concept_quality AS (
             SELECT trade_date, count(DISTINCT concept_code) AS concept_count,
@@ -74,12 +79,17 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
             SELECT trade_date, count(DISTINCT concept_code) AS checkpoint_total,
                    sum(CASE WHEN status='success' THEN 1 ELSE 0 END) AS checkpoint_success
             FROM ths_concept_member_checkpoint GROUP BY trade_date
+        ), expected_quality AS (
+            SELECT trade_date, expected_concepts
+            FROM ths_concept_snapshot_expectation
+            WHERE status IN ('success', 'bootstrap_observed')
         ), snapshot_quality AS (
             SELECT c.trade_date
             FROM concept_quality c
             JOIN member_quality m USING (trade_date)
             JOIN checkpoint_quality cp USING (trade_date)
-            WHERE c.concept_count >= 374
+            JOIN expected_quality e USING (trade_date)
+            WHERE c.concept_count = e.expected_concepts
               AND c.fetched_dates=1 AND m.fetched_dates=1
               AND c.verified_concepts=c.concept_rows
               AND m.verified_members=m.member_rows
@@ -91,12 +101,7 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
             SELECT trade_date, concept_code, provider,
                    row_number() OVER (
                        PARTITION BY trade_date, concept_code
-                       ORDER BY CASE provider
-                           WHEN 'ths_index_blockrank' THEN 1
-                           WHEN 'tushare_ths_member' THEN 2
-                           WHEN 'ths_concept_board' THEN 3
-                           WHEN 'ths_web+ths_member_supplement' THEN 4
-                           ELSE 9 END,
+                       ORDER BY {concept_provider_order} ASC,
                            updated_at DESC NULLS LAST
                    ) AS provider_rank
             FROM ths_concept_member_checkpoint
@@ -118,16 +123,13 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
                   ) <> 'true'
               AND coalesce(t.date_verified, false) = true
         )
+        -- KPL is retained as a raw/recovery source, but it is not eligible
+        -- for the default review contract until it has a source-controlled
+        -- completeness checkpoint equivalent to the THS snapshot contract.
+        -- A partial KPL date must never look like a complete concept universe.
         SELECT * FROM ths_quality
-        UNION ALL
-        SELECT k.trade_date, k.concept_code, k.concept_name, k.rank, k.stock_count, k.source, k.raw_json, k.date_verified
-        FROM kpl_concept_daily k
-        WHERE NOT EXISTS (
-            SELECT 1 FROM ths_quality t
-            WHERE t.trade_date = k.trade_date
-        )
     """)
-    db.execute("""
+    db.execute(f"""
         CREATE OR REPLACE VIEW v_default_concept_stock_history AS
         WITH concept_quality AS (
             SELECT trade_date, count(DISTINCT concept_code) AS concept_count,
@@ -147,12 +149,17 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
             SELECT trade_date, count(DISTINCT concept_code) AS checkpoint_total,
                    sum(CASE WHEN status='success' THEN 1 ELSE 0 END) AS checkpoint_success
             FROM ths_concept_member_checkpoint GROUP BY trade_date
+        ), expected_quality AS (
+            SELECT trade_date, expected_concepts
+            FROM ths_concept_snapshot_expectation
+            WHERE status IN ('success', 'bootstrap_observed')
         ), snapshot_quality AS (
             SELECT c.trade_date
             FROM concept_quality c
             JOIN member_quality m USING (trade_date)
             JOIN checkpoint_quality cp USING (trade_date)
-            WHERE c.concept_count >= 374
+            JOIN expected_quality e USING (trade_date)
+            WHERE c.concept_count = e.expected_concepts
               AND c.fetched_dates=1 AND m.fetched_dates=1
               AND c.verified_concepts=c.concept_rows
               AND m.verified_members=m.member_rows
@@ -164,12 +171,7 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
             SELECT trade_date, concept_code, provider,
                    row_number() OVER (
                        PARTITION BY trade_date, concept_code
-                       ORDER BY CASE provider
-                           WHEN 'ths_index_blockrank' THEN 1
-                           WHEN 'tushare_ths_member' THEN 2
-                           WHEN 'ths_concept_board' THEN 3
-                           WHEN 'ths_web+ths_member_supplement' THEN 4
-                           ELSE 9 END,
+                       ORDER BY {concept_provider_order} ASC,
                            updated_at DESC NULLS LAST
                    ) AS provider_rank
             FROM ths_concept_member_checkpoint
@@ -192,19 +194,21 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
                   ) <> 'true'
               AND coalesce(h.date_verified, false) = true
         )
+        -- See v_default_concept_daily: KPL history remains available for
+        -- repair/audit, never as an unchecked default-page fallback.
         SELECT * FROM ths_quality
-        UNION ALL
-        SELECT k.trade_date, k.concept_code, k.concept_name, k.stock_code, k.stock_name, k.concept_rank, k.source, k.raw_json, k.date_verified
-        FROM kpl_concept_stock_history k
-        WHERE NOT EXISTS (
-            SELECT 1 FROM ths_quality t
-            WHERE t.trade_date = k.trade_date
-        )
     """)
 
 
 def init_schema(db: duckdb.DuckDBPyConnection):
     """Initialize all tables for KPL data storage."""
+    # The canonical runner applies numbered migrations before launching
+    # collectors and marks child processes with this flag.  In that mode a
+    # collector may use the already-open connection for business writes, but
+    # must never perform bootstrap DDL while the pipeline lock is held.
+    # Standalone/recovery callers retain the historical bootstrap behavior.
+    if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() == "1":
+        return
     
     # ========== 市场情绪 (3) ==========
     db.execute("""
@@ -882,6 +886,16 @@ def init_schema(db: duckdb.DuckDBPyConnection):
         db.execute(
             f"ALTER TABLE ths_concept_member_checkpoint ADD COLUMN IF NOT EXISTS {_column} {_type}"
         )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS ths_concept_snapshot_expectation (
+            trade_date DATE PRIMARY KEY,
+            expected_concepts INTEGER NOT NULL,
+            provider VARCHAR NOT NULL,
+            catalog_hash VARCHAR,
+            status VARCHAR DEFAULT 'success',
+            fetched_at TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
     # Source-aware, quality-gated default relations.  Keep this refresh in a
     # shared helper so normal view maintenance cannot leave stale concept
     # semantics behind.
@@ -922,6 +936,10 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             volume DOUBLE,
             turnover DOUBLE,
             change_pct DOUBLE,
+            volume_unit VARCHAR,
+            amount_unit VARCHAR,
+            adjustment VARCHAR,
+            provider VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -1100,6 +1118,9 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             amount DOUBLE,
             change_pct DOUBLE,
             provider VARCHAR,
+            volume_unit VARCHAR,
+            amount_unit VARCHAR,
+            adjustment VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp,
             is_stale BOOLEAN DEFAULT FALSE,
             raw_json VARCHAR
@@ -1170,6 +1191,8 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             total_mv DOUBLE,
             circ_mv DOUBLE,
             provider VARCHAR,
+            total_mv_unit VARCHAR,
+            circ_mv_unit VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp,
             is_stale BOOLEAN DEFAULT FALSE,
             raw_json VARCHAR
@@ -1484,6 +1507,7 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             time VARCHAR,
             price DOUBLE,
             volume BIGINT,
+            volume_unit VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -1751,6 +1775,10 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             turnover BIGINT,
             change_pct DOUBLE,
             ktype VARCHAR,
+            volume_unit VARCHAR,
+            amount_unit VARCHAR,
+            adjustment VARCHAR,
+            provider VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -2587,6 +2615,24 @@ def init_schema(db: duckdb.DuckDBPyConnection):
     _applied = apply_pending(db)
     if _applied:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Applied schema migrations: {_applied}")
+
+    # Existing databases predate the dynamic THS expectation relation.  Seed
+    # their historical official snapshots once, explicitly marked as an
+    # observed bootstrap; the API collector replaces the row with a real
+    # catalogue hash on the next full run.  This statement lives here rather
+    # than in the migration because minimal migration fixtures may not carry
+    # the large THS history tables yet.
+    db.execute("""
+        INSERT INTO ths_concept_snapshot_expectation(
+            trade_date, expected_concepts, provider, catalog_hash, status
+        )
+        SELECT trade_date, count(DISTINCT concept_code),
+               'migration_bootstrap', 'bootstrap_observed', 'bootstrap_observed'
+        FROM ths_concept_daily
+        WHERE source = 'hithink_index_api'
+        GROUP BY trade_date
+        ON CONFLICT(trade_date) DO NOTHING
+    """)
 
     _ensure_business_indexes(db)
     

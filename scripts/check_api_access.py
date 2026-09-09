@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import API_BASE, API_KEY
 from trade_system.api_health import require_api_key
+from trade_system.http_transport import classify_transport_error, open_verified, ssl_context_note
 
 
 def main() -> int:
@@ -28,13 +29,25 @@ def main() -> int:
     url = f"{API_BASE}{args.endpoint}?{urllib.parse.urlencode({'date': args.date})}"
     req = urllib.request.Request(url, headers={"accept": "application/json", "X-API-Key": key})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = resp.read(300).decode("utf-8", "replace").replace("\n", " ")
-            print(f"API access: status={resp.status} endpoint={args.endpoint} body_sample={body[:220]}")
+        with open_verified(req, timeout=20) as resp:
+            # Do not write provider text to a GBK console.  The old body
+            # sample could turn a valid response into a UnicodeEncodeError;
+            # status/content-type/byte count are sufficient for this canary.
+            body = resp.read()
+            print(
+                f"API access: status={resp.status} endpoint={args.endpoint} "
+                f"content_type={resp.headers.get('content-type', '')} bytes={len(body)}"
+            )
             return 0
     except urllib.error.HTTPError as exc:
-        body = exc.read(300).decode("utf-8", "replace").replace("\n", " ")
-        print(f"API access: http={exc.code} endpoint={args.endpoint} body_sample={body[:220]}")
+        exc.read(300)
+        print(f"API access: http={exc.code} endpoint={args.endpoint}")
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            f"API access: error={classify_transport_error(exc)} "
+            f"transport={ssl_context_note()}"
+        )
         return 1
     except Exception as exc:
         print(f"API access: error={type(exc).__name__} message={str(exc)[:220]}")

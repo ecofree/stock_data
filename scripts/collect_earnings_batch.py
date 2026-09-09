@@ -70,7 +70,9 @@ def main() -> int:
     client = HiThinkClient(min_interval=0.5)
 
     try:
-        con = duckdb.connect(args.db)
+        # Read-only probe: requesting the writer lock here would collide with
+        # the close-phase pipeline for no benefit.
+        con = duckdb.connect(args.db, read_only=True)
         codes = [r[0] for r in con.execute(
             "SELECT DISTINCT stock_code FROM official_limit_pool WHERE trade_date=?",
             [args.trade_date]).fetchall()]

@@ -103,7 +103,7 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     top_concept = (concepts[0].get("concept_name") if concepts else None) or None
     top_limit_up = concepts[0].get("limit_up_count") if concepts else None
     missing = [str(item) for item in (readiness.get("missing_groups") or []) if item]
-    blocked = control.get("override") == "BLOCK" or not readiness.get(
+    blocked = not readiness.get(
         "analysis_ready", readiness.get("certified_ready", False)
     )
     execution_ready = bool(control.get("execution_ready"))
@@ -293,7 +293,9 @@ def build_daily_review_context(
     trade_date: str | None = None,
     *,
     con: duckdb.DuckDBPyConnection | None = None,
+    as_of: datetime | str | None = None,
 ) -> dict:
+    review_now = datetime.fromisoformat(as_of) if isinstance(as_of, str) and as_of else as_of
     owns_connection = con is None
     con = con or duckdb.connect(str(db_path), read_only=True)
     flow_evidence_present = False
@@ -321,6 +323,8 @@ def build_daily_review_context(
             + " ORDER BY score DESC LIMIT 10",
             [selected_date],
         )
+        stage_cols = set(table_columns(con, "stock_candidate_stage_signal"))
+        stage_actionable = "is_actionable" in stage_cols
         stages = _rows(
             con,
             "stock_candidate_stage_signal",
@@ -328,6 +332,9 @@ def build_daily_review_context(
             SELECT stage, stock_code, stock_name, score, decision
             FROM stock_candidate_stage_signal
             WHERE trade_date = ?
+            """
+            + ("AND coalesce(is_actionable, false) = true " if stage_actionable else "")
+            + """
             ORDER BY stage, score DESC NULLS LAST, stock_code
             LIMIT 80
             """,
@@ -395,7 +402,11 @@ def build_daily_review_context(
             # current close evidence.  Keep the same 2-hour freshness contract
             # used by the integrated close gate.
             readiness = assess_trade_date_readiness(
-                con, selected_date, stage="postmarket", max_age_seconds=7200
+                con,
+                selected_date,
+                stage="postmarket",
+                max_age_seconds=7200,
+                now=review_now,
             )
         except Exception as exc:
             readiness = {
@@ -418,11 +429,24 @@ def build_daily_review_context(
     flow_health: dict[str, Any] = {}
     if flow_evidence_present:
         try:
-            flow_health = assess_capital_flow_health(
-                db_path,
-                selected_date,
-                max_age_seconds=None,
-            )
+            cached_flow_health = readiness.get("capital_flow_health") or {}
+            cached_blockers = cached_flow_health.get("blockers") or []
+            if not cached_flow_health or any(
+                str(item).startswith("capital_flow_health_error:")
+                for item in cached_blockers
+            ):
+                # ``assess_trade_date_readiness`` may be running on the open
+                # shared DuckDB connection.  DuckDB rejects a nested connection
+                # with different configuration on Windows; retry here after the
+                # context connection has closed, using the report's exact clock.
+                flow_health = assess_capital_flow_health(
+                    db_path,
+                    selected_date,
+                    max_age_seconds=7200,
+                    now=review_now,
+                )
+            else:
+                flow_health = cached_flow_health
         except Exception as exc:
             flow_health = {
                 "flow_certified_ready": False,
@@ -441,7 +465,9 @@ def build_daily_review_context(
         ),
         flow_certified_ready=flow_certified,
         execution_ready=bool(readiness.get("execution_ready", False)),
-        run_status="reviewed",
+        # The data context does not prove that a pipeline run was committed.
+        # Keep publication state separate from the review calculation.
+        run_status=readiness.get("run_status", "not_published"),
         blockers=(readiness.get("missing_groups") or [])
         + (flow_health.get("blockers") or []),
         warnings=flow_health.get("warnings") or [],
@@ -470,7 +496,14 @@ def build_daily_review_context(
     certified_ready = analysis_ready
     analytics_ready = analysis_ready
     execution_ready = bool(readiness.get("execution_ready"))
-    effective_position = suggested if analysis_ready else 0
+    # A model/regime suggestion is not an executable position allowance.
+    # While the execution gate is closed, surface the actual risk snapshot
+    # position (or zero), never the theoretical suggested cap.
+    effective_position = (
+        suggested
+        if execution_ready
+        else (risk_position if risk_position is not None else 0)
+    )
 
     return {
         "trade_date": selected_date,
@@ -951,12 +984,14 @@ def render_daily_review_markdown(context: dict) -> str:
     lines.extend(["", "## Risk Alerts", "", "| Severity | Category | Message |", "|---|---|---|"])
     lines.extend(_table_rows(context.get("alerts", []), ["severity", "category", "message"]))
 
-    lines.extend(["", "## Plan Execution", "", "| Stock | Max Position | Status | Entry | Stop |", "|---|---:|---|---|---|"])
+    execution_ready = bool(control.get("execution_ready"))
+    plan_heading = "Plan Execution" if execution_ready else "Research Plan Drafts (Execution Gate Closed)"
+    lines.extend(["", f"## {plan_heading}", "", "| Stock | Research Limit | Status | Observe | Invalidation |", "|---|---:|---|---|---|"])
     plan_rows = [
         {
             "stock": row.get("stock_name") or row.get("stock_code"),
             "max_position_pct": row.get("max_position_pct"),
-            "status": row.get("status"),
+            "status": row.get("status") if execution_ready else "research_draft_gate_closed",
             "entry_condition": row.get("entry_condition"),
             "stop_condition": row.get("stop_condition"),
         }
@@ -1059,9 +1094,27 @@ def render_daily_review_markdown(context: dict) -> str:
     return "\n".join(lines)
 
 
-def write_daily_review(db_path: str | Path, out_path: str | Path, trade_date: str | None = None) -> Path:
-    context = build_daily_review_context(db_path, trade_date)
+def write_daily_review(
+    db_path: str | Path,
+    out_path: str | Path,
+    trade_date: str | None = None,
+    *,
+    allow_direct_publish: bool = False,
+    context: dict | None = None,
+    as_of: datetime | str | None = None,
+) -> Path:
+    context = context or build_daily_review_context(db_path, trade_date, as_of=as_of)
     path = Path(out_path)
+    project_reports = Path(__file__).resolve().parents[1] / "reports"
+    if (
+        not allow_direct_publish
+        and path.resolve().parent == project_reports.resolve()
+        and path.name == "daily_review_latest.md"
+    ):
+        raise ValueError(
+            "latest review files must be written through the integrated pipeline; "
+            "use a staging/preview path or explicitly allow direct publish"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_daily_review_markdown(context), encoding="utf-8")
     return path

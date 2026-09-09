@@ -9,7 +9,7 @@ for pre-market context), and fallback-only evidence must remain visible.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -144,6 +144,23 @@ def relation_freshness(
             "latest_timestamp": None,
             "status": "missing_relation",
         }
+    # In the production database v_kline_daily is a canonical/fallback view
+    # over the large TuShare staging table.  Re-expanding its de-duplication
+    # window for every readiness relation can consume several GB and is
+    # unnecessary for the close gate, which separately certifies tushare_daily.
+    # Read the same authority directly while keeping the public relation name
+    # in the readiness payload.
+    if relation == "v_kline_daily" and table_exists(con, "tushare_daily"):
+        result = relation_freshness(
+            con,
+            "tushare_daily",
+            trade_date,
+            max_age_seconds=max_age_seconds,
+            now=now,
+        )
+        result["relation"] = relation
+        result["source_relation"] = "tushare_daily"
+        return result
     date_column = _date_column(con, relation)
     if not date_column:
         return {
@@ -173,7 +190,14 @@ def relation_freshness(
         else "count(*)"
     )
     timestamp_column = _timestamp_column(con, relation)
-    timestamp_expr = f'max("{timestamp_column}")' if timestamp_column else "NULL"
+    # Legacy relations may store fetched_at/updated_at as VARCHAR while newer
+    # relations use TIMESTAMP.  Cast at the SQL boundary so both schemas obey
+    # the same as-of and freshness contract.
+    timestamp_value_expr = (
+        f'TRY_CAST("{timestamp_column}" AS TIMESTAMP)'
+        if timestamp_column else "NULL"
+    )
+    timestamp_expr = f'max({timestamp_value_expr})' if timestamp_column else "NULL"
     flow_columns = (
         ("main_net", "super_net", "large_net", "mid_net", "small_net")
         if relation == "multi_source_sector_flow"
@@ -192,7 +216,7 @@ def relation_freshness(
     if relation == "multi_source_stock_flow" and "main_net" in columns:
         valid_flow = '"main_net" IS NOT NULL'
     as_of_filter = (
-        f' AND "{timestamp_column}" <= ?'
+        f" AND {timestamp_value_expr} <= ?"
         if now is not None and timestamp_column
         else ""
     )
@@ -224,8 +248,8 @@ def relation_freshness(
                 FROM "{relation}"
                 WHERE CAST("{date_column}" AS VARCHAR) = ?
                   AND {valid_flow}
-                  AND "{timestamp_column}" >= ?
-                  AND "{timestamp_column}" <= ?
+                  AND {timestamp_value_expr} >= ?
+                  AND {timestamp_value_expr} <= ?
                 """,
                 [trade_date, cutoff, now or datetime.now()],
             ).fetchone()
@@ -334,7 +358,11 @@ def _sector_semantic_gate(con: duckdb.DuckDBPyConnection, trade_date: str) -> di
         # "validated" from "legacy semantic checks unavailable".
         return {"ready": True, "invalid_rows": 0, "issues": ["multi_source_sector_flow missing; legacy validation only"]}
     cols = set(table_columns(con, "multi_source_sector_flow"))
-    amount_expr = 'amount_unit IS NULL OR amount_unit NOT IN (\'yuan\', \'yuan_from_100m_yuan\')' if 'amount_unit' in cols else 'FALSE'
+    amount_expr = (
+        "amount_unit IS NULL OR amount_unit NOT IN "
+        "('yuan', 'yuan_from_10000', 'yuan_from_100m_yuan')"
+        if 'amount_unit' in cols else 'FALSE'
+    )
     invalid_unit = int(con.execute(
         f"SELECT count(*) FROM multi_source_sector_flow WHERE source_date=CAST(? AS DATE) AND ({amount_expr})",
         [trade_date],
@@ -370,11 +398,18 @@ def assess_trade_date_readiness(
     # readiness when an operator reviews a weekend or historical audit.
     now = as_local_naive(now) or datetime.now()
     selected_groups = tuple(required_groups or STAGE_REQUIREMENTS.get(stage, STAGE_REQUIREMENTS["close"]))
-    # Postmarket is a completed-session review.  Its evidence contract is
-    # exact trade-date coverage plus a timestamp from the same local date;
-    # applying the intraday two-hour TTL after the close incorrectly turns a
-    # valid 17:30 snapshot into a blocker when the report is opened later.
-    freshness_max_age_seconds = None if stage == "postmarket" else max_age_seconds
+    # Close/postmarket replays are historical evidence reviews.  Once the
+    # requested session is before the local audit date, the exact trade-date
+    # row and its certification are authoritative; applying today's TTL to a
+    # yesterday's 17:30 snapshot creates false market/flow blockers.  A same-
+    # day close still uses the TTL so a stale intraday snapshot cannot pass.
+    historical_close = (
+        stage in {"close", "postmarket"}
+        and date.fromisoformat(trade_date) < now.date()
+    )
+    freshness_max_age_seconds = (
+        None if stage == "postmarket" or historical_close else max_age_seconds
+    )
     owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
     con = duckdb.connect(str(db_path), read_only=True) if owns_connection else db_path
     try:
@@ -565,13 +600,13 @@ def assess_trade_date_readiness(
             certification = None
             if table_exists(con, "close_snapshot_certification"):
                 certification = con.execute(
-                    "SELECT status,expected_rows,observed_rows,distinct_codes,invalid_rows,coverage_pct,error_message "
+                    "SELECT status,expected_rows,observed_rows,distinct_codes,invalid_rows,coverage_pct,error_message,provider "
                     "FROM close_snapshot_certification WHERE dataset='daily' AND trade_date=CAST(? AS DATE) "
-                    "AND provider='tushare'",
+                    "ORDER BY fetched_at DESC LIMIT 1",
                     [trade_date],
                 ).fetchone()
             if certification:
-                cert_status, cert_expected, cert_observed, cert_distinct, cert_invalid, cert_coverage, cert_error = certification
+                cert_status, cert_expected, cert_observed, cert_distinct, cert_invalid, cert_coverage, cert_error, cert_provider = certification
                 close_source["certification"] = {
                     "status": cert_status,
                     "expected_rows": cert_expected,
@@ -580,6 +615,7 @@ def assess_trade_date_readiness(
                     "invalid_rows": cert_invalid,
                     "coverage_pct": cert_coverage,
                     "error_message": cert_error,
+                    "provider": cert_provider,
                 }
                 if str(cert_status) != "certified":
                     close_source["status"] = "uncertified"
@@ -668,10 +704,40 @@ def assess_trade_date_readiness(
         executable_candidates,
     ) = candidate_counts
     source_ready = not missing
-    # Capital-flow certification is a hard operational input.  There is no
-    # third "not assessed" ready state in the daily report: when the
-    # independent reconciliation has not run, the result is explicitly false
-    # and the operator state stays blocked/uncertified.
+    # Capital-flow certification is a hard operational input and has one
+    # authority: ``assess_capital_flow_health``.  Hard-coding False here made
+    # the readiness report contradict the capital-flow report produced a few
+    # seconds earlier in the same run.
+    try:
+        from trade_system.capital_flow_health import assess_capital_flow_health
+
+        flow_db_path = db_path
+        if isinstance(db_path, duckdb.DuckDBPyConnection):
+            db_rows = db_path.execute("PRAGMA database_list").fetchall()
+            persisted = next(
+                (str(row[2]) for row in db_rows if len(row) > 2 and row[2]),
+                "",
+            )
+            if not persisted:
+                raise ValueError("capital flow certification requires a persisted database")
+            flow_db_path = persisted
+        flow_health = assess_capital_flow_health(
+            flow_db_path,
+            trade_date,
+            max_age_seconds=max_age_seconds,
+            now=now,
+        )
+        flow_certified_ready = bool(flow_health.get("flow_certified_ready", False))
+        flow_blockers = list(flow_health.get("blockers") or [])
+        flow_warnings = list(flow_health.get("warnings") or [])
+    except Exception as exc:
+        flow_health = {
+            "flow_certified_ready": False,
+            "blockers": [f"capital_flow_health_error:{type(exc).__name__}"],
+        }
+        flow_certified_ready = False
+        flow_blockers = list(flow_health["blockers"])
+        flow_warnings = []
     pipeline_ready = source_ready
     artifact_current = True
     operator_state = build_operator_state(
@@ -679,10 +745,21 @@ def assess_trade_date_readiness(
         pipeline_ready=pipeline_ready,
         artifact_current=artifact_current,
         data_certified_ready=source_ready and pipeline_ready and artifact_current,
-        flow_certified_ready=False,
+        flow_certified_ready=flow_certified_ready,
         execution_ready=executable_candidates > 0,
-        run_status="not_run",
-        blockers=missing,
+        # This function evaluates data state only.  It must not claim that a
+        # review or pipeline run was published; publication provenance belongs
+        # to the pipeline manifest.
+        run_status="not_published",
+        blockers=missing + flow_blockers,
+        warnings=flow_warnings,
+    )
+    # Keep the raw stage-signal count for diagnostics, but expose only the
+    # effective count under the operator-facing name.  Otherwise a row left
+    # executable by an earlier stage can coexist with execution_ready=false
+    # and make the readiness report contradict itself.
+    effective_executable_candidates = (
+        executable_candidates if operator_state["execution_ready"] else 0
     )
     return {
         **operator_state,
@@ -693,14 +770,16 @@ def assess_trade_date_readiness(
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
         "freshness_contract": (
             "same_trade_date_after_close"
-            if stage == "postmarket" else "timestamp_ttl"
+            if stage == "postmarket" or historical_close else "timestamp_ttl"
         ),
         "actionable_candidates": actionable_candidates,
         "tradable_candidates": tradable_candidates,
         "risk_approved_candidates": risk_approved_candidates,
-        "executable_candidates": executable_candidates,
+        "executable_candidates": effective_executable_candidates,
+        "candidate_pool_executable_candidates": executable_candidates,
         "missing_groups": missing,
         "groups": group_results,
+        "capital_flow_health": flow_health,
     }
 
 

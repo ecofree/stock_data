@@ -5,7 +5,7 @@ import json
 import duckdb
 
 from scripts.export_qlib_features import export_features
-from scripts.train_qlib_shadow import QlibFrameDataset
+from scripts.train_qlib_shadow import QlibFrameDataset, _load_features
 
 
 def test_export_qlib_features_has_target_only_label(tmp_path):
@@ -30,16 +30,17 @@ def test_export_qlib_features_has_target_only_label(tmp_path):
     con.close()
 
     out = tmp_path / "features.csv"
-    result = export_features(db, out, start_date="2026-01-02", end_date="2026-01-06")
+    result = export_features(db, out, start_date="2026-01-02", end_date="2026-01-06", label_mode="legacy")
     assert result["rows"] == 3
     assert result["labeled_rows"] == 2
     metadata = json.loads(out.with_suffix(".metadata.json").read_text(encoding="utf-8"))
     assert metadata["label_column"] == "label_next_ret"
     assert "label_next_ret" not in metadata["feature_columns"]
 
+    # 默认即 T+1 合规口径，不再是 legacy。
     exec_out = tmp_path / "features_exec.csv"
     exec_result = export_features(
-        db, exec_out, start_date="2026-01-02", end_date="2026-01-06", label_mode="t1_exec"
+        db, exec_out, start_date="2026-01-02", end_date="2026-01-06"
     )
     assert exec_result["labeled_rows"] == 1
     exec_metadata = json.loads(exec_out.with_suffix(".metadata.json").read_text(encoding="utf-8"))
@@ -89,6 +90,45 @@ def test_export_qlib_features_includes_canonical_flow_windows_when_available(tmp
     assert frame.loc[0, "flow_main_net_1d"] == 1
 
 
+def test_export_qlib_features_applies_adjustment_factor_to_prices_and_labels(tmp_path):
+    db = tmp_path / "qlib_adjustment.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE tushare_daily (date DATE, stock_code VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, "
+        "close DOUBLE, volume DOUBLE, turnover DOUBLE, change_pct DOUBLE)"
+    )
+    con.execute(
+        "CREATE TABLE tushare_daily_basic (date DATE, stock_code VARCHAR, turnover_rate DOUBLE, volume_ratio DOUBLE, "
+        "pe DOUBLE, pb DOUBLE, total_mv DOUBLE, circ_mv DOUBLE)"
+    )
+    con.execute(
+        "CREATE TABLE tushare_moneyflow (date DATE, stock_code VARCHAR, buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, "
+        "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)"
+    )
+    con.execute(
+        "CREATE TABLE tushare_adj_factor (date DATE, stock_code VARCHAR, adj_factor DOUBLE)"
+    )
+    for day, close, factor in [
+        ("2026-01-02", 10, 1), ("2026-01-05", 5, 2), ("2026-01-06", 6, 2),
+    ]:
+        con.execute("INSERT INTO tushare_daily VALUES (?, '000001', 10, 11, 9, ?, 100, 1000, 1)", [day, close])
+        con.execute("INSERT INTO tushare_daily_basic VALUES (?, '000001', 1, 1, 10, 1, 100, 80)", [day])
+        con.execute("INSERT INTO tushare_moneyflow VALUES (?, '000001', 10, 5, 20, 10, 15)", [day])
+        con.execute("INSERT INTO tushare_adj_factor VALUES (?, '000001', ?)", [day, factor])
+    con.close()
+
+    out = tmp_path / "features_adjusted.csv"
+    result = export_features(db, out, start_date="2026-01-02", end_date="2026-01-06", label_mode="legacy")
+    assert result["adjustment_available"] is True
+    assert "tushare_adj_factor" in result["source_tables"]
+    import pandas as pd
+
+    frame = pd.read_csv(out)
+    assert frame.loc[1, "close"] == 10
+    assert frame.loc[1, "volume"] == 50
+    assert frame.loc[0, "label_next_ret"] == 0
+
+
 def test_qlib_frame_dataset_returns_multiindex_feature_label():
     import pandas as pd
 
@@ -103,3 +143,44 @@ def test_qlib_frame_dataset_returns_multiindex_feature_label():
     dataset = QlibFrameDataset(frame, ["f"], "2026-01-02", "2026-01-05", "2026-01-05")
     prepared = dataset.prepare("train", col_set=["feature", "label"])
     assert list(prepared.columns) == [("feature", "f"), ("label", "label_next_ret")]
+
+
+def test_partitioned_parquet_loader_samples_before_pandas_materialization(tmp_path):
+    db = tmp_path / "qlib_partitioned.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE tushare_daily (date DATE, stock_code VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, "
+        "close DOUBLE, volume DOUBLE, turnover DOUBLE, change_pct DOUBLE)"
+    )
+    con.execute(
+        "CREATE TABLE tushare_daily_basic (date DATE, stock_code VARCHAR, turnover_rate DOUBLE, volume_ratio DOUBLE, "
+        "pe DOUBLE, pb DOUBLE, total_mv DOUBLE, circ_mv DOUBLE)"
+    )
+    con.execute(
+        "CREATE TABLE tushare_moneyflow (date DATE, stock_code VARCHAR, buy_lg_amount DOUBLE, sell_lg_amount DOUBLE, "
+        "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)"
+    )
+    for day in ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]:
+        for code in ["000001", "000002"]:
+            con.execute(
+                "INSERT INTO tushare_daily VALUES (?, ?, 10, 11, 9, 10, 100, 1000, 1)",
+                [day, code],
+            )
+            con.execute(
+                "INSERT INTO tushare_daily_basic VALUES (?, ?, 1, 1, 10, 1, 100, 80)",
+                [day, code],
+            )
+            con.execute(
+                "INSERT INTO tushare_moneyflow VALUES (?, ?, 10, 5, 20, 10, 15)",
+                [day, code],
+            )
+    con.close()
+
+    out = tmp_path / "features.parquet"
+    metadata = export_features(
+        db, out, start_date="2026-01-02", end_date="2026-01-07", output_format="parquet"
+    )
+    frame = _load_features(out, metadata["feature_columns"], max_rows=4)
+    assert len(frame) <= 4
+    assert frame["datetime"].nunique() == 4
+    assert frame["label_next_ret"].notna().all()

@@ -18,10 +18,11 @@ def _verdict(stats: dict, min_return_samples: int) -> str:
         return "insufficient_sample"
     hit_rate = stats.get("hit_rate")
     avg_return = stats.get("avg_forward_return_pct")
+    # 仅描述样本内统计，不证明策略能力；判读规则见页面 Interpretation Rules。
     if hit_rate is not None and avg_return is not None and hit_rate >= 50 and avg_return > 0:
-        return "positive_sample"
+        return "positive_review_sample"
     if avg_return is not None and avg_return < 0:
-        return "negative_sample"
+        return "negative_review_sample"
     return "mixed_sample"
 
 
@@ -30,12 +31,21 @@ def _regime_stage_counts(db_path: str | Path) -> dict[str, dict[str, int]]:
     try:
         if not table_exists(con, "stock_candidate_stage_signal") or not table_exists(con, "market_regime_snapshot"):
             return {}
+        # 与回测口径对齐：只计 is_actionable=true（列存在时），展示≠回测的混入在此切断。
+        actionable_filter = ""
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info('stock_candidate_stage_signal')").fetchall()}
+            if "is_actionable" in cols:
+                actionable_filter = "AND coalesce(s.is_actionable, false) = true"
+        except Exception:
+            actionable_filter = ""
         rows = _fetch_dicts(
             con,
-            """
+            f"""
             SELECT coalesce(m.regime, 'unknown') AS regime, s.stage, count(*) AS count
             FROM stock_candidate_stage_signal s
             LEFT JOIN market_regime_snapshot m ON s.trade_date = m.trade_date
+            WHERE 1 = 1 {actionable_filter}
             GROUP BY 1, 2
             ORDER BY 1, 2
             """,
@@ -102,7 +112,8 @@ def render_daily_review_statistics(stats: dict) -> str:
             "## Interpretation Rules",
             "",
             "- `insufficient_sample` means the stage does not yet have enough forward-return samples to support a trading conclusion.",
-            "- Positive or negative labels are statistical review aids only; they do not create orders.",
+            "- `positive_review_sample` / `negative_review_sample` describe in-sample statistics only; they do not prove strategy capability.",
+            "- Regime group counts cover actionable signals only (`is_actionable=true` when the column exists), aligned with the backtest caliber.",
             "",
         ]
     )

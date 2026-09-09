@@ -55,14 +55,14 @@ def run_funnel(con, trade_date: str) -> dict:
     stages.append(FunnelStage("L1", "硬性排雷(ST+红线)", len(universe), len(l1_pass),
                               removed_l1))
 
-    # --- L2: Factor score threshold ---
+    # --- L2: Factor score threshold (NULL = 未覆盖，跳过不 crash 不计入) ---
     l2_pass = []
     for s in l1_pass:
         row = con.execute(
             """SELECT total_score FROM daily_stock_picks
                WHERE trade_date=? AND stock_code=?""",
             [trade_date, s["stock_code"]]).fetchone()
-        if row and row[0] >= 35:
+        if row and row[0] is not None and row[0] >= 35:
             s["total_score"] = row[0]
             l2_pass.append(s)
     stages.append(FunnelStage("L2", "多因子评分≥35", len(l1_pass), len(l2_pass)))
@@ -82,8 +82,8 @@ def run_funnel(con, trade_date: str) -> dict:
         l3_pass.append(s)
     stages.append(FunnelStage("L3", "相位适配过滤", len(l2_pass), len(l3_pass)))
 
-    # --- L4: Top N by score (buy decision pool) ---
-    l3_pass.sort(key=lambda s: -(s.get("total_score") or 0))
+    # --- L4: Top N by score (buy decision pool; NULL 沉底) ---
+    l3_pass.sort(key=lambda s: (s.get("total_score") is None, -(s.get("total_score") or 0)))
     l4_pass = l3_pass[:20]
     stages.append(FunnelStage("L4", "买入决策池Top20", len(l3_pass), len(l4_pass)))
 

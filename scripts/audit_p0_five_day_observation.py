@@ -20,7 +20,10 @@ def main() -> int:
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument("--as-of", default=date.today().isoformat())
     parser.add_argument("--required-days", type=int, default=5)
-    parser.add_argument("--minimum-ths-concepts", type=int, default=374)
+    parser.add_argument(
+        "--minimum-ths-concepts", type=int, default=0,
+        help="Optional legacy lower bound; the normal gate uses the recorded source expectation.",
+    )
     parser.add_argument("--out", default="reports/p0_five_day_observation_latest.md")
     args = parser.parse_args()
 
@@ -29,7 +32,7 @@ def main() -> int:
         args.reports_dir,
         args.as_of,
         required_days=args.required_days,
-        minimum_ths_concepts=args.minimum_ths_concepts,
+        minimum_ths_concepts=args.minimum_ths_concepts or None,
     )
     content = render_observation(result)
     out = Path(args.out)

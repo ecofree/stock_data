@@ -44,7 +44,7 @@ def test_generate_signals_creates_market_regime_and_sector_scores(tmp_path):
     make_signal_db(db_path)
     build_normalized_views(str(db_path))
 
-    result = generate_signals(str(db_path), "2026-07-06")
+    result = generate_signals(str(db_path), "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path))
     regime = con.execute(
@@ -64,7 +64,7 @@ def test_generate_signals_repeated_replace_keeps_one_consistent_snapshot(tmp_pat
     build_normalized_views(str(db_path))
 
     for _ in range(20):
-        generate_signals(str(db_path), "2026-07-06")
+        generate_signals(str(db_path), "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:

@@ -61,7 +61,7 @@ def test_daily_review_report_contains_operator_required_sections(tmp_path):
         "Mainline Themes",
         "Four-Stage Candidates",
         "Risk Alerts",
-        "Plan Execution",
+            "Research Plan Drafts (Execution Gate Closed)",
         "Mistakes And Invalidations",
         "Next-Day Focus",
         "Data Gaps And Degradation",

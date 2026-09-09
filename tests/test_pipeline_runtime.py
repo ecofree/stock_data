@@ -148,6 +148,7 @@ def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
     tx = LatestReportTransaction(reports, "run-one", staging)
     tx.begin()
     (staging / "daily_review_latest.md").write_text("review", encoding="utf-8")
+    (staging / "data_readiness_latest.md").write_text("readiness", encoding="utf-8")
     (staging / "daily_review_latest.lazy.js").write_text(
         "window.__REVIEW_LAZY_DATA__ = {};", encoding="utf-8"
     )
@@ -165,8 +166,66 @@ def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
     assert pointer["artifact_files"] == [
         "daily_review_latest.lazy.js",
         "daily_review_latest.md",
+        "data_readiness_latest.md",
     ]
+    assert (reports / "data_readiness_current.md").read_text(encoding="utf-8") == "readiness"
     assert (manifest.run_dir / "pipeline_run_latest.json").exists()
+    status = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
+    assert status["status"] == "completed"
+    assert (reports / "pipeline_status_latest.html").exists()
+
+
+def test_failed_run_publishes_status_without_mutating_last_complete_page(tmp_path):
+    reports = tmp_path / "reports"
+    staging = reports / ".staging" / "failed-run"
+    reports.mkdir()
+    complete_page = (
+        "<!doctype html><html><body><main class=\"wrap\">"
+        "<h1>2026-08-27 last complete</h1></main></body></html>"
+    )
+    (reports / "daily_review_latest.html").write_text(complete_page, encoding="utf-8")
+    (reports / "daily_review_last_complete.html").write_text(complete_page, encoding="utf-8")
+    manifest = RunManifest(reports, "failed-run", "2026-08-28", "close")
+    tx = LatestReportTransaction(reports, "failed-run", staging)
+    tx.begin()
+    (staging / "partial_latest.md").write_text("partial", encoding="utf-8")
+    retained = tx.rollback(manifest.run_dir)
+    manifest.finish("failed", "encoding failure")
+    tx.publish_failure_status(manifest.run_dir, "encoding failure")
+
+    page = (reports / "daily_review_latest.html").read_text(encoding="utf-8")
+    status = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
+    assert retained == ["partial_latest.md"]
+    assert page == complete_page
+    assert (reports / "daily_review_last_complete.html").read_text(encoding="utf-8") == complete_page
+    assert status["status"] == "failed"
+    assert status["trade_date"] == "2026-08-28"
+    assert "收盘任务执行失败" in (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
+
+
+def test_non_close_commit_does_not_publish_review_or_advance_last_complete(tmp_path):
+    reports = tmp_path / "reports"
+    staging = reports / ".staging" / "intraday-run"
+    reports.mkdir()
+    complete_page = "<html><body><h1>last close</h1></body></html>"
+    (reports / "daily_review_latest.html").write_text(complete_page, encoding="utf-8")
+    (reports / "daily_review_last_complete.html").write_text(complete_page, encoding="utf-8")
+    manifest = RunManifest(reports, "intraday-run", "2026-08-28", "intraday")
+    tx = LatestReportTransaction(reports, "intraday-run", staging)
+    tx.begin()
+    (staging / "daily_review_latest.html").write_text("wrong intraday page", encoding="utf-8")
+    (staging / "data_readiness_latest.md").write_text("intraday readiness", encoding="utf-8")
+    manifest.finish("completed")
+
+    tx.commit(manifest.run_dir)
+
+    assert (reports / "daily_review_latest.html").read_text(encoding="utf-8") == complete_page
+    assert (reports / "daily_review_last_complete.html").read_text(encoding="utf-8") == complete_page
+    pointer = json.loads((reports / "pipeline_run_latest.json").read_text(encoding="utf-8"))
+    assert pointer["review_published"] is False
+    status_html = (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
+    assert "盘中任务已完成" in status_html
+    assert "收盘复盘已发布" not in status_html
 
 
 def test_prune_retains_one_phase_anchor_for_recent_trade_dates(tmp_path):

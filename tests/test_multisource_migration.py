@@ -132,6 +132,33 @@ def test_readiness_audit_separates_stock_and_sector_coverage(tmp_path):
     assert result["capital_flow"]["multi_source_stock_flow"]["latest"] == "2026-07-10"
 
 
+def test_readiness_audit_never_uses_future_rows_or_historical_peak_as_denominator(tmp_path):
+    db = tmp_path / "audit-asof.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        "CREATE TABLE multi_source_sector_flow(source_date DATE, sector_code VARCHAR, is_stale BOOLEAN)"
+    )
+    con.execute(
+        "INSERT INTO multi_source_sector_flow VALUES "
+        "('2026-07-10','BK0001',false),('2026-07-11','BK0001',false),"
+        "('2026-07-11','BK0002',false),('2026-07-12','BK0001',false),"
+        "('2026-07-12','BK0002',false),('2026-07-12','BK0003',false)"
+    )
+    con.execute(
+        "CREATE TABLE intraday_sector_flow_batch(trade_date DATE, expected_rows INTEGER, updated_at TIMESTAMP)"
+    )
+    con.execute("INSERT INTO intraday_sector_flow_batch VALUES ('2026-07-11',2,'2026-07-11 15:00:00')")
+    con.close()
+
+    result = audit_multisource(db, "2026-07-11")
+    flow = result["capital_flow"]["multi_source_sector_flow"]
+    assert flow["latest"] == "2026-07-11"
+    assert flow["latest_coverage"] == 2
+    assert flow["expected_coverage"] == 2
+    assert flow["coverage_pct_of_expected"] == 100.0
+    assert flow["status"] == "available"
+
+
 def test_kpl_intraday_flow_promotes_latest_cumulative_point(tmp_path):
     db = tmp_path / "kpl.duckdb"
     con = duckdb.connect(str(db))

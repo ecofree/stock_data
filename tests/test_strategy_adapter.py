@@ -150,6 +150,7 @@ def test_strategy_result_backtest_uses_next_available_close(tmp_path):
             "CREATE TABLE kline(date DATE, stock_code VARCHAR, open DOUBLE, close DOUBLE, ktype VARCHAR)"
         )
         con.execute("INSERT INTO kline VALUES ('2026-07-06','000001',10.0,11.0,'D')")
+        con.execute("INSERT INTO kline VALUES ('2026-07-07','000001',11.0,11.0,'D')")
     finally:
         con.close()
 

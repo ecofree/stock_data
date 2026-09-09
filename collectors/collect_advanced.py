@@ -1,7 +1,30 @@
 """Advanced data collectors (75 endpoints - largest category)."""
 import json
+import re
 from datetime import datetime
 from base import KPLClient, DuckDBStore
+
+
+def _safe_float(value):
+    """Parse a scalar API number without turning malformed CSV into a value."""
+    if value in (None, "", "-"):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "")
+    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", text):
+        text = text.replace(",", "")
+    if not re.fullmatch(r"[-+]?\d+(\.\d+)?", text):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _safe_int(value):
+    number = _safe_float(value)
+    return int(number) if number is not None and number.is_integer() else None
 
 
 def collect_advanced_news_flash(client: KPLClient, store: DuckDBStore, date: str) -> int:
@@ -204,7 +227,8 @@ def collect_advanced_weipan_qiangchou(client: KPLClient, store: DuckDBStore, dat
             ))
     if rows:
         n = store.insert_rows("advanced_weipan_qiangchou", rows,
-            ["date", "stock_code", "stock_name", "amount"])
+            ["date", "stock_code", "stock_name", "amount"],
+            replace_on=["date", "stock_code"])
         store.log_collect("advanced_weipan_qiangchou", "/advanced/weipan-qiangchou", n, "ok")
         return n
     return 0
@@ -324,14 +348,37 @@ def collect_advanced_his_sharp_withdrawal(client: KPLClient, store: DuckDBStore,
                 date,
                 str(s.get("stock_code", s.get("code", ""))),
                 s.get("stock_name", s.get("name", "")),
-                s.get("withdrawal_pct", s.get("回撤幅度", 0)),
+                _safe_float(s.get("withdrawal_pct", s.get("回撤幅度", 0))),
             ))
     if rows:
         n = store.insert_rows("advanced_his_sharp_withdrawal", rows,
-            ["date", "stock_code", "stock_name", "withdrawal_pct"])
+            ["date", "stock_code", "stock_name", "withdrawal_pct"],
+            replace_on=["date", "stock_code"])
         store.log_collect("advanced_his_sharp_withdrawal", "/advanced/his-sharp-withdrawal", n, "ok")
         return n
     return 0
+
+
+def collect_advanced_his_zhangfu_detail(client: KPLClient, store: DuckDBStore, date: str) -> int:
+    """Persist the provider's grouped historical change distribution as raw JSON.
+
+    The endpoint returns a keyed distribution rather than stock rows, so a
+    structured stock parser would invent fields.  The table is intentionally
+    ``(date, raw_json)``; retaining the exact payload is the correct P1 step.
+    """
+    data = client.get("/advanced/his-zhangfu-detail")
+    if not data:
+        return 0
+    day = data.get("day", date) if isinstance(data, dict) else date
+    row = (day, json.dumps(data, ensure_ascii=False, sort_keys=True))
+    n = store.insert_rows(
+        "advanced_his_zhangfu_detail",
+        [row],
+        ["date", "raw_json"],
+        replace_on=["date"],
+    )
+    store.log_collect("advanced_his_zhangfu_detail", "/advanced/his-zhangfu-detail", n, "ok")
+    return n
 
 
 def collect_advanced_weight_performance(client: KPLClient, store: DuckDBStore, date: str) -> int:
@@ -346,12 +393,13 @@ def collect_advanced_weight_performance(client: KPLClient, store: DuckDBStore, d
                 date,
                 str(s.get("stock_code", s.get("code", ""))),
                 s.get("stock_name", s.get("name", "")),
-                s.get("change_pct", s.get("涨跌幅", 0)),
-                s.get("weight", s.get("权重", 0)),
+                _safe_float(s.get("change_pct", s.get("涨跌幅", 0))),
+                _safe_float(s.get("weight", s.get("权重", 0))),
             ))
     if rows:
         n = store.insert_rows("advanced_weight_performance", rows,
-            ["date", "stock_code", "stock_name", "change_pct", "weight"])
+            ["date", "stock_code", "stock_name", "change_pct", "weight"],
+            replace_on=["date", "stock_code"])
         store.log_collect("advanced_weight_performance", "/advanced/weight-performance", n, "ok")
         return n
     return 0
@@ -368,11 +416,12 @@ def collect_advanced_zhangting_expression(client: KPLClient, store: DuckDBStore,
             rows.append((
                 date,
                 item.get("expression_type", item.get("类型", "")),
-                item.get("count", item.get("数量", 0)),
+                _safe_int(item.get("count", item.get("数量", 0))),
             ))
     if rows:
         n = store.insert_rows("advanced_zhangting_expression", rows,
-            ["date", "expression_type", "count"])
+            ["date", "expression_type", "count"],
+            replace_on=["date", "expression_type"])
         store.log_collect("advanced_zhangting_expression", "/advanced/zhangting-expression", n, "ok")
         return n
     return 0
@@ -390,11 +439,12 @@ def collect_advanced_newhigh_group(client: KPLClient, store: DuckDBStore, date: 
                 rows.append((
                     date,
                     item.get("group_type", item.get("类型", "")),
-                    item.get("count", item.get("数量", 0)),
+                    _safe_int(item.get("count", item.get("数量", 0))),
                 ))
         if rows:
             n = store.insert_rows("advanced_newhigh_group_count", rows,
-                ["date", "group_type", "count"])
+                ["date", "group_type", "count"],
+                replace_on=["date", "group_type"])
             total += n
     
     # Group stocks
@@ -413,7 +463,8 @@ def collect_advanced_newhigh_group(client: KPLClient, store: DuckDBStore, date: 
                 ))
         if rows:
             n = store.insert_rows("advanced_newhigh_group_stocks", rows,
-                ["date", "group_type", "stock_code", "stock_name"])
+                ["date", "group_type", "stock_code", "stock_name"],
+                replace_on=["date", "group_type", "stock_code"])
             total += n
     
     if total:
@@ -458,12 +509,13 @@ def collect_advanced_his_ranking(client: KPLClient, store: DuckDBStore, date: st
                 date,
                 str(s.get("stock_code", s.get("code", ""))),
                 s.get("stock_name", s.get("name", "")),
-                s.get("change_pct", s.get("涨跌幅", 0)),
-                s.get("ranking", s.get("排名", 0)),
+                _safe_float(s.get("change_pct", s.get("涨跌幅", 0))),
+                _safe_int(s.get("ranking", s.get("排名", 0))),
             ))
     if rows:
         n = store.insert_rows("advanced_his_ranking", rows,
-            ["date", "stock_code", "stock_name", "change_pct", "ranking"])
+            ["date", "stock_code", "stock_name", "change_pct", "ranking"],
+            replace_on=["date", "stock_code"])
         store.log_collect("advanced_his_ranking", "/advanced/his-ranking", n, "ok")
         return n
     return 0
@@ -513,6 +565,7 @@ def collect_all_advanced(client: KPLClient, store: DuckDBStore, date: str) -> di
     results["advanced_disk_review"] = collect_advanced_disk_review(client, store, date)
     results["advanced_market_scln"] = collect_advanced_market_scln(client, store, date)
     results["advanced_his_sharp_withdrawal"] = collect_advanced_his_sharp_withdrawal(client, store, date)
+    results["advanced_his_zhangfu_detail"] = collect_advanced_his_zhangfu_detail(client, store, date)
     results["advanced_weight_performance"] = collect_advanced_weight_performance(client, store, date)
     results["advanced_zhangting_expression"] = collect_advanced_zhangting_expression(client, store, date)
     results["advanced_newhigh_group"] = collect_advanced_newhigh_group(client, store, date)

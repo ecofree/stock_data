@@ -140,7 +140,13 @@ def collect_index_full_info(client: KPLClient, store: DuckDBStore, date: str, in
 def collect_index_kline(client: KPLClient, store: DuckDBStore, date: str, index_codes: list[str]) -> int:
     total = 0
     for code in index_codes:
-        data = client.get("/index/zhishu-kline", {"code": code})
+        # The new KPL documentation makes the daily series explicit. Passing
+        # the documented shape avoids falling onto a provider default that
+        # may be intraday or a different asset type.
+        data = client.get(
+            "/index/zhishu-kline",
+            {"code": code, "ktype": "d", "index": "0"},
+        )
         rows = []
         for item in _items(data, "klines"):
             if not isinstance(item, dict):
@@ -169,6 +175,60 @@ def collect_index_kline(client: KPLClient, store: DuckDBStore, date: str, index_
             )
     if total:
         store.log_collect("index_kline", "/index/zhishu-kline", total, "ok")
+    return total
+
+
+def collect_index_kline_eastmoney(store: DuckDBStore, date: str, index_codes: list[str]) -> int:
+    """Recover index daily OHLC from Eastmoney without promoting the source.
+
+    The rows are written to the existing compatibility relation with a
+    provider marker in ``raw_json``.  Only the missing requested date is
+    inserted, so a late fallback cannot replace a newer KPL row.
+    """
+    import json
+
+    from trade_system.stock_data_sources import _from_em_index_kline
+
+    total = 0
+    for code in index_codes:
+        data = _from_em_index_kline(code) or []
+        rows = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            trade_date = _date(item.get("date"), date)
+            if trade_date != date:
+                continue
+            rows.append(
+                (
+                    trade_date,
+                    code,
+                    _float(item.get("open", item.get("o"))),
+                    _float(item.get("high", item.get("h"))),
+                    _float(item.get("low", item.get("l"))),
+                    _float(item.get("close", item.get("c"))),
+                    _int(item.get("volume", item.get("v"))),
+                    _int(item.get("turnover", item.get("amount"))),
+                    _float(item.get("change_pct", item.get("pct"))),
+                    "D",
+                    json.dumps(
+                        {"provider": "eastmoney", "source": "index_kline", "payload": item},
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        if rows:
+            total += store.insert_rows(
+                "index_kline",
+                rows,
+                [
+                    "date", "index_code", "open", "high", "low", "close",
+                    "volume", "turnover", "change_pct", "ktype", "raw_json",
+                ],
+                replace_on=["date", "index_code", "ktype"],
+            )
+    if total:
+        store.log_collect("index_kline", "eastmoney", total, "fallback")
     return total
 
 

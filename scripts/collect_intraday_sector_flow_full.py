@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -29,6 +30,7 @@ from trade_system import resilient_sources
 from trade_system.capital_flow_health import assess_capital_flow_health, render_capital_flow_health_markdown
 from trade_system.host_limiter import shared_host_limiter
 from trade_system.quality import table_exists
+from trade_system.source_authority import provider_rank_sql
 
 
 SECTOR_COVERAGE_SUCCESS_PCT = 99.5
@@ -134,16 +136,13 @@ def _aggregate_ths_stock_flow(con: duckdb.DuckDBPyConnection, trade_date: str) -
     in ``raw`` for auditability.
     """
     try:
+        provider_order = provider_rank_sql("stock_flow", "provider")
         rows = con.execute(
-            """
+            f"""
             WITH ranked_stock_flow AS (
                 SELECT *, row_number() OVER (
                     PARTITION BY stock_code
-                    ORDER BY CASE provider
-                        WHEN 'eastmoney_intraday_clist_delay' THEN 1
-                        WHEN 'eastmoney_market' THEN 2
-                        WHEN 'eastmoney_intraday_clist' THEN 3
-                        ELSE 9 END,
+                    ORDER BY {provider_order} ASC,
                         fetched_at DESC
                 ) AS provider_rank
                 FROM multi_source_stock_flow
@@ -199,7 +198,102 @@ def _aggregate_ths_stock_flow(con: duckdb.DuckDBPyConnection, trade_date: str) -
     ]
 
 
+def rebuild_ths_derived_flow(db_path: str | Path, trade_date: str) -> dict:
+    """Rebuild only the deterministic THS aggregate from persisted stock flow.
+
+    This is the recovery path after a report/control-plane failure.  It does
+    not call a remote provider and it replaces the complete provider/date
+    slice so concepts removed from the new membership snapshot cannot linger.
+    """
+    with MultiSourceStore(db_path) as store:
+        con = store.con
+        init_schema(con)
+        _ensure_batch_table(con)
+        snapshot, age = _ths_membership_snapshot(con, trade_date)
+        rows = _aggregate_ths_stock_flow(con, trade_date)
+        if not snapshot or not rows:
+            return {
+                "trade_date": trade_date,
+                "provider": "derived_ths_stock_aggregate",
+                "status": "missing_inputs",
+                "fetched_rows": 0,
+                "expected_rows": 0,
+                "coverage_pct": 0.0,
+                "ths_membership_snapshot": str(snapshot) if snapshot else None,
+                "ths_membership_age_days": age,
+                "error": "complete THS membership or same-date stock flow unavailable",
+                "taxonomy_status": {},
+                "fetched_pages": 0,
+                "expected_pages": 0,
+                "reconciliation_pages": 0,
+                "ths_members_stale": True,
+            }
+        expected = int(con.execute(
+            "SELECT count(DISTINCT concept_code) FROM v_default_concept_stock_history "
+            "WHERE trade_date=CAST(? AS DATE)",
+            [snapshot],
+        ).fetchone()[0] or 0)
+        con.execute(
+            "DELETE FROM multi_source_sector_flow "
+            "WHERE source_date=CAST(? AS DATE) AND provider='derived_ths_stock_aggregate'",
+            [trade_date],
+        )
+        stored = store.store(
+            "sector_flow", None, rows,
+            {"source": "derived_ths_stock_aggregate", "status": "live", "trade_date": trade_date},
+            asset_type="sector", trade_date=trade_date,
+        )
+        observed = int(con.execute(
+            "SELECT count(DISTINCT sector_code) FROM multi_source_sector_flow "
+            "WHERE source_date=CAST(? AS DATE) "
+            "AND provider='derived_ths_stock_aggregate' AND coalesce(is_stale,FALSE)=FALSE",
+            [trade_date],
+        ).fetchone()[0] or 0)
+        coverage, taxonomy_state = _taxonomy_coverage_status(expected, observed)
+        con.execute(
+            """
+            INSERT INTO intraday_sector_flow_taxonomy(
+                trade_date,taxonomy,provider,expected_rows,fetched_rows,
+                coverage_pct,status,last_error,updated_at
+            ) VALUES (CAST(? AS DATE),'ths_concept','derived_ths_stock_aggregate',?,?,?,?,?,current_timestamp)
+            ON CONFLICT(trade_date,taxonomy) DO UPDATE SET
+                provider=excluded.provider, expected_rows=excluded.expected_rows,
+                fetched_rows=excluded.fetched_rows, coverage_pct=excluded.coverage_pct,
+                status=excluded.status, last_error=excluded.last_error,
+                updated_at=now()
+            """,
+            [trade_date, expected, observed, coverage, taxonomy_state, ""],
+        )
+        con.commit()
+        return {
+            "trade_date": trade_date,
+            "provider": "derived_ths_stock_aggregate",
+            "status": taxonomy_state,
+            "fetched_rows": observed,
+            "expected_rows": expected,
+            "coverage_pct": coverage,
+            "rows_written": int(stored.get("rows_written") or 0),
+            "ths_membership_snapshot": str(snapshot),
+            "ths_membership_age_days": age,
+            "error": "",
+            "taxonomy_status": {
+                "ths_concept": {
+                    "expected_rows": expected,
+                    "fetched_rows": observed,
+                    "coverage_pct": coverage,
+                    "status": taxonomy_state,
+                }
+            },
+            "fetched_pages": 1,
+            "expected_pages": 1,
+            "reconciliation_pages": 0,
+            "ths_members_stale": bool(age is None or age > THS_MEMBERSHIP_MAX_AGE_DAYS),
+        }
+
+
 def _ensure_batch_table(con: duckdb.DuckDBPyConnection) -> None:
+    if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() == "1":
+        return
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS intraday_sector_flow_batch (
@@ -486,6 +580,11 @@ def collect_full_sector_flow(
             # silently replace the 361 THS concept flows.
             derived_rows = _aggregate_ths_stock_flow(con, trade_date)
             if derived_rows:
+                con.execute(
+                    "DELETE FROM multi_source_sector_flow "
+                    "WHERE source_date=CAST(? AS DATE) AND provider='derived_ths_stock_aggregate'",
+                    [trade_date],
+                )
                 store.store(
                     "sector_flow", None, derived_rows,
                     {"source": "derived_ths_stock_aggregate", "status": "live", "trade_date": trade_date},
@@ -662,13 +761,22 @@ def main() -> int:
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--pause-seconds", type=float, default=0.35)
     parser.add_argument("--out", default="reports/intraday_sector_flow_latest.md")
+    parser.add_argument(
+        "--ths-derived-only",
+        action="store_true",
+        help="Rebuild THS concept aggregates from persisted same-date stock flow without remote collection.",
+    )
     args = parser.parse_args()
     if args.date != date.today().isoformat():
         print(f"date={args.date} status=historical_collection_blocked")
         return 2
-    result = collect_full_sector_flow(
-        args.db, args.date, page_size=args.page_size,
-        max_pages=args.max_pages, pause_seconds=args.pause_seconds,
+    result = (
+        rebuild_ths_derived_flow(args.db, args.date)
+        if args.ths_derived_only
+        else collect_full_sector_flow(
+            args.db, args.date, page_size=args.page_size,
+            max_pages=args.max_pages, pause_seconds=args.pause_seconds,
+        )
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from trade_system.collection_profiles import phase_tasks, resolve_phase
+from trade_system.config import default_trade_date
 from trade_system.pipeline_contract import (
     CLOSE_DEFERRED_GATES,
     DEGRADABLE_EXTERNAL_STEPS,
@@ -19,6 +20,7 @@ from trade_system.pipeline_contract import (
     RESEARCH_CHAIN_STEPS,
     REVIEW_CHAIN_STEPS,
 )
+from trade_system.source_authority import validate_production_plan
 
 CommandStep = tuple[str, list[str], bool]
 
@@ -35,6 +37,60 @@ TUSHARE_GAPFILL_LOOKBACK_DAYS = 10
 # window (--freshness-seconds 21600 below) is intentionally left at 6h: it spans the
 # trading day for the day-outcome decision, a different concern from collection freshness.
 CLOSE_READINESS_MAX_AGE_SECONDS = 7200
+
+
+def _utf8_subprocess_env() -> dict[str, str]:
+    """Return a deterministic text protocol for every Python child process.
+
+    Windows scheduled tasks otherwise inherit a GBK console while the parent
+    decodes captured output as UTF-8.  That produced U+FFFD in the parent and
+    then crashed again when the replacement character was written to GBK.
+    """
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    # Schema is migrated once by the lock owner before child collectors are
+    # launched.  Child processes must not replay bootstrap DDL against the
+    # same DuckDB file.
+    env["KPL_RUNTIME_SCHEMA_READY"] = "1"
+    return env
+
+
+def _decode_process_bytes(payload: bytes | str | None, stream_name: str) -> tuple[str, bool]:
+    if payload is None:
+        return "", False
+    if isinstance(payload, str):
+        return payload, False
+    try:
+        return payload.decode("utf-8", errors="strict"), False
+    except UnicodeDecodeError as exc:
+        # Preserve the exact offending bytes as ASCII escapes.  Never inject
+        # U+FFFD into a Windows console or silently call corrupted text valid.
+        safe = payload.decode("utf-8", errors="backslashreplace")
+        detail = (
+            f"\n[{stream_name}_encoding_error offset={exc.start} "
+            f"bytes={payload[exc.start:exc.end].hex()} expected=utf-8]\n"
+        )
+        return safe + detail, True
+
+
+def _safe_stream_write(stream, value: str) -> None:
+    """Write diagnostics without allowing console encoding to abort a run."""
+    if not value:
+        return
+    try:
+        stream.write(value)
+        stream.flush()
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        safe = value.encode(encoding, errors="backslashreplace")
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            buffer.write(safe)
+            buffer.flush()
+        else:  # pragma: no cover - StringIO and unusual embedded hosts
+            stream.write(safe.decode(encoding, errors="strict"))
+            stream.flush()
 
 
 
@@ -65,7 +121,7 @@ def command_plan(
     signal_limit: int = 200,
     reports_dir: str = "reports",
     as_of_time: str | None = None,
-    collection_profile: str = "full",
+    collection_profile: str = "priority",
     phase: str | None = None,
     history_start: str = "",
     history_end: str = "",
@@ -73,25 +129,31 @@ def command_plan(
     include_research: bool | None = None,
 ) -> list[CommandStep]:
     py = sys.executable
-    selected_date = trade_date or date.today().isoformat()
-    # ``None`` preserves the legacy full/compatibility plan.  Explicit close
-    # runs default to the operational chain only; research is opt-in so Qlib,
-    # news and backtests cannot lengthen or fail the close publication.
+    selected_date = trade_date or default_trade_date(db_path)
+    if collection_profile != "priority":
+        raise ValueError("the legacy collection profile was retired; use priority")
+    if phase == "full":
+        raise ValueError("the legacy full phase was retired; use close, history, or a narrow phase")
+    # Direct callers that request collection without a phase now use the same
+    # canonical close plan as the scheduler.  This removes the old implicit
+    # compatibility fan-out from the reachable default path.
+    if include_collection and phase is None:
+        phase = "close"
+    # Research is opt-in so Qlib, news and backtests cannot lengthen or fail
+    # the close publication.
     research_enabled = (
-        phase in {None, "full"}
+        phase is None
         if include_research is None
         else bool(include_research)
     )
     report = lambda name: str(Path(reports_dir) / name)
     steps: list[CommandStep] = []
-    if include_collection and phase not in {None, "full"}:
-        # Phase mode is intentionally narrow.  It is the production path for
-        # auction/intraday/close runs; the legacy fan-out below remains
-        # available only when callers explicitly omit ``phase`` or select
-        # ``full`` for compatibility/backfill work.
+    if include_collection and phase is not None:
+        # Phase mode is intentionally narrow and is the only collection path.
         if phase == "auction":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_auction_evidence", [py, "scripts/collect_auction_evidence.py", "--db", db_path, "--date", selected_date, "--max-stocks", str(signal_limit), "--out", report("auction_collection_latest.json")], False),
                 ("build_auction_evidence", [py, "scripts/build_auction_evidence.py", "--db", db_path, "--trade-date", selected_date, "--out", report("auction_evidence_latest.md")], False),
@@ -99,6 +161,7 @@ def command_plan(
         elif phase == "intraday":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
                 # Phase mode never runs full L2; keep candidate stock curves fresh.
@@ -115,6 +178,7 @@ def command_plan(
         elif phase == "close":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 # P0#2: close guarantees the newest snapshot here; the following
                 # physical-kline step also repairs the bounded recent-gap window
                 # before copying it, so older history remains a separate batch.
@@ -129,10 +193,15 @@ def command_plan(
                 ("sync_tushare_ohlc_core", [py, "scripts/sync_tushare_ohlc.py", "--db", db_path,
                  "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
                  "--end-date", selected_date, "--repair-close-gaps", "--repair-budget-seconds", "180"], False),
-                ("refresh_ths_weekly", [py, "scripts/backfill_2026_ths_concepts.py", "--db", db_path,
-                 "--start-date", selected_date.replace("-", ""), "--end-date", selected_date.replace("-", ""),
-                 "--period", "week", "--mode", "full", "--max-member-pages", "0", "--max-concepts", "0",
-                 "--member-source", "web", "--report", report("ths_weekly_latest.md")], False),
+                # The official same-day THS snapshot must exist before the
+                # stock-flow aggregate is grouped into concepts.  Running this
+                # after sector flow created same-date rows based on a prior
+                # membership snapshot and mixed two data versions on the page.
+                ("collect_ths_concepts_api", [py, "scripts/collect_ths_concepts_api.py", "--db", db_path,
+                 "--snapshot-date", selected_date], False),
+                ("collect_hithink_limit_pool_daily", [py, "scripts/collect_hithink_limit_pool_daily.py", "--db", db_path,
+                 "--date", selected_date, "--out", report("hithink_limit_pool_latest.json"),
+                 "--assume-pipeline-lock"], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_kpl_stock_flow_focus", [py, "scripts/collect_capital_flow_focus.py", "--db", db_path,
                  "--date", selected_date, "--max-stocks", str(signal_limit), "--max-sectors", "0",
@@ -141,19 +210,14 @@ def command_plan(
                 ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
                 ("collect_intraday_sector_flow_full", [py, "scripts/collect_intraday_sector_flow_full.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_sector_flow_latest.md")], False),
                 ("derive_market_context", [py, "scripts/derive_market_context.py", "--db", db_path, "--date", selected_date, "--out", report("market_context_latest.json")], False),
-                ("collect_finance_gapfill", [py, "collect_finance.py", "--db", db_path, "--date", selected_date, "--max-stocks", str(finance_max_stocks), "--refresh-days", "7"], False),
                 # LHB was orphaned in the phase-mode migration (fetch_all.py
                 # imports collect_all_lhb but the --only-market path returns
                 # before any call), leaving lhb_* frozen at 2026-07-08.
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
-                # Bidding anomalies can only be fetched after close: the KPL
-                # endpoint returns the latest trading day, which only matches
-                # the requested date once the session has ended.
-                ("collect_auction_anomaly_daily", [py, "scripts/collect_auction_anomaly_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_anomaly_collection_latest.md")], False),
-                # Full 09:15-09:25 auction tick series (KPL returns the whole
-                # day's sequence after close; the parser bug that silently
-                # dropped every tick was fixed in collect_misc.collect_auction_tick).
-                ("collect_auction_tick_daily", [py, "scripts/collect_auction_tick_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_tick_collection_latest.md")], False),
+                # One full-market request replaces the retired per-stock
+                # auction/tick and bidding-anomaly fan-out.  It writes both
+                # the normalized auction sequence and final matched snapshot.
+                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_market_collection_latest.json")], False),
                 # On-the-LHB probability predictions (previously unreachable:
                 # only wired behind fetch_all.py's non --only-market path).
                 ("collect_advanced_lhb_daily", [py, "scripts/collect_advanced_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("advanced_lhb_collection_latest.md")], False),
@@ -165,11 +229,25 @@ def command_plan(
                 # previously unreachable because the scheduler always runs
                 # fetch_all.py with --only-market, which returns early.
                 ("collect_index_kline_daily", [py, "scripts/collect_index_kline_daily.py", "--db", db_path, "--date", selected_date, "--out", report("index_kline_collection_latest.md")], False),
+                # xiaodefa relay: official chips / margin / unlock calendar /
+                # HK-connect holdings. Range kinds (hsgt/ggt/float) tolerate a
+                # forward window because future rows simply return empty.
+                ("collect_xiaodefa", [py, "-m", "trade_system.xiaodefa_source", "--db", db_path,
+                 "--trade-date", selected_date,
+                 "--start-date", selected_date,
+                 "--end-date", (date.fromisoformat(selected_date) + timedelta(days=14)).strftime("%Y-%m-%d"),
+                 "--kinds", "cyq,margin,float,premarket,kpl,hk_hold"], False),
                 # L2 is an intraday-only source.  After the market closes the
                 # upstream endpoint normally returns an empty payload, so the
                 # close phase reuses the last same-day intraday snapshot.
                 ("collect_executable_quotes", [py, "scripts/collect_executable_quotes.py", "--db", db_path, "--date", selected_date,
                  "--limit", str(signal_limit), "--auto-boost-if-kpl-stale"], False),
+                # P1 review enhancement is bounded and failure-isolated.  The
+                # parent already owns PipelineLock, so the child must not try
+                # to acquire a second lock for the same database.
+                ("collect_review_supplement", [py, "scripts/collect_review_supplement.py", "--db", db_path,
+                 "--date", selected_date, "--max-sectors", "20", "--assume-pipeline-lock",
+                 "--out", report("review_supplement_latest.json")], False),
             ]
         elif phase == "history":
             start = history_start or "20260101"
@@ -182,136 +260,17 @@ def command_plan(
         else:
             raise ValueError(f"Unsupported collection phase: {phase}")
         steps.extend(collection_steps)
-    elif include_collection:
-        collection_steps = [
-                (
-                    "collect_market_context",
-                    [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"],
-                    False,
-                ),
-                (
-                    "collect_realtime_limit_pool",
-                    [
-                        py,
-                        "scripts/collect_realtime_limit_pool.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--out",
-                        report("realtime_candidate_pool_latest.md"),
-                    ],
-                    False,
-                ),
-                (
-                    "collect_intraday_stock_flow_market",
-                    [
-                        py,
-                        "scripts/collect_intraday_stock_flow_market.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--out",
-                        report("intraday_stock_flow_latest.md"),
-                    ],
-                    False,
-                ),
-                (
-                    "collect_capital_flow_focus",
-                    [
-                        py,
-                        "scripts/collect_capital_flow_focus.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--max-stocks",
-                        str(max_stocks),
-                        "--max-sectors",
-                        str(max_sectors),
-                        "--strict",
-                        "--out",
-                        report("capital_flow_freshness_latest.md"),
-                    ],
-                    False,
-                ),
-                (
-                    "collect_intraday_sector_flow_full",
-                    [
-                        py,
-                        "scripts/collect_intraday_sector_flow_full.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--out",
-                        report("intraday_sector_flow_latest.md"),
-                    ],
-                    False,
-                ),
-                (
-                    "collect_multisource_capital_flow",
-                    [
-                        py,
-                        "scripts/run_staged_multisource.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--max-stocks",
-                        str(max_stocks),
-                        "--max-sectors",
-                        str(max_sectors),
-                        "--stage",
-                        "close",
-                        "--report",
-                        report("multisource_collection_latest.md"),
-                    ],
-                    False,
-                ),
-                (
-                    "collect_finance_gapfill",
-                    [
-                        py,
-                        "collect_finance.py",
-                        "--db",
-                        db_path,
-                        "--date",
-                        selected_date,
-                        "--max-stocks",
-                        str(finance_max_stocks),
-                    ],
-                    False,
-                ),
-            ]
-        if collection_profile == "priority":
-            # The full-market collectors already persist complete snapshots.
-            # Avoid the older focus/staged calls unless an operator explicitly
-            # requests the compatibility profile; this prevents duplicate API
-            # traffic and competing writes during the same close run.
-            keep = {
-                "collect_market_context",
-                "collect_realtime_limit_pool",
-                "collect_intraday_stock_flow_market",
-                "collect_intraday_sector_flow_full",
-                "collect_finance_gapfill",
-            }
-            collection_steps = [step for step in collection_steps if step[0] in keep]
-        elif collection_profile != "full":
-            raise ValueError(f"Unsupported collection profile: {collection_profile}")
-        steps.extend(collection_steps)
     if phase not in {"auction", "intraday", "close", "history"}:
         phase = None
-    # Narrow phases stop after their decision-window work.  The full legacy
-    # report/backtest fan-out is retained for explicit full/compatibility runs.
+    # Narrow phases stop after their decision-window work.  Research remains
+    # an explicit opt-in on the canonical close plan.
     if phase == "auction":
         steps.extend([
             ("build_normalized_views", [py, "scripts/build_normalized_views.py", "--db", db_path], False),
-            ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date], False),
+            ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date, "--readiness-stage", "auction"], False),
             ("generate_auction_stage_signals", [py, "scripts/generate_stage_signals.py", "--db", db_path, "--date", selected_date, "--stage", "auction_confirmation", "--run-id", "integrated_auction", "--freshness-seconds", "300", "--strict-tradability", "--allow-blocked", "--limit", str(signal_limit)], False),
             ("run_daily_operator_loop", [py, "scripts/run_daily_operator_loop.py", "--db", db_path, "--trade-date", selected_date, "--stage", "auction", "--limit", str(signal_limit)], False),
-            ("check_data_readiness", [py, "scripts/check_data_readiness.py", "--db", db_path, "--date", selected_date, "--stage", "auction", "--max-age-seconds", "300", "--out", report("data_readiness_auction_latest.md")], False),
+            ("check_data_readiness", [py, "scripts/check_data_readiness.py", "--db", db_path, "--date", selected_date, "--stage", "auction", "--gate", "data", "--max-age-seconds", "300", "--out", report("data_readiness_auction_latest.md")], False),
             ("generate_web_dashboard", [py, "scripts/generate_web_dashboard.py", "--db", db_path, "--date", selected_date, "--out", report("trading_dashboard_latest.html")], False),
             ("generate_trading_terminal", [py, "scripts/generate_trading_terminal.py", "--db", db_path, "--date", selected_date, "--out", report("trading_terminal_latest.html")], False),
         ])
@@ -325,10 +284,10 @@ def command_plan(
             ("collect_executable_quotes", [py, "scripts/collect_executable_quotes.py", "--db", db_path, "--date", selected_date, "--limit", str(signal_limit), "--auto-boost-if-kpl-stale"], False),
             ("audit_multisource_readiness", [py, "scripts/audit_multisource_readiness.py", "--db", db_path, "--as-of", selected_date, "--out", report("multisource_readiness_intraday_latest.md")], False),
             ("check_capital_flow_health", [py, "scripts/check_capital_flow_health.py", "--db", db_path, "--date", selected_date, "--max-age-seconds", "600", "--min-coverage-pct", "99.5", "--out", report("capital_flow_freshness_latest.md")], False),
-            ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date], False),
+            ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date, "--readiness-stage", "intraday"], False),
             ("generate_intraday_stage_signals", [py, "scripts/generate_stage_signals.py", "--db", db_path, "--date", selected_date, "--stage", "intraday_strength", "--run-id", "integrated_intraday", "--freshness-seconds", "600", "--strict-tradability", "--limit", str(signal_limit)], False),
             ("run_daily_operator_loop", [py, "scripts/run_daily_operator_loop.py", "--db", db_path, "--trade-date", selected_date, "--stage", "intraday", "--limit", str(signal_limit)], False),
-            ("check_data_readiness", [py, "scripts/check_data_readiness.py", "--db", db_path, "--date", selected_date, "--stage", "intraday", "--max-age-seconds", "600", "--out", report("data_readiness_intraday_latest.md")], False),
+            ("check_data_readiness", [py, "scripts/check_data_readiness.py", "--db", db_path, "--date", selected_date, "--stage", "intraday", "--gate", "data", "--max-age-seconds", "600", "--out", report("data_readiness_intraday_latest.md")], False),
             ("audit_p3_candidates", [py, "scripts/audit_p3_candidates.py", "--db", db_path, "--date", selected_date, "--out", report("p3_candidate_audit_intraday_latest.md")], False),
             ("generate_web_dashboard", [py, "scripts/generate_web_dashboard.py", "--db", db_path, "--date", selected_date, "--out", report("trading_dashboard_latest.html")], False),
             ("generate_trading_terminal", [py, "scripts/generate_trading_terminal.py", "--db", db_path, "--date", selected_date, "--out", report("trading_terminal_latest.html")], False),
@@ -355,6 +314,11 @@ def command_plan(
         "--freshness-seconds",
         "21600",
         "--strict-tradability",
+        # No actionable close candidate is a valid market outcome.  The
+        # following readiness gate remains the authority for source/data
+        # failure; do not label an empty candidate set as infrastructure
+        # degradation.
+        "--allow-blocked",
         "--limit",
         str(signal_limit),
     ]
@@ -367,7 +331,7 @@ def command_plan(
     ]
     readiness_command = [
         py, "scripts/check_data_readiness.py", "--db", db_path,
-        "--date", selected_date, "--stage", "close",
+        "--date", selected_date, "--stage", "close", "--gate", "data",
         "--max-age-seconds", str(CLOSE_READINESS_MAX_AGE_SECONDS),
         "--out", report("data_readiness_latest.md"),
     ]
@@ -384,10 +348,14 @@ def command_plan(
     steps.extend([
         ("repair_critical_integrity", [py, "scripts/repair_critical_integrity.py", "--db", db_path], False),
         ("build_normalized_views", [py, "scripts/build_normalized_views.py", "--db", db_path], False),
-        ("ensure_operational_indexes", [py, "scripts/ensure_operational_indexes.py", "--db", db_path], False),
         (
             "audit_multisource_readiness",
             [py, "scripts/audit_multisource_readiness.py", "--db", db_path, "--as-of", selected_date, "--out", report("multisource_readiness_latest.md")],
+            False,
+        ),
+        (
+            "audit_source_conflicts",
+            [py, "scripts/audit_source_conflicts.py", "--db", db_path, "--out", report("source_conflict_audit_latest.md")],
             False,
         ),
         (
@@ -416,7 +384,7 @@ def command_plan(
         ),
         # The legacy aggregate signal is diagnostic only; it must not turn a
         # missing/stale data chain into a green production run.
-        ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date], False),
+        ("generate_signals", [py, "scripts/generate_signals.py", "--db", db_path, "--date", selected_date, "--readiness-stage", "close"], False),
         (
             "generate_close_stage_signals",
             close_stage_command,
@@ -444,6 +412,27 @@ def command_plan(
         (
             "check_data_readiness",
             readiness_command,
+            False,
+        ),
+        # Build auxiliary data used by the review before rendering the HTML.
+        # These steps are failure-isolated: their failure must be visible in
+        # the manifest but must not leave the previous day's review published.
+        (
+            "generate_health_trend",
+            [py, "scripts/generate_health_trend.py", "--db", db_path,
+             "--out", report("data_health_trend_latest.md")],
+            False,
+        ),
+        (
+            "generate_cycle_analytics",
+            [py, "scripts/generate_cycle_analytics.py", "--db", db_path,
+             "--out", report("cycle_phase_latest.md")],
+            False,
+        ),
+        (
+            "generate_signal_attribution",
+            [py, "scripts/generate_signal_attribution.py", "--db", db_path,
+             "--out", report("signal_attribution_latest.md")],
             False,
         ),
         (
@@ -517,7 +506,7 @@ def command_plan(
                     False,
                 )
             ]
-            if phase in {None, "full", "close"}
+            if phase in {None, "close"}
             else []
         ),
         ("evaluate_qlib_shadow", [py, "scripts/evaluate_qlib_shadow.py", "--db", db_path, "--out", report("qlib_shadow_latest.md")], False),
@@ -543,12 +532,36 @@ def command_plan(
         ),
         (
             "generate_daily_review",
-            [py, "scripts/generate_daily_review.py", "--db", db_path, "--trade-date", selected_date, "--out", report("daily_review_latest.md")],
+            [
+                py, "scripts/generate_daily_review.py", "--db", db_path,
+                "--trade-date", selected_date, "--out", report("daily_review_latest.md"),
+                *(["--as-of", as_of_time] if as_of_time else []),
+            ],
             False,
         ),
         (
             "generate_daily_review_web",
-            [py, "scripts/generate_daily_review_web.py", "--db", db_path, "--trade-date", selected_date, "--out", report("daily_review_latest.html")],
+            [
+                py, "scripts/generate_daily_review_web.py", "--db", db_path,
+                "--trade-date", selected_date, "--out", report("daily_review_latest.html"),
+                *(["--as-of", as_of_time] if as_of_time else []),
+            ],
+            False,
+        ),
+        (
+            "audit_daily_review_artifact",
+            [
+                py,
+                "scripts/audit_daily_review_artifact.py",
+                "--db",
+                db_path,
+                "--date",
+                selected_date,
+                "--html",
+                report("daily_review_latest.html"),
+                "--out",
+                report("daily_review_artifact_audit_latest.md"),
+            ],
             False,
         ),
         (
@@ -589,7 +602,7 @@ def command_plan(
         ),
         (
             "generate_professional_reports",
-            [py, "scripts/generate_professional_reports.py", "--db", db_path, "--date", selected_date, "--out-dir", reports_dir],
+            [py, "scripts/generate_professional_reports.py", "--db", db_path, "--date", selected_date, "--readiness-stage", "close", "--out-dir", reports_dir],
             False,
         ),
         (
@@ -603,7 +616,7 @@ def command_plan(
             False,
         ),
     ])
-    if not research_enabled and phase in {None, "full", "close"}:
+    if not research_enabled and phase in {None, "close"}:
         steps = [step for step in steps if step[0] not in RESEARCH_CHAIN_STEPS]
     return steps
 
@@ -622,7 +635,11 @@ def _command_option(cmd: list[str], name: str, default: str = "") -> str:
     return str(cmd[index + 1]) if index + 1 < len(cmd) else default
 
 
-def _run_report_in_process(name: str, cmd: list[str]) -> int:
+def _run_report_in_process(
+    name: str,
+    cmd: list[str],
+    context_cache: dict[str, object] | None = None,
+) -> int:
     """Run the two read/render-only daily reports without a child process.
 
     Collection, signal generation and database migrations intentionally remain
@@ -633,11 +650,18 @@ def _run_report_in_process(name: str, cmd: list[str]) -> int:
     db_path = _command_option(cmd, "--db")
     trade_date = _command_option(cmd, "--trade-date")
     out_path = _command_option(cmd, "--out")
+    as_of = _command_option(cmd, "--as-of")
     if name == "generate_daily_review":
         from trade_system.daily_review import build_daily_review_context, write_daily_review
 
-        context = build_daily_review_context(db_path, trade_date or None)
-        path = write_daily_review(db_path, out_path, context["trade_date"])
+        context = build_daily_review_context(
+            db_path, trade_date or None, as_of=as_of or None
+        )
+        if context_cache is not None:
+            context_cache["daily_review"] = context
+        path = write_daily_review(
+            db_path, out_path, context["trade_date"], context=context
+        )
         print(f"daily_review_report={path}")
         print(f"trade_date={context['trade_date']}")
         print(f"plans={len(context.get('plans', []))}")
@@ -646,10 +670,68 @@ def _run_report_in_process(name: str, cmd: list[str]) -> int:
     if name == "generate_daily_review_web":
         from trade_system.review_web import write_review_web
 
-        path = write_review_web(db_path, out_path, trade_date or None)
+        context = None
+        if context_cache is not None:
+            cached = context_cache.get("daily_review")
+            if isinstance(cached, dict):
+                context = cached
+        path = write_review_web(
+            db_path, out_path, trade_date or None, context=context,
+            as_of=as_of or None,
+        )
         print(f"review_web={path}")
         return 0
     raise ValueError(f"unsupported in-process report task: {name}")
+
+
+REPORT_RECOVERY_STEPS = {
+    "repair_critical_integrity",
+    "build_normalized_views",
+    "ensure_operational_indexes",
+    "audit_multisource_readiness",
+    "audit_source_conflicts",
+    "reconcile_independent_stock_flow",
+    "build_operator_views",
+    "build_auction_evidence",
+    "check_capital_flow_health",
+    "generate_signals",
+    "generate_close_stage_signals",
+    "create_operator_outcome_template",
+    "run_daily_operator_loop",
+    "check_data_readiness",
+    "generate_operator_reports",
+    "generate_daily_review",
+    "generate_daily_review_web",
+    "audit_daily_review_artifact",
+    "audit_p0_p3_acceptance",
+    "audit_p3_candidates",
+    "generate_professional_reports",
+    "generate_web_dashboard",
+    "generate_trading_terminal",
+}
+
+RENDER_ONLY_STEPS = {
+    "check_capital_flow_health",
+    "check_data_readiness",
+    "generate_daily_review",
+    "generate_daily_review_web",
+    "audit_daily_review_artifact",
+    "audit_p0_p3_acceptance",
+}
+
+
+def _report_recovery_plan(
+    plan: list[tuple[str, list[str], bool]],
+) -> list[tuple[str, list[str], bool]]:
+    """Keep only deterministic gates and current-report publication work."""
+    return [step for step in plan if step[0] in REPORT_RECOVERY_STEPS]
+
+
+def _render_only_plan(
+    plan: list[tuple[str, list[str], bool]],
+) -> list[tuple[str, list[str], bool]]:
+    """Rebuild and atomically publish reports without mutating signals."""
+    return [step for step in plan if step[0] in RENDER_ONLY_STEPS]
 
 
 def main() -> int:
@@ -658,14 +740,24 @@ def main() -> int:
     parser.add_argument("--trade-date", default=date.today().isoformat())
     parser.add_argument(
         "--phase",
-        choices=("auto", "auction", "intraday", "close", "history", "full"),
+        choices=("auto", "auction", "intraday", "close", "history"),
         default="auto",
-        help="Decision window. auto uses local Asia/Shanghai time; full is legacy compatibility fan-out.",
+        help="Decision window. auto uses local Asia/Shanghai time.",
     )
     parser.add_argument("--history-start", default="", help="History phase start date, YYYYMMDD.")
     parser.add_argument("--history-end", default="", help="History phase end date, YYYYMMDD.")
     parser.add_argument("--history-max-days", type=int, default=0, help="Bound TuShare history work for this invocation; 0 means checkpointed remaining dates.")
     parser.add_argument("--skip-collect", action="store_true")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Recover signals, gates, and reports from already-persisted same-day data without recollection.",
+    )
+    parser.add_argument(
+        "--render-only",
+        action="store_true",
+        help="Atomically rebuild current reports from persisted signals without recollection or signal mutation.",
+    )
     parser.add_argument("--max-stocks", type=int, default=20)
     parser.add_argument("--max-sectors", type=int, default=20)
     parser.add_argument("--finance-max-stocks", type=int, default=5)
@@ -684,9 +776,9 @@ def main() -> int:
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument(
         "--collection-profile",
-        choices=("priority", "full"),
+        choices=("priority",),
         default="priority",
-        help="priority avoids duplicate focus/staged collection; full keeps the compatibility fan-out",
+        help="Use the single production collection profile.",
     )
     parser.add_argument(
         "--include-research",
@@ -702,35 +794,14 @@ def main() -> int:
     args = parser.parse_args()
 
     selected_phase = resolve_phase(args.phase)
-    if not args.skip_collect and args.trade_date != date.today().isoformat() and selected_phase != "history":
+    skip_collection = bool(args.skip_collect or args.report_only or args.render_only)
+    if not skip_collection and args.trade_date != date.today().isoformat() and selected_phase != "history":
         print(
             "Historical integrated runs must use --skip-collect; some upstream endpoints "
             "are current snapshots and cannot be relabeled safely.",
             file=sys.stderr,
         )
         return 2
-    if (
-        not args.skip_collect
-        and not args.dry_run
-        and selected_phase in {"auction", "intraday", "close"}
-    ):
-        from trade_system.trading_calendar import ensure_trading_session_status
-
-        session = ensure_trading_session_status(args.db, args.trade_date)
-        if session.state == "closed":
-            print(
-                f"MARKET_CLOSED trade_date={args.trade_date} "
-                f"source={session.source} reason={session.reason}"
-            )
-            return 0
-        if session.state != "open":
-            print(
-                f"MARKET_CALENDAR_UNVERIFIED trade_date={args.trade_date} "
-                f"source={session.source} reason={session.reason}",
-                file=sys.stderr,
-            )
-            return 2
-
     run_id = args.run_id or f"{args.trade_date.replace('-', '')}_{datetime.now().strftime('%H%M%S')}_{os.getpid()}"
     # P0: every report-producing subprocess writes into an isolated run staging
     # directory.  Root ``*_latest`` files remain the last published snapshot
@@ -742,7 +813,7 @@ def main() -> int:
     plan = command_plan(
         args.db,
         args.trade_date,
-        include_collection=not args.skip_collect,
+        include_collection=not skip_collection,
         max_stocks=args.max_stocks,
         max_sectors=args.max_sectors,
         finance_max_stocks=args.finance_max_stocks,
@@ -756,6 +827,19 @@ def main() -> int:
         history_max_days=args.history_max_days,
         include_research=True if args.include_research else None,
     )
+    if not skip_collection:
+        try:
+            validate_production_plan(selected_phase, [name for name, _, _ in plan])
+        except ValueError as exc:
+            print(f"PRODUCTION_PLAN_INVALID: {exc}", file=sys.stderr)
+            return 2
+    if args.render_only:
+        plan = _render_only_plan(plan)
+    elif args.report_only:
+        # A report recovery must never make a fresh network collection or
+        # rerun historical research/backtests.  Keep the deterministic source
+        # repair, one readiness authority, and current artifact publication.
+        plan = _report_recovery_plan(plan)
     if args.dry_run:
         print(f"COLLECTION_PHASE={selected_phase}")
         if selected_phase in {"auction", "intraday", "close", "history"}:
@@ -776,11 +860,51 @@ def main() -> int:
     )
     from trade_system.pipeline_audit import ensure_pipeline_task_audit, record_pipeline_task
 
-    ensure_pipeline_task_audit(args.db)
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
     report_tx = LatestReportTransaction(args.reports_dir, run_id, artifact_reports_dir)
     try:
         with PipelineLock(args.db, run_id):
+            # Every DuckDB read/write that belongs to a scheduled pipeline must
+            # happen after the process-wide lock.  Calendar refresh and audit
+            # schema setup used to run before this point, so an overlapping
+            # auction/intraday invocation failed with a raw DuckDB file-lock
+            # error instead of a clean PipelineAlreadyRunning outcome.
+            # Schema bootstrap/migrations are part of the lock owner's work;
+            # children receive KPL_RUNTIME_SCHEMA_READY and therefore never
+            # race DDL against the writer.
+            import duckdb
+            from trade_system.schema import init_schema
+
+            schema_con = duckdb.connect(str(args.db))
+            try:
+                init_schema(schema_con)
+            finally:
+                schema_con.close()
+            ensure_pipeline_task_audit(args.db)
+            if (
+                not skip_collection
+                and selected_phase in {"auction", "intraday", "close"}
+            ):
+                from trade_system.trading_calendar import ensure_trading_session_status
+
+                session = ensure_trading_session_status(args.db, args.trade_date)
+                if session.state == "closed":
+                    manifest.finish("skipped_market_closed", session.reason)
+                    report_tx.cleanup_staging()
+                    print(
+                        f"MARKET_CLOSED trade_date={args.trade_date} "
+                        f"source={session.source} reason={session.reason}"
+                    )
+                    return 0
+                if session.state != "open":
+                    manifest.finish("blocked_calendar_unverified", session.reason)
+                    report_tx.cleanup_staging()
+                    print(
+                        f"MARKET_CALENDAR_UNVERIFIED trade_date={args.trade_date} "
+                        f"source={session.source} reason={session.reason}",
+                        file=sys.stderr,
+                    )
+                    return 2
             reaped = reap_stale_run_manifests(
                 args.reports_dir,
                 exclude_run_id=run_id,
@@ -791,6 +915,7 @@ def main() -> int:
             degraded_steps = []
             chain_failed_steps = []
             informational_steps = []
+            report_context_cache: dict[str, object] = {}
             for name, cmd, optional in plan:
                 if selected_phase in {"auction", "intraday", "close"} and name in {item.name for item in phase_tasks(selected_phase)}:
                     from trade_system.collection_profiles import task_due
@@ -815,6 +940,12 @@ def main() -> int:
                     continue
                 print(f"RUN {name}: {' '.join(cmd)}")
                 started = datetime.now()
+                safe_step_name = "".join(
+                    char if char.isalnum() or char in {"-", "_"} else "_"
+                    for char in name
+                )
+                step_log_path = manifest.run_dir / "steps" / f"{safe_step_name}.log"
+                step_log_path.parent.mkdir(parents=True, exist_ok=True)
                 # A5: record the step as running BEFORE launching it so a hung or
                 # externally-killed step is still visible in the manifest/audit.  The
                 # 2026-07-27 close manifest froze at the first step because records
@@ -822,6 +953,7 @@ def main() -> int:
                 manifest.upsert_step(
                     name, "running", cmd,
                     started_at=started.isoformat(timespec="seconds"),
+                    log_path=str(step_log_path),
                 )
                 record_pipeline_task(
                     args.db, run_id=run_id, trade_date=args.trade_date,
@@ -829,20 +961,43 @@ def main() -> int:
                     started_at=started,
                 )
                 timed_out = False
+                step_stdout = ""
+                step_stderr = ""
                 try:
                     if not args.subprocess_reports and name in {"generate_daily_review", "generate_daily_review_web"}:
-                        return_code = _run_report_in_process(name, cmd)
+                        return_code = _run_report_in_process(
+                            name, cmd, report_context_cache
+                        )
                     else:
                         completed = subprocess.run(
                             cmd, cwd=ROOT, check=False,
+                            capture_output=True,
+                            env=_utf8_subprocess_env(),
                             timeout=(args.step_timeout if args.step_timeout > 0 else None),
                         )
                         return_code = completed.returncode
-                except subprocess.TimeoutExpired:
+                        step_stdout, stdout_encoding_error = _decode_process_bytes(
+                            completed.stdout, "stdout"
+                        )
+                        step_stderr, stderr_encoding_error = _decode_process_bytes(
+                            completed.stderr, "stderr"
+                        )
+                        if (stdout_encoding_error or stderr_encoding_error) and return_code == 0:
+                            return_code = -2
+                except subprocess.TimeoutExpired as exc:
                     # subprocess.run kills the child before raising; this bounds a
                     # step that would otherwise hang the whole pipeline.
                     timed_out = True
                     return_code = -1
+                    step_stdout, _ = _decode_process_bytes(exc.stdout, "stdout")
+                    step_stderr, _ = _decode_process_bytes(exc.stderr, "stderr")
+                except Exception as exc:
+                    return_code = -2
+                    step_stderr = f"{type(exc).__name__}: {exc}\n"
+                step_log_path.write_text(
+                    "[stdout]\n" + step_stdout + "\n[stderr]\n" + step_stderr,
+                    encoding="utf-8",
+                )
                 duration = round((datetime.now() - started).total_seconds(), 3)
                 is_degradable = _is_degradable_failure(selected_phase, name)
                 if return_code == 0:
@@ -868,6 +1023,9 @@ def main() -> int:
                     return_code=return_code,
                     duration_seconds=duration,
                     reason=reason,
+                    log_path=str(step_log_path),
+                    stdout_tail=step_stdout[-2000:],
+                    stderr_tail=step_stderr[-2000:],
                 )
                 record_pipeline_task(
                     args.db, run_id=run_id, trade_date=args.trade_date,
@@ -876,6 +1034,19 @@ def main() -> int:
                     finished_at=datetime.now(), duration_seconds=duration,
                     reason=reason,
                 )
+                # Replay diagnostics only after the durable manifest and task
+                # records have left the running state.  Console encoding can
+                # no longer strand the step even on a legacy host.
+                if step_stdout:
+                    _safe_stream_write(
+                        sys.stdout,
+                        step_stdout + ("" if step_stdout.endswith("\n") else "\n"),
+                    )
+                if step_stderr:
+                    _safe_stream_write(
+                        sys.stderr,
+                        step_stderr + ("" if step_stderr.endswith("\n") else "\n"),
+                    )
                 if return_code != 0:
                     if status == "degraded":
                         degraded_steps.append(name)
@@ -895,7 +1066,12 @@ def main() -> int:
                         print(f"CONTINUE chain-isolated {chain} step {name}: return_code={return_code}{' (timeout)' if timed_out else ''}")
                         continue
                     raise subprocess.CalledProcessError(return_code, cmd)
-            close_blocked = selected_phase == "close" and bool(degraded_steps)
+            # External capability loss is visible in the manifest, but it is
+            # not itself a data gate.  A close is blocked only when an actual
+            # deferred readiness/signal gate fails after fallback collection.
+            close_blocked = selected_phase == "close" and any(
+                name in CLOSE_DEFERRED_GATES for name in degraded_steps
+            )
             chain_failed = bool(chain_failed_steps)
             final_status = (
                 "completed_blocked"
@@ -938,7 +1114,15 @@ def main() -> int:
         else:
             report_tx.cleanup_staging()
         manifest.finish("failed", str(exc))
-        print(f"RUN_FAILED run_id={run_id} error={exc}", file=sys.stderr)
+        try:
+            report_tx.publish_failure_status(manifest.run_dir, str(exc))
+        except Exception as status_exc:
+            _safe_stream_write(
+                sys.stderr,
+                f"FAILURE_STATUS_PUBLISH_FAILED run_id={run_id} "
+                f"error={type(status_exc).__name__}: {status_exc}\n",
+            )
+        _safe_stream_write(sys.stderr, f"RUN_FAILED run_id={run_id} error={exc}\n")
         return 2
 
 if __name__ == "__main__":

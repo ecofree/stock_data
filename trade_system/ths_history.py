@@ -26,6 +26,7 @@ from trade_system.schema import init_schema
 from trade_system.stock_data_sources import _auto_decode, _from_ths_hot_list
 from trade_system.host_limiter import shared_host_limiter
 from trade_system.ths_quality import canonical_ths_snapshot
+from trade_system.trading_calendar import open_session_dates
 
 
 DEFAULT_CONCEPT_SOURCE = "ths"
@@ -41,60 +42,6 @@ _THS_LAST_REQUEST_AT: float | None = None
 # absent, only the public anti-bot cookie is generated and blocked/partial
 # pages remain fail-closed.
 _THS_COOKIE: str | None = os.getenv("THS_COOKIE", "").strip() or None
-
-
-def _repair_member_checkpoint_storage(con: duckdb.DuckDBPyConnection) -> None:
-    """Rebuild the small THS checkpoint table before a recovery write.
-
-    DuckDB can leave a stale primary-key/secondary-index entry after an
-    interrupted ``ON CONFLICT DO UPDATE``.  The table is only a board-level
-    checkpoint (a few hundred rows), so a deterministic copy-and-recreate is
-    safer and cheaper than allowing the next page write to hit a fatal index
-    error and invalidate the whole connection.
-    """
-    exists = con.execute(
-        "SELECT count(*) FROM information_schema.tables "
-        "WHERE table_schema='main' AND table_name='ths_concept_member_checkpoint'"
-    ).fetchone()[0]
-    if not exists:
-        return
-    columns = (
-        "trade_date, concept_code, concept_name, status, pages_expected, "
-        "pages_fetched, member_rows, attempts, last_error, updated_at, "
-        "provider, crawler_version, catalog_hash"
-    )
-    con.execute("DROP INDEX IF EXISTS idx_ths_member_date_status_updated")
-    con.execute(
-        "CREATE TABLE ths_concept_member_checkpoint_repair AS "
-        f"SELECT {columns} FROM ths_concept_member_checkpoint"
-    )
-    con.execute("DROP TABLE ths_concept_member_checkpoint")
-    con.execute(
-        "ALTER TABLE ths_concept_member_checkpoint_repair "
-        "RENAME TO ths_concept_member_checkpoint"
-    )
-    con.execute(
-        "ALTER TABLE ths_concept_member_checkpoint "
-        "ADD PRIMARY KEY (trade_date, concept_code)"
-    )
-    con.execute(
-        "CREATE INDEX idx_ths_member_date_status_updated "
-        "ON ths_concept_member_checkpoint(trade_date, status, updated_at)"
-    )
-    # The member rows are also replaced board-by-board.  Rebuild their unique
-    # business index in the same recovery pass so the first successful board
-    # cannot fail after the checkpoint table has been repaired.
-    stock_history_exists = con.execute(
-        "SELECT count(*) FROM information_schema.tables "
-        "WHERE table_schema='main' AND table_name='ths_concept_stock_history'"
-    ).fetchone()[0]
-    if stock_history_exists:
-        con.execute("DROP INDEX IF EXISTS uq_ths_concept_member_business")
-        con.execute(
-            "CREATE UNIQUE INDEX uq_ths_concept_member_business "
-            "ON ths_concept_stock_history(trade_date, concept_code, stock_code)"
-        )
-    con.commit()
 
 
 def _ths_request_cookie() -> str:
@@ -560,7 +507,6 @@ class THSConceptHistoryCollector:
         self.db_path = str(db_path)
         self.store = DuckDBStore(self.db_path)
         init_schema(self.store.conn)
-        _repair_member_checkpoint_storage(self.store.conn)
         self.fetcher = fetcher or _from_ths_hot_list
         self.period = period
         self.mode = mode
@@ -1120,7 +1066,7 @@ class THSConceptHistoryCollector:
         today's snapshot; with it, it resumes that stored checkpoint without
         relabelling the historical snapshot as date-verified.
         """
-        requested_dates = _weekday_dates(start_date, end_date)
+        requested_dates = open_session_dates(self.store.conn, start_date, end_date)
         today = date.today().isoformat()
         selected_snapshot = _iso(snapshot_date) if snapshot_date else today
         snapshot = self.collect_snapshot(selected_snapshot, force=force)

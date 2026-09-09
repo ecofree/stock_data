@@ -20,6 +20,7 @@ from pathlib import Path
 import duckdb
 
 from trade_system.signals import classify_market_regime
+from trade_system.cycle import PHASE_CN
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.logging_setup import get_logger
 from trade_system.i18n_labels import (
@@ -114,6 +115,17 @@ def _market_meta(con, trade_date: str) -> dict:
     if rows and rows[0][0]:
         meta["regime"], meta["regime_score"], meta["position_pct"] = rows[0][0], rows[0][1], rows[0][2]
         meta["regime_source"] = "snapshot"
+    # Single presentation standard: the cycle engine (market_cycle_phase) is
+    # the canonical market-regime label everywhere.  The snapshot's position
+    # suggestion stays execution-only; the displayed label/score always come
+    # from the cycle phase when available.
+    phase_rows = _q(con,
+        "SELECT phase, score FROM market_cycle_phase "
+        "WHERE CAST(trade_date AS VARCHAR)<=? ORDER BY trade_date DESC LIMIT 1", [trade_date])
+    if phase_rows and phase_rows[0][0]:
+        meta["regime"] = PHASE_CN.get(phase_rows[0][0], phase_rows[0][0])
+        meta["regime_score"] = phase_rows[0][1]
+        meta["regime_source"] = "cycle_phase"
     # Breadth row (latest available up to trade_date) for computing/confirming regime.
     breadth = _q(con,
         "SELECT CAST(trade_date AS VARCHAR), limit_up_count, limit_down_count, rise_count, "
@@ -175,17 +187,31 @@ def _emotion_history(con, trade_date: str, days: int = 380) -> list:
         "cgl, yll, success_rate "
         "FROM v_market_state_inputs WHERE CAST(trade_date AS VARCHAR)<=? "
         "ORDER BY trade_date DESC LIMIT ?", [trade_date, days])
+    # Canonical per-day labels come from the cycle engine; the breadth-derived
+    # classifier is only a fallback for days the phase table does not cover.
+    phase_map = {
+        str(r[0]): (r[1], r[2])
+        for r in _q(con,
+            "SELECT CAST(trade_date AS VARCHAR), phase, score FROM market_cycle_phase "
+            "WHERE CAST(trade_date AS VARCHAR)<=? ORDER BY trade_date DESC LIMIT ?",
+            [trade_date, days])
+    }
     out = []
     for r in reversed(rows):  # chronological
-        cls = classify_market_regime({
-            "limit_up_count": r[1], "limit_down_count": r[2], "rise_count": r[3],
-            "fall_count": r[4], "consecutive_count": r[5],
-            "earning_effect_score": r[6], "acute_drop_risk_score": r[7],
-        })
+        phase = phase_map.get(r[0])
+        if phase and phase[0]:
+            regime_label, regime_score = PHASE_CN.get(phase[0], phase[0]), phase[1]
+        else:
+            cls = classify_market_regime({
+                "limit_up_count": r[1], "limit_down_count": r[2], "rise_count": r[3],
+                "fall_count": r[4], "consecutive_count": r[5],
+                "earning_effect_score": r[6], "acute_drop_risk_score": r[7],
+            })
+            regime_label, regime_score = cls["regime"], cls["regime_score"]
         out.append({
             "d": r[0], "lu": r[1] or 0, "ld": r[2] or 0, "rise": r[3] or 0, "fall": r[4] or 0,
             "ch": r[5] or 0, "ee": _fnum(r[6]), "ad": _fnum(r[7]),
-            "regime": cls["regime"], "score": cls["regime_score"],
+            "regime": regime_label, "score": regime_score,
             "fb": bool(r[8]) if r[8] is not None else False,
             "cgl": _fnum(r[9]), "yll": _fnum(r[10]), "sr": _fnum(r[11]),
         })
@@ -778,9 +804,17 @@ def _theme_timeline_data(con, trade_date: str, days: int = 20, top_n: int = 12) 
     if not dates:
         return {"dates": [], "rows": [], "coverage": 0}
     marks = ",".join("?" * len(dates))
+    expected_row = con.execute(
+        """SELECT expected_concepts FROM ths_concept_snapshot_expectation
+           WHERE trade_date=CAST(? AS DATE) AND status IN ('success','bootstrap_observed')""",
+        [dates[0]],
+    ).fetchone() if con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name='ths_concept_snapshot_expectation'"
+    ).fetchone()[0] else None
     coverage = con.execute(
         """SELECT count(DISTINCT concept_code) FROM ths_concept_daily
            WHERE CAST(trade_date AS DATE)=?""", [dates[0]]).fetchone()[0]
+    expected_concepts = int(expected_row[0]) if expected_row and expected_row[0] else int(coverage or 0)
     rows_raw = con.execute(
         f"""SELECT concept_name, CAST(trade_date AS VARCHAR), count(*) AS zt
             FROM ths_concept_stock_history
@@ -794,7 +828,7 @@ def _theme_timeline_data(con, trade_date: str, days: int = 20, top_n: int = 12) 
     rows = [{"name": n, "cells": [by_theme[n].get(d, 0) for d in reversed(dates)],
              "total": totals[n]} for n in top]
     return {"dates": list(reversed(dates)), "rows": rows,
-            "coverage": int(coverage)}
+            "coverage": int(coverage), "expected_concepts": expected_concepts}
 
 
 def _northbound(con, trade_date: str) -> dict:
@@ -1409,10 +1443,13 @@ def _candidates_section(cand: dict) -> str:
 
 
 _VERDICT_META = {
-    "positive_sample": ("正样本", "b-ok"),
-    "negative_sample": ("负样本", "b-bad"),
+    "positive_review_sample": ("正样本(仅样本内)", "b-ok"),
+    "negative_review_sample": ("负样本(仅样本内)", "b-bad"),
     "mixed_sample": ("混合样本", "b-warn"),
     "insufficient_sample": ("样本不足", "b-neutral"),
+    # 兼容旧标签（2026-09-06前复盘页写入）：仅展示用，新样本不再产生。
+    "positive_sample": ("正样本(旧)", "b-ok"),
+    "negative_sample": ("负样本(旧)", "b-bad"),
 }
 
 
@@ -2657,12 +2694,13 @@ def _theme_timeline_html(ctx: dict) -> str:
             for c, d in zip(r["cells"], dates))
         body_rows.append(
             f"<div class='tlb-row'><div class='tlb-name'>{r['name'] or '—'}</div>{cells}</div>")
-    warn = "" if tl.get("coverage", 0) >= 374 else \
-        f" ⚠️ 当日快照不完整（{tl.get('coverage', 0)}/375）"
+    expected = int(tl.get("expected_concepts") or tl.get("coverage", 0) or 0)
+    warn = "" if tl.get("coverage", 0) >= expected else \
+        f" ⚠️ 当日快照不完整（{tl.get('coverage', 0)}/{expected}）"
     return (
         "<div class='tlb-head'><div class='tlb-name'></div>" + head + "</div>"
         + "".join(body_rows)
-        + f"<div class='dim' style='margin-top:8px'>最新快照覆盖 {tl.get('coverage', 0)}/375{warn}"
+        + f"<div class='dim' style='margin-top:8px'>最新快照覆盖 {tl.get('coverage', 0)}/{expected}{warn}"
         "；颜色深浅=当日涨停家数。research-only。</div>")
 
 

@@ -10,7 +10,7 @@ from trade_system.stock_screener import (
 )
 
 
-def _row(code, board=1, qlib=None, flow=None, seal=100.0, max_seal=200.0,
+def _row(code, board=1, qlib=0.5, flow=0.5, seal=100.0, max_seal=200.0,
          opens=0, heat=0.5):
     return {"stock_code": code, "stock_name": code, "board": board,
             "qlib_score": qlib, "flow_rank_pct": flow, "seal_money": seal,

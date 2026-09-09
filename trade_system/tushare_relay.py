@@ -383,6 +383,7 @@ def collect_tushare_daily(
                     _to_float(row.get("vol")),
                     _to_float(row.get("amount")),
                     _to_float(row.get("pct_chg")),
+                    "hands", "thousand_yuan", "none", "tushare",
                 )
                 for row in rows
                 if _iso_date(row.get("trade_date"))
@@ -390,7 +391,7 @@ def collect_tushare_daily(
             total += store.insert_rows(
                 "tushare_daily",
                 out,
-                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct"],
+                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct", "volume_unit", "amount_unit", "adjustment", "provider"],
                 replace_on=["ts_code", "date"],
             )
     return total
@@ -527,6 +528,12 @@ def sync_tushare_ohlc_to_core_tables(
     try:
         for spec_name in ("kline", "index_kline"):
             store.conn.execute(TABLE_SPECS[spec_name]["ddl"])
+        # Older core tables were created before source semantics were stored.
+        # Add the columns defensively so a verified TuShare refresh can carry
+        # its raw units into the core row without changing old data in place.
+        for column, dtype in (("volume_unit", "VARCHAR"), ("amount_unit", "VARCHAR"),
+                              ("adjustment", "VARCHAR"), ("provider", "VARCHAR")):
+            store.conn.execute(f"ALTER TABLE kline ADD COLUMN IF NOT EXISTS {column} {dtype}")
         stock_codes_normalized = _stock_code_filter_values(stock_codes)
         index_codes_normalized = _index_code_filter_values(index_codes)
 
@@ -577,12 +584,20 @@ def sync_tushare_ohlc_to_core_tables(
                             close=source.close,
                             volume=CAST(source.volume AS BIGINT),
                             turnover=CAST(source.turnover AS BIGINT),
-                            change_pct=source.change_pct
+                            change_pct=source.change_pct,
+                            volume_unit='hands',
+                            amount_unit='thousand_yuan',
+                            adjustment='none',
+                            provider=coalesce(nullif(source.provider, ''), 'tushare')
                         WHEN NOT MATCHED AND source._rn=1 THEN INSERT
-                            (date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype)
+                            (date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,volume_unit,amount_unit,adjustment,provider)
                         VALUES
                             (source.date,source.stock_code,source.open,source.high,source.low,source.close,
-                             CAST(source.volume AS BIGINT),CAST(source.turnover AS BIGINT),source.change_pct,'D')
+                             CAST(source.volume AS BIGINT),CAST(source.turnover AS BIGINT),source.change_pct,'D',
+                             coalesce(nullif(source.volume_unit, ''), 'hands'),
+                             coalesce(nullif(source.amount_unit, ''), 'thousand_yuan'),
+                             coalesce(nullif(source.adjustment, ''), 'none'),
+                             coalesce(nullif(source.provider, ''), 'tushare'))
                         """,
                         stock_params,
                     )
@@ -634,13 +649,18 @@ def sync_tushare_ohlc_to_core_tables(
                             MERGE INTO multi_source_kline AS target
                             USING (
                                 SELECT source_date, asset_type, asset_code, open, high, low,
-                                       close, volume, amount, change_pct, provider, fetched_at,
+                                       close, volume, amount, change_pct, provider, volume_unit,
+                                       amount_unit, adjustment, fetched_at,
                                        is_stale, raw_json
                                 FROM (
                                     SELECT date AS source_date, 'stock' AS asset_type,
                                            stock_code AS asset_code, open, high, low, close,
                                            volume, turnover AS amount, change_pct,
-                                           'tushare' AS provider, fetched_at,
+                                           coalesce(nullif(provider, ''), 'tushare') AS provider,
+                                           coalesce(nullif(volume_unit, ''), 'hands') AS volume_unit,
+                                           coalesce(nullif(amount_unit, ''), 'thousand_yuan') AS amount_unit,
+                                           coalesce(nullif(adjustment, ''), 'none') AS adjustment,
+                                           fetched_at,
                                            FALSE AS is_stale, NULL::VARCHAR AS raw_json,
                                            row_number() OVER (
                                                PARTITION BY date, stock_code
@@ -658,15 +678,19 @@ def sync_tushare_ohlc_to_core_tables(
                             WHEN MATCHED THEN UPDATE SET
                                 open=source.open, high=source.high, low=source.low,
                                 close=source.close, volume=source.volume, amount=source.amount,
-                                change_pct=source.change_pct, fetched_at=source.fetched_at,
+                                change_pct=source.change_pct, volume_unit=source.volume_unit,
+                                amount_unit=source.amount_unit, adjustment=source.adjustment,
+                                fetched_at=source.fetched_at,
                                 is_stale=FALSE, raw_json=source.raw_json
                             WHEN NOT MATCHED THEN INSERT (
                                 source_date, asset_type, asset_code, open, high, low, close,
-                                volume, amount, change_pct, provider, fetched_at, is_stale, raw_json
+                                volume, amount, change_pct, provider, volume_unit, amount_unit,
+                                adjustment, fetched_at, is_stale, raw_json
                             ) VALUES (
                                 source.source_date, source.asset_type, source.asset_code,
                                 source.open, source.high, source.low, source.close,
                                 source.volume, source.amount, source.change_pct, source.provider,
+                                source.volume_unit, source.amount_unit, source.adjustment,
                                 source.fetched_at, source.is_stale, source.raw_json
                             )
                             """,

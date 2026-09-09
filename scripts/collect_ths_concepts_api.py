@@ -12,6 +12,7 @@ minted.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -24,6 +25,7 @@ import duckdb  # noqa: E402
 
 from trade_system.hithink_client import HiThinkClient  # noqa: E402
 from trade_system.logging_setup import configure, get_logger  # noqa: E402
+from trade_system.schema import init_schema  # noqa: E402
 
 logger = get_logger("ths_api_collector")
 
@@ -59,11 +61,43 @@ def main() -> int:
     client = HiThinkClient(min_interval=0.35)
     con = duckdb.connect(args.db)
     try:
+        # Keep standalone repair/backfill runs safe on an older database.  The
+        # integrated close runner already applies schema under PipelineLock;
+        # init_schema is a no-op in its guarded child processes.
+        init_schema(con)
         bridge = _existing_code_by_name(con)
         catalog = client.ths_concept_catalog(tag="cn_concept")
         if args.max_concepts:
             catalog = catalog[: args.max_concepts]
         print(f"catalog: {len(catalog)} concepts; bridge table {len(bridge)} names")
+        catalog_hash = hashlib.sha256(
+            json.dumps(
+                [
+                    {"thscode": str(item.get("thscode") or ""), "name": str(item.get("name") or "")}
+                    for item in catalog
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        # A bounded test/repair run must not publish its partial size as the
+        # production expectation.  The full official catalogue is the only
+        # snapshot allowed to advance the dynamic completeness gate.
+        if not args.max_concepts:
+            con.execute(
+                """
+                INSERT INTO ths_concept_snapshot_expectation(
+                    trade_date, expected_concepts, provider, catalog_hash, status, fetched_at
+                ) VALUES (?, ?, 'hithink_index_api', ?, 'success', now())
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    expected_concepts=excluded.expected_concepts,
+                    provider=excluded.provider,
+                    catalog_hash=excluded.catalog_hash,
+                    status=excluded.status,
+                    fetched_at=excluded.fetched_at
+                """,
+                [snap, len(catalog), catalog_hash],
+            )
 
         written_d = written_m = skipped = 0
         for idx, entry in enumerate(catalog):
@@ -121,7 +155,7 @@ def main() -> int:
                        VALUES (?, ?, ?, ?, ?, 'hithink_index_api', ?, true, now())""",
                     [snap, concept_code, name, idx + 1, len(members), raw_daily],
                 )
-                # Write checkpoint row so the ≥374 completeness gate passes.
+                # Write checkpoint row so the source-sized completeness gate passes.
                 con.execute(
                     """INSERT INTO ths_concept_member_checkpoint
                        (trade_date, concept_code, concept_name, status,

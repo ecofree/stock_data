@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, time
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -14,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from base import DuckDBStore, KPLClient
-from collect_misc import collect_auction_tick
+from collect_misc import collect_auction_market
 from config import API_KEY, TODAY
 from schema import init_schema
 from trade_system.api_health import require_api_key
@@ -22,6 +23,8 @@ from trade_system.stock_data_sources import _from_tencent_quote
 
 
 def _ensure_batch(con: duckdb.DuckDBPyConnection) -> None:
+    if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() == "1":
+        return
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS auction_collection_batch (
@@ -48,6 +51,7 @@ def _ensure_batch(con: duckdb.DuckDBPyConnection) -> None:
             quote_time VARCHAR,
             indicative_price DOUBLE,
             cumulative_volume BIGINT,
+            volume_unit VARCHAR,
             bid1_price DOUBLE,
             bid1_volume BIGINT,
             ask1_price DOUBLE,
@@ -58,6 +62,9 @@ def _ensure_batch(con: duckdb.DuckDBPyConnection) -> None:
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
         """
+    )
+    con.execute(
+        "ALTER TABLE auction_quote_snapshot ADD COLUMN IF NOT EXISTS volume_unit VARCHAR"
     )
     con.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_auction_quote_snapshot "
@@ -145,13 +152,13 @@ def _collect_tencent_auction_quotes(
             """
             INSERT INTO auction_quote_snapshot
             (date,stock_code,quote_time,indicative_price,cumulative_volume,
-             bid1_price,bid1_volume,ask1_price,ask1_volume,order_imbalance,
+             volume_unit,bid1_price,bid1_volume,ask1_price,ask1_volume,order_imbalance,
              provider,raw_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             [
                 trade_date, stock_code, quote_time, indicative,
-                int(volume or 0), bid1_price, int(bid1_volume or 0),
+                int(volume or 0), "hands", bid1_price, int(bid1_volume or 0),
                 ask1_price, int(ask1_volume or 0), imbalance, "tencent_qt",
                 json.dumps(
                     {
@@ -257,15 +264,18 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
         client = KPLClient()
         store = DuckDBStore(db_path)
         init_schema(store.conn)
-        tick_rows = collect_auction_tick(client, store, trade_date, codes)
-        # Anomaly collection moved to the close phase
-        # (scripts/collect_auction_anomaly_daily.py): the KPL endpoint ignores
-        # the requested date and always returns the latest trading day, so
-        # inside the 08:25-09:35 window its payload carries the previous day's
-        # date and semantic validation rejects every call.  Querying it here
-        # only burned the morning API budget.
+        market = collect_auction_market(client, store, trade_date)
+        tick_rows = int(market.get("tick_rows") or 0)
+        quote_rows = int(market.get("quote_rows") or 0)
+        # Anomaly collection moved out of the auction window: the old route
+        # is a latest-session snapshot and is not a reliable same-date source.
+        # The full-market route above is the authoritative auction input.
         anomaly_rows = 0
-        quote_rows = _collect_tencent_auction_quotes(store.conn, trade_date, codes)
+        if not tick_rows and not quote_rows:
+            # Tencent remains a bounded order-book fallback for the rare case
+            # where the full KPL route is temporarily empty.  It is written to
+            # the separate quote table and never relabelled as trade ticks.
+            quote_rows = _collect_tencent_auction_quotes(store.conn, trade_date, codes)
         store.close()
         result.update({
             "status": "success" if tick_rows or anomaly_rows or quote_rows else "empty",

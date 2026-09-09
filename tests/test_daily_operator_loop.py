@@ -170,3 +170,55 @@ def test_daily_operator_loop_marks_zero_position_plan_as_data_blocked(tmp_path):
 
     assert plan == (0.0, "blocked_data_quality")
     assert watchlist_status == "blocked_data_quality"
+
+
+def test_daily_operator_loop_is_idempotent_for_repeated_stage_refresh(tmp_path):
+    db_path = tmp_path / "daily_loop_repeat.duckdb"
+    init_trading_tables(db_path)
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(
+            "CREATE TABLE market_regime_snapshot("
+            "trade_date VARCHAR, regime VARCHAR, regime_score DOUBLE, suggested_position_pct INTEGER, "
+            "evidence_json VARCHAR, generated_at TIMESTAMP)"
+        )
+        con.execute(
+            "INSERT INTO market_regime_snapshot VALUES "
+            "('2026-07-10','normal',70,30,'{}',current_timestamp)"
+        )
+        con.execute(
+            "CREATE TABLE stock_candidate_score("
+            "trade_date VARCHAR, stock_code VARCHAR, stock_name VARCHAR, score DOUBLE, "
+            "source VARCHAR, sector_code VARCHAR, evidence_json VARCHAR)"
+        )
+        con.execute(
+            "INSERT INTO stock_candidate_score VALUES "
+            "('2026-07-10','000001','Alpha',80,'test','801001','{}')"
+        )
+        con.execute(
+            "CREATE TABLE stock_candidate_stage_signal("
+            "trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, stock_name VARCHAR, "
+            "score DOUBLE, decision VARCHAR, evidence_json VARCHAR, generated_at TIMESTAMP)"
+        )
+    finally:
+        con.close()
+
+    run_daily_operator_loop(db_path, "2026-07-10")
+    run_daily_operator_loop(db_path, "2026-07-10")
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        counts = {
+            table: con.execute(
+                f"SELECT count(*) FROM {table} WHERE trade_date='2026-07-10'"
+            ).fetchone()[0]
+            for table in ("watchlist", "trade_plan", "risk_snapshot", "portfolio_snapshot")
+        }
+    finally:
+        con.close()
+    assert counts == {
+        "watchlist": 1,
+        "trade_plan": 1,
+        "risk_snapshot": 1,
+        "portfolio_snapshot": 1,
+    }

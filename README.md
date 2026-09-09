@@ -68,24 +68,28 @@ The exact source/cadence matrix and current TTL decisions are written by:
 D:\anaconda\python.exe scripts\describe_collection_profiles.py --db kpl_data.duckdb --phase intraday
 ```
 
-The legacy all-source plan is still available only as an explicit escape hatch:
-`--phase full` (or by calling `command_plan` without a phase in compatibility
-tests). It should not be used as the intraday scheduler.
+Collection runs require an explicit phase (`auction`, `intraday`, `close`, or
+`history`). The retired `--phase full` compatibility fan-out is no longer a
+supported production entry point.
 
 The integrated runner collects market and focused capital-flow data by
 default, takes an exclusive database lock, and writes an atomic run manifest
 below `reports/runs/<run-id>/run.json`. Intraday data gates block signals but
 do not stop the retry watcher. At the close, failed data gates remain
 non-actionable while the runner continues far enough to publish the review,
-dashboard and exact gap reports; the final close task still exits nonzero and
-is recorded as `completed_blocked`. Use `--skip-collect` only for an
-offline/research rerun of data already captured.
+dashboard and exact gap reports. A close run that published its reports but
+was blocked by a data gate is recorded as `completed_blocked` and exits 0 on
+purpose: the manifest/readiness report carries the blocked state, and the
+zero exit prevents Task Scheduler from mislabeling a published fail-closed
+review as an infrastructure failure. Other data or chain failures still exit
+nonzero. Use `--skip-collect` only for an offline/research rerun of data
+already captured.
 
 Before any signal run, verify same-date readiness. A nonzero exit means the
 requested stage is not actionable:
 
 ```powershell
-D:\anaconda\python.exe scripts\check_data_readiness.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage close
+D:\anaconda\python.exe scripts\check_data_readiness.py --db kpl_data.duckdb --date <YYYY-MM-DD> --stage close --gate data
 ```
 
 During the trading session, refresh bounded intraday capital-flow evidence
@@ -124,6 +128,10 @@ Important generated reports:
 - `reports/empty_table_catalog_latest.md`
 - `reports/data_readiness_latest.md`
 - `reports/capital_flow_freshness_latest.md`
+
+`*_latest` 复盘文件只能由 integrated pipeline 的事务发布更新。手工预览请输出到
+`reports/qa_preview_<date>/` 等隔离目录；若确需受控恢复，必须显式使用
+`--allow-direct-publish`，并在恢复后重新执行 close run 与发布指针核验。
 
 ## Manual Trading Loop
 
@@ -299,6 +307,14 @@ install:
 ```powershell
 PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File D:\accio\stock_data\scripts\install_stock_data_task.ps1 -RegisterAll -Register
 ```
+
+`-RegisterAll` also installs two post-close tasks: `StockData-SupplementalRetry`
+at 20:00 for late KPL/xiaodefa supplements and `StockData-QLibResearch` at
+20:30 for the isolated QLib shadow refresh. Both use the single-writer lock;
+each successful late refresh republishes the self-contained review page.
+KPL/HiThink HTTPS uses verified direct transport first and falls back to the
+configured proxy. If a provider uses a private root, configure
+`KPL_SSL_CA_BUNDLE`; certificate verification is never disabled.
 
 `is_executable` means stock-level evidence is complete; a candidate is
 counted as execution-ready only when `risk_approved` is also true. Blocked,

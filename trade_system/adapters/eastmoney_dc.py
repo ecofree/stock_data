@@ -128,11 +128,12 @@ def _em_get_clist_json(params=None, timeout=15):
 
 
 def _em_datacenter(report_name, filter_str="", page_size=50,
-                   sort_columns="", sort_types="-1", columns="ALL", timeout=15):
+                   sort_columns="", sort_types="-1", columns="ALL", timeout=15,
+                   page_number=1):
     """东财数据中心统一查询（龙虎榜/解禁/融资融券/大宗/股东/分红/研报共用）。
     columns=ALL 解锁全部字段（沙箱实测必须带，否则只回部分列）。"""
     params = {"reportName": report_name, "columns": columns, "filter": filter_str,
-              "pageNumber": "1", "pageSize": str(page_size),
+              "pageNumber": str(page_number), "pageSize": str(page_size),
               "sortColumns": sort_columns, "sortTypes": sort_types,
               "source": "WEB", "client": "WEB"}
     d = _em_get_json(DATACENTER_URL, params, timeout=timeout)
@@ -207,16 +208,54 @@ def _from_em_dragon_tiger_daily(date):
         "RPT_DAILYBILLBOARD_DETAILSNEW",
         filter_str=f'(TRADE_DATE>=\'{date}\')(TRADE_DATE<=\'{date}\')',
         page_size=500, sort_columns="BILLBOARD_NET_AMT", sort_types="-1", timeout=15)
-    stocks = []
+    by_code = {}
     for row in data:
+        code = str(row.get("SECURITY_CODE", "")).strip()
+        if not code:
+            continue
         net = (row.get("BILLBOARD_NET_AMT") or 0) / 1e4
-        stocks.append({"code": row.get("SECURITY_CODE", ""), "name": row.get("SECURITY_NAME_ABBR", ""),
-                       "reason": row.get("EXPLANATION", ""), "close": row.get("CLOSE_PRICE") or 0,
-                       "change_pct": round(float(row.get("CHANGE_RATE") or 0), 2),
-                       "net_buy_wan": round(net, 1),
-                       "buy_wan": round((row.get("BILLBOARD_BUY_AMT") or 0) / 1e4, 1),
-                       "sell_wan": round((row.get("BILLBOARD_SELL_AMT") or 0) / 1e4, 1),
-                       "turnover_pct": round(float(row.get("TURNOVERRATE") or 0), 2)})
+        reason = str(row.get("EXPLANATION") or "").strip()
+        current = by_code.setdefault(
+            code,
+            {
+                "code": code,
+                "name": row.get("SECURITY_NAME_ABBR", ""),
+                "reason": reason,
+                "close": row.get("CLOSE_PRICE") or 0,
+                "change_pct": round(float(row.get("CHANGE_RATE") or 0), 2),
+                "net_buy_wan": 0.0,
+                "buy_wan": 0.0,
+                "sell_wan": 0.0,
+                "turnover": 0.0,
+                "net_amount": 0.0,
+                "buy_amount": 0.0,
+                "sell_amount": 0.0,
+                "turnover_pct": round(float(row.get("TURNOVERRATE") or 0), 2),
+            },
+        )
+        if reason and reason not in str(current.get("reason") or "").split("；"):
+            current["reason"] = "；".join(
+                part for part in (str(current.get("reason") or ""), reason) if part
+            )
+        buy_amount = float(row.get("BILLBOARD_BUY_AMT") or 0)
+        sell_amount = float(row.get("BILLBOARD_SELL_AMT") or 0)
+        net_amount = float(row.get("BILLBOARD_NET_AMT") or 0)
+        current["buy_amount"] += buy_amount
+        current["sell_amount"] += sell_amount
+        current["net_amount"] += net_amount
+        current["buy_wan"] += buy_amount / 1e4
+        current["sell_wan"] += sell_amount / 1e4
+        current["net_buy_wan"] += net
+        current["turnover"] += float(row.get("BILLBOARD_DEAL_AMT") or 0)
+    stocks = list(by_code.values())
+    for item in stocks:
+        item["net_buy_wan"] = round(item["net_buy_wan"], 1)
+        item["buy_wan"] = round(item["buy_wan"], 1)
+        item["sell_wan"] = round(item["sell_wan"], 1)
+        item["turnover"] = int(round(item["turnover"]))
+        item["net_amount"] = int(round(item["net_amount"]))
+        item["buy_amount"] = int(round(item["buy_amount"]))
+        item["sell_amount"] = int(round(item["sell_amount"]))
     return {"date": date, "total_records": len(stocks), "stocks": stocks, "_src": "eastmoney"}
 
 
@@ -229,6 +268,27 @@ def _from_em_margin(code, page_size=30):
             "rzche": r.get("RZCHE", 0), "rqye": r.get("RQYE", 0), "rqmcl": r.get("RQMCL", 0),
             "rqchl": r.get("RQCHL", 0), "rzrqye": r.get("RZRQYE", 0)} for r in data]
     return out or None
+
+
+def _from_em_margin_detail_daily(date, page_size=500, max_pages=20):
+    """全市场融资融券明细（恢复 xiaodefa margin_detail 的晚到批次）。"""
+    rows = []
+    for page_number in range(1, max_pages + 1):
+        batch = _em_datacenter(
+            "RPTA_WEB_RZRQ_GGMX",
+            filter_str=f"(DATE='{date}')",
+            page_size=page_size,
+            sort_columns="SCODE",
+            sort_types="1",
+            timeout=20,
+            page_number=page_number,
+        )
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+    return rows
 
 
 def _from_em_holder(code, page_size=10):
@@ -347,7 +407,7 @@ def _from_em_sector_flow(top_n=200, *, page=1, page_size=None):
     params = {
         "pn": str(max(1, int(page))), "pz": str(size), "po": "1", "np": "1",
         "fltt": "2", "invt": "2", "fid": "f62", "fs": "m:90+t:2",
-        "fields": "f2,f3,f12,f14,f62,f66,f69,f72,f75,f78,f81,f84,f87,f104,f105,f128,f136,f140",
+              "fields": "f2,f3,f12,f14,f62,f66,f69,f72,f75,f78,f81,f84,f87,f104,f105,f128,f136,f140,f184",
     }
     d = _em_get_clist_json(params, timeout=15)
     items = (d.get("data") or {}).get("diff") or []
@@ -411,7 +471,7 @@ def _from_em_sector_flow_page(
         # without issuing one request per board.
         "po": str(sort_order), "np": "1", "fltt": "2", "invt": "2", "fid": str(sort_field),
         "fs": "m:90+t:2",
-        "fields": "f2,f3,f12,f14,f62,f66,f69,f72,f75,f78,f81,f84,f87,f104,f105,f128,f136,f140",
+        "fields": "f2,f3,f12,f14,f62,f66,f69,f72,f75,f78,f81,f84,f87,f104,f105,f128,f136,f140,f184",
     }
     d = _em_get_clist_json(params, timeout=15)
     payload = (d.get("data") or {}) if isinstance(d, dict) else {}

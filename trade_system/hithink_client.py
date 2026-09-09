@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trade_system.logging_setup import get_logger
+from trade_system.http_transport import open_verified
 
 logger = get_logger(__name__)
 
@@ -65,7 +66,7 @@ class HiThinkClient:
             url += "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"X-api-key": self.api_key})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with open_verified(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         finally:
             self._last_call = time.time()

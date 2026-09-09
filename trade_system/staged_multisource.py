@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from trade_system.multi_source_store import MultiSourceStore, infer_codes, new_run_id
+from trade_system.trading_calendar import previous_open_session
 
 
 STAGE_ORDER = ("premarket", "open", "midday", "close", "after_close")
@@ -91,18 +92,18 @@ def _ymd(value: str) -> str:
     return _iso(value).replace("-", "")
 
 
-def _recent_session_dates() -> set[str]:
+def _recent_session_dates(con) -> set[str]:
     """Dates that may still be legitimately refreshed as current snapshots.
 
     A close-stage run on the following morning commonly refreshes the prior
     trading session.  Allowing one prior weekday preserves that workflow while
     still rejecting older historical dates (which must use dated collectors).
     """
-    today = date.today()
-    out = {today.isoformat()}
-    previous = today - timedelta(days=1)
-    if previous.weekday() < 5:
-        out.add(previous.isoformat())
+    today = date.today().isoformat()
+    out = {today}
+    previous = previous_open_session(con, today)
+    if previous:
+        out.add(previous)
     return out
 
 
@@ -239,7 +240,7 @@ class StageScheduler:
         started_mono = time.monotonic()
         results: list[dict[str, Any]] = []
         budget_exhausted = False
-        current_snapshot_dates = _recent_session_dates()
+        current_snapshot_dates = _recent_session_dates(self.store.con)
 
         if dry_run:
             return {"run_id": run_id, "stages": selected, "planned": len(tasks),
@@ -313,9 +314,9 @@ class StageScheduler:
                 results.append({"task": task, "status": "failed", "rows_written": 0,
                                 "provider": None, "error": error})
 
-        if not dry_run and any(stage in selected for stage in ("close", "after_close")):
-            self.store.sync_sector_capital(self.trade_date)
-            self.store.sync_core_klines()
+        # This is a compatibility/recovery path. Keep provider evidence in
+        # multi_source_*; the integrated phase owner is the only normal
+        # writer allowed to promote rows into canonical core tables.
 
         finished_all = datetime.now()
         counts = {key: sum(1 for item in results if item["status"] == key)

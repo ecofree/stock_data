@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 import filecmp
+import hashlib
+import html
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 
 try:
     import psutil
@@ -16,6 +21,63 @@ except Exception:  # pragma: no cover - optional on minimal runtimes
 
 
 STALE_LOCAL_LOCK_GRACE_SECONDS = 120
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _file_fingerprint(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: str(item).lower()):
+        try:
+            digest.update(str(path.relative_to(PROJECT_ROOT)).encode("utf-8"))
+            digest.update(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+    return digest.hexdigest()
+
+
+def runtime_fingerprint() -> dict[str, str | bool]:
+    """Capture non-secret inputs that determine a run's interpretation.
+
+    The fingerprint is deliberately small and source-bound: it records the
+    repository revision/dirty state plus the files that define schema,
+    configuration and publication behavior.  It never serializes credentials
+    or environment values.
+    """
+    git_commit = "unknown"
+    worktree_dirty = False
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False,
+        ).stdout.strip() or "unknown"
+        worktree_dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False,
+        ).stdout.strip())
+    except OSError:
+        pass
+    schema_paths = [PROJECT_ROOT / "trade_system" / "schema.py"]
+    schema_paths.extend((PROJECT_ROOT / "migrations").glob("*.sql"))
+    config_paths = [PROJECT_ROOT / "trade_system" / "config.py"]
+    source_paths = [
+        PROJECT_ROOT / "trade_system" / "pipeline_runtime.py",
+        PROJECT_ROOT / "scripts" / "run_integrated_daily.py",
+    ]
+    try:
+        import duckdb
+        duckdb_version = str(duckdb.__version__)
+    except Exception:
+        duckdb_version = "unknown"
+    return {
+        "git_commit": git_commit,
+        "worktree_dirty": worktree_dirty,
+        "source_hash": _file_fingerprint(source_paths),
+        "config_hash": _file_fingerprint(config_paths),
+        "schema_hash": _file_fingerprint(schema_paths),
+        "python_version": platform.python_version(),
+        "python_executable": sys.executable,
+        "duckdb_version": duckdb_version,
+    }
 
 
 class PipelineAlreadyRunning(RuntimeError):
@@ -133,6 +195,7 @@ class RunManifest:
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "completed_at": None,
             "steps": [],
+            "runtime_fingerprint": runtime_fingerprint(),
         }
         self.write()
 
@@ -253,7 +316,11 @@ class LatestReportTransaction:
         if self.staging_dir != self.reports_dir:
             self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=False)
-        for path in self.reports_dir.glob("*latest*"):
+        snapshot_paths = list(self.reports_dir.glob("*latest*"))
+        last_complete = self.reports_dir / "daily_review_last_complete.html"
+        if last_complete.is_file():
+            snapshot_paths.append(last_complete)
+        for path in snapshot_paths:
             if path.is_file():
                 self.original_names.add(path.name)
                 shutil.copy2(path, self.snapshot_dir / path.name)
@@ -261,6 +328,100 @@ class LatestReportTransaction:
     @staticmethod
     def _run_artifact(path: Path) -> bool:
         return path.name not in {"qlib_shadow_training_latest.json", "qlib_features_latest.csv"}
+
+    # These names predate the run-scoped ``*_latest`` publication pointer and
+    # are still used by operators and older dashboard links. Keep them as
+    # atomically refreshed aliases so they cannot silently lag the published
+    # report set.
+    CURRENT_ALIASES = {
+        "data_readiness_latest.md": "data_readiness_current.md",
+        "p0_p3_acceptance_latest.md": "p0_p3_acceptance_current.md",
+        "daily_review_artifact_audit_latest.md": "daily_review_artifact_audit_current.md",
+    }
+
+    def _write_pipeline_status(
+        self,
+        run_path: Path,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        manifest_path = run_path / "run.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = {
+            "run_id": manifest.get("run_id"),
+            "trade_date": manifest.get("trade_date"),
+            "phase": manifest.get("phase"),
+            "status": status,
+            "started_at": manifest.get("started_at"),
+            "completed_at": manifest.get("completed_at"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "error": error,
+            "last_complete_report": "daily_review_last_complete.html"
+            if (self.reports_dir / "daily_review_last_complete.html").exists()
+            else None,
+            "review_published": bool(
+                str(manifest.get("phase") or "") == "close"
+                and (run_path / "daily_review_latest.html").is_file()
+            ),
+        }
+        json_path = self.reports_dir / "pipeline_status_latest.json"
+        json_temp = json_path.with_suffix(json_path.suffix + ".publish.tmp")
+        json_temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        json_temp.replace(json_path)
+
+        failed = status == "failed"
+        phase = str(payload.get("phase") or "unknown")
+        color = "#d64545" if failed else "#2f9e6f"
+        phase_labels = {
+            "auction": "竞价",
+            "intraday": "盘中",
+            "close": "收盘",
+            "history": "历史",
+        }
+        phase_label = phase_labels.get(phase, phase)
+        if failed:
+            title = f"{phase_label}任务执行失败"
+        elif phase == "close" and payload["review_published"]:
+            title = "今日收盘复盘已发布"
+        elif phase == "close":
+            title = "今日收盘任务已完成（复盘未发布）"
+        else:
+            title = f"{phase_label}任务已完成"
+        detail = html.escape(error or "运行已完成")
+        trade_date = html.escape(str(payload.get("trade_date") or "—"))
+        run_id = html.escape(str(payload.get("run_id") or "—"))
+        link = (
+            "<a href='daily_review_last_complete.html'>打开最后完整复盘</a>"
+            if payload.get("last_complete_report") and failed
+            else (
+                "<a href='daily_review_latest.html'>打开最新复盘</a>"
+                if payload.get("review_published")
+                else "<a href='pipeline_run_latest.json'>查看本次运行清单</a>"
+            )
+        )
+        status_html = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>{title} · {trade_date}</title><style>
+body{{margin:0;background:#11100d;color:#eee4d3;font-family:system-ui,'Microsoft YaHei',sans-serif}}
+main{{max-width:960px;margin:8vh auto;padding:32px}}.card{{border:1px solid {color};border-radius:12px;padding:24px;background:#1b1713}}
+h1{{margin-top:0}}code{{color:#e5b96f}}a{{color:#7fb2ff}}.dim{{color:#a89880}}
+</style></head><body><main><div class='card'><h1>{title}</h1>
+<p>交易日：<code>{trade_date}</code>　运行：<code>{run_id}</code></p>
+<p>{detail}</p><p>{link}</p><p class='dim'>该页面由流水线状态发布器静态生成，不依赖运行时取数。</p>
+</div></main></body></html>"""
+        html_path = self.reports_dir / "pipeline_status_latest.html"
+        html_temp = html_path.with_suffix(html_path.suffix + ".publish.tmp")
+        html_temp.write_text(status_html, encoding="utf-8")
+        html_temp.replace(html_path)
+        shutil.copy2(json_path, run_path / json_path.name)
+        shutil.copy2(html_path, run_path / html_path.name)
+
+    def publish_failure_status(self, run_dir: str | Path, error: str) -> None:
+        """Publish failure status while leaving the last published review untouched."""
+        run_path = Path(run_dir)
+        run_path.mkdir(parents=True, exist_ok=True)
+        self._write_pipeline_status(run_path, status="failed", error=error)
 
     def rollback(self, run_dir: str | Path | None = None) -> list[str]:
         """Restore root latest reports and retain changed failure artifacts.
@@ -288,7 +449,9 @@ class LatestReportTransaction:
                 retained.append(path.name)
         if self.staging_dir != self.reports_dir and self.staging_dir.exists():
             shutil.rmtree(self.staging_dir)
-        for path in self.reports_dir.glob("*latest*"):
+        managed_paths = list(self.reports_dir.glob("*latest*"))
+        managed_paths.append(self.reports_dir / "daily_review_last_complete.html")
+        for path in managed_paths:
             if path.is_file() and path.name not in self.original_names:
                 path.unlink()
         for path in self.snapshot_dir.iterdir():
@@ -304,10 +467,17 @@ class LatestReportTransaction:
 
     def commit(self, run_dir: str | Path) -> None:
         run_path = Path(run_dir)
+        manifest = json.loads((run_path / "run.json").read_text(encoding="utf-8"))
+        phase = str(manifest.get("phase") or "")
         source_paths = self.staging_dir.glob("*latest*") if self.staging_dir != self.reports_dir else self.reports_dir.glob("*latest*")
         published_names: list[str] = []
         for path in source_paths:
             if path.is_file():
+                # Auction/intraday runs must never replace a close review or
+                # its inline lazy payload.  Their status and run manifest are
+                # the publication surface for that phase.
+                if phase != "close" and path.name.startswith("daily_review_latest"):
+                    continue
                 # Large model diagnostics are current-state artifacts, not
                 # immutable per-run evidence.  Copying them into every 5-minute
                 # run caused unbounded report growth.
@@ -319,11 +489,18 @@ class LatestReportTransaction:
                 shutil.copy2(path, temp)
                 temp.replace(target)
                 published_names.append(path.name)
+        for latest_name, current_name in self.CURRENT_ALIASES.items():
+            source = self.reports_dir / latest_name
+            if not source.is_file():
+                continue
+            target = self.reports_dir / current_name
+            temp = target.with_suffix(target.suffix + ".publish.tmp")
+            shutil.copy2(source, temp)
+            temp.replace(target)
         # One small, machine-readable pointer makes the root ``*_latest``
         # files auditable as a set.  The pointer itself is included in the
         # transaction snapshot because its name also contains ``latest``.
         manifest_path = run_path / "run.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         pointer = {
             "run_id": manifest.get("run_id"),
             "trade_date": manifest.get("trade_date"),
@@ -334,12 +511,29 @@ class LatestReportTransaction:
             "published_at": datetime.now().isoformat(timespec="seconds"),
             "run_dir": str(run_path.relative_to(self.reports_dir)),
             "artifact_files": sorted(published_names),
+            "review_published": bool(
+                phase == "close" and "daily_review_latest.html" in published_names
+            ),
         }
         pointer_path = self.reports_dir / "pipeline_run_latest.json"
         pointer_temp = pointer_path.with_suffix(pointer_path.suffix + ".publish.tmp")
         pointer_temp.write_text(json.dumps(pointer, ensure_ascii=False, indent=2), encoding="utf-8")
         pointer_temp.replace(pointer_path)
         shutil.copy2(pointer_path, run_path / pointer_path.name)
+        current_review = self.reports_dir / "daily_review_latest.html"
+        review_published = bool(
+            phase == "close"
+            and "daily_review_latest.html" in published_names
+            and current_review.exists()
+            and "pipeline-failure-banner" not in current_review.read_text(encoding="utf-8", errors="replace")
+        )
+        if review_published:
+            last_complete = self.reports_dir / "daily_review_last_complete.html"
+            last_complete_temp = last_complete.with_suffix(last_complete.suffix + ".publish.tmp")
+            shutil.copy2(current_review, last_complete_temp)
+            last_complete_temp.replace(last_complete)
+            shutil.copy2(last_complete, run_path / last_complete.name)
+        self._write_pipeline_status(run_path, status=str(manifest.get("status") or "completed"))
         if self.staging_dir != self.reports_dir and self.staging_dir.exists():
             shutil.rmtree(self.staging_dir)
         shutil.rmtree(self.snapshot_dir)

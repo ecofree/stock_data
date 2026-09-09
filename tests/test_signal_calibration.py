@@ -104,7 +104,7 @@ def test_sector_scores_do_not_saturate_all_high_quality_sectors(tmp_path):
     db_path = tmp_path / "sector_scale.duckdb"
     _calibration_db(db_path)
 
-    generate_signals(db_path, "2026-07-06")
+    generate_signals(db_path, "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -121,7 +121,7 @@ def test_weak_market_penalizes_candidates_and_records_fallback_risk(tmp_path):
     db_path = tmp_path / "weak_market_candidates.duckdb"
     _calibration_db(db_path, weak_market=True)
 
-    generate_signals(db_path, "2026-07-06")
+    generate_signals(db_path, "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:

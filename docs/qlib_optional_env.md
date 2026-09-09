@@ -20,7 +20,7 @@ Windows/Python 3.12 下 `gym==0.26.2` 没有 wheel，需要源码构建；全量
 .\.venv-qlib\Scripts\python.exe scripts\check_qlib_env.py
 ```
 
-检查脚本只做导入和 `LGBModel` 构造 smoke test，不访问网络、不写 DuckDB、不启动 MLflow 服务。QLib 仍然只用于 shadow 训练、预测和后验评估，不直接改变候选池或交易信号。
+检查脚本只做导入和 `LGBModel` 构造 smoke test，不访问网络、不写 DuckDB、不启动 MLflow 服务。QLib 可用于 shadow 训练、预测、研究候选融合和后验评估，但不直接改变交易信号、仓位或订单。
 
 ## 运行
 
@@ -28,5 +28,5 @@ Windows/Python 3.12 下 `gym==0.26.2` 没有 wheel，需要源码构建；全量
 .\.venv-qlib\Scripts\python.exe scripts\export_qlib_features.py --db kpl_data.duckdb --start-date 2026-01-01 --end-date 2026-07-14 --out reports\qlib_features_2026.csv --format both
 .\.venv-qlib\Scripts\python.exe scripts\train_qlib_shadow.py --db kpl_data.duckdb --features reports\qlib_features_2026.parquet --model-id qlib_shadow_lgbm_2026_ytd
 .\.venv-qlib\Scripts\python.exe scripts\evaluate_qlib_shadow.py --db kpl_data.duckdb --out reports\qlib_shadow_latest.md
+.\.venv-qlib\Scripts\python.exe scripts\run_qlib_research_daily.py --db kpl_data.duckdb --trade-date YYYY-MM-DD --reports-dir reports
 ```
-

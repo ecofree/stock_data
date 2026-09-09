@@ -36,6 +36,15 @@ FORBIDDEN_RE = re.compile(
     r"commit|rollback)\b",
     re.IGNORECASE,
 )
+# DuckDB table functions that read arbitrary files / globs.  A SELECT-only
+# allowlist is not enough: read_text('.env') is a valid SELECT and would
+# exfiltrate secrets to any local process that can reach this console.
+FORBIDDEN_TABLE_FUNCS = re.compile(
+    r"\b(read_text|read_csv|read_json|read_parquet|read_json_auto|"
+    r"read_csv_auto|glob|parquet_scan|csv_scan|json_scan|"
+    r"iceberg_scan|delta_scan|arrow_scan|range|generate_series)\s*\(",
+    re.IGNORECASE,
+)
 COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 
 
@@ -59,6 +68,9 @@ def guard_sql(sql: str) -> str:
     match = FORBIDDEN_RE.search(cleaned)
     if match:
         raise QueryRejected(f"keyword '{match.group(0)}' is not allowed")
+    func_match = FORBIDDEN_TABLE_FUNCS.search(cleaned)
+    if func_match:
+        raise QueryRejected(f"table function '{func_match.group(1)}' is not allowed")
     if not re.search(r"\blimit\b", cleaned, re.IGNORECASE):
         cleaned += f" LIMIT {MAX_ROWS}"
     return cleaned

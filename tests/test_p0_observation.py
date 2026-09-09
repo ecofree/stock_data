@@ -102,6 +102,15 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path):
         "SELECT '2026-07-23', 'THS-' || lpad(CAST(i AS VARCHAR),4,'0'), 'success' "
         "FROM range(374) t(i)"
     )
+    con.execute(
+        "CREATE TABLE ths_concept_snapshot_expectation("
+        "trade_date DATE PRIMARY KEY,expected_concepts INTEGER,provider VARCHAR,"
+        "catalog_hash VARCHAR,status VARCHAR DEFAULT 'success')"
+    )
+    con.execute(
+        "INSERT INTO ths_concept_snapshot_expectation "
+        "VALUES ('2026-07-23',374,'test_catalog','test','success')"
+    )
     con.close()
     for trade_date in ("2026-07-23", "2026-07-24"):
         for phase in ("auction", "intraday", "close"):

@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 import math
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Iterable
@@ -26,6 +27,8 @@ from trade_system.tushare_relay import (
     ts_code_to_stock_code,
 )
 from trade_system.flow_contract import ensure_stock_flow_contract
+from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
+from trade_system.config import SETTINGS
 
 
 CHECKPOINT_DATE = "1900-01-01"
@@ -108,7 +111,33 @@ class TushareHistoryCollector:
         self.store = DuckDBStore(self.db_path)
         init_schema(self.store.conn)
         ensure_stock_flow_contract(self.store.conn)
-        self.client = client or TushareRelayClient(timeout=request_timeout, retries=retries)
+        self._relay_client: TushareRelayClient | None = None
+        self._primary_init_error: str | None = None
+        if client is not None:
+            self.client = client
+        else:
+            # xiaodefa is the preferred historical close source.  The fast
+            # relay remains a real fallback, not a second writer.  Operators
+            # can explicitly select the old order for a controlled rollback.
+            preferred = str(
+                os.environ.get("TUSHARE_PRIMARY_PROVIDER")
+                or SETTINGS.get("TUSHARE_PRIMARY_PROVIDER", "xiaodefa")
+                or "xiaodefa"
+            ).strip().lower()
+            if preferred in {"tushare", "fast", "fast_relay", "relay"}:
+                self.client = TushareRelayClient(timeout=request_timeout, retries=retries)
+            else:
+                try:
+                    self.client = XiaodefaClient(
+                        min_interval_seconds=0.65,
+                        max_retries=max(1, int(retries)),
+                    )
+                except (XiaodefaError, ImportError, RuntimeError) as exc:
+                    self._primary_init_error = f"{type(exc).__name__}: {exc}"
+                    self.client = TushareRelayClient(timeout=request_timeout, retries=retries)
+        self._secondary_client: XiaodefaClient | None = None
+        self._secondary_init_error: str | None = None
+        self._last_source_provider = self._provider_name(self.client)
         self.batch_limit = max(100, int(batch_limit))
         self.moneyflow_page_size = max(100, min(int(moneyflow_page_size), 1000))
         self.budget_seconds = max(1.0, float(budget_seconds))
@@ -128,7 +157,7 @@ class TushareHistoryCollector:
 
     def _validate_stock_snapshot(self, dataset: str, rows: list[Any], trade_date: str) -> None:
         """Reject an empty/short real close snapshot before publishing it."""
-        if not isinstance(self.client, TushareRelayClient):
+        if not self._is_production_source():
             return
         observed = len(rows)
         if observed <= 0:
@@ -147,6 +176,52 @@ class TushareHistoryCollector:
             "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
         ).fetchone()[0] or 0)
 
+    def _is_production_source(self) -> bool:
+        return isinstance(self.client, (TushareRelayClient, XiaodefaClient))
+
+    @staticmethod
+    def _provider_name(source: Any) -> str:
+        return "xiaodefa" if isinstance(source, XiaodefaClient) else "tushare" if isinstance(source, TushareRelayClient) else "custom"
+
+    def _xiaodefa_client(self) -> XiaodefaClient | None:
+        """Create the secondary close source lazily and only for the relay.
+
+        Test/fake clients must remain deterministic, and a missing xiaodefa
+        credential must be recorded as a fallback miss rather than preventing
+        the normal fast-relay path from starting.
+        """
+        if not isinstance(self.client, TushareRelayClient):
+            return None
+        if self._secondary_client is not None:
+            return self._secondary_client
+        if self._secondary_init_error:
+            return None
+        try:
+            self._secondary_client = XiaodefaClient(
+                min_interval_seconds=0.65,
+                max_retries=max(1, min(3, int(getattr(self.client, "retries", 1)))),
+            )
+        except (XiaodefaError, ImportError, RuntimeError) as exc:
+            self._secondary_init_error = f"{type(exc).__name__}: {exc}"
+        return self._secondary_client
+
+    def _tushare_relay_client(self) -> TushareRelayClient | None:
+        """Create the fast relay only when xiaodefa needs a fallback."""
+        if isinstance(self.client, TushareRelayClient):
+            return self.client
+        if not isinstance(self.client, XiaodefaClient):
+            return None
+        if self._relay_client is not None:
+            return self._relay_client
+        try:
+            self._relay_client = TushareRelayClient(
+                timeout=20,
+                retries=max(1, min(3, int(getattr(self.client, "max_retries", 1)))),
+            )
+        except Exception:
+            self._relay_client = None
+        return self._relay_client
+
     def _is_complete_stock_table(self, table: str, date_column: str, trade_date: str) -> bool:
         expected = self._expected_stock_count()
         if expected < 1000:
@@ -158,7 +233,7 @@ class TushareHistoryCollector:
         return observed >= max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE))
 
     def _certify_close_snapshot(self, dataset: str, trade_date: str, *, status: str,
-                                error_message: str = "") -> None:
+                                error_message: str = "", provider: str = "tushare") -> None:
         table_by_dataset = {
             "daily": ("tushare_daily", "date", "close"),
             "daily_basic": ("tushare_daily_basic", "date", None),
@@ -198,7 +273,7 @@ class TushareHistoryCollector:
             "expected_rows=excluded.expected_rows,observed_rows=excluded.observed_rows,distinct_codes=excluded.distinct_codes,"
             "invalid_rows=excluded.invalid_rows,coverage_pct=excluded.coverage_pct,source_event_date=excluded.source_event_date,"
             "fetched_at=excluded.fetched_at,status=excluded.status,error_message=excluded.error_message",
-            [dataset, _iso(trade_date), "tushare", expected, observed, distinct_codes, invalid_rows,
+            [dataset, _iso(trade_date), provider, expected, observed, distinct_codes, invalid_rows,
              coverage, _iso(trade_date), final_status, error_message[:500]],
         )
         self.store.conn.commit()
@@ -297,38 +372,50 @@ class TushareHistoryCollector:
         if with_limit:
             params["limit"] = self.batch_limit
         target = _iso(trade_date)
-        semantic_attempts = max(1, min(4, int(getattr(self.client, "retries", 1))))
-        best_rows: list[dict[str, Any]] = []
+        clients: list[Any] = [self.client]
+        secondary = self._xiaodefa_client()
+        if secondary is None:
+            secondary = self._tushare_relay_client()
+        if secondary is not None:
+            clients.append(secondary)
         last_reason = "empty response"
-        for attempt in range(semantic_attempts):
-            try:
-                rows = self.client.query_rows(api, params, fields)
-            except Exception as exc:
-                if not isinstance(self.client, TushareRelayClient):
-                    raise
-                last_reason = f"{type(exc).__name__}: {exc}"
-                rows = []
-            dated_rows = []
-            for row in rows:
+        for source in clients:
+            semantic_attempts = max(1, min(4, int(getattr(source, "retries", getattr(source, "max_retries", 1)))))
+            best_rows: list[dict[str, Any]] = []
+            for attempt in range(semantic_attempts):
                 try:
-                    if row.get("trade_date") and _iso(row.get("trade_date")) == target:
-                        dated_rows.append(row)
-                except (TypeError, ValueError):
-                    continue
-            if len(dated_rows) > len(best_rows):
-                best_rows = dated_rows
-            if not isinstance(self.client, TushareRelayClient):
-                return dated_rows
-            if not dated_rows:
-                last_reason = f"empty {api} response for requested date {target}"
-            elif api in STOCK_SNAPSHOT_DATASETS and len(dated_rows) < max(1000, math.ceil(self._expected_stock_count() * MIN_STOCK_SNAPSHOT_COVERAGE)):
-                last_reason = f"incomplete {api} response: {len(dated_rows)} rows for requested date {target}"
-            elif len(dated_rows) < 1000:
-                last_reason = f"suspiciously short {api} response: {len(dated_rows)} rows"
-            else:
-                return dated_rows
-            if attempt + 1 < semantic_attempts:
-                time.sleep(min(15.0, 2.0 ** attempt))
+                    rows = source.query_rows(api, params, fields)
+                except Exception as exc:
+                    if not self._is_production_source():
+                        raise
+                    last_reason = f"{type(exc).__name__}: {exc}"
+                    rows = []
+                dated_rows = []
+                for row in rows:
+                    try:
+                        if row.get("trade_date") and _iso(row.get("trade_date")) == target:
+                            dated_rows.append(row)
+                    except (TypeError, ValueError):
+                        continue
+                if len(dated_rows) > len(best_rows):
+                    best_rows = dated_rows
+                if not self._is_production_source():
+                    self._last_source_provider = "custom"
+                    return dated_rows
+                expected_minimum = max(1000, math.ceil(self._expected_stock_count() * MIN_STOCK_SNAPSHOT_COVERAGE))
+                if not dated_rows:
+                    last_reason = f"empty {api} response for requested date {target}"
+                elif api in STOCK_SNAPSHOT_DATASETS and len(dated_rows) < expected_minimum:
+                    last_reason = f"incomplete {api} response: {len(dated_rows)} rows for requested date {target}"
+                elif len(dated_rows) < 1000:
+                    last_reason = f"suspiciously short {api} response: {len(dated_rows)} rows"
+                else:
+                    self._last_source_provider = self._provider_name(source)
+                    return dated_rows
+                if attempt + 1 < semantic_attempts:
+                    time.sleep(min(15.0, 2.0 ** attempt))
+            if best_rows and isinstance(source, XiaodefaClient):
+                last_reason = f"incomplete xiaodefa {api} response: {len(best_rows)} rows for requested date {target}"
         raise TushareRelayError(last_reason)
 
     def _query_code_batches(self, api: str, trade_date: str, fields: str) -> list[dict[str, Any]]:
@@ -340,7 +427,8 @@ class TushareHistoryCollector:
         result is large enough to be useful; callers still checkpoint an
         incomplete result as an error.
         """
-        if not isinstance(self.client, TushareRelayClient):
+        relay = self._tushare_relay_client()
+        if relay is None:
             return []
         codes = [str(row[0]) for row in self.store.conn.execute(
             "SELECT DISTINCT ts_code FROM tushare_stock_basic "
@@ -355,7 +443,7 @@ class TushareHistoryCollector:
                 break
             batch = codes[start:start + QUOTE_CODE_BATCH_SIZE]
             try:
-                rows = self.client.query_rows(
+                rows = relay.query_rows(
                     api,
                     {"ts_code": ",".join(batch), "trade_date": _ymd(trade_date)},
                     fields,
@@ -370,7 +458,7 @@ class TushareHistoryCollector:
                     if not self._budget_left():
                         break
                     try:
-                        rows = self.client.query_rows(
+                        rows = relay.query_rows(
                             api,
                             {"ts_code": ",".join(smaller), "trade_date": _ymd(trade_date)},
                             fields,
@@ -483,7 +571,8 @@ class TushareHistoryCollector:
                 deduped[(row.get("ts_code"), _iso(row.get("trade_date")))] = (
                     row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
                     _num(row.get("open")), _num(row.get("high")), _num(row.get("low")), _num(row.get("close")),
-                    _num(row.get("vol")), _num(row.get("amount")), _num(row.get("pct_chg")))
+                    _num(row.get("vol")), _num(row.get("amount")), _num(row.get("pct_chg")),
+                    "hands", "thousand_yuan", "none", self._last_source_provider)
         out = list(deduped.values())
         self._validate_stock_snapshot("daily", out, trade_date)
         # Clear stale/partial rows only after a complete-looking response has
@@ -493,11 +582,11 @@ class TushareHistoryCollector:
             self.store.conn.execute("DELETE FROM tushare_daily WHERE date=?", [_iso(trade_date)])
             count = self._bulk_replace(
                 "tushare_daily", out,
-                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct"],
+                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct", "volume_unit", "amount_unit", "adjustment", "provider"],
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("daily", trade_date, status="certified")
+            self._certify_close_snapshot("daily", trade_date, status="certified", provider=self._last_source_provider)
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -523,7 +612,7 @@ class TushareHistoryCollector:
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("daily_basic", trade_date, status="certified")
+            self._certify_close_snapshot("daily_basic", trade_date, status="certified", provider=self._last_source_provider)
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -550,7 +639,7 @@ class TushareHistoryCollector:
                 ["ts_code", "date"],
             )
             self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("adj_factor", trade_date, status="certified")
+            self._certify_close_snapshot("adj_factor", trade_date, status="certified", provider=self._last_source_provider)
             return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
@@ -558,6 +647,8 @@ class TushareHistoryCollector:
 
     def _collect_moneyflow(self, trade_date: str) -> int:
         total = 0
+        flow_client: Any = self.client
+        relay = self._tushare_relay_client()
         # Fetch/publish as one transaction.  A failed relay page must not erase
         # the previous verified market snapshot.
         self.store.conn.execute("BEGIN TRANSACTION")
@@ -613,12 +704,22 @@ class TushareHistoryCollector:
                 # are best-effort because the relay may reject the larger
                 # projection; missing size values remain NULL instead of
                 # losing net flow.
-                rows = self.client.query_rows("moneyflow", params, MONEYFLOW_MAIN_FIELDS)
+                try:
+                    rows = flow_client.query_rows("moneyflow", params, MONEYFLOW_MAIN_FIELDS)
+                except Exception:
+                    if relay is None or flow_client is relay:
+                        raise
+                    # A xiaodefa endpoint outage must fall through to the
+                    # fast relay inside the same atomic batch, with provenance
+                    # visible in close_snapshot_certification.
+                    flow_client = relay
+                    self._last_source_provider = "tushare"
+                    rows = flow_client.query_rows("moneyflow", params, MONEYFLOW_MAIN_FIELDS)
                 if not rows:
                     break
                 detail_by_key: dict[tuple[str, str], dict[str, Any]] = {}
                 try:
-                    details = self.client.query_rows("moneyflow", params, MONEYFLOW_SIZE_FIELDS)
+                    details = flow_client.query_rows("moneyflow", params, MONEYFLOW_SIZE_FIELDS)
                     detail_by_key = {(str(r.get("ts_code")), _iso(r.get("trade_date"))): r for r in details}
                 except Exception:
                     detail_by_key = {}
@@ -645,7 +746,7 @@ class TushareHistoryCollector:
                 )
                 if len(rows) < self.moneyflow_page_size:
                     break
-            if isinstance(self.client, TushareRelayClient) and total < 4000:
+            if relay is not None and total < 4000:
                 # Some relay deployments index recent moneyflow rows by
                 # ``ts_code`` but return an empty/short result for the same
                 # request filtered only by ``trade_date``.  Retry the date in
@@ -665,7 +766,7 @@ class TushareHistoryCollector:
                     best_batch: list[dict[str, Any]] = []
                     for attempt in range(2):
                         try:
-                            candidate = self.client.query_rows(
+                            candidate = relay.query_rows(
                                 "moneyflow",
                                 {"ts_code": ",".join(code_batch), "trade_date": _ymd(trade_date), "limit": 2000},
                                 MONEYFLOW_MAIN_FIELDS,
@@ -709,7 +810,7 @@ class TushareHistoryCollector:
                 )
                 if total < 4000:
                     raise TushareRelayError(f"incomplete moneyflow response: {total} rows")
-            if isinstance(self.client, TushareRelayClient):
+            if self._is_production_source():
                 expected = int(self.store.conn.execute(
                     "SELECT count(*) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
                 ).fetchone()[0] or 0)
@@ -768,6 +869,8 @@ class TushareHistoryCollector:
              _num(row.get("sell_sm_amount")), _json(row))
             for row in rows if row.get("ts_code")
         ]
+        if not out:
+            return 0
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute("DELETE FROM tushare_moneyflow_industry WHERE trade_date=?", [_iso(trade_date)])
@@ -806,6 +909,12 @@ class TushareHistoryCollector:
                         "yuan", "main_orders_net", "moneyflow", "tushare", "stock_flow_v2", False,
                         _json({"ts_code": row[0], "source": "tushare_moneyflow", "unit": "yuan",
                                "net_total": total, "main_net_definition": "super_net+large_net"})])
+        # An empty source batch is not a valid replacement.  In particular,
+        # an upstream timeout can leave the raw table empty while the last
+        # verified normalized snapshot is still usable.  Return before the
+        # DELETE so the old provider rows survive the transient failure.
+        if not out:
+            return 0
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute(
@@ -843,6 +952,8 @@ class TushareHistoryCollector:
                         super_net, large, mid, small, row[2], "tushare_sector_full",
                         "tushare_dc_sector", "yuan", False,
                         _json({"close": row[3], "source": "moneyflow_ind_dc", "unit": "yuan"})])
+        if not out:
+            return 0
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute(

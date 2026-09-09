@@ -80,5 +80,8 @@ def run(db, start, end, offset, max_stocks, workers):
     finally: store.close()
 
 def main():
-    root=Path(__file__).resolve().parents[1]; p=argparse.ArgumentParser(); p.add_argument('--db',default=str(root/'kpl_data.duckdb')); p.add_argument('--start-date',required=True); p.add_argument('--end-date',required=True); p.add_argument('--offset',type=int,default=0); p.add_argument('--max-stocks',type=int,default=40); p.add_argument('--workers',type=int,default=4); a=p.parse_args(); out=run(a.db,a.start_date,a.end_date,a.offset,a.max_stocks,a.workers); print(out); return 0 if out['errors']==0 else 1
+    root=Path(__file__).resolve().parents[1]; p=argparse.ArgumentParser(); p.add_argument('--db',default=str(root/'kpl_data.duckdb')); p.add_argument('--start-date',required=True); p.add_argument('--end-date',required=True); p.add_argument('--offset',type=int,default=0); p.add_argument('--max-stocks',type=int,default=40); p.add_argument('--workers',type=int,default=4); p.add_argument('--allow-unverified-units',action='store_true',help='允许旧版BaoStock脚本写入未统一单位的核心表（仅用于受控迁移）'); a=p.parse_args()
+    if not a.allow_unverified_units:
+        p.error('legacy BaoStock backfill is frozen: pass --allow-unverified-units only for a controlled migration')
+    out=run(a.db,a.start_date,a.end_date,a.offset,a.max_stocks,a.workers); print(out); return 0 if out['errors']==0 else 1
 if __name__=='__main__': raise SystemExit(main())

@@ -13,7 +13,7 @@ def test_network_permission_error_opens_circuit(monkeypatch):
         calls.append((args, kwargs))
         raise urllib.error.URLError(reason)
 
-    monkeypatch.setattr(base.urllib.request, "urlopen", denied)
+    monkeypatch.setattr(base, "open_verified", denied)
     client = base.KPLClient(request_timeout=0.1, max_attempts=5, total_budget_seconds=5)
 
     assert client.get("/sector/capital", {"code": "801001"}) is None
@@ -26,8 +26,8 @@ def test_network_permission_error_opens_circuit(monkeypatch):
 
 def test_expired_total_budget_skips_request(monkeypatch):
     monkeypatch.setattr(
-        base.urllib.request,
-        "urlopen",
+        base,
+        "open_verified",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call")),
     )
     client = base.KPLClient(total_budget_seconds=1)
@@ -51,7 +51,7 @@ def test_dated_semantic_mismatch_does_not_retry(monkeypatch):
         def read(self):
             return b'{"raw_data": [{"date": "2026-07-15"}]}'
 
-    monkeypatch.setattr(base.urllib.request, "urlopen", lambda *args, **kwargs: (calls.append(1) or Response()))
+    monkeypatch.setattr(base, "open_verified", lambda *args, **kwargs: (calls.append(1) or Response()))
     monkeypatch.setattr(
         base,
         "validate_kpl",
@@ -81,8 +81,8 @@ def test_rise_fall_source_date_can_be_explicitly_preserved(monkeypatch):
             )
 
     monkeypatch.setattr(
-        base.urllib.request,
-        "urlopen",
+        base,
+        "open_verified",
         lambda *args, **kwargs: (calls.append(1) or Response()),
     )
     client = base.KPLClient(max_attempts=5, total_budget_seconds=30)
@@ -95,3 +95,32 @@ def test_rise_fall_source_date_can_be_explicitly_preserved(monkeypatch):
     assert len(calls) == 1
     assert client.stats["success"] == 1
     assert client.stats["semantic_error"] == 1
+
+
+def test_forbidden_optional_route_does_not_poison_core_client(monkeypatch):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"data": [{"date": "2026-08-28"}]}'
+
+    def open_route(request, **kwargs):
+        calls.append(request.full_url)
+        if "/auction/tick?" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 403, "forbidden", {}, None)
+        return Response()
+
+    monkeypatch.setattr(base, "open_verified", open_route)
+    client = base.KPLClient(max_attempts=1, total_budget_seconds=30)
+
+    assert client.get("/auction/tick", {"code": "600519", "date": "2026-08-28"}) is None
+    assert client.get("/daily", {"date": "2026-08-28"}) is not None
+    assert client.stats["auth_error"] == 1
+    assert client.stats["circuit_open"] == 0
+    assert len(calls) == 2

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+from trade_system.trading_calendar import open_session_dates
 
 
 STOCK_TABLES = {
@@ -66,15 +67,9 @@ def _table_names(con) -> set[str]:
 
 
 def _calendar_dates(con, start: str, end: str) -> list[str]:
-    if "tushare_trade_cal" in _table_names(con):
-        rows = con.execute(
-            "SELECT CAST(cal_date AS VARCHAR) FROM tushare_trade_cal "
-            "WHERE exchange='SSE' AND is_open AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
-            [start, end],
-        ).fetchall()
-        if rows:
-            return [str(row[0])[:10] for row in rows]
-    return _weekday_dates(start, end)
+    # Missing calendar data is an operational gap, not permission to invent
+    # sessions from weekdays.
+    return open_session_dates(con, start, end)
 
 
 def _daily_coverage(con, table: str, date_col: str, code_col: str, expected_dates: list[str],

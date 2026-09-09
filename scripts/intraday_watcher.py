@@ -77,7 +77,6 @@ def main() -> int:
     args = parser.parse_args()
 
     configure()
-    con = duckdb.connect(args.db, read_only=True)
     seen: set = set()
     try:
         while True:
@@ -87,7 +86,14 @@ def main() -> int:
                 time.sleep(300)
                 continue
             try:
-                fresh = fetch_new_signals(con, seen)
+                # Do not hold a DuckDB connection across the polling interval.
+                # On Windows even a read-only connection can prevent the close
+                # pipeline from opening the database for writes.
+                con = duckdb.connect(args.db, read_only=True)
+                try:
+                    fresh = fetch_new_signals(con, seen)
+                finally:
+                    con.close()
                 if fresh:
                     logger.info("%d new triggered signals", len(fresh))
                     push_batch(fresh)
@@ -103,8 +109,6 @@ def main() -> int:
             time.sleep(max(30, args.interval))
     except KeyboardInterrupt:
         pass
-    finally:
-        con.close()
     print("watcher done")
     return 0
 

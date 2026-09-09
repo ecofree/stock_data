@@ -7,6 +7,55 @@ import trade_system.ths_history as ths_history
 from trade_system.ths_history import THSConceptHistoryCollector, _concept_code
 
 
+def test_ths_checkpoint_repair_is_explicit_and_dry_run_is_read_only():
+    from trade_system.ths_checkpoint_migration import repair_ths_checkpoint_storage
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute(
+            """
+            CREATE TABLE ths_concept_member_checkpoint(
+                trade_date DATE, concept_code VARCHAR, concept_name VARCHAR,
+                status VARCHAR, pages_expected INTEGER, pages_fetched INTEGER,
+                member_rows INTEGER, attempts INTEGER, last_error VARCHAR,
+                updated_at TIMESTAMP, provider VARCHAR, crawler_version VARCHAR,
+                catalog_hash VARCHAR
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE ths_concept_stock_history(
+                trade_date DATE, concept_code VARCHAR, stock_code VARCHAR
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO ths_concept_member_checkpoint VALUES
+            ('2026-08-28','THS-1','概念一','success',1,1,1,1,'',CURRENT_TIMESTAMP,'ths','v2','h')
+            """
+        )
+        con.execute(
+            "INSERT INTO ths_concept_stock_history VALUES ('2026-08-28','THS-1','000001')"
+        )
+
+        assert repair_ths_checkpoint_storage(con, dry_run=True) == {
+            "status": "dry_run", "checkpoint_rows": 1, "member_rows": 1
+        }
+        assert con.execute("SELECT count(*) FROM ths_concept_member_checkpoint").fetchone()[0] == 1
+
+        result = repair_ths_checkpoint_storage(con)
+        assert result["status"] == "repaired"
+        assert con.execute("SELECT count(*) FROM ths_concept_member_checkpoint").fetchone()[0] == 1
+        assert con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name='ths_concept_member_checkpoint_repair'"
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
 def test_ths_member_parser_prefers_paginated_constituent_table():
     html = """
     <table class="series-table">
@@ -158,6 +207,14 @@ def test_ths_recovery_skips_cached_stale_boards_by_default(tmp_path, monkeypatch
 def test_ths_run_reports_unavailable_history(tmp_path):
     db = tmp_path / "ths-gap.duckdb"
     with THSConceptHistoryCollector(db, fetcher=lambda _period: []) as collector:
+        # The unavailable-history report is based on verified calendar rows;
+        # a missing calendar must not be replaced by an implicit weekday list.
+        collector.store.conn.execute(
+            "INSERT INTO tushare_trade_cal(exchange,cal_date,is_open) "
+            "SELECT 'SSE', CAST(d AS DATE), true "
+            "FROM generate_series(DATE '2026-01-01', DATE '2026-07-14', INTERVAL '1 day') AS t(d)"
+        )
+        collector.store.conn.commit()
         result = collector.run("2026-01-01", "2026-07-14")
     assert result["historical_supported"] is False
     assert len(result["missing_historical_dates"]) > 100

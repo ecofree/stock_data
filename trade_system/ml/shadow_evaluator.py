@@ -74,13 +74,12 @@ def evaluate_qlib_shadow(
     db_path: str | Path,
     *,
     quantile: float = 0.2,
-    round_trip_cost_bps: float = 0.0,
+    round_trip_cost_bps: float = 25.0,
 ) -> dict:
     """Evaluate shadow predictions with an optional conservative round-trip cost.
 
-    The default remains gross-return compatible for legacy callers.  Formal
-    promotion must pass a positive cost budget so the displayed result cannot
-    be mistaken for executable performance.
+    The default is cost-aware (25 bps) so displayed results cannot be mistaken
+    for executable performance. Pass 0.0 explicitly for legacy gross-only runs.
     """
     round_trip_cost_bps = max(0.0, float(round_trip_cost_bps))
     ensure_qlib_shadow_tables(db_path)
@@ -173,7 +172,16 @@ def evaluate_qlib_shadow(
 
     con = duckdb.connect(str(db_path))
     try:
-        con.execute("DELETE FROM qlib_shadow_evaluation")
+        con.execute("BEGIN TRANSACTION")
+        # 追加式版本化：只覆盖同一 (model, method, quantile, cost) 的旧行，
+        # 不删其他参数/模型的历史评估，保留追溯链。
+        con.execute(
+            "ALTER TABLE qlib_shadow_evaluation ADD COLUMN IF NOT EXISTS round_trip_cost_bps DOUBLE"
+        )
+        con.execute(
+            "DELETE FROM qlib_shadow_evaluation WHERE evaluation_method = 'daily_cross_sectional_quantile' AND quantile = ? AND coalesce(round_trip_cost_bps, 0.0) = ?",
+            [quantile, round_trip_cost_bps],
+        )
         models = {}
         for model_id, rows in sorted(grouped.items()):
             returns = [float(row["forward_return_pct"]) for row in rows]
@@ -247,11 +255,11 @@ def evaluate_qlib_shadow(
                     model_id, sample_start, sample_end, sample_count, ic, rank_ic,
                     avg_forward_return, top_quantile_return, bottom_quantile_return,
                     top_bottom_spread, hit_rate, top_hit_rate, daily_top_hit_rate,
-                    max_drawdown, evaluation_method, quantile, updated_at,
+                    max_drawdown, evaluation_method, quantile, round_trip_cost_bps, updated_at,
                     avg_net_return, net_top_bottom_spread, top_quantile_net_return,
                     bottom_quantile_net_return
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     model_id,
@@ -270,6 +278,7 @@ def evaluate_qlib_shadow(
                     item["max_drawdown"],
                     item["evaluation_method"],
                     item["quantile"],
+                    round_trip_cost_bps,
                     datetime.now(),
                     item["avg_net_return"],
                     item["net_top_bottom_spread"],
@@ -277,6 +286,14 @@ def evaluate_qlib_shadow(
                     item["bottom_quantile_net_return"],
                 ],
             )
-        return {"sample_count": len(evaluated_rows), "models": models, "rows": evaluated_rows}
+        result = {"sample_count": len(evaluated_rows), "models": models, "rows": evaluated_rows}
+        con.commit()
+        return result
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()

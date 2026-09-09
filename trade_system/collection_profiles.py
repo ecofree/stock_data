@@ -16,6 +16,7 @@ from typing import Any
 import duckdb
 
 from trade_system.ths_quality import canonical_ths_snapshot
+from trade_system.time_utils import as_local_naive
 
 
 PHASES = ("auction", "intraday", "close", "history")
@@ -34,7 +35,7 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
     "auction": (
         ProfileTask("collect_market_context", "KPL market/rise-fall", 300, "market regime and auction context"),
         ProfileTask("collect_realtime_limit_pool", "KPL L2 realtime/ladder", 180, "same-day executable limit-up pool"),
-        ProfileTask("collect_auction_evidence", "KPL auction tick/anomaly", 180, "bounded stock-level auction evidence"),
+        ProfileTask("collect_auction_evidence", "KPL /auction/market + Tencent fallback", 180, "full-market auction sequence and final match evidence"),
         ProfileTask("build_auction_evidence", "DuckDB auction snapshot", 60, "normalize stock-level auction evidence", network=False),
     ),
     "intraday": (
@@ -60,13 +61,14 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
     "close": (
         ProfileTask("collect_market_context", "KPL market/rise-fall", 3600, "final market snapshot"),
         ProfileTask("sync_tushare_close", "TuShare relay date batches", 3600, "same-day daily/basic/adjustment/money-flow facts"),
-        ProfileTask("refresh_ths_weekly", "THS concept web catalogue/members", 7 * 86400, "weekly 374-concept membership snapshot"),
+        ProfileTask("collect_hithink_limit_pool_daily", "HiThink official limit-up pool", 3600, "same-day close limit-up facts and reasons"),
         ProfileTask("collect_realtime_limit_pool", "KPL L2 then Eastmoney push2ex", 3600, "final limit-up pool"),
         ProfileTask("collect_kpl_stock_flow_focus", "KPL advanced/zjmm-min", 3600, "bounded independent money-flow confirmation for candidate stocks"),
         ProfileTask("collect_intraday_stock_flow_market", "Eastmoney push2 then push2delay + datacenter", 3600, "final stock capital-flow snapshot"),
         ProfileTask("collect_intraday_sector_flow_full", "Eastmoney sector pages + TuShare/THS aggregate", 3600, "final sector capital-flow snapshot"),
         ProfileTask("collect_executable_quotes", "Tencent qt.gtimg.cn spot", 3600, "final candidate live prices; auto-boost if KPL stale"),
-        ProfileTask("collect_finance_gapfill", "Eastmoney/Sina financial statements", 7 * 86400, "bounded quarterly gap-fill"),
+        ProfileTask("collect_review_supplement", "KPL bounded P1 review supplement", 86400, "daily review enhancement; never a close gate"),
+        ProfileTask("collect_auction_market_daily", "KPL /auction/market", 3600, "full-market after-close auction evidence"),
     ),
     "history": (
         ProfileTask("backfill_2026_tushare", "TuShare relay", None, "resumable daily/basic/moneyflow history"),
@@ -88,10 +90,8 @@ def resolve_phase(phase: str = "auto", now: datetime | None = None) -> str:
     value = (phase or "auto").strip().lower()
     if value in PHASES:
         return value
-    if value not in {"auto", "full"}:
+    if value != "auto":
         raise ValueError(f"unsupported collection phase: {phase}")
-    if value == "full":
-        return "full"
     current = (now or datetime.now()).time()
     for name, (start, end) in _WINDOWS.items():
         if start <= current < end:
@@ -212,13 +212,11 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
                 "ths_concept_stock_history",
                 "ths_concept_member_checkpoint",
             )):
-                canonical = canonical_ths_snapshot(
-                    con, trade_date, minimum_concepts=374
-                )
+                canonical = canonical_ths_snapshot(con, trade_date)
                 if canonical is None:
                     return True, "canonical THS snapshot missing or incomplete"
                 fetched = datetime.fromisoformat(canonical["snapshot_date"])
-                age = max(0.0, (current.replace(tzinfo=None) - fetched).total_seconds())
+                age = max(0.0, (as_local_naive(current) - fetched).total_seconds())
                 if age < task.cadence_seconds:
                     return False, f"fresh canonical snapshot age={int(age)}s ttl={task.cadence_seconds}s"
                 return True, f"expired canonical snapshot age={int(age)}s ttl={task.cadence_seconds}s"
@@ -228,6 +226,19 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
                 "WHERE dataset='ths_concept_snapshot' "
                 "ORDER BY updated_at DESC LIMIT 1",
                 [],
+            )
+        elif task_name == "collect_hithink_limit_pool_daily":
+            if not _table_exists(con, "official_limit_pool"):
+                return True, "official limit pool table missing"
+            row = _latest(
+                con,
+                """
+                SELECT max(fetched_at),
+                       CASE WHEN count(*) >= 5 THEN 'success' ELSE 'partial' END
+                FROM official_limit_pool
+                WHERE CAST(trade_date AS VARCHAR)=?
+                """,
+                [trade_date],
             )
         elif task_name == "sync_tushare_close":
             if not _table_exists(con, "history_fetch_checkpoint"):
@@ -260,15 +271,33 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
             if not _table_exists(con, "intraday_sector_flow_batch"):
                 return True, "sector-flow batch missing"
             row = _latest(con, "SELECT updated_at, status FROM intraday_sector_flow_batch WHERE CAST(trade_date AS VARCHAR)=? ORDER BY updated_at DESC LIMIT 1", [trade_date])
+        elif task_name == "collect_auction_market_daily":
+            if not _table_exists(con, "auction_collection_batch"):
+                return True, "auction batch checkpoint missing"
+            row = _latest(
+                con,
+                "SELECT attempted_at, status FROM auction_collection_batch "
+                "WHERE CAST(trade_date AS VARCHAR)=? ORDER BY attempted_at DESC LIMIT 1",
+                [trade_date],
+            )
         elif task_name == "collect_finance_gapfill":
             if not _table_exists(con, "finance_fetch_checkpoint"):
                 return True, "finance checkpoint missing"
             row = _latest(con, "SELECT max(fetched_at), count(*) FROM finance_fetch_checkpoint WHERE CAST(target_date AS VARCHAR)=?", [trade_date])
+        elif task_name == "collect_review_supplement":
+            if not _table_exists(con, "review_supplement_batch"):
+                return True, "review supplement checkpoint missing"
+            row = _latest(
+                con,
+                "SELECT attempted_at, status FROM review_supplement_batch "
+                "WHERE CAST(trade_date AS VARCHAR)=? ORDER BY attempted_at DESC LIMIT 1",
+                [trade_date],
+            )
         if not row or row[0] is None:
             return True, "no same-date snapshot"
         fetched = row[0]
         if not isinstance(fetched, datetime):
-            fetched = datetime.fromisoformat(str(fetched).replace("Z", "+00:00")).replace(tzinfo=None)
+            fetched = as_local_naive(str(fetched).replace("Z", "+00:00"))
         status = str(row[1]).lower() if len(row) > 1 and row[1] is not None else ""
         ttl = task.cadence_seconds
         if task_name == "refresh_ths_weekly":
@@ -286,7 +315,7 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
             # checkpoint behind; without this it would be treated as fresh
             # for the full TTL and never retried (observed 2026-08-10 THS).
             ttl = max(60, min(ttl // 2, 86400))
-        age = max(0.0, (current.replace(tzinfo=None) - fetched).total_seconds())
+        age = max(0.0, (as_local_naive(current) - as_local_naive(fetched)).total_seconds())
         if age < ttl:
             return False, f"fresh age={int(age)}s ttl={ttl}s status={status or 'ok'}"
         return True, f"expired age={int(age)}s ttl={ttl}s status={status or 'ok'}"

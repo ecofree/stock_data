@@ -13,9 +13,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate separated professional trading reports.")
     parser.add_argument("--db", default="kpl_data.duckdb")
     parser.add_argument("--date")
+    parser.add_argument(
+        "--readiness-stage",
+        choices=("premarket", "auction", "intraday", "close", "postmarket"),
+        default="close",
+    )
     parser.add_argument("--out-dir", default="reports")
     args = parser.parse_args()
-    paths = write_professional_reports(args.db, args.out_dir, args.date)
+    paths = write_professional_reports(args.db, args.out_dir, args.date, args.readiness_stage)
     print("Professional reports:")
     for name, path in paths.items():
         print(f"{name}={path}")

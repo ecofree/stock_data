@@ -61,7 +61,7 @@ def run_market_regime_backtest(db_path: str | Path) -> dict:
 
 
 
-def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = False) -> dict:
+def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = True) -> dict:
     """Backtest actionable stage-v2 signals with stage-appropriate prices.
 
     A-share T+1 is enforced: an entry cannot be sold until the next trading
@@ -114,7 +114,30 @@ def run_stage_candidate_backtest(db_path: str | Path, *, enforce_t1: bool = Fals
                 "excluded_count": len(signals),
             }
         code_placeholders = ",".join("?" for _ in stock_codes)
-        if table_exists(con, "v_kline_daily"):
+        if table_exists(con, "tushare_daily"):
+            kline_rows = _fetch_dicts(
+                con,
+                f"""
+                SELECT trade_date, stock_code, open, close
+                FROM (
+                    SELECT CAST(date AS VARCHAR) AS trade_date,
+                           regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                           open, close,
+                           row_number() OVER (
+                               PARTITION BY CAST(date AS DATE),
+                                   regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')
+                               ORDER BY fetched_at DESC NULLS LAST, rowid DESC
+                           ) AS rn
+                    FROM tushare_daily
+                    WHERE close IS NOT NULL
+                      AND regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') IN ({code_placeholders})
+                ) ranked
+                WHERE rn = 1
+                ORDER BY stock_code, trade_date
+                """,
+                stock_codes,
+            )
+        elif table_exists(con, "v_kline_daily"):
             kline_rows = _fetch_dicts(
                 con,
                 f"""

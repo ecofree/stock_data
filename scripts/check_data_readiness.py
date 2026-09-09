@@ -22,6 +22,12 @@ def main() -> int:
     parser.add_argument("--out", default="reports/data_readiness_latest.md")
     parser.add_argument("--report-only", action="store_true", help="Always exit zero after writing the report.")
     parser.add_argument(
+        "--gate",
+        choices=["source", "data", "flow", "analysis", "execution"],
+        default="data",
+        help="Gate represented by the exit code; default is the certified data gate.",
+    )
+    parser.add_argument(
         "--as-of",
         default="",
         help="Evaluate freshness at this ISO timestamp; used for audited historical recovery runs.",
@@ -58,7 +64,15 @@ def main() -> int:
         f"executable_candidates={result.get('executable_candidates', 0)} "
         f"missing={','.join(result['missing_groups']) or 'none'} out={out}"
     )
-    return 0 if result.get("source_ready", result["ready"]) or args.report_only else 2
+    gate_fields = {
+        "source": "source_ready",
+        "data": "data_certified_ready",
+        "flow": "flow_certified_ready",
+        "analysis": "analysis_ready",
+        "execution": "execution_ready",
+    }
+    gate_ok = bool(result.get(gate_fields[args.gate], False))
+    return 0 if gate_ok or args.report_only else 2
 
 
 if __name__ == "__main__":

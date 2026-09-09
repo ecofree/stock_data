@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
+import os
 from pathlib import Path
 import sys
 import uuid
@@ -90,6 +91,8 @@ def _normalize_realtime_page(rows: list[dict], trade_date: str) -> list[dict]:
 
 
 def _ensure_checkpoint_table(con: duckdb.DuckDBPyConnection) -> None:
+    if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() == "1":
+        return
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS intraday_stock_flow_batch (
@@ -121,12 +124,26 @@ def _ensure_checkpoint_table(con: duckdb.DuckDBPyConnection) -> None:
             primary_only_rows INTEGER,
             reference_only_rows INTEGER,
             overlap_reference_pct DOUBLE,
+            overlap_sign_disagreement INTEGER DEFAULT 0,
+            overlap_sign_disagreement_pct DOUBLE,
+            mean_abs_main_net_diff DOUBLE,
+            value_status VARCHAR DEFAULT 'not_observed',
             status VARCHAR,
             last_error VARCHAR,
             updated_at TIMESTAMP DEFAULT current_timestamp
         )
         """
     )
+    for column, column_type in (
+        ("overlap_sign_disagreement", "INTEGER DEFAULT 0"),
+        ("overlap_sign_disagreement_pct", "DOUBLE"),
+        ("mean_abs_main_net_diff", "DOUBLE"),
+        ("value_status", "VARCHAR DEFAULT 'not_observed'"),
+    ):
+        con.execute(
+            f"ALTER TABLE intraday_stock_flow_reconciliation "
+            f"ADD COLUMN IF NOT EXISTS {column} {column_type}"
+        )
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS intraday_stock_flow_page_checkpoint (
@@ -556,6 +573,8 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         "status": "not_run", "reference_provider": "eastmoney_market",
         "reference_rows": 0, "overlap_rows": 0, "primary_only_rows": 0,
         "reference_only_rows": 0, "overlap_reference_pct": 0.0,
+        "overlap_sign_disagreement": 0, "overlap_sign_disagreement_pct": None,
+        "mean_abs_main_net_diff": None, "value_status": "not_observed",
     }
     if not checkpoint_ok:
         reconciliation["status"] = "skipped"
@@ -567,10 +586,10 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             _skip_con = duckdb.connect(str(db_path))
             _skip_con.execute(
                 "INSERT INTO intraday_stock_flow_reconciliation "
-                "(trade_date, primary_provider, primary_rows, status, last_error, updated_at) "
-                "VALUES (?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
+                "(trade_date, primary_provider, primary_rows, status, value_status, last_error, updated_at) "
+                "VALUES (?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
                 "status=excluded.status, last_error=excluded.last_error, updated_at=excluded.updated_at",
-                [trade_date, source_provider, fetched_rows, "skipped", checkpoint_error],
+                [trade_date, source_provider, fetched_rows, "skipped", "not_observed", checkpoint_error],
             )
             _skip_con.commit()
             _skip_con.close()
@@ -604,7 +623,45 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             reference_codes = {str(row.get("code")) for row in reference_rows}
             overlap = primary_codes & reference_codes
             overlap_pct = round(len(overlap) * 100.0 / len(reference_codes), 2) if reference_codes else 0.0
-            recon_status = "pass" if reference_codes and overlap_pct >= 98.0 else "warning"
+            primary_values = {
+                str(row[0]): row[1]
+                for row in con.execute(
+                    "SELECT stock_code, main_net FROM multi_source_stock_flow "
+                    "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+                    [trade_date, source_provider],
+                ).fetchall()
+            }
+            reference_values = {
+                str(row.get("code")): row.get("main_net")
+                for row in reference_rows
+            }
+            value_pairs = [
+                (primary_values[code], reference_values[code])
+                for code in overlap
+                if primary_values.get(code) is not None and reference_values.get(code) is not None
+            ]
+            def _sign(value):
+                return 1 if float(value) > 0 else -1 if float(value) < 0 else 0
+            sign_disagreement = sum(
+                1 for left, right in value_pairs if _sign(left) != _sign(right)
+            )
+            sign_pct = round(sign_disagreement * 100.0 / len(value_pairs), 2) if value_pairs else None
+            mean_abs_diff = (
+                round(sum(abs(float(left) - float(right)) for left, right in value_pairs) / len(value_pairs), 2)
+                if value_pairs else None
+            )
+            # Coverage and value agreement are independent dimensions.  A
+            # high-overlap sweep with material sign disagreement is a warning,
+            # not a silently certified reconciliation.
+            value_status = (
+                "pass" if value_pairs and (sign_pct or 0.0) <= 5.0
+                else "not_observed" if not value_pairs
+                else "warning"
+            )
+            recon_status = (
+                "pass" if reference_codes and overlap_pct >= 98.0 and value_status == "pass"
+                else "warning"
+            )
             reconciliation = {
                 "status": recon_status,
                 "reference_provider": reference_provider,
@@ -613,21 +670,31 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 "primary_only_rows": len(primary_codes - reference_codes),
                 "reference_only_rows": len(reference_codes - primary_codes),
                 "overlap_reference_pct": overlap_pct,
+                "overlap_sign_disagreement": sign_disagreement,
+                "overlap_sign_disagreement_pct": sign_pct,
+                "mean_abs_main_net_diff": mean_abs_diff,
+                "value_status": value_status,
             }
             con.execute(
                 "INSERT INTO intraday_stock_flow_reconciliation "
                 "(trade_date,primary_provider,primary_rows,reference_provider,reference_rows,overlap_rows,"
-                "primary_only_rows,reference_only_rows,overlap_reference_pct,status,last_error,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,current_timestamp) "
+                "primary_only_rows,reference_only_rows,overlap_reference_pct,overlap_sign_disagreement,"
+                "overlap_sign_disagreement_pct,mean_abs_main_net_diff,value_status,status,last_error,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,current_timestamp) "
                 "ON CONFLICT(trade_date) DO UPDATE SET primary_provider=excluded.primary_provider,"
                 "primary_rows=excluded.primary_rows,reference_provider=excluded.reference_provider,"
                 "reference_rows=excluded.reference_rows,overlap_rows=excluded.overlap_rows,"
                 "primary_only_rows=excluded.primary_only_rows,reference_only_rows=excluded.reference_only_rows,"
-                "overlap_reference_pct=excluded.overlap_reference_pct,status=excluded.status,last_error=NULL,"
+                "overlap_reference_pct=excluded.overlap_reference_pct,"
+                "overlap_sign_disagreement=excluded.overlap_sign_disagreement,"
+                "overlap_sign_disagreement_pct=excluded.overlap_sign_disagreement_pct,"
+                "mean_abs_main_net_diff=excluded.mean_abs_main_net_diff,"
+                "value_status=excluded.value_status,status=excluded.status,last_error=NULL,"
                 "updated_at=excluded.updated_at",
                 [trade_date, source_provider, fetched_rows, reference_provider, len(reference_codes),
                  len(overlap), len(primary_codes - reference_codes), len(reference_codes - primary_codes),
-                 overlap_pct, recon_status, ""],
+                 overlap_pct, sign_disagreement, sign_pct, mean_abs_diff, value_status,
+                 recon_status, ""],
             )
             con.commit()
         except Exception as exc:
@@ -639,12 +706,12 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             try:
                 con.execute(
                     "INSERT INTO intraday_stock_flow_reconciliation "
-                    "(trade_date,primary_provider,primary_rows,reference_provider,status,last_error,updated_at) "
-                    "VALUES (?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
+                    "(trade_date,primary_provider,primary_rows,reference_provider,status,value_status,last_error,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date) DO UPDATE SET "
                     "primary_provider=excluded.primary_provider,primary_rows=excluded.primary_rows,"
-                    "reference_provider=excluded.reference_provider,status=excluded.status,"
+                    "reference_provider=excluded.reference_provider,status=excluded.status,value_status=excluded.value_status,"
                     "last_error=excluded.last_error,updated_at=excluded.updated_at",
-                    [trade_date, source_provider, fetched_rows, "eastmoney_market", "error", str(exc)[:500]],
+                    [trade_date, source_provider, fetched_rows, "eastmoney_market", "error", "not_observed", str(exc)[:500]],
                 )
                 con.commit()
             except Exception:
@@ -682,6 +749,9 @@ def render_report(result: dict) -> str:
         f"- after-close reconciliation: `{result.get('reconciliation', {}).get('status', 'not_run')}` "
         f"({result.get('reconciliation', {}).get('overlap_rows', 0)}/"
         f"{result.get('reconciliation', {}).get('reference_rows', 0)})",
+        f"- reconciliation value agreement: `{result.get('reconciliation', {}).get('value_status', 'not_observed')}` "
+        f"(sign disagreement={result.get('reconciliation', {}).get('overlap_sign_disagreement_pct', 'n/a')}%, "
+        f"mean abs main-net diff={result.get('reconciliation', {}).get('mean_abs_main_net_diff', 'n/a')})",
         "",
         "Historical datacenter rows are never relabelled. For today's session, rows come from Eastmoney's live push2 snapshot and are stamped with the verified local session date.",
         "",

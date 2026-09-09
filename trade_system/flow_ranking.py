@@ -7,21 +7,21 @@ provider priority, and must not surface near-market mega baskets as "mainline".
 
 from __future__ import annotations
 
-# Higher score wins when choosing the canonical provider for a stock.
+from trade_system.source_authority import policy, provider_rank, provider_rank_sql
+
+# Compatibility mapping for callers that display a score.  The order itself
+# is owned by source_authority; this map must never become a second policy.
 STOCK_FLOW_PROVIDER_PRIORITY: dict[str, int] = {
-    # Live Eastmoney clist (if ever landed without delay tag).
-    "eastmoney_intraday_clist": 100,
-    "eastmoney_market": 95,
-    # Primary production path today: delayed full-market clist.
-    "eastmoney_intraday_clist_delay": 90,
-    "eastmoney": 80,
-    "tushare": 70,
-    "tushare_moneyflow": 70,
-    # KPL focus snapshots only cover a tiny candidate set — never promote them
-    # over full-market providers when ranking the whole market.
-    "kpl": 40,
-    "kpl_focus": 40,
+    provider: 1000 - rank
+    for rank, provider in enumerate(policy("stock_flow").provider_order)
 }
+STOCK_FLOW_PROVIDER_PRIORITY.update({
+    alias: STOCK_FLOW_PROVIDER_PRIORITY[target]
+    for alias, target in {
+        "tushare_moneyflow": "tushare",
+        "kpl_focus": "kpl",
+    }.items()
+})
 
 # Sector types preferred for theme/mainline ranking (higher first).
 SECTOR_TYPE_PRIORITY: dict[str, int] = {
@@ -73,13 +73,9 @@ def stock_provider_rank(provider: str | None) -> int:
     raw = str(provider or "").strip().lower()
     if not raw:
         return 0
-    if raw in STOCK_FLOW_PROVIDER_PRIORITY:
-        return STOCK_FLOW_PROVIDER_PRIORITY[raw]
-    for key, score in STOCK_FLOW_PROVIDER_PRIORITY.items():
-        if key in raw:
-            return score
-    # Unknown providers beat KPL-focus-only noise but lose to known full-market.
-    return 55
+    # Keep the public score shape, but resolve the order through the one
+    # authority matrix.  Higher scores still win for existing callers.
+    return max(1, 1000 - provider_rank("stock_flow", raw))
 
 
 def sector_type_rank(sector_type: str | None) -> int:
@@ -105,7 +101,7 @@ def stock_flow_rank_sql(
 
     Caller binds the trade date once for the ``source_date`` filter.
     """
-    # CASE expression mirrors STOCK_FLOW_PROVIDER_PRIORITY for DuckDB-only paths.
+    provider_order = provider_rank_sql("stock_flow", "provider")
     return f"""
         SELECT {alias}.*
         FROM (
@@ -114,15 +110,7 @@ def stock_flow_rank_sql(
                 row_number() OVER (
                     PARTITION BY stock_code
                     ORDER BY
-                        CASE
-                            WHEN lower(coalesce(provider, '')) = 'eastmoney_intraday_clist' THEN 100
-                            WHEN lower(coalesce(provider, '')) = 'eastmoney_market' THEN 95
-                            WHEN lower(coalesce(provider, '')) = 'eastmoney_intraday_clist_delay' THEN 90
-                            WHEN lower(coalesce(provider, '')) LIKE 'eastmoney%' THEN 80
-                            WHEN lower(coalesce(provider, '')) LIKE 'tushare%' THEN 70
-                            WHEN lower(coalesce(provider, '')) LIKE 'kpl%' THEN 40
-                            ELSE 55
-                        END DESC,
+                        {provider_order} ASC,
                         fetched_at DESC NULLS LAST
                 ) AS _rn
             FROM multi_source_stock_flow
@@ -148,6 +136,7 @@ def sector_flow_rank_sql(
             f"coalesce(sector_name, '') LIKE '%{marker}%'" for marker in MEGA_SECTOR_NAME_MARKERS
         )
         mega_filter = f"AND NOT ({clauses})"
+    provider_order = provider_rank_sql("sector_flow", "provider")
     return f"""
         SELECT {alias}.*
         FROM (
@@ -156,6 +145,7 @@ def sector_flow_rank_sql(
                 row_number() OVER (
                     PARTITION BY sector_code
                     ORDER BY
+                        {provider_order} ASC,
                         CASE
                             WHEN lower(coalesce(sector_type, '')) = 'ths_concept' THEN 100
                             WHEN lower(coalesce(sector_type, '')) = 'ths_concept_derived' THEN 80

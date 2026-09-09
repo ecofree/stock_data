@@ -4,10 +4,40 @@ import sys
 import duckdb
 
 from scripts.run_integrated_daily import (
+    _decode_process_bytes,
     _is_degradable_failure,
+    _report_recovery_plan,
+    _render_only_plan,
+    _utf8_subprocess_env,
     command_plan,
     main,
 )
+
+
+def test_report_recovery_plan_excludes_collectors_and_backtests():
+    filtered = _report_recovery_plan(command_plan("kpl_data.duckdb"))
+    names = {step[0] for step in filtered}
+    assert "generate_daily_review_web" in names
+    assert "audit_daily_review_artifact" in names
+    assert "check_data_readiness" in names
+    assert "collect_minute_snapshots" not in names
+    assert "run_stage_backtest" not in names
+    assert "generate_cycle_analytics" not in names
+
+
+def test_render_only_plan_is_atomic_and_does_not_mutate_signals():
+    filtered = _render_only_plan(command_plan("kpl_data.duckdb"))
+    names = [step[0] for step in filtered]
+    assert names == [
+        "check_capital_flow_health",
+        "check_data_readiness",
+        "generate_daily_review",
+        "generate_daily_review_web",
+        "audit_daily_review_artifact",
+        "audit_p0_p3_acceptance",
+    ]
+    assert "generate_signals" not in names
+    assert "run_daily_operator_loop" not in names
 
 
 def test_integrated_daily_command_plan_contains_required_steps():
@@ -16,8 +46,8 @@ def test_integrated_daily_command_plan_contains_required_steps():
     assert names == [
         "repair_critical_integrity",
         "build_normalized_views",
-        "ensure_operational_indexes",
         "audit_multisource_readiness",
+        "audit_source_conflicts",
         "audit_stock_flow_contract",
         "reconcile_independent_stock_flow",
         "build_operator_views",
@@ -28,6 +58,9 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "create_operator_outcome_template",
         "run_daily_operator_loop",
         "check_data_readiness",
+        "generate_health_trend",
+        "generate_cycle_analytics",
+        "generate_signal_attribution",
         "run_stage_backtest",
         "run_daily_review_statistics",
         "run_operator_backtest",
@@ -45,6 +78,7 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "generate_operator_reports",
         "generate_daily_review",
         "generate_daily_review_web",
+        "audit_daily_review_artifact",
         "build_ai_review_snapshot",
         "audit_p0_p3_acceptance",
         "audit_p3_candidates",
@@ -64,11 +98,23 @@ def test_operator_backtest_is_optional_until_phase_5_exists():
     assert optional == {"run_operator_backtest", "run_news_radar"}
 
 
+def test_close_runs_auxiliary_reports_before_review_and_isolates_them():
+    from trade_system.pipeline_contract import REVIEW_CHAIN_STEPS
+
+    steps = command_plan("kpl_data.duckdb", "2026-07-09", phase="close")
+    names = [name for name, _, _ in steps]
+    assert names.index("generate_cycle_analytics") < names.index("generate_daily_review")
+    assert names.index("generate_signal_attribution") < names.index("generate_daily_review")
+    assert {"generate_health_trend", "generate_cycle_analytics",
+            "generate_signal_attribution"} <= REVIEW_CHAIN_STEPS
+
+
 def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection():
     steps = command_plan(
         "sample.duckdb",
         "2026-07-09",
         include_collection=True,
+        phase="close",
         max_stocks=12,
         max_sectors=9,
     )
@@ -76,18 +122,12 @@ def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection
 
     assert [steps[0][0], steps[1][0], steps[2][0]] == [
         "collect_market_context",
-        "collect_realtime_limit_pool",
-        "collect_intraday_stock_flow_market",
+        "check_kpl_connectivity",
+        "sync_tushare_close",
     ]
-    capital_cmd = by_name["collect_capital_flow_focus"]
-    assert capital_cmd[capital_cmd.index("--max-stocks") + 1] == "12"
-    assert capital_cmd[capital_cmd.index("--max-sectors") + 1] == "9"
-    assert "--strict" in capital_cmd
-    multisource_cmd = by_name["collect_multisource_capital_flow"]
-    assert multisource_cmd[multisource_cmd.index("--max-stocks") + 1] == "12"
-    assert "scripts/run_staged_multisource.py" in multisource_cmd
-    assert multisource_cmd[multisource_cmd.index("--stage") + 1] == "close"
-    assert by_name["generate_signals"][-2:] == ["--date", "2026-07-09"]
+    assert "collect_capital_flow_focus" not in by_name
+    assert "collect_multisource_capital_flow" not in by_name
+    assert by_name["generate_signals"][-4:] == ["--date", "2026-07-09", "--readiness-stage", "close"]
     operator_cmd = by_name["run_daily_operator_loop"]
     assert operator_cmd[operator_cmd.index("--trade-date") + 1] == "2026-07-09"
     assert operator_cmd[operator_cmd.index("--stage") + 1] == "close"
@@ -98,10 +138,10 @@ def test_priority_collection_profile_avoids_duplicate_fanout():
     names = [step[0] for step in steps]
     assert names[:5] == [
         "collect_market_context",
-        "collect_realtime_limit_pool",
-        "collect_intraday_stock_flow_market",
-        "collect_intraday_sector_flow_full",
-        "collect_finance_gapfill",
+        "check_kpl_connectivity",
+        "sync_tushare_close",
+        "sync_tushare_ohlc_core",
+        "collect_ths_concepts_api",
     ]
     assert "collect_capital_flow_focus" not in names
     assert "collect_multisource_capital_flow" not in names
@@ -163,6 +203,21 @@ def test_close_plan_reuses_intraday_l2_instead_of_fetching_after_hours():
     names = [step[0] for step in steps]
     assert "collect_l2_focus" not in names
     assert "collect_executable_quotes" in names
+    assert names.index("collect_ths_concepts_api") < names.index(
+        "collect_intraday_sector_flow_full"
+    )
+
+
+def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_character():
+    env = _utf8_subprocess_env()
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    text, broken = _decode_process_bytes("启动".encode("utf-8"), "stdout")
+    assert (text, broken) == ("启动", False)
+    text, broken = _decode_process_bytes("启动".encode("gbk"), "stdout")
+    assert broken is True
+    assert "�" not in text
+    assert "stdout_encoding_error" in text
 
 
 def test_close_recovery_as_of_is_applied_to_all_freshness_gates():
@@ -185,16 +240,13 @@ def test_close_recovery_as_of_is_applied_to_all_freshness_gates():
         assert command[command.index("--as-of") + 1] == as_of
 
 
-def test_close_data_gates_are_deferred_until_reports_but_remain_blocking():
+def test_close_data_gates_are_deferred_but_empty_signal_set_is_valid():
     from scripts.run_integrated_daily import _is_degradable_failure
 
-    for name in (
-        "check_data_readiness",
-        "check_capital_flow_health",
-        "generate_signals",
-        "generate_close_stage_signals",
-    ):
+    for name in ("check_data_readiness", "generate_signals"):
         assert _is_degradable_failure("close", name) is True
+    assert _is_degradable_failure("close", "generate_close_stage_signals") is False
+    assert _is_degradable_failure("close", "check_capital_flow_health") is False
     assert _is_degradable_failure("close", "generate_daily_review") is False
 
 
@@ -255,7 +307,7 @@ def test_intraday_readiness_blocks_signals_without_killing_retry_watcher():
     assert _is_degradable_failure("intraday", "generate_intraday_stage_signals")
     # Close-stage gates are deferred so reports can be generated, but main()
     # returns non-zero after publishing them.
-    assert _is_degradable_failure("close", "check_capital_flow_health")
+    assert not _is_degradable_failure("close", "check_capital_flow_health")
     assert _is_degradable_failure("close", "check_data_readiness")
 
 
@@ -317,7 +369,7 @@ def test_close_plan_chains_isolate_research_and_review():
 
     assert "evaluate_qlib_shadow" in RESEARCH_CHAIN_STEPS
     assert "run_strategy_scan" in RESEARCH_CHAIN_STEPS
-    assert "reconcile_independent_stock_flow" in RESEARCH_CHAIN_STEPS
+    assert "reconcile_independent_stock_flow" not in RESEARCH_CHAIN_STEPS
     assert "generate_web_dashboard" in REVIEW_CHAIN_STEPS
     assert "generate_daily_review" in REVIEW_CHAIN_STEPS
     # DATA steps are in neither chain (fail-fast).
@@ -333,6 +385,7 @@ def test_close_plan_chains_isolate_research_and_review():
     assert "build_flow_features" not in names
     assert "build_ai_review_snapshot" not in names
     assert "generate_web_dashboard" in names
+    assert "reconcile_independent_stock_flow" in names
     research_names = {
         name for name, _, _ in command_plan(
             "sample.duckdb", "2026-07-28", include_collection=True,
@@ -355,3 +408,15 @@ def test_close_readiness_gate_is_tightened_to_2h():
         assert cmd[cmd.index("--max-age-seconds") + 1] == "7200"
     close_sig = by_name["generate_close_stage_signals"]
     assert close_sig[close_sig.index("--freshness-seconds") + 1] == "21600"
+    assert "--allow-blocked" in close_sig
+
+
+def test_close_as_of_is_propagated_into_both_daily_reports():
+    as_of = "2026-08-28T17:50:53+08:00"
+    steps = command_plan(
+        "sample.duckdb", "2026-08-28", phase="close", as_of_time=as_of
+    )
+    by_name = {name: cmd for name, cmd, _ in steps}
+    for name in ("generate_daily_review", "generate_daily_review_web"):
+        cmd = by_name[name]
+        assert cmd[cmd.index("--as-of") + 1] == as_of

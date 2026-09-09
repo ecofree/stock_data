@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -41,7 +41,7 @@ def _relation_health(
     now: datetime | None = None,
 ) -> dict:
     collected_after = as_local_naive(collected_after)
-    now = as_local_naive(now)
+    now = as_local_naive(now) or datetime.now()
     if not table_exists(con, relation):
         return {
             "relation": relation,
@@ -181,19 +181,46 @@ def assess_capital_flow_health(
         collected_after = as_local_naive(collected_after)
     else:
         collected_after = as_local_naive(collected_after)
-    now = as_local_naive(now)
+    now = as_local_naive(now) or datetime.now()
+    # A historical close replay is evaluated against exact trade-date rows.
+    # Applying the current wall-clock TTL to yesterday's 14:50 flow snapshot
+    # turns a complete source into a false stale blocker.  Same-day intraday
+    # and close runs retain the TTL safety gate.
+    historical_close = date.fromisoformat(str(trade_date)[:10]) < now.date()
+    effective_max_age_seconds = None if historical_close else max_age_seconds
     con = connect_duckdb(str(db_path), read_only=True)
+    primary_stock_provider = None
+    primary_stock_codes = None
     try:
         # Full-market collectors persist their expected universe in a durable
         # checkpoint.  Use it automatically when the CLI caller does not
         # provide a count; otherwise a partial snapshot can look ready merely
         # because it contains some rows.
         if not expected_stock_codes and table_exists(con, "intraday_stock_flow_batch"):
+            batch_columns = set(table_columns(con, "intraday_stock_flow_batch"))
+            provider_expr = "provider" if "provider" in batch_columns else "NULL"
             batch_row = con.execute(
-                "SELECT coalesce(expected_rows,0) FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
+                f"SELECT coalesce(expected_rows,0), {provider_expr} "
+                "FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
                 [trade_date],
             ).fetchone()
             expected_stock_codes = int(batch_row[0] or 0) if batch_row else 0
+            primary_stock_provider = str(batch_row[1] or "") if batch_row else None
+        elif table_exists(con, "intraday_stock_flow_batch"):
+            batch_columns = set(table_columns(con, "intraday_stock_flow_batch"))
+            if "provider" in batch_columns:
+                batch_row = con.execute(
+                    "SELECT provider FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
+                    [trade_date],
+                ).fetchone()
+                primary_stock_provider = str(batch_row[0] or "") if batch_row else None
+        if primary_stock_provider and table_exists(con, "multi_source_stock_flow"):
+            primary_stock_codes = int(con.execute(
+                "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow "
+                "WHERE source_date=CAST(? AS DATE) AND provider=? "
+                "AND coalesce(is_stale,FALSE)=FALSE AND main_net IS NOT NULL",
+                [trade_date, primary_stock_provider],
+            ).fetchone()[0] or 0)
         if not expected_sector_codes and table_exists(con, "intraday_sector_flow_batch"):
             batch_row = con.execute(
                 "SELECT coalesce(expected_rows,0) FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
@@ -203,24 +230,31 @@ def assess_capital_flow_health(
         stock_relations = [
             _relation_health(
                 con, relation, trade_date, "stock_code", collected_after,
-                max_age_seconds=max_age_seconds, now=now,
+                max_age_seconds=effective_max_age_seconds, now=now,
             )
             for relation in STOCK_FLOW_RELATIONS
         ]
         sector_relations = [
             _relation_health(
                 con, relation, trade_date, "sector_code", collected_after,
-                max_age_seconds=max_age_seconds, now=now,
+                max_age_seconds=effective_max_age_seconds, now=now,
             )
             for relation in SECTOR_FLOW_RELATIONS
         ]
     finally:
         con.close()
 
-    gated = collected_after is not None or max_age_seconds is not None
+    gated = collected_after is not None or effective_max_age_seconds is not None
     code_field = "recent_codes" if gated else "codes"
     row_field = "recent_rows" if gated else "rows"
-    stock_codes = max((item[code_field] for item in stock_relations), default=0)
+    # Coverage is measured against the batch's own provider/universe.  Taking
+    # the union across TuShare and Eastmoney produced impossible ratios such
+    # as 5,547 / 5,539 and hid the 17 unavailable primary rows.
+    stock_codes = (
+        int(primary_stock_codes)
+        if primary_stock_codes is not None
+        else max((item[code_field] for item in stock_relations), default=0)
+    )
     stock_coverage = (
         stock_codes * 100.0 / expected_stock_codes if expected_stock_codes else None
     )
@@ -272,6 +306,9 @@ def assess_capital_flow_health(
     # be visible to the gate/report even though directional industry flow is fine.
     sector_taxonomy_stale = False
     sector_taxonomy_note = ""
+    canonical_membership_snapshot = None
+    derived_membership_snapshots: list[str] = []
+    membership_batch_consistent = True
     try:
         con = connect_duckdb(str(db_path), read_only=True)
         if table_exists(con, "intraday_sector_flow_taxonomy"):
@@ -283,6 +320,45 @@ def assess_capital_flow_health(
             if stale_row and str(stale_row[0] or "").lower() in {"stale_members", "partial_members"}:
                 sector_taxonomy_stale = True
                 sector_taxonomy_note = str(stale_row[1] or "ths concept membership is stale or partial")
+        if table_exists(con, "v_default_concept_stock_history"):
+            canonical_row = con.execute(
+                "SELECT max(CAST(trade_date AS DATE)) "
+                "FROM v_default_concept_stock_history WHERE trade_date<=CAST(? AS DATE)",
+                [trade_date],
+            ).fetchone()
+            canonical_membership_snapshot = (
+                str(canonical_row[0]) if canonical_row and canonical_row[0] else None
+            )
+        if table_exists(con, "multi_source_sector_flow"):
+            derived_membership_snapshots = [
+                str(row[0])
+                for row in con.execute(
+                    """
+                    SELECT DISTINCT json_extract_string(
+                        raw_json, '$.raw.membership_snapshot_date'
+                    ) AS snapshot_date
+                    FROM multi_source_sector_flow
+                    WHERE source_date=CAST(? AS DATE)
+                      AND provider='derived_ths_stock_aggregate'
+                      AND coalesce(is_stale,FALSE)=FALSE
+                    ORDER BY snapshot_date
+                    """,
+                    [trade_date],
+                ).fetchall()
+                if row[0]
+            ]
+        if derived_membership_snapshots:
+            membership_batch_consistent = (
+                canonical_membership_snapshot is not None
+                and derived_membership_snapshots == [canonical_membership_snapshot]
+            )
+            if not membership_batch_consistent:
+                sector_taxonomy_stale = True
+                sector_taxonomy_note = (
+                    "derived THS sector flow membership snapshots "
+                    f"{derived_membership_snapshots} do not match canonical "
+                    f"{canonical_membership_snapshot or 'none'}"
+                )
         con.close()
     except Exception:
         sector_taxonomy_stale = False
@@ -292,6 +368,9 @@ def assess_capital_flow_health(
     # be visible rather than silently passing.
     recon_status = "not_run"
     recon_reference_rows = 0
+    recon_value_status = "not_observed"
+    recon_sign_disagreement_pct = None
+    recon_mean_abs_main_net_diff = None
     independent_source_present = False
     independent_status = "not_run"
     independent_overlap_pct = None
@@ -300,14 +379,28 @@ def assess_capital_flow_health(
     try:
         con = connect_duckdb(str(db_path), read_only=True)
         if table_exists(con, "intraday_stock_flow_reconciliation"):
+            columns = set(table_columns(con, "intraday_stock_flow_reconciliation"))
+            select_columns = ["status", "reference_rows"]
+            if "value_status" in columns:
+                select_columns.append("value_status")
+            if "overlap_sign_disagreement_pct" in columns:
+                select_columns.append("overlap_sign_disagreement_pct")
+            if "mean_abs_main_net_diff" in columns:
+                select_columns.append("mean_abs_main_net_diff")
             recon_row = con.execute(
-                "SELECT status, reference_rows FROM intraday_stock_flow_reconciliation "
+                f"SELECT {', '.join(select_columns)} FROM intraday_stock_flow_reconciliation "
                 "WHERE trade_date=CAST(? AS DATE)",
                 [trade_date],
             ).fetchone()
             if recon_row:
                 recon_status = str(recon_row[0] or "not_run")
                 recon_reference_rows = int(recon_row[1] or 0)
+                if len(recon_row) > 2:
+                    recon_value_status = str(recon_row[2] or "not_observed")
+                if len(recon_row) > 3:
+                    recon_sign_disagreement_pct = float(recon_row[3]) if recon_row[3] is not None else None
+                if len(recon_row) > 4:
+                    recon_mean_abs_main_net_diff = float(recon_row[4]) if recon_row[4] is not None else None
         if table_exists(con, "multi_source_stock_flow"):
             independent_source_present = bool(con.execute(
                 "SELECT count(*) FROM multi_source_stock_flow "
@@ -334,7 +427,9 @@ def assess_capital_flow_health(
     # Keep that result visible and fail the independent gate until TuShare (or
     # another genuinely independent provider) has rows for this date.
     same_vendor_reconciliation_ready = (
-        recon_status.lower() == "pass" and recon_reference_rows > 0
+        recon_status.lower() == "pass"
+        and recon_value_status.lower() == "pass"
+        and recon_reference_rows > 0
     )
     independent_reconciliation_ready = (
         same_vendor_reconciliation_ready
@@ -376,11 +471,16 @@ def assess_capital_flow_health(
         else None,
         "min_coverage_pct": float(min_coverage_pct),
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
+        "effective_max_age_seconds": (
+            int(effective_max_age_seconds) if effective_max_age_seconds is not None else None
+        ),
+        "freshness_contract": "same_trade_date" if historical_close else "timestamp_ttl",
         "stock_flow": {
             "ready": stock_ready,
             "observed_codes": stock_codes,
             "expected_codes": int(expected_stock_codes or 0),
             "coverage_pct": round(stock_coverage, 2) if stock_coverage is not None else None,
+            "coverage_provider": primary_stock_provider,
             "relations": stock_relations,
         },
         "sector_flow": {
@@ -391,10 +491,16 @@ def assess_capital_flow_health(
             "relations": sector_relations,
             "taxonomy_stale": sector_taxonomy_stale,
             "taxonomy_stale_note": sector_taxonomy_note,
+            "canonical_membership_snapshot": canonical_membership_snapshot,
+            "derived_membership_snapshots": derived_membership_snapshots,
+            "membership_batch_consistent": membership_batch_consistent,
         },
         "reconciliation": {
             "status": recon_status,
             "reference_rows": recon_reference_rows,
+            "value_status": recon_value_status,
+            "overlap_sign_disagreement_pct": recon_sign_disagreement_pct,
+            "mean_abs_main_net_diff": recon_mean_abs_main_net_diff,
             "independent_source_present": independent_source_present,
             "same_vendor_reconciliation_ready": same_vendor_reconciliation_ready,
             "independent_reconciliation_ready": independent_reconciliation_ready,
@@ -439,7 +545,8 @@ def render_capital_flow_health_markdown(result: dict) -> str:
             "",
             f"- Minimum required: `{result['min_coverage_pct']}%` when an expected universe is supplied",
             f"- Stock codes: `{result['stock_flow']['observed_codes']}` / "
-            f"`{result['stock_flow']['expected_codes'] or 'not supplied'}`",
+            f"`{result['stock_flow']['expected_codes'] or 'not supplied'}` "
+            f"(provider `{result['stock_flow'].get('coverage_provider') or 'best available'}`)",
             f"- Sector codes: `{result['sector_flow']['observed_codes']}` / "
             f"`{result['sector_flow']['expected_codes'] or 'not supplied'}`",
             "",
@@ -451,16 +558,26 @@ def render_capital_flow_health_markdown(result: dict) -> str:
             f"`{result['sector_flow'].get('taxonomy_stale_note', '')}` "
             "(concept taxonomy is not certified ready)"
         )
+    lines.append(
+        "- THS membership batch: canonical "
+        f"`{result['sector_flow'].get('canonical_membership_snapshot') or 'none'}`, "
+        f"derived `{result['sector_flow'].get('derived_membership_snapshots') or []}`, "
+        "consistent "
+        f"`{str(result['sector_flow'].get('membership_batch_consistent', True)).lower()}`"
+    )
     recon = result.get("reconciliation", {})
     lines.extend([
         "",
         "## Independent reconciliation",
         "",
-        f"- Reconciliation status: `{recon.get('status', 'not_run')}`",
+        f"- Same-vendor transport status: `{recon.get('status', 'not_run')}`",
+        f"- Same-vendor value agreement: `{recon.get('value_status', 'not_observed')}` "
+        f"(sign disagreement={recon.get('overlap_sign_disagreement_pct')}, "
+        f"mean abs main-net diff={recon.get('mean_abs_main_net_diff')})",
         f"- Reference rows: `{recon.get('reference_rows', 0)}`",
         f"- Independent (TuShare) source present: "
         f"`{str(recon.get('independent_source_present', False)).lower()}`",
-        f"- Independent persisted status: `{recon.get('independent_status', 'not_run')}`",
+        f"- Cross-vendor persisted status: `{recon.get('independent_status', 'not_run')}`",
         f"- Independent overlap: `{recon.get('independent_overlap_pct')}`%",
         f"- Independent main-net correlation: `{recon.get('independent_correlation_main_net')}`",
         f"- Independent sign agreement: `{recon.get('independent_sign_agreement_pct')}`%",

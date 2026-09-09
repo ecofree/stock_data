@@ -82,6 +82,7 @@ from trade_system.adapters.eastmoney_dc import (  # noqa: F401
     _from_em_dragon_tiger,
     _from_em_dragon_tiger_daily,
     _from_em_margin,
+    _from_em_margin_detail_daily,
     _from_em_holder,
     _from_em_lockup,
     _from_em_dividend,
@@ -193,6 +194,7 @@ def _from_tencent_valuation(code):
         "amount": g("amount_wan"), "change": g("change"), "change_pct": g("change_pct"),
         "turnover": g("turnover"), "pe_ttm": g("pe_ttm"), "pb": g("pb"),
         "total_mv": g("total_mv_yi"), "circ_mv": g("circ_mv_yi"),
+        "total_mv_unit": "billion_yuan", "circ_mv_unit": "billion_yuan",
         "limit_up": g("limit_up"), "limit_down": g("limit_down"),
         "time": parts[_TENCENT_Q["time"]], "_src": "tencent",
     }
@@ -758,6 +760,8 @@ def _from_em_kline_secid(secid, start, end, fq="qfq", klt=101):
         out.append({"date": p[0], "open": float(p[1]), "close": float(p[2]),
                     "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
                     "amount": float(p[6]), "pct": (float(p[8]) if len(p) > 8 else None),
+                    "volume_unit": "hands", "amount_unit": "yuan",
+                    "adjustment": {"0": "none", "1": "qfq", "2": "hfq"}.get(fqt, "unknown"),
                     "_src": "eastmoney"})
     return out or None
 
@@ -781,7 +785,8 @@ def _from_em_index_spot(code):
     return {"code": d.get("f57"), "name": d.get("f58"), "price": _f(d, "f43"),
             "pct": _f(d, "f170"), "high": _f(d, "f44"), "low": _f(d, "f45"),
             "open": _f(d, "f46"), "prev_close": _f(d, "f60"),
-            "total_mv": _f(d, "f116"), "time": d.get("f86"), "_src": "eastmoney"}
+            "total_mv": _f(d, "f116"), "total_mv_unit": "yuan",
+            "time": d.get("f86"), "_src": "eastmoney"}
 
 
 def _from_em_etf_kline(code, start="20260101", end="20500101", fq="qfq"):
@@ -796,6 +801,7 @@ def _from_em_etf_info(code):
             "pct": _f(d, "f170"), "high": _f(d, "f44"), "low": _f(d, "f45"),
             "open": _f(d, "f46"), "prev_close": _f(d, "f60"),
             "total_mv": _f(d, "f116"), "circ_mv": _f(d, "f117"),
+            "total_mv_unit": "yuan", "circ_mv_unit": "yuan",
             "time": d.get("f86"), "_src": "eastmoney"}
 
 

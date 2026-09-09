@@ -15,6 +15,8 @@ from typing import Any
 
 import duckdb
 
+from trade_system.source_authority import provider_rank_sql
+
 STOCK_FEATURE_TABLE = "qlib_stock_flow_features"
 SECTOR_FEATURE_TABLE = "qlib_sector_flow_features"
 FEATURE_VERSION = "flow_features_v1"
@@ -112,22 +114,14 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
     net_total = "CAST(net_total AS DOUBLE)" if "net_total" in cols else "CAST(NULL AS DOUBLE)"
     source_end = "AND source_date <= CAST(? AS DATE)" if end_date else ""
     params: list[Any] = [end_date] if end_date else []
-    # The operator ranking helper is date-scoped.  For history we use the same
-    # priority CASE expression and additionally partition by source_date.
+    provider_order = provider_rank_sql("stock_flow", "provider")
     query = f"""
     WITH canonical AS (
         SELECT source_date AS trade_date, stock_code, provider, main_net,
                {net_total} AS net_total, turnover, close, change_pct,
                row_number() OVER (
                    PARTITION BY source_date, stock_code
-                   ORDER BY CASE
-                       WHEN lower(coalesce(provider,''))='eastmoney_intraday_clist' THEN 100
-                       WHEN lower(coalesce(provider,''))='eastmoney_market' THEN 95
-                       WHEN lower(coalesce(provider,''))='eastmoney_intraday_clist_delay' THEN 90
-                       WHEN lower(coalesce(provider,'')) LIKE 'eastmoney%' THEN 80
-                       WHEN lower(coalesce(provider,'')) LIKE 'tushare%' THEN 70
-                       WHEN lower(coalesce(provider,'')) LIKE 'kpl%' THEN 40
-                       ELSE 55 END DESC,
+                   ORDER BY {provider_order} ASC,
                        fetched_at DESC NULLS LAST
                ) AS rn
         FROM multi_source_stock_flow
@@ -242,51 +236,64 @@ def build_flow_features(
         if not target_start or not target_end:
             return {"stock_rows": 0, "sector_rows": 0, "start_date": target_start, "end_date": target_end, "feature_version": FEATURE_VERSION}
 
-        if stock_min:
-            stock_sql, stock_params = _stock_query(con, target_end)
-            con.execute(f"DELETE FROM {STOCK_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end])
-            con.execute(
-                f"""
-                INSERT INTO {STOCK_FEATURE_TABLE} (
-                    trade_date, stock_code, provider, main_net_1d, main_net_3d,
-                    main_net_5d, main_net_10d, main_net_20d, positive_days_3d,
-                    positive_days_5d, positive_days_10d, positive_days_20d,
-                    observed_days_20d, flow_acceleration_5d, main_net_ratio_1d,
-                    net_total_1d, close, change_pct, quality_status, feature_version
+        con.execute("BEGIN TRANSACTION")
+        try:
+            if stock_min:
+                stock_sql, stock_params = _stock_query(con, target_end)
+                con.execute(f"DELETE FROM {STOCK_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end])
+                con.execute(
+                    f"""
+                    INSERT INTO {STOCK_FEATURE_TABLE} (
+                        trade_date, stock_code, provider, main_net_1d, main_net_3d,
+                        main_net_5d, main_net_10d, main_net_20d, positive_days_3d,
+                        positive_days_5d, positive_days_10d, positive_days_20d,
+                        observed_days_20d, flow_acceleration_5d, main_net_ratio_1d,
+                        net_total_1d, close, change_pct, quality_status, feature_version
+                    )
+                    SELECT * FROM ({stock_sql}) q
+                    WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                    """,
+                    [*stock_params, target_start, target_end],
                 )
-                SELECT * FROM ({stock_sql}) q
-                WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-                """,
-                [*stock_params, target_start, target_end],
-            )
-        if sector_min:
-            sector_sql, sector_params = _sector_query(con, target_end)
-            con.execute(f"DELETE FROM {SECTOR_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end])
-            con.execute(
-                f"""
-                INSERT INTO {SECTOR_FEATURE_TABLE} (
-                    trade_date, sector_code, sector_name, sector_type, provider,
-                    main_net_1d, main_net_3d, main_net_5d, main_net_10d,
-                    main_net_20d, positive_days_3d, positive_days_5d,
-                    positive_days_10d, positive_days_20d, observed_days_20d,
-                    flow_acceleration_5d, main_net_ratio_1d, change_pct,
-                    quality_status, feature_version
+            if sector_min:
+                sector_sql, sector_params = _sector_query(con, target_end)
+                con.execute(f"DELETE FROM {SECTOR_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end])
+                con.execute(
+                    f"""
+                    INSERT INTO {SECTOR_FEATURE_TABLE} (
+                        trade_date, sector_code, sector_name, sector_type, provider,
+                        main_net_1d, main_net_3d, main_net_5d, main_net_10d,
+                        main_net_20d, positive_days_3d, positive_days_5d,
+                        positive_days_10d, positive_days_20d, observed_days_20d,
+                        flow_acceleration_5d, main_net_ratio_1d, change_pct,
+                        quality_status, feature_version
+                    )
+                    SELECT * FROM ({sector_sql}) q
+                    WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                    """,
+                    [*sector_params, target_start, target_end],
                 )
-                SELECT * FROM ({sector_sql}) q
-                WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-                """,
-                [*sector_params, target_start, target_end],
-            )
 
-        stock_rows = int(con.execute(f"SELECT count(*) FROM {STOCK_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end]).fetchone()[0])
-        sector_rows = int(con.execute(f"SELECT count(*) FROM {SECTOR_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end]).fetchone()[0])
-        return {
-            "stock_rows": stock_rows,
-            "sector_rows": sector_rows,
-            "start_date": target_start,
-            "end_date": target_end,
-            "feature_version": FEATURE_VERSION,
-            "generated_at": date.today().isoformat(),
-        }
+            stock_rows = int(con.execute(f"SELECT count(*) FROM {STOCK_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end]).fetchone()[0])
+            sector_rows = int(con.execute(f"SELECT count(*) FROM {SECTOR_FEATURE_TABLE} WHERE trade_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)", [target_start, target_end]).fetchone()[0])
+            result = {
+                "stock_rows": stock_rows,
+                "sector_rows": sector_rows,
+                "start_date": target_start,
+                "end_date": target_end,
+                "feature_version": FEATURE_VERSION,
+                "generated_at": date.today().isoformat(),
+            }
+            con.commit()
+            return result
+        except Exception:
+            con.rollback()
+            raise
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()

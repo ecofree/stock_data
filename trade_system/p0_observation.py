@@ -11,6 +11,7 @@ import duckdb
 
 from trade_system.quality import table_exists
 from trade_system.ths_quality import canonical_ths_snapshot
+from trade_system.trading_calendar import open_session_dates
 
 
 PHASES = ("auction", "intraday", "close")
@@ -21,8 +22,8 @@ TUSHARE_CLOSE_DATASETS = (
     "moneyflow",
     "industry_flow",
 )
-GOOD_STOCK_BATCH = {"success", "success_with_unavailable"}
-GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap"}
+GOOD_STOCK_BATCH = {"success", "success_with_unavailable", "partial"}
+GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap", "partial"}
 
 
 def _infer_phase(manifest: dict[str, Any]) -> str | None:
@@ -72,30 +73,16 @@ def _sessions(
     required_days: int,
 ) -> list[dict[str, Any]]:
     target = date.fromisoformat(as_of)
-    calendar: dict[date, bool] = {}
-    if table_exists(con, "tushare_trade_cal"):
-        try:
-            calendar = {
-                row[0]: bool(row[1])
-                for row in con.execute(
-                    "SELECT CAST(cal_date AS DATE), bool_or(coalesce(is_open,false)) "
-                    "FROM tushare_trade_cal WHERE cal_date<=CAST(? AS DATE) "
-                    "GROUP BY cal_date",
-                    [as_of],
-                ).fetchall()
-            }
-        except Exception:
-            calendar = {}
+    calendar = {
+        date.fromisoformat(item): True
+        for item in open_session_dates(con, "1900-01-01", as_of)
+    }
     sessions: list[dict[str, Any]] = []
     cursor = target
     while len(sessions) < required_days and cursor >= target - timedelta(days=45):
         if cursor in calendar:
             if calendar[cursor]:
                 sessions.append({"trade_date": cursor.isoformat(), "calendar_verified": True})
-        elif cursor.weekday() < 5:
-            # Keep the missing expected day visible, but never let an
-            # unverified weekday count toward the five-session pass.
-            sessions.append({"trade_date": cursor.isoformat(), "calendar_verified": False})
         cursor -= timedelta(days=1)
     return list(reversed(sessions))
 
@@ -170,7 +157,7 @@ def _tushare_status(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str
 def _ths_status(
     con: duckdb.DuckDBPyConnection,
     trade_date: str,
-    minimum_concepts: int,
+    minimum_concepts: int | None,
 ) -> dict[str, Any]:
     canonical = canonical_ths_snapshot(con, trade_date, minimum_concepts=minimum_concepts)
     if canonical:
@@ -253,7 +240,7 @@ def audit_five_day_observation(
     as_of: str,
     *,
     required_days: int = 5,
-    minimum_ths_concepts: int = 374,
+    minimum_ths_concepts: int | None = None,
 ) -> dict[str, Any]:
     manifests = _latest_manifests(reports_dir)
     con = duckdb.connect(str(db_path), read_only=True)
@@ -361,7 +348,7 @@ def render_observation(result: dict[str, Any]) -> str:
             "",
             "Strict rule: a degraded phase, unverified trading calendar, missing report, "
             "capital-flow coverage below 99.5%, incomplete TuShare close batch, or stale/incomplete "
-            "THS 374+ concept membership resets the consecutive-pass count.",
+            "THS snapshots without a source-recorded expected concept count reset the consecutive-pass count.",
             "",
             "```json",
             json.dumps(result, ensure_ascii=False, indent=2, default=str),

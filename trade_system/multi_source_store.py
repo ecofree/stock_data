@@ -19,6 +19,7 @@ import duckdb
 
 from trade_system import resilient_sources
 from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
+from trade_system.source_authority import provider_rank, provider_rank_sql
 
 
 def _date(value: Any, fallback: str | None = None) -> str | None:
@@ -74,7 +75,8 @@ class MultiSourceStore:
             CREATE TABLE IF NOT EXISTS multi_source_kline(
               source_date DATE, asset_type VARCHAR, asset_code VARCHAR, open DOUBLE,
               high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE, amount DOUBLE,
-              change_pct DOUBLE, provider VARCHAR, fetched_at TIMESTAMP DEFAULT current_timestamp,
+              change_pct DOUBLE, provider VARCHAR, volume_unit VARCHAR, amount_unit VARCHAR,
+              adjustment VARCHAR, fetched_at TIMESTAMP DEFAULT current_timestamp,
               is_stale BOOLEAN DEFAULT FALSE, raw_json VARCHAR)
         """)
         self.con.execute("""
@@ -99,12 +101,16 @@ class MultiSourceStore:
         # never be ranked without declaring what the amount means.
         self.con.execute("ALTER TABLE multi_source_sector_flow ADD COLUMN IF NOT EXISTS sector_type VARCHAR")
         self.con.execute("ALTER TABLE multi_source_sector_flow ADD COLUMN IF NOT EXISTS amount_unit VARCHAR")
+        self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS volume_unit VARCHAR")
+        self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS amount_unit VARCHAR")
+        self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS adjustment VARCHAR")
         ensure_stock_flow_contract(self.con)
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS multi_source_quote(
               source_date DATE, asset_type VARCHAR, asset_code VARCHAR, name VARCHAR,
               price DOUBLE, change_pct DOUBLE, pe_ttm DOUBLE, pb DOUBLE, total_mv DOUBLE,
-              circ_mv DOUBLE, provider VARCHAR, fetched_at TIMESTAMP DEFAULT current_timestamp,
+              circ_mv DOUBLE, provider VARCHAR, total_mv_unit VARCHAR, circ_mv_unit VARCHAR,
+              fetched_at TIMESTAMP DEFAULT current_timestamp,
               is_stale BOOLEAN DEFAULT FALSE, raw_json VARCHAR)
         """)
         self.con.execute("""
@@ -139,46 +145,56 @@ class MultiSourceStore:
 
     def store(self, data_type: str, code: str | None, data: Any, meta: dict, *, asset_type: str | None = None,
               trade_date: str | None = None, commit: bool = True) -> dict[str, Any]:
-        status = str(meta.get("status") or "failed")
-        stale = status == "stale"
-        provider = str(meta.get("source") or "unknown")
-        payload = data if data is not None else {"error": meta.get("error")}
-        payload_hash = _hash(payload)
-        rows_written = 0
+        if commit:
+            self.con.execute("BEGIN TRANSACTION")
+        try:
+            status = str(meta.get("status") or "failed")
+            stale = status == "stale"
+            provider = str(meta.get("source") or "unknown")
+            payload = data if data is not None else {"error": meta.get("error")}
+            payload_hash = _hash(payload)
+            rows_written = 0
 
-        source_date = _date(trade_date or meta.get("trade_date"))
-        if isinstance(data, list):
-            for row in data:
-                if isinstance(row, dict):
-                    source_date = source_date or _date(row.get("date") or row.get("trade_date"))
-                    break
-        elif isinstance(data, dict):
-            source_date = source_date or _date(data.get("date") or data.get("trade_date"))
+            source_date = _date(trade_date or meta.get("trade_date"))
+            if isinstance(data, list):
+                for row in data:
+                    if isinstance(row, dict):
+                        source_date = source_date or _date(row.get("date") or row.get("trade_date"))
+                        break
+            elif isinstance(data, dict):
+                source_date = source_date or _date(data.get("date") or data.get("trade_date"))
 
-        self.con.execute(
-            "INSERT INTO multi_source_observation "
-            "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [source_date, data_type, asset_type or data_type, code, provider, status,
-             int(float(meta.get("latency", 0) or 0) * 1000), stale, _json(payload), payload_hash],
-        )
+            self.con.execute(
+                "INSERT INTO multi_source_observation "
+                "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [source_date, data_type, asset_type or data_type, code, provider, status,
+                 int(float(meta.get("latency", 0) or 0) * 1000), stale, _json(payload), payload_hash],
+            )
 
         # Do not overwrite a live row with an expired cache result.  The stale
         # observation above is enough to make the degradation auditable.
-        if data is not None and not stale:
-            if data_type in {"kline", "index_kline", "etf_kline", "cb_kline"}:
-                rows_written = self._store_klines(data_type, code, data, provider, asset_type, stale)
-            elif data_type in {"stock_flow", "fund_flow_120d", "fund_flow"}:
-                rows_written = self._store_stock_flow(code, data, provider, stale)
-            elif data_type == "sector_flow":
-                rows_written = self._store_sector_flow(data, provider, trade_date, stale)
-            elif data_type in {"valuation", "index_spot", "etf_info", "cb_quote", "bid_ask"}:
-                rows_written = self._store_quote(data_type, code, data, provider, asset_type, stale, trade_date)
+            if data is not None and not stale:
+                if data_type in {"kline", "index_kline", "etf_kline", "cb_kline"}:
+                    rows_written = self._store_klines(data_type, code, data, provider, asset_type, stale)
+                elif data_type in {"stock_flow", "fund_flow_120d", "fund_flow"}:
+                    rows_written = self._store_stock_flow(code, data, provider, stale)
+                elif data_type == "sector_flow":
+                    rows_written = self._store_sector_flow(data, provider, trade_date, stale)
+                elif data_type in {"valuation", "index_spot", "etf_info", "cb_quote", "bid_ask"}:
+                    rows_written = self._store_quote(data_type, code, data, provider, asset_type, stale, trade_date)
 
-        if commit:
-            self.con.commit()
-        return {"status": status, "provider": provider, "rows_written": rows_written,
-                "stale": stale, "source_date": source_date, "payload_hash": payload_hash}
+            if commit:
+                self.con.commit()
+            return {"status": status, "provider": provider, "rows_written": rows_written,
+                    "stale": stale, "source_date": source_date, "payload_hash": payload_hash}
+        except Exception:
+            if commit:
+                try:
+                    self.con.rollback()
+                except Exception:
+                    pass
+            raise
 
     def _store_klines(self, data_type, code, data, provider, asset_type, stale):
         rows = data if isinstance(data, list) else []
@@ -194,11 +210,13 @@ class MultiSourceStore:
                 [d, kind, ac, provider],
             )
             self.con.execute(
-                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,is_stale,raw_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,volume_unit,amount_unit,adjustment,is_stale,raw_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [d, kind, ac, _number(row.get("open")), _number(row.get("high")), _number(row.get("low")),
                  _number(row.get("close")), _number(row.get("volume")), _number(row.get("amount")),
-                 _number(row.get("change_pct") or row.get("pct")), provider, stale, _json(row)],
+                 _number(row.get("change_pct") or row.get("pct")), provider,
+                 row.get("volume_unit") or "unknown", row.get("amount_unit") or "unknown",
+                 row.get("adjustment") or "unknown", stale, _json(row)],
             )
             count += 1
         return count
@@ -306,11 +324,13 @@ class MultiSourceStore:
             [d, asset_type or data_type, ac, provider],
         )
         self.con.execute(
-            "INSERT INTO multi_source_quote(source_date,asset_type,asset_code,name,price,change_pct,pe_ttm,pb,total_mv,circ_mv,provider,is_stale,raw_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO multi_source_quote(source_date,asset_type,asset_code,name,price,change_pct,pe_ttm,pb,total_mv,circ_mv,provider,total_mv_unit,circ_mv_unit,is_stale,raw_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [d, asset_type or data_type, ac, data.get("name"), _number(data.get("price")),
              _number(data.get("change_pct") or data.get("pct")), _number(data.get("pe_ttm")), _number(data.get("pb")),
-             _number(data.get("total_mv")), _number(data.get("circ_mv")), provider, stale, _json(data)],
+             _number(data.get("total_mv")), _number(data.get("circ_mv")), provider,
+             data.get("total_mv_unit") or "unknown", data.get("circ_mv_unit") or "unknown",
+             stale, _json(data)],
         )
         return 1
 
@@ -319,13 +339,11 @@ class MultiSourceStore:
         try:
             date_clause = " AND source_date=CAST(? AS DATE)" if trade_date else ""
             params = [trade_date] if trade_date else []
+            sector_order = provider_rank_sql("sector_flow", "provider")
             rows = self.con.execute(
-                "SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net FROM ("
+                f"SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net FROM ("
                 "SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net,provider,fetched_at,"
-                "row_number() OVER (PARTITION BY source_date,sector_code ORDER BY "
-                "CASE WHEN provider='derived_ths_stock_aggregate' THEN 0 "
-                "WHEN provider='eastmoney_sector_full' THEN 1 "
-                "WHEN provider='eastmoney_market' THEN 2 ELSE 3 END, fetched_at DESC) AS _rn "
+                f"row_number() OVER (PARTITION BY source_date,sector_code ORDER BY {sector_order} ASC, fetched_at DESC) AS _rn "
                 "FROM multi_source_sector_flow WHERE is_stale=FALSE"
                 " AND (main_net IS NOT NULL OR super_net IS NOT NULL OR large_net IS NOT NULL OR mid_net IS NOT NULL OR small_net IS NOT NULL)"
                 + date_clause + ") WHERE _rn=1",
@@ -333,6 +351,7 @@ class MultiSourceStore:
             ).fetchall()
             if not rows:
                 return 0
+            self.con.execute("BEGIN TRANSACTION")
             if trade_date:
                 # Remove quote-only compatibility rows and duplicate providers
                 # for this session before copying the authoritative selection.
@@ -375,6 +394,7 @@ class MultiSourceStore:
             ).fetchall()
             if not rows:
                 return 0
+            self.con.execute("BEGIN TRANSACTION")
             if trade_date is not None:
                 self.con.execute(
                     "DELETE FROM multi_source_stock_flow WHERE provider='kpl' AND source_date=CAST(? AS DATE)",
@@ -406,6 +426,7 @@ class MultiSourceStore:
     def sync_core_klines(self, asset_type: str | None = None) -> int:
         """Populate the existing kline/index_kline chains from fresh migrated rows."""
         try:
+            self.con.execute("BEGIN TRANSACTION")
             where = "provider <> 'existing_core' AND is_stale=FALSE"
             params = []
             if asset_type:
@@ -418,26 +439,38 @@ class MultiSourceStore:
                     continue
                 if target not in existing_tables:
                     continue
+                source_policy = "kline" if kind == "stock" else "index"
+                provider_order = provider_rank_sql(source_policy, "provider")
                 self.con.execute(
                     f"DELETE FROM {target} WHERE EXISTS (SELECT 1 FROM multi_source_kline s "
                     f"WHERE s.asset_type=? AND s.provider <> 'existing_core' AND s.is_stale=FALSE "
                     f"AND s.source_date={target}.date AND s.asset_code={target}.{'stock_code' if kind == 'stock' else 'index_code'} AND {target}.ktype='D')",
-                    [kind],
+                [kind],
                 )
                 if kind == "stock":
-                    self.con.execute(
-                        "INSERT INTO kline(date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,raw_json) "
-                        "SELECT source_date,asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',raw_json "
-                        "FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
-                        "ORDER BY is_stale ASC, fetched_at DESC NULLS LAST, provider) AS _rn "
-                        f"FROM multi_source_kline WHERE {where} AND asset_type='stock') ranked WHERE _rn=1", params,
-                    )
+                    kline_columns = {row[1] for row in self.con.execute("PRAGMA table_info('kline')").fetchall()}
+                    if {"volume_unit", "amount_unit", "adjustment", "provider"} <= kline_columns:
+                        self.con.execute(
+                            "INSERT INTO kline(date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,volume_unit,amount_unit,adjustment,provider,raw_json) "
+                            "SELECT source_date,asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',volume_unit,amount_unit,adjustment,provider,raw_json "
+                            f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
+                            f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
+                            f"FROM multi_source_kline WHERE {where} AND asset_type='stock') ranked WHERE _rn=1", params,
+                        )
+                    else:
+                        self.con.execute(
+                            "INSERT INTO kline(date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,raw_json) "
+                            "SELECT source_date,asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',raw_json "
+                            f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
+                            f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
+                            f"FROM multi_source_kline WHERE {where} AND asset_type='stock') ranked WHERE _rn=1", params,
+                        )
                 else:
                     self.con.execute(
                         "INSERT INTO index_kline(date,index_code,open,high,low,close,volume,turnover,change_pct,ktype,raw_json) "
                         "SELECT CAST(source_date AS DATE),asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',raw_json "
-                        "FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
-                        "ORDER BY is_stale ASC, fetched_at DESC NULLS LAST, provider) AS _rn "
+                        f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
+                        f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
                         f"FROM multi_source_kline WHERE {where} AND asset_type='index') ranked WHERE _rn=1", params,
                     )
                 count += self.con.execute(
@@ -455,38 +488,37 @@ class MultiSourceStore:
     def bootstrap_from_core(self) -> dict[str, int]:
         """Preserve already-collected core rows in the migrated source-aware layer."""
         counts = {"kline": 0, "index_kline": 0, "sector_capital": 0}
+        self.con.execute("BEGIN TRANSACTION")
         try:
-            self.con.execute("DELETE FROM multi_source_kline WHERE provider='existing_core'")
-            self.con.execute(
-                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,is_stale,raw_json) "
-                "SELECT date,'stock',stock_code,open,high,low,close,volume,turnover,change_pct,'existing_core',FALSE,"
-                "COALESCE(raw_json, '{\"migrated_from\":\"kline\"}') FROM kline"
-            )
-            counts["kline"] = self.con.execute("SELECT count(*) FROM multi_source_kline WHERE provider='existing_core'").fetchone()[0]
+            tables = {row[0] for row in self.con.execute("SHOW TABLES").fetchall()}
+            if "kline" in tables:
+                self.con.execute("DELETE FROM multi_source_kline WHERE provider='existing_core' AND asset_type='stock'")
+                self.con.execute(
+                    "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,is_stale,raw_json) "
+                    "SELECT date,'stock',stock_code,open,high,low,close,volume,turnover,change_pct,'existing_core',FALSE,"
+                    "COALESCE(raw_json, '{\"migrated_from\":\"kline\"}') FROM kline"
+                )
+                counts["kline"] = self.con.execute("SELECT count(*) FROM multi_source_kline WHERE provider='existing_core' AND asset_type='stock'").fetchone()[0]
+            if "index_kline" in tables:
+                self.con.execute("DELETE FROM multi_source_kline WHERE provider='existing_core' AND asset_type='index'")
+                self.con.execute(
+                    "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,is_stale,raw_json) "
+                    "SELECT try_cast(date AS DATE),'index',index_code,open,high,low,close,volume,turnover,change_pct,'existing_core',FALSE,"
+                    "COALESCE(raw_json, '{\"migrated_from\":\"index_kline\"}') FROM index_kline"
+                )
+                counts["index_kline"] = self.con.execute("SELECT count(*) FROM multi_source_kline WHERE provider='existing_core' AND asset_type='index'").fetchone()[0]
+            if "sector_capital" in tables:
+                self.con.execute("DELETE FROM multi_source_sector_flow WHERE provider='existing_core'")
+                self.con.execute(
+                    "INSERT INTO multi_source_sector_flow(source_date,sector_code,sector_name,main_net,super_net,large_net,mid_net,small_net,change_pct,main_ratio,provider,sector_type,amount_unit,is_stale,raw_json) "
+                    "SELECT date,sector_code,NULL,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow,NULL,NULL,'existing_core','legacy_core','yuan',FALSE,'{\"migrated_from\":\"sector_capital\"}' FROM sector_capital"
+                )
+                counts["sector_capital"] = self.con.execute("SELECT count(*) FROM multi_source_sector_flow WHERE provider='existing_core'").fetchone()[0]
+            self.con.commit()
+            return counts
         except Exception:
             self.con.rollback()
-
-        try:
-            self.con.execute(
-                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,is_stale,raw_json) "
-                "SELECT try_cast(date AS DATE),'index',index_code,open,high,low,close,volume,turnover,change_pct,'existing_core',FALSE,"
-                "COALESCE(raw_json, '{\"migrated_from\":\"index_kline\"}') FROM index_kline"
-            )
-            counts["index_kline"] = self.con.execute("SELECT count(*) FROM multi_source_kline WHERE provider='existing_core' AND asset_type='index'").fetchone()[0]
-        except Exception:
-            self.con.rollback()
-
-        try:
-            self.con.execute("DELETE FROM multi_source_sector_flow WHERE provider='existing_core'")
-            self.con.execute(
-                "INSERT INTO multi_source_sector_flow(source_date,sector_code,sector_name,main_net,super_net,large_net,mid_net,small_net,change_pct,main_ratio,provider,sector_type,amount_unit,is_stale,raw_json) "
-                "SELECT date,sector_code,NULL,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow,NULL,NULL,'existing_core','legacy_core','yuan',FALSE,'{\"migrated_from\":\"sector_capital\"}' FROM sector_capital"
-            )
-            counts["sector_capital"] = self.con.execute("SELECT count(*) FROM multi_source_sector_flow WHERE provider='existing_core'").fetchone()[0]
-        except Exception:
-            self.con.rollback()
-        self.con.commit()
-        return counts
+            raise
 
     def record_run(self, *, run_id: str, started: datetime, finished: datetime,
                    trade_date: str | None, data_type: str, asset_scope: str,

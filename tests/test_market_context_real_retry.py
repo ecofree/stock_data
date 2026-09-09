@@ -204,12 +204,9 @@ def test_kpl_stale_tracker_accumulates_and_resets(tmp_path):
         store.close()
 
 
-def test_self_heal_purges_raw_json_via_column_rebuild(tmp_path):
-    """WP0 in-pipeline self-heal: purge the frozen oversized daily_summary.raw_json
-    blob by dropping and re-adding the column -- a columnar metadata op that never
-    materializes the giant value (a multi-GB single value cannot be allocated, so it
-    must not be read).  Scalar data is preserved and the purge runs once (guarded)."""
-    from collect_market import _self_heal_daily_summary_bloat
+def test_daily_summary_schema_check_is_read_only(tmp_path):
+    """Collection validates the schema but never repairs it with destructive DDL."""
+    from collect_market import _require_daily_summary_schema
 
     store = DuckDBStore(tmp_path / "self-heal.duckdb")
     try:
@@ -221,18 +218,15 @@ def test_self_heal_purges_raw_json_via_column_rebuild(tmp_path):
             "INSERT INTO daily_summary(date,limit_up_count,raw_json,source_kind) "
             "VALUES ('2026-07-27', 10, '{\"ok\":true}', 'real')")
 
-        _self_heal_daily_summary_bloat(store)
+        _require_daily_summary_schema(store)
 
-        # raw_json is purged for every row (column dropped + recreated => NULL).
+        # Validation leaves existing audit payloads intact.
         assert store.conn.execute(
             "SELECT count(*) FROM daily_summary WHERE raw_json IS NOT NULL"
-        ).fetchone()[0] == 0
-        # Scalar data and source_kind on the healed row are preserved.
+        ).fetchone()[0] == 2
         assert store.conn.execute(
             "SELECT limit_up_count,source_kind FROM daily_summary WHERE date='2026-07-24'"
         ).fetchone() == (14, "real_cross_source")
-        # Guarded: a second call is a no-op and later inserts still carry raw_json.
-        _self_heal_daily_summary_bloat(store)
         store.conn.execute(
             "INSERT INTO daily_summary(date,limit_up_count,raw_json,source_kind) "
             "VALUES ('2026-07-28', 5, '{\"new\":true}', 'real')")

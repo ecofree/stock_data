@@ -12,15 +12,32 @@ The following boundaries are now the maintenance contract.
 3. `trade_system/daily_review.py` assembles the shared review context.
 4. `trade_system/review_facts.py` assembles page-only facts.
 5. `trade_system/review_web.py` renders HTML and must not issue page-specific
-   SQL queries. `write_review_web` publishes a bounded HTML shell plus a
-   same-directory `daily_review_latest.lazy.js` detail asset; the shell keeps
-   only summaries and the first 50 stock cards.
+   SQL queries. `write_review_web` publishes one self-contained
+   `daily_review_latest.html`; all interactive data is embedded in that file
+   and the first 50 stock cards are shown before explicit user expansion.
 6. `trade_system/pipeline_runtime.py` publishes latest artifacts through the
    run transaction and `reports/pipeline_run_latest.json`.
 
 The close path excludes Qlib, backtests, news, AI snapshots, and other
 research steps by default. Use `--include-research` only for a deliberate
 research run.
+
+Late supplements and QLib are separate scheduled paths:
+`scripts/run_supplemental_retry.ps1` retries the KPL full-market auction route,
+LHB/index and bounded xiaodefa chip/margin batches at 20:00, while
+`scripts/run_qlib_research_daily.ps1` refreshes features, shadow predictions,
+candidate fusion and posterior evaluation at 20:30. Register both with
+`scripts/install_stock_data_task.ps1 -RegisterAll -Register`; the installer
+also removes the retired intraday task. They share the pipeline lock and
+republish the static review only after the write phase releases it.
+KPL/HiThink requests use verified direct HTTPS first, then the configured
+proxy; do not replace this with certificate bypass.
+
+`scripts/collect_multisource.py` and `trade_system/staged_multisource.py` are
+compatibility/recovery paths. They keep provider-separated evidence by
+default and do not promote rows into canonical `kline` or `sector_capital`.
+The explicit `--allow-core-sync` flag is reserved for a controlled migration
+or repair run after the authority and lock checks have been reviewed.
 
 The two read/render-only daily reports run in-process by default to remove
 interpreter and DuckDB reconnect churn. Collection, migration, signal and
@@ -49,6 +66,12 @@ entry points and should not acquire new callers.
 - The P2 gate is intentionally read-only against the database. It validates
   source structure and tests; data acceptance remains the responsibility of
   the P0 readiness and flow gates.
+- Run `scripts/audit_source_conflicts.py` after a close run to inspect same-key
+  multi-provider records before changing a source priority or archiving a
+  compatibility path.
+- Run `scripts/build_empty_table_catalog.py` after an API inventory refresh.
+  Empty tables are classified and retained; no collector may treat an empty
+  optional or permission-denied table as a production failure.
 
 ## Routine commands
 

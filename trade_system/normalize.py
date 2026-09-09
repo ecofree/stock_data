@@ -9,6 +9,8 @@ import duckdb
 from trade_system.schema import _refresh_default_concept_views
 from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
+from trade_system.limit_rules import limit_threshold_sql
+from trade_system.source_authority import provider_rank
 
 logger = get_logger(__name__)
 
@@ -77,7 +79,9 @@ def _canonical_kline_cte(table_name: str, order_col: str, value_column: str = "c
         "SELECT *, row_number() OVER ("
         "PARTITION BY date, stock_code, upper(coalesce(nullif(trim(ktype), ''), 'D')) "
         f"ORDER BY {order}) AS _rn "
-        f"FROM {table_name} WHERE {value_column} IS NOT NULL"
+        f"FROM {table_name} "
+        f"WHERE {value_column} IS NOT NULL "
+        "AND upper(coalesce(nullif(trim(ktype), ''), 'D')) = 'D'"
         ") WHERE _rn = 1"
     )
 
@@ -126,12 +130,7 @@ def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
             "LEFT JOIN tushare_stock_basic b ON b.stock_code=d.stock_code"
             if has_basic else ""
         )
-        threshold = (
-            "CASE WHEN upper(coalesce(b.stock_name,'')) LIKE '%ST%' THEN 4.8 "
-            "WHEN b.market IN ('创业板','科创板') THEN 19.5 "
-            "WHEN b.market IN ('北交所','北交所A股') THEN 29.5 ELSE 9.5 END"
-            if has_basic else "9.5"
-        )
+        threshold = limit_threshold_sql("d.stock_code", "b.stock_name", "b.market") if has_basic else "9.8"
         if table_exists(con, "eastmoney_limit_up_pool"):
             limit_up_expr = (
                 "coalesce((SELECT count(DISTINCT e.stock_code) FROM eastmoney_limit_up_pool e "
@@ -235,6 +234,10 @@ def _create_sector_daily(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
+    hithink_priority = provider_rank("limit_pool", "hithink")
+    xiaodefa_priority = provider_rank("limit_pool", "xiaodefa")
+    eastmoney_priority = provider_rank("limit_pool", "eastmoney")
+    kpl_priority = provider_rank("limit_pool", "kpl")
     cols = [
         ("trade_date", "VARCHAR"),
         ("board_level", "INTEGER"),
@@ -242,25 +245,52 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
         ("stock_name", "VARCHAR"),
         ("limit_up_time", "VARCHAR"),
         ("fetched_at", "TIMESTAMP"),
+        ("source", "VARCHAR"),
+        ("source_priority", "INTEGER"),
     ]
     has_l2 = table_exists(con, "l2_realtime_all_boards")
     has_ladder = table_exists(con, "ladder_realtime_boards")
     has_eastmoney = table_exists(con, "eastmoney_limit_up_pool")
     has_tushare = table_exists(con, "official_limit_pool")
-    if has_l2 or has_ladder or has_eastmoney or has_tushare:
+    has_xdf = (
+        table_exists(con, "xdf_limit_pool")
+        and _relation_has_rows(con, "xdf_limit_pool")
+    )
+    if has_l2 or has_ladder or has_eastmoney or has_tushare or has_xdf:
         sources = []
         if has_tushare:
             # Priority 0: backfilled exchange-grade history with exact
             # limit_times (board level) and first/last seal times.  Days
             # covered by the backfill use this source exclusively.
             sources.append(
-                """
+                f"""
                 SELECT CAST(trade_date AS VARCHAR) AS trade_date,
                        continue_day_cnt AS board_level, stock_code, stock_name,
                        limit_up_time, fetched_at,
-                       0 AS source_priority
+                       coalesce(source, 'hithink') AS source,
+                       {hithink_priority} AS source_priority
                 FROM official_limit_pool
                 WHERE continue_day_cnt IS NOT NULL
+                """
+            )
+        if has_xdf:
+            # Priority 0 as well: TuShare limit_list_d is exchange-grade too.
+            # Same-priority rows coexist within a day so the two official
+            # sources fill each other's gaps instead of excluding one another;
+            # the QUALIFY dedupe resolves per-stock conflicts by freshness.
+            # board_level is derived at collection time from local kline streaks.
+            sources.append(
+                f"""
+                SELECT CAST(trade_date AS VARCHAR) AS trade_date,
+                       TRY_CAST(board_level AS INTEGER) AS board_level,
+                       regexp_replace(CAST(ts_code AS VARCHAR), '[.].*$', '') AS stock_code,
+                       max(name) AS stock_name,
+                       CAST(NULL AS VARCHAR) AS limit_up_time,
+                       CAST(max(fetched_at) AS TIMESTAMP) AS fetched_at,
+                       'xiaodefa' AS source,
+                       {xiaodefa_priority} AS source_priority
+                FROM xdf_limit_pool
+                GROUP BY 1, 2, 3
                 """
             )
         if has_eastmoney:
@@ -273,7 +303,8 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
                 f"""
                 SELECT CAST(date AS VARCHAR) AS trade_date,
                        board_level, stock_code, stock_name, limit_up_time, fetched_at,
-                       1 AS source_priority
+                       'eastmoney' AS source,
+                       {eastmoney_priority} AS source_priority
                 FROM ({latest})
                 """
             )
@@ -287,7 +318,8 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
                 f"""
                 SELECT CAST(date AS VARCHAR) AS trade_date,
                        board_level, stock_code, stock_name, limit_up_time, fetched_at,
-                       2 AS source_priority
+                       'kpl_l2' AS source,
+                       {kpl_priority} AS source_priority
                 FROM ({latest})
                 """
             )
@@ -302,7 +334,8 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
                 SELECT CAST(date AS VARCHAR) AS trade_date,
                        TRY_CAST(board_type AS INTEGER) AS board_level,
                        stock_code, stock_name, limit_up_time, fetched_at,
-                       3 AS source_priority
+                       'kpl_ladder' AS source,
+                       {kpl_priority} AS source_priority
                 FROM ({latest})
                 """
             )
@@ -310,12 +343,11 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(
             f"""
             CREATE OR REPLACE VIEW v_limit_pool AS
-            SELECT trade_date, board_level, stock_code, stock_name, limit_up_time, fetched_at
+            SELECT trade_date, board_level, stock_code, stock_name, limit_up_time, fetched_at,
+                   source, source_priority
             FROM (
-                SELECT *, min(source_priority) OVER (PARTITION BY trade_date) AS date_source_priority
-                FROM ({combined})
+                SELECT * FROM ({combined})
             )
-            WHERE source_priority=date_source_priority
             QUALIFY row_number() OVER (
                 PARTITION BY trade_date, stock_code ORDER BY source_priority, fetched_at DESC NULLS LAST
             ) = 1
@@ -449,14 +481,26 @@ def _create_auction_status(con: duckdb.DuckDBPyConnection) -> None:
             ["date", "stock_code", "time"],
             _timestamp_column(con, "auction_tick"),
         )
+        tick_columns = set(table_columns(con, "auction_tick"))
+        tick_unit = "volume_unit" if "volume_unit" in tick_columns else "'unknown'"
+        tick_volume_shares = (
+            f"CASE lower(coalesce(nullif({tick_unit}, ''), 'unknown')) "
+            "WHEN 'hands' THEN volume * 100 WHEN 'shares' THEN volume ELSE NULL END"
+        )
         sources.append(
             f"""
             SELECT CAST(date AS VARCHAR) AS trade_date,stock_code,
                    CAST(NULL AS VARCHAR) AS stock_name,
-                   CAST(sum(price * volume) AS BIGINT) AS auction_amount,
+                   CASE WHEN count(DISTINCT lower(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 1
+                        AND lower(max(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 'hands'
+                        THEN CAST(sum(price * volume * 100) AS BIGINT)
+                        WHEN count(DISTINCT lower(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 1
+                        AND lower(max(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 'shares'
+                        THEN CAST(sum(price * volume) AS BIGINT)
+                        ELSE CAST(NULL AS BIGINT) END AS auction_amount,
                    'tick_volume' AS anomaly_type,
-                   CAST(sum(volume) AS DOUBLE) AS anomaly_value,
-                   round(sum(volume) / 1000000.0, 2) AS auction_strength,
+                   CAST(sum({tick_volume_shares}) AS DOUBLE) AS anomaly_value,
+                   round(sum({tick_volume_shares}) / 1000000.0, 2) AS auction_strength,
                    'tick_confirmed' AS confirmation,'auction_tick' AS source_table,
                    false AS is_fallback,max(fetched_at) AS fetched_at,1 AS source_priority
             FROM ({latest}) GROUP BY date,stock_code
@@ -468,15 +512,28 @@ def _create_auction_status(con: duckdb.DuckDBPyConnection) -> None:
             ["date", "stock_code", "quote_time", "provider"],
             _timestamp_column(con, "auction_quote_snapshot"),
         )
+        quote_columns = set(table_columns(con, "auction_quote_snapshot"))
+        quote_unit = "volume_unit" if "volume_unit" in quote_columns else "'unknown'"
+        quote_volume_shares = (
+            f"CASE lower(coalesce(nullif({quote_unit}, ''), 'unknown')) "
+            "WHEN 'hands' THEN cumulative_volume * 100 "
+            "WHEN 'shares' THEN cumulative_volume ELSE NULL END"
+        )
         sources.append(
             f"""
             SELECT CAST(date AS VARCHAR) AS trade_date,stock_code,
                    CAST(NULL AS VARCHAR) AS stock_name,
-                   CAST(max(indicative_price) * max(cumulative_volume) * 100 AS BIGINT) AS auction_amount,
+                   CASE WHEN count(DISTINCT lower(coalesce(nullif({quote_unit}, ''), 'unknown'))) = 1
+                        AND lower(max(coalesce(nullif({quote_unit}, ''), 'unknown'))) = 'hands'
+                        THEN CAST(max(indicative_price) * max(cumulative_volume) * 100 AS BIGINT)
+                        WHEN count(DISTINCT lower(coalesce(nullif({quote_unit}, ''), 'unknown'))) = 1
+                        AND lower(max(coalesce(nullif({quote_unit}, ''), 'unknown'))) = 'shares'
+                        THEN CAST(max(indicative_price) * max(cumulative_volume) AS BIGINT)
+                        ELSE CAST(NULL AS BIGINT) END AS auction_amount,
                    'order_book_imbalance' AS anomaly_type,
                    arg_max(order_imbalance,fetched_at) AS anomaly_value,
-                   round(arg_max(order_imbalance,fetched_at) * 100
-                         + least(max(cumulative_volume) / 100000.0,20),2) AS auction_strength,
+                   round(coalesce(arg_max(order_imbalance,fetched_at), 0) * 100
+                         + least(coalesce(max({quote_volume_shares}), 0) / 100000.0,20),2) AS auction_strength,
                    'quote_confirmed' AS confirmation,
                    'auction_quote_snapshot' AS source_table,
                    false AS is_fallback,max(fetched_at) AS fetched_at,2 AS source_priority
@@ -696,11 +753,26 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
         ("source_table", "VARCHAR"),
         ("is_fallback", "BOOLEAN"),
         ("fetched_at", "TIMESTAMP"),
+        ("volume_unit", "VARCHAR"),
+        ("amount_unit", "VARCHAR"),
+        ("adjustment", "VARCHAR"),
+        ("provider", "VARCHAR"),
     ]
     # TuShare is the project's bulk daily-history source.  Prefer it for
     # dates it actually covers, then retain newer/auxiliary rows from the
     # legacy KPL views instead of letting the legacy table hide fresh history.
     if _relation_has_rows(con, "tushare_daily"):
+        tushare_order = _timestamp_column(con, "tushare_daily")
+        tushare_latest = (
+            "SELECT * FROM (SELECT *, row_number() OVER ("
+            f"PARTITION BY date, stock_code ORDER BY {tushare_order} DESC NULLS LAST, rowid DESC"
+            ") AS _rn FROM tushare_daily WHERE close IS NOT NULL) WHERE _rn=1"
+        )
+        tushare_columns = set(table_columns(con, "tushare_daily"))
+        tushare_volume_unit = "volume_unit" if "volume_unit" in tushare_columns else "'unknown'"
+        tushare_amount_unit = "amount_unit" if "amount_unit" in tushare_columns else "'unknown'"
+        tushare_adjustment = "adjustment" if "adjustment" in tushare_columns else "'unknown'"
+        tushare_provider = "provider" if "provider" in tushare_columns else "'unknown'"
         tushare_sql = """
             SELECT
                 CAST(date AS VARCHAR) AS trade_date,
@@ -709,24 +781,61 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 high,
                 low,
                 close,
-                CAST(volume AS BIGINT) AS volume,
-                CAST(turnover AS BIGINT) AS turnover,
+                CASE lower(coalesce(nullif({tushare_volume_unit}, ''), 'unknown'))
+                    WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
+                    WHEN 'shares' THEN CAST(volume AS BIGINT)
+                    ELSE CAST(NULL AS BIGINT)
+                END AS volume,
+                CASE lower(coalesce(nullif({tushare_amount_unit}, ''), 'unknown'))
+                    WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
+                    WHEN 'yuan' THEN CAST(turnover AS BIGINT)
+                    ELSE CAST(NULL AS BIGINT)
+                END AS turnover,
                 change_pct,
                 'D' AS ktype,
                 'tushare_daily' AS source_table,
                 false AS is_fallback,
-                fetched_at
-            FROM tushare_daily
+                fetched_at,
+                lower(coalesce(nullif({tushare_volume_unit}, ''), 'unknown')) AS volume_unit,
+                lower(coalesce(nullif({tushare_amount_unit}, ''), 'unknown')) AS amount_unit,
+                coalesce(nullif({tushare_adjustment}, ''), 'none') AS adjustment,
+                coalesce(nullif({tushare_provider}, ''), 'unknown') AS provider
+            FROM ({tushare_latest})
             WHERE stock_code IS NOT NULL AND date IS NOT NULL
-        """
+        """.format(
+            tushare_latest=tushare_latest,
+            tushare_volume_unit=tushare_volume_unit,
+            tushare_amount_unit=tushare_amount_unit,
+            tushare_adjustment=tushare_adjustment,
+            tushare_provider=tushare_provider,
+        )
         fallback_sql = None
         if _relation_has_rows(con, "kline"):
             latest = _canonical_kline_cte("kline", _timestamp_column(con, "kline"))
+            kline_columns = set(table_columns(con, "kline"))
+            volume_unit = "volume_unit" if "volume_unit" in kline_columns else "'unknown'"
+            amount_unit = "amount_unit" if "amount_unit" in kline_columns else "'unknown'"
+            adjustment = "adjustment" if "adjustment" in kline_columns else "'unknown'"
+            provider = "provider" if "provider" in kline_columns else "'unknown'"
             fallback_sql = f"""
                 SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, open, high,
-                       low, close, volume, turnover, change_pct,
+                       low, close,
+                       CASE lower(coalesce(nullif({volume_unit}, ''), 'unknown'))
+                           WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
+                           WHEN 'shares' THEN CAST(volume AS BIGINT)
+                           ELSE CAST(NULL AS BIGINT)
+                       END AS volume,
+                       CASE lower(coalesce(nullif({amount_unit}, ''), 'unknown'))
+                           WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
+                           WHEN 'yuan' THEN CAST(turnover AS BIGINT)
+                           ELSE CAST(NULL AS BIGINT)
+                       END AS turnover,
+                       change_pct,
                        upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                       'kline' AS source_table, false AS is_fallback, fetched_at
+                       'kline' AS source_table, false AS is_fallback, fetched_at,
+                       'shares' AS volume_unit, 'yuan' AS amount_unit,
+                       coalesce(nullif({adjustment}, ''), 'unknown') AS adjustment,
+                       coalesce(nullif({provider}, ''), 'unknown') AS provider
                 FROM ({latest})
             """
         elif _relation_has_rows(con, "advanced_kline_today"):
@@ -735,9 +844,12 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
             )
             fallback_sql = f"""
                 SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, open, high,
-                       low, close, volume, turnover, CAST(NULL AS DOUBLE) AS change_pct,
+                       low, close, CAST(NULL AS BIGINT) AS volume, CAST(NULL AS BIGINT) AS turnover,
+                       CAST(NULL AS DOUBLE) AS change_pct,
                        upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                       'advanced_kline_today' AS source_table, true AS is_fallback, fetched_at
+                       'advanced_kline_today' AS source_table, true AS is_fallback, fetched_at,
+                       'shares' AS volume_unit, 'yuan' AS amount_unit,
+                       'unknown' AS adjustment, 'advanced_kline_today' AS provider
                 FROM ({latest})
             """
         if fallback_sql:
@@ -759,6 +871,11 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
         return
     if _relation_has_rows(con, "kline"):
         latest = _canonical_kline_cte("kline", _timestamp_column(con, "kline"))
+        kline_columns = set(table_columns(con, "kline"))
+        volume_unit = "volume_unit" if "volume_unit" in kline_columns else "'unknown'"
+        amount_unit = "amount_unit" if "amount_unit" in kline_columns else "'unknown'"
+        adjustment = "adjustment" if "adjustment" in kline_columns else "'unknown'"
+        provider = "provider" if "provider" in kline_columns else "'unknown'"
         con.execute(
             f"""
             CREATE OR REPLACE VIEW v_kline_daily AS
@@ -769,13 +886,25 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 high,
                 low,
                 close,
-                volume,
-                turnover,
+                CASE lower(coalesce(nullif({volume_unit}, ''), 'unknown'))
+                    WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
+                    WHEN 'shares' THEN CAST(volume AS BIGINT)
+                    ELSE CAST(NULL AS BIGINT)
+                END AS volume,
+                CASE lower(coalesce(nullif({amount_unit}, ''), 'unknown'))
+                    WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
+                    WHEN 'yuan' THEN CAST(turnover AS BIGINT)
+                    ELSE CAST(NULL AS BIGINT)
+                END AS turnover,
                 change_pct,
                 upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
                 'kline' AS source_table,
                 false AS is_fallback,
-                fetched_at
+                fetched_at,
+                'shares' AS volume_unit,
+                'yuan' AS amount_unit,
+                coalesce(nullif({adjustment}, ''), 'unknown') AS adjustment,
+                coalesce(nullif({provider}, ''), 'unknown') AS provider
             FROM ({latest})
             """
         )
@@ -794,13 +923,17 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 high,
                 low,
                 close,
-                volume,
-                turnover,
+                CAST(NULL AS BIGINT) AS volume,
+                CAST(NULL AS BIGINT) AS turnover,
                 CAST(NULL AS DOUBLE) AS change_pct,
                 upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
                 'advanced_kline_today' AS source_table,
                 true AS is_fallback,
-                fetched_at
+                fetched_at,
+                'shares' AS volume_unit,
+                'yuan' AS amount_unit,
+                'unknown' AS adjustment,
+                'advanced_kline_today' AS provider
             FROM ({latest})
             """
         )
@@ -827,7 +960,11 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
                 'advanced_gujia_kline' AS source_table,
                 true AS is_fallback,
-                fetched_at
+                fetched_at,
+                'shares' AS volume_unit,
+                'yuan' AS amount_unit,
+                'unknown' AS adjustment,
+                'advanced_gujia_kline' AS provider
             FROM ({latest})
             """
         )
@@ -1143,6 +1280,14 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
         if _table_has_columns(con, table_name, ["date", "stock_code"]):
             table_cols = set(table_columns(con, table_name))
             amount_expr = "big_net_amount" if "big_net_amount" in table_cols else "0"
+            # The THS daily large-order endpoint has used both ``D`` and ``1``
+            # for its daily record across API versions.  Minute values (5/15/
+            # 30/60) must not be mixed into the daily evidence or the UNION
+            # would multiply the daily net amount several times over.
+            ktype_filter = (
+                "WHERE upper(coalesce(ktype, 'D')) IN ('D', '1')"
+                if "ktype" in table_cols else ""
+            )
             dadan_parts.append(
                 f"""
                 SELECT
@@ -1150,6 +1295,7 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
                     stock_code,
                     coalesce({amount_expr}, 0) AS dadan_big_net_amount
                 FROM {table_name}
+                {ktype_filter}
                 """
             )
     if dadan_parts:
@@ -1647,9 +1793,8 @@ def _create_theme_mainline_evidence(con: duckdb.DuckDBPyConnection) -> None:
                   SELECT 1
                   FROM v_default_concept_daily d
                   WHERE d.trade_date = CAST(b.trade_date AS DATE)
-                    AND d.concept_code LIKE 'THS-%'
                   GROUP BY d.trade_date
-                  HAVING count(DISTINCT d.concept_code) >= 374
+                  HAVING count(DISTINCT d.concept_code) > 0
               )
         """
     else:

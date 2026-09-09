@@ -108,13 +108,38 @@ def _table_names(conn) -> set:
     return {r[0] for r in rows}
 
 
+def _table_schema(conn) -> list[tuple]:
+    """Return a deterministic table-column signature for pre-swap checks."""
+    return conn.execute(
+        "SELECT table_name, column_name, ordinal_position, data_type "
+        "FROM information_schema.columns WHERE table_schema='main' "
+        "AND table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema='main') "
+        "ORDER BY table_name, ordinal_position"
+    ).fetchall()
+
+
+def _critical_row_counts(conn, relations: set[str]) -> dict[str, int]:
+    """Check representative operator/research tables without scanning every table."""
+    critical = {
+        "kline", "index_kline", "market_state", "sector_capital",
+        "stock_capital_flow", "qlib_prediction", "qlib_stock_flow_features",
+        "ths_concept_daily", "ths_concept_stock_history",
+        "daily_summary", "limit_up_pool",
+    }
+    out: dict[str, int] = {}
+    for name in sorted(critical & relations):
+        out[name] = int(conn.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0])
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compact kpl_data.duckdb via EXPORT+IMPORT to reclaim disk space."
     )
     parser.add_argument("--db", default=DB_PATH, help="DuckDB database path")
     parser.add_argument(
-        "--backup-dir", default="backups", help="Directory for the full-file backup")
+        "--backup-dir", default=None,
+        help="Directory for the full-file backup (default: <db parent>/backups)")
     parser.add_argument(
         "--min-free-gb", type=float, default=25.0,
         help="Abort if free disk space is below this many GB (default 25)")
@@ -147,6 +172,8 @@ def main() -> int:
     try:
         size_before = _database_size_bytes(conn)
         tables_before = _table_names(conn)
+        schema_before = _table_schema(conn)
+        counts_before = _critical_row_counts(conn, tables_before)
         # Flush the WAL so the file copy backup is self-consistent.
         conn.execute("CHECKPOINT")
     finally:
@@ -170,7 +197,11 @@ def main() -> int:
             return 1
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = Path(args.backup_dir)
+    backup_dir = (
+        Path(args.backup_dir).resolve()
+        if args.backup_dir
+        else db_path.parent / "backups"
+    )
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_path = backup_dir / f"{db_path.stem}.pre-reclaim.{ts}.duckdb"
     export_dir = db_path.with_name(f"{db_path.name}.export.{ts}")
@@ -201,18 +232,43 @@ def main() -> int:
             cconn.execute(f"IMPORT DATABASE '{export_dir.as_posix()}'")
             cconn.execute("CHECKPOINT")
             tables_after = _table_names(cconn)
+            schema_after = _table_schema(cconn)
+            counts_after = _critical_row_counts(cconn, tables_after)
             size_after = _database_size_bytes(cconn)
         finally:
             cconn.close()
 
         # --- 4. Verify the compacted database ---
-        missing = tables_before - tables_after
-        if missing:
-            print(f"REFUSING TO SWAP: compacted DB is missing tables: {sorted(missing)[:20]}")
+        if tables_before != tables_after:
+            missing = sorted(tables_before - tables_after)
+            extra = sorted(tables_after - tables_before)
+            print(
+                "REFUSING TO SWAP: compacted DB relation set differs; "
+                f"missing={missing[:20]} extra={extra[:20]}"
+            )
+            print(f"Compacted file left at {compacted_path}; backup at {backup_path}.")
+            return 4
+        if schema_before != schema_after:
+            print("REFUSING TO SWAP: compacted table schema differs from source.")
+            print(f"Compacted file left at {compacted_path}; backup at {backup_path}.")
+            return 4
+        if counts_before != counts_after:
+            print(
+                "REFUSING TO SWAP: critical table row counts changed; "
+                f"before={counts_before} after={counts_after}"
+            )
             print(f"Compacted file left at {compacted_path}; backup at {backup_path}.")
             return 4
         print(f"[4/6] verified: {len(tables_after)} tables, "
               f"compacted size {_human(size_after)}")
+
+        # A watcher may start between the initial pre-flight and this point.
+        # Never swap a live database after the lock has been reacquired.
+        reason = _writer_active(db_path)
+        if reason:
+            print(f"REFUSING TO SWAP: {reason}")
+            print(f"Compacted file left at {compacted_path}; backup at {backup_path}.")
+            return 4
 
         # --- 5. Swap (keep original as *.pre-reclaim.old) ---
         print("[5/6] swapping files ...")
@@ -232,27 +288,63 @@ def main() -> int:
 
         # --- 6. Restore schema guarantees + secondary indexes ---
         print("[6/6] re-applying schema + operational indexes ...")
+        from schema import init_schema
+        iconn = connect_duckdb(str(db_path))
         try:
-            from schema import init_schema
-            iconn = connect_duckdb(str(db_path))
-            try:
-                init_schema(iconn)
-            finally:
-                iconn.close()
-        except Exception as exc:
-            print(f"  warning: init_schema step failed: {exc}")
+            init_schema(iconn)
+            iconn.execute("CHECKPOINT")
+        finally:
+            iconn.close()
         idx_script = ROOT / "scripts" / "ensure_operational_indexes.py"
         if idx_script.exists():
             subprocess.run(
                 [sys.executable, str(idx_script), "--db", str(db_path)],
-                cwd=str(ROOT), check=False)
+                cwd=str(ROOT), check=True)
         # Rebuild the normalized signal/report views (belt-and-suspenders in case
         # EXPORT/IMPORT did not carry every view definition).
         views_script = ROOT / "scripts" / "build_normalized_views.py"
         if views_script.exists():
             subprocess.run(
                 [sys.executable, str(views_script), "--db", str(db_path)],
-                cwd=str(ROOT), check=False)
+                cwd=str(ROOT), check=True)
+
+        # Strict post-swap validation.  If the rebuilt file cannot satisfy the
+        # same core contract, restore the original and leave the candidate for
+        # forensic inspection instead of reporting a false success.
+        try:
+            verify = duckdb.connect(str(db_path), read_only=True)
+            try:
+                final_tables = _table_names(verify)
+                final_counts = _critical_row_counts(verify, final_tables)
+                final_views = {
+                    row[0] for row in verify.execute(
+                        "SELECT table_name FROM information_schema.views WHERE table_schema='main'"
+                    ).fetchall()
+                }
+                required_views = {
+                    "v_kline_daily", "v_default_concept_daily",
+                    "v_default_concept_stock_history",
+                }
+                if (
+                    final_tables != tables_before
+                    or final_counts != counts_before
+                    or not required_views <= final_views
+                ):
+                    raise RuntimeError(
+                        "post-swap contract mismatch: "
+                        f"tables={final_tables == tables_before}, "
+                        f"counts={final_counts == counts_before}, "
+                        f"missing_views={sorted(required_views - final_views)}"
+                    )
+                verify.execute("SELECT 1").fetchone()
+            finally:
+                verify.close()
+        except Exception:
+            broken_path = db_path.with_name(f"{db_path.name}.post-reclaim-invalid.{ts}")
+            if db_path.exists() and old_path.exists():
+                os.replace(str(db_path), str(broken_path))
+                os.replace(str(old_path), str(db_path))
+            raise
 
         print(f"database_size(after): {_human(size_after)}")
         if size_before > 0 and size_after > 0:

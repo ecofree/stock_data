@@ -13,6 +13,7 @@ from typing import Any
 import duckdb
 
 from trade_system.quality import table_exists
+from trade_system.review_metrics import metric_contract
 
 
 def _trend_series(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
@@ -236,7 +237,19 @@ def build_review_page_facts(con: duckdb.DuckDBPyConnection, trade_date: str) -> 
         "candidate_flow": _candidate_flow(con, trade_date),
         "emotion_rows": [],
         "consecutive": None,
+        "metric_contract": metric_contract(),
     }
+    # The same-date canonical ladder is the page authority.  daily_summary,
+    # ladder_market and L2 are provider evidence and may legitimately omit the
+    # field; allowing those NULLs to win made one page show both "6板" and
+    # "最高连板 —".
+    ladder_heights = [
+        int(row["height"])
+        for row in facts["ladder"]
+        if row.get("height") is not None and int(row.get("count") or 0) > 0
+    ]
+    if ladder_heights:
+        facts["consecutive"] = max(ladder_heights)
     try:
         facts["emotion_rows"] = [
             {"cgl": row[0]}
@@ -250,7 +263,7 @@ def build_review_page_facts(con: duckdb.DuckDBPyConnection, trade_date: str) -> 
     # The shared context may already have a reliable same-date ladder.  The
     # fallback queries below remain isolated here instead of the renderer.
     try:
-        if table_exists(con, "ladder_market"):
+        if facts["consecutive"] is None and table_exists(con, "ladder_market"):
             row = con.execute(
                 "SELECT max(consecutive_days) FROM ladder_market WHERE date=CAST(? AS DATE)",
                 [trade_date],

@@ -67,6 +67,27 @@ def test_build_gap_summary_marks_derived_and_missing_local_sources():
     assert missing.verdict == "derived_missing"
 
 
+def test_index_kline_is_a_dedicated_kpl_requirement():
+    from trade_system.api_data_audit import build_default_requirements
+
+    requirement = next(item for item in build_default_requirements() if item.name == "index_kline")
+    assert requirement.endpoint == "/index/zhishu-kline"
+    assert requirement.source_type == "api"
+    assert requirement.params["code"] == "SH000001"
+
+
+def test_retired_auction_routes_are_opt_in_compatibility_probes():
+    from trade_system.api_data_audit import build_default_requirements
+
+    current = {item.name for item in build_default_requirements()}
+    compatibility = {
+        item.name for item in build_default_requirements(include_compatibility=True)
+    }
+    assert "auction_tick_legacy" not in current
+    assert "auction_bidding_anomaly_legacy" not in current
+    assert {"auction_tick_legacy", "auction_bidding_anomaly_legacy"} <= compatibility
+
+
 def test_materialize_params_replaces_known_placeholders():
     params = materialize_params(
         {"code": "{stock_code}", "date": "{date}", "ktype": "d"},

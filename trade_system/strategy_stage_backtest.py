@@ -19,7 +19,7 @@ def run_strategy_result_backtest(
     fee_rate: float = 0.001,
     slippage_bps: float = 10.0,
     *,
-    enforce_t1: bool = False,
+    enforce_t1: bool = True,
 ) -> dict:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -114,6 +114,22 @@ def summarize_strategy_backtest(result: dict, config_hash: str = "default") -> l
     for (strategy_id, stage), rows in sorted(grouped.items()):
         returns = [float(row["net_return_pct"]) for row in rows]
         dates = sorted(str(row["trade_date"]) for row in rows)
+        # 权益曲线口径的最大回撤与盈亏比：min(returns)是单笔最小收益，不是回撤。
+        equity = 1.0
+        peak = 1.0
+        max_dd = 0.0
+        gross_profit = 0.0
+        gross_loss = 0.0
+        for value in returns:
+            equity *= 1.0 + value / 100.0
+            peak = max(peak, equity)
+            drawdown = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
+            max_dd = min(max_dd, drawdown)
+            if value > 0:
+                gross_profit += value
+            elif value < 0:
+                gross_loss += -value
+        profit_factor = round(gross_profit / gross_loss, 4) if gross_loss > 0 else (None if not gross_profit else float("inf"))
         summaries.append(
             {
                 "strategy_id": strategy_id,
@@ -125,8 +141,8 @@ def summarize_strategy_backtest(result: dict, config_hash: str = "default") -> l
                 if returns
                 else None,
                 "avg_return": round(mean(returns), 2) if returns else None,
-                "max_drawdown": min(returns) if returns else None,
-                "profit_factor": None,
+                "max_drawdown": round(max_dd, 2) if returns else None,
+                "profit_factor": profit_factor,
                 "config_hash": config_hash,
             }
         )

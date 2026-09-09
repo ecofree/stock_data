@@ -92,14 +92,42 @@ def audit(
     scheduler = {}
     try:
         completed = subprocess.run(
-            ["schtasks", "/Query", "/FO", "CSV", "/NH"],
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                "$names=@('StockData-Auction','StockData-Intraday','StockData-DailyClose');"
+                "$rows=@(); foreach($name in $names){"
+                "$task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;"
+                "if($task){$info=Get-ScheduledTaskInfo -TaskName $name;"
+                "$rows += [pscustomobject]@{name=$name;enabled=[bool]$task.Settings.Enabled;"
+                "state=[string]$task.State;last_result=[int64]$info.LastTaskResult;"
+                "last_run=[string]$info.LastRunTime;next_run=[string]$info.NextRunTime}}};"
+                "$rows|ConvertTo-Json -Compress",
+            ],
             capture_output=True, text=True, timeout=10, check=False,
         )
-        text = completed.stdout
-        for name in ("StockData-Auction", "StockData-Intraday", "StockData-DailyClose"):
-            scheduler[name] = name in text
+        rows = json.loads(completed.stdout or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+        scheduler = {
+            str(row["name"]): {
+                **row,
+                "healthy": bool(row.get("enabled") and int(row.get("last_result") or 0) == 0),
+            }
+            for row in rows
+        }
     except Exception:
         scheduler = {name: None for name in ("StockData-Auction", "StockData-Intraday", "StockData-DailyClose")}
+    review_candidates = (
+        f"daily_review_{trade_date}_p3.md",
+        f"daily_review_{trade_date}.md",
+        "daily_review_latest.md",
+        "daily_review_latest.html",
+    )
+    daily_review_exists = any(
+        (root / name).exists()
+        and trade_date in (root / name).read_text(encoding="utf-8", errors="ignore")[:2000]
+        for name in review_candidates
+    )
     report = {
         "trade_date": trade_date,
         # Keep historical audits unambiguous: when omitted, freshness is
@@ -129,13 +157,7 @@ def audit(
         "p3": {
             "watchlist_rows": watchlist,
             "trade_plan_rows": plans,
-            "daily_review_exists": any(
-                (root / name).exists()
-                for name in (
-                    f"daily_review_{trade_date}_p3.md",
-                    f"daily_review_{trade_date}.md",
-                )
-            ),
+            "daily_review_exists": daily_review_exists,
         },
     }
     flow_health = assess_capital_flow_health(
@@ -145,31 +167,63 @@ def audit(
         max_age_seconds=max_age_seconds,
         now=now,
     )
+    # This acceptance script is invoked after the close publication chain.
+    # The old implementation always assessed ``intraday`` and then required
+    # an executable candidate, so a perfectly usable historical close review
+    # was reported as not ready merely because no trade was approved.  Keep
+    # execution eligibility as a separate outcome and make close data the
+    # review gate.
+    readiness_stage = "close"
     data_readiness = assess_trade_date_readiness(
         db_path,
         trade_date,
-        "intraday",
+        readiness_stage,
         max_age_seconds=max_age_seconds,
         now=now,
     )
     report["p0"]["flow_health"] = flow_health
     report["p0"]["data_readiness"] = data_readiness
-    report["p0"]["intraday_ready"] = bool(flow_health["ready"] and data_readiness["ready"])
-    report["ready_for_manual_use"] = bool(
-        report["p0"]["intraday_ready"]
-        and execution_ready > 0
-        and evidence == actionable
+    report["p0"]["readiness_stage"] = readiness_stage
+    report["p0"]["close_ready"] = bool(flow_health["ready"] and data_readiness["ready"])
+    # Preserve the legacy field for consumers, but make its meaning explicit:
+    # it now reflects the close review data gate, not intraday execution.
+    report["p0"]["intraday_ready"] = report["p0"]["close_ready"]
+    review_ready = bool(
+        report["p0"]["close_ready"]
         and report["p2"]["index_kline_date_type"] == "DATE"
         and report["p2"]["aborted_wal_files"] == 0
         and watchlist > 0
         and plans > 0
+        and report["p3"]["daily_review_exists"]
     )
+    execution_ready_state = bool(
+        report["p0"]["close_ready"]
+        and execution_ready > 0
+        and evidence == actionable
+    )
+    report["p0"]["review_ready"] = review_ready
+    report["p0"]["execution_ready"] = execution_ready_state
+    # ``ready_for_manual_use`` is intentionally review-only.  It must not
+    # change to false just because the risk gate correctly approved zero
+    # orders; execution readiness is reported independently above.
+    report["ready_for_manual_use"] = review_ready
     return report
 
 
 def render(report: dict) -> str:
     as_of = report.get("as_of") or "runtime clock"
-    lines = ["# P0-P3 Acceptance", "", f"- Trade date: `{report['trade_date']}`", f"- As of: `{as_of}`", f"- Manual-use ready: `{str(report['ready_for_manual_use']).lower()}`", "", "```json", json.dumps(report, ensure_ascii=False, indent=2, default=str), "```", ""]
+    p0 = report.get("p0", {})
+    lines = [
+        "# P0-P3 Acceptance", "",
+        f"- Trade date: `{report['trade_date']}`",
+        f"- As of: `{as_of}`",
+        f"- Review ready: `{str(p0.get('review_ready', report['ready_for_manual_use'])).lower()}`",
+        f"- Execution ready: `{str(p0.get('execution_ready', False)).lower()}`",
+        "",
+        "Manual-use readiness means the close data and review artifact are valid. It is intentionally independent from whether the risk gate approved an executable trade.",
+        "",
+        "```json", json.dumps(report, ensure_ascii=False, indent=2, default=str), "```", "",
+    ]
     return "\n".join(lines)
 
 

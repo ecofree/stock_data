@@ -208,7 +208,7 @@ def test_generate_signals_writes_explainable_evidence(tmp_path):
     con.close()
     build_normalized_views(str(db_path))
 
-    generate_signals(str(db_path), "2026-07-06")
+    generate_signals(str(db_path), "2026-07-06", require_ready=False)
 
     con = duckdb.connect(str(db_path))
     sector_evidence = con.execute(

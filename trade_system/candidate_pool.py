@@ -21,6 +21,7 @@ def _iso_date(value: str | None) -> str | None:
 
 
 def _pct_rank(values: dict[str, float | None], *, higher_is_better: bool = True) -> dict[str, float]:
+    # 榜单内百分位，仅同口径同期限比较时有效；跨期限混排禁止（见 combined 方法声明）。
     valid = sorted(
         ((key, float(value)) for key, value in values.items() if value is not None),
         key=lambda item: item[1],
@@ -31,6 +32,12 @@ def _pct_rank(values: dict[str, float | None], *, higher_is_better: bool = True)
     denominator = max(1, len(valid) - 1)
     ranks = {key: 100.0 * (1.0 - index / denominator) for index, (key, _) in enumerate(valid)}
     return {key: round(ranks.get(key, 0.0), 4) for key in values}
+
+
+# 综合分方法声明：等权分位相加，未经样本外验证，不得用于正式排序。
+# qlib horizon 来自预测行；flow(5d)/rule(当期) 的期限未经验证，horizon_verified 恒为
+# False，直到调用方传入经验证的期限映射。正式排序必须过滤 horizon_verified=true。
+COMBINED_METHOD = "experimental_unweighted_ranks_v1"
 
 
 def ensure_candidate_pool_table(db_path: str | Path) -> None:
@@ -132,6 +139,7 @@ def build_candidate_pool(
             ).fetchall()
         }
         qlib_scores = {str(row[0]): float(row[1]) if row[1] is not None else None for row in predictions}
+        qlib_horizons = sorted({str(row[3]) for row in predictions if row[3] is not None})
         stock_values = {code: (stock_flow.get(code) or {}).get("main_net_5d") for code in codes}
         sector_values = {code: sector_flow.get(code) for code in codes}
         rule_values = {code: rule_scores.get(code) for code in codes}
@@ -155,6 +163,11 @@ def build_candidate_pool(
             blockers = []
             if model_status != "champion":
                 blockers.append("model_not_champion")
+            if len(qlib_horizons) != 1:
+                blockers.append("horizon_mixed")
+            # flow(5d)/rule(当期)与 qlib 预测期限的对应关系未经样本外验证：
+            # combined 仅供研究对比，正式排序必须等 horizon_verified=true。
+            blockers.append("horizon_unverified")
             if stock_net is None:
                 blockers.append("stock_flow_missing")
             if sector_net is None:
@@ -167,6 +180,9 @@ def build_candidate_pool(
                 "model_id": model_id,
                 "model_status": model_status,
                 "prediction_horizon": horizon,
+                "prediction_horizons": qlib_horizons,
+                "combined_method": COMBINED_METHOD,
+                "horizon_verified": False,
                 "membership_date": str(membership_date)[:10] if membership_date else None,
                 "stock_flow_quality": sf.get("quality_status"),
                 "blockers": blockers,
@@ -193,6 +209,7 @@ def build_candidate_pool(
             })
         output_rows.sort(key=lambda row: (-row["combined_score"], row["stock_code"]))
         output_rows = output_rows[: max(1, int(limit))]
+        con.execute("BEGIN TRANSACTION")
         con.execute("DELETE FROM qlib_candidate_pool WHERE trade_date = ? AND model_id = ?", [selected_date, model_id])
         if output_rows:
             con.executemany(
@@ -211,6 +228,7 @@ def build_candidate_pool(
                     "risk_approved", "is_executable", "blocker_reason", "evidence_json"
                 )] for row in output_rows],
             )
+        con.commit()
         return {
             "trade_date": selected_date,
             "model_id": model_id,
@@ -220,5 +238,11 @@ def build_candidate_pool(
             "executable": sum(1 for row in output_rows if row["is_executable"]),
             "membership_date": str(membership_date)[:10] if membership_date else None,
         }
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()

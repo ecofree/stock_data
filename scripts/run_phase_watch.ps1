@@ -36,6 +36,7 @@ $effectiveMinRunWindow = if ($MinRunWindowSeconds -gt 0) {
 $attempts = 0
 $successes = 0
 $failures = 0
+$deferred = 0
 $nextRun = Get-Date
 
 function Write-WatchEvent([string]$Message) {
@@ -62,6 +63,12 @@ while ((Get-Date) -lt $endAtToday) {
     $runCode = $LASTEXITCODE
     if ($runCode -eq 0) {
         $successes++
+    } elseif ($runCode -eq 3) {
+        # Another phase owns the single-writer pipeline lock.  This attempt
+        # was safely deferred; counting it as a provider failure makes the
+        # scheduler red even though no data task actually failed.
+        $deferred++
+        Write-WatchEvent "PHASE_WATCH_DEFER phase=$Phase attempt=$attempts reason=pipeline_busy"
     } else {
         $failures++
         if (-not $ContinueOnFailure) {
@@ -84,7 +91,7 @@ while ((Get-Date) -lt $endAtToday) {
     }
 }
 
-Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase attempts=$attempts successes=$successes failures=$failures end=$EndAt"
+Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase attempts=$attempts successes=$successes deferred=$deferred failures=$failures end=$EndAt"
 # A watch is successful only when every attempted run succeeded.  A single
 # green attempt must not hide later provider failures or stale data.
 if ($attempts -gt 0 -and $failures -eq 0) { exit 0 }

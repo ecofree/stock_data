@@ -86,7 +86,7 @@ def _readiness(sample_count: int, return_sample_count: int, real_outcome_count: 
     reasons: list[str] = []
     if context["kline_trading_days"] < MIN_HISTORY_TRADING_DAYS:
         reasons.append(
-            f"历史日线仅 {context['kline_trading_days']} 个交易日，至少需要 {MIN_HISTORY_TRADING_DAYS} 个"
+            f"历史日线仅 {context['kline_trading_days']} 个交易日，至少需要 {MIN_HISTORY_TRADING_DAYS} 个交易日"
         )
     if return_sample_count < MIN_RETURN_SAMPLES:
         reasons.append(
@@ -215,8 +215,10 @@ def _real_outcome_rows(con: duckdb.DuckDBPyConnection) -> list[dict]:
         ) = row
         result.append(
             {
+                # trade_date是信号/计划归属日；entry_date是真实执行日（T+1映射已体现在
+                # 实际成交价中，不再把trade_date冒充为执行日）。
                 "signal_date": str(trade_date),
-                "entry_date": str(trade_date),
+                "entry_date": str(entry_time)[:10] if entry_time else str(trade_date),
                 "stage": "operator_outcome",
                 "stock_code": stock_code,
                 "stock_name": stock_name,
@@ -271,7 +273,7 @@ def run_operator_stage_backtest(
     fee_rate: float = 0.001,
     slippage_bps: float = 10.0,
     *,
-    enforce_t1: bool = False,
+    enforce_t1: bool = True,
 ) -> dict:
     con = duckdb.connect(str(db_path), read_only=True)
     try:

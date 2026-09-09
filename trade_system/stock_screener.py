@@ -37,10 +37,14 @@ PHASE_BOARD_ADJUST = {
 }
 
 
-def _percentile_ranks(values: list[float | None]) -> list[float]:
-    """Rank-normalize to 0..1 (higher is better); None → 0."""
+def _percentile_ranks(values: list[float | None]) -> list[float | None]:
+    """Rank-normalize to 0..1 (higher is better); None stays None.
+
+    缺失不补 0：缺失是未知，不是最低分。调用方必须把缺失计为未覆盖，
+    缺核心因子即 total_score=None 并沉底。
+    """
     indexed = [(i, v) for i, v in enumerate(values) if v is not None]
-    out = [0.0] * len(values)
+    out: list[float | None] = [None] * len(values)
     if not indexed:
         return out
     ranked = sorted(indexed, key=lambda iv: iv[1])
@@ -74,7 +78,8 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
     q_seal_ratio = _percentile_ranks(seal_ratio)
     q_seal_abs = _percentile_ranks([r.get("seal_money") for r in rows])
     q_seal = [
-        0.6 * a + 0.4 * b for a, b in zip(q_seal_ratio, q_seal_abs)
+        0.6 * a + 0.4 * b if a is not None and b is not None else (a if b is None else b)
+        for a, b in zip(q_seal_ratio, q_seal_abs)
     ]
     q_heat = _percentile_ranks([r.get("concept_heat") for r in rows])
 
@@ -101,7 +106,10 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
     scr_vals = [r.get("scr_90") for r in rows]
     q_win = _percentile_ranks(win_inverted)
     q_scr = _percentile_ranks(scr_vals)
-    q_chip = [0.6 * w + 0.4 * s for w, s in zip(q_win, q_scr)]
+    q_chip = [
+        0.6 * w + 0.4 * s if w is not None and s is not None else (w if s is None else s)
+        for w, s in zip(q_win, q_scr)
+    ]
 
     thr, penalty, first_bonus = PHASE_BOARD_ADJUST.get(
         phase, (None, 0.0, 0.0))
@@ -110,39 +118,56 @@ def score_candidates(rows: list[dict[str, Any]], phase: str) -> list[dict[str, A
     for i, r in enumerate(rows):
         board = r.get("board") or 1
         opens = r.get("open_times")
+        missing_core = (
+            q_qlib[i] is None or q_flow[i] is None or q_seal[i] is None
+        )
         factor_scores = {
-            "qlib": round(q_qlib[i] * WEIGHTS["qlib"], 2),
-            "flow": round(q_flow[i] * WEIGHTS["flow"], 2),
-            "seal": round(q_seal[i] * WEIGHTS["seal"], 2),
-            "heat": round(q_heat[i] * WEIGHTS["heat"], 2),
+            "qlib": round(q_qlib[i] * WEIGHTS["qlib"], 2)
+                if q_qlib[i] is not None else None,
+            "flow": round(q_flow[i] * WEIGHTS["flow"], 2)
+                if q_flow[i] is not None else None,
+            "seal": round(q_seal[i] * WEIGHTS["seal"], 2)
+                if q_seal[i] is not None else None,
+            "heat": round(q_heat[i] * WEIGHTS["heat"], 2)
+                if q_heat[i] is not None else None,
             "valuation": round(q_val[i] * WEIGHTS["valuation"], 2)
-                if pe_ttm_vals[i] is not None else 0,
+                if pe_ttm_vals[i] is not None and q_val[i] is not None else None,
             "earnings": round(q_earn[i] * WEIGHTS["earnings"], 2)
-                if earn_vals[i] is not None else 0,
+                if earn_vals[i] is not None and q_earn[i] is not None else None,
             "chip": round(q_chip[i] * WEIGHTS["chip"], 2)
-                if win_inverted[i] is not None else 0,
+                if win_inverted[i] is not None and q_chip[i] is not None else None,
         }
-        total = sum(factor_scores.values())
+        missing = sorted(k for k, v in factor_scores.items() if v is None)
+        total = None if missing_core else sum(v for v in factor_scores.values() if v is not None)
         notes: list[str] = []
-        if thr is not None and board >= thr:
-            total += penalty
-            notes.append(f"{board}板高位相位惩罚{penalty:+.0f}")
-        if board == 1 and first_bonus:
-            total += first_bonus
-            notes.append(f"低位首板相位加分{first_bonus:+.0f}")
-        if isinstance(opens, int) and opens >= 2:
-            total -= 3.0
-            notes.append(f"开板{opens}次扣分-3")
+        if total is not None:
+            if thr is not None and board >= thr:
+                total += penalty
+                notes.append(f"{board}板高位相位惩罚{penalty:+.0f}")
+            if board == 1 and first_bonus:
+                total += first_bonus
+                notes.append(f"低位首板相位加分{first_bonus:+.0f}")
+            if isinstance(opens, int) and opens >= 2:
+                total -= 3.0
+                notes.append(f"开板{opens}次扣分-3")
+        else:
+            notes.append(f"核心因子缺失({','.join(missing)})未覆盖，不排名")
         picks.append({
             **r,
             "factor_json": {**factor_scores,
-                            "phase_adjust": round(total - sum(factor_scores.values()), 2),
+                            "missing_factors": missing,
+                            "phase_adjust": round(total - sum(v for v in factor_scores.values() if v is not None), 2)
+                                if total is not None else None,
                             "notes": "; ".join(notes)},
-            "total_score": round(total, 2),
+            "total_score": round(total, 2) if total is not None else None,
+            "scored": total is not None,
         })
-    picks.sort(key=lambda p: p["total_score"], reverse=True)
-    for rank, p in enumerate(picks, start=1):
+    # 缺失沉底：有分按分排，无分按原序沉底，不冒充 0 分。
+    picks.sort(key=lambda p: (p["total_score"] is None, -(p["total_score"] or 0), p.get("stock_code") or ""))
+    for rank, p in enumerate([p for p in picks if p["scored"]], start=1):
         p["rank"] = rank
+    for p in picks:
+        p.setdefault("rank", None)
     return picks
 
 

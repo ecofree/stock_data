@@ -175,7 +175,9 @@ def _from_baostock(code, start, end, fq="qfq"):
                 rows.append({
                     "date": r[0], "open": float(r[1] or 0), "high": float(r[2] or 0),
                     "low": float(r[3] or 0), "close": float(r[4] or 0),
-                    "volume": float(r[5] or 0), "amount": float(r[6] or 0), "_src": "baostock"})
+                    "volume": float(r[5] or 0), "amount": float(r[6] or 0),
+                    "volume_unit": "shares", "amount_unit": "yuan",
+                    "adjustment": "none", "_src": "baostock"})
             return rows or None
         except Exception:
             # The next request should perform a fresh login rather than reuse
@@ -214,6 +216,8 @@ def _from_pytdx(code, start, end, fq="qfq"):
                     "low": float(b["low"]), "close": float(b["close"]),
                     "volume": float(b.get("volume") or b.get("vol") or 0),
                     "amount": float(b.get("amount") or 0),
+                    "volume_unit": "hands", "amount_unit": "yuan",
+                    "adjustment": "none",
                     "_src": "pytdx"})
             return out or None
         except Exception:
@@ -244,7 +248,8 @@ def _from_tencent(code, start, end, fq="qfq"):
             continue
         out.append({"date": str(r[0]), "open": float(r[1]), "close": float(r[2]),
                     "high": float(r[3]), "low": float(r[4]), "volume": float(r[5]),
-                    "amount": 0.0, "_src": "tencent"})
+                    "amount": None, "volume_unit": "hands", "amount_unit": "not_provided",
+                    "adjustment": "none" if fqw == "bfq" else fqw, "_src": "tencent"})
     return out or None
 
 
@@ -269,7 +274,9 @@ def _from_sina(code, start, end, fq="qfq"):
             continue
         res.append({"date": r["day"], "open": float(r["open"]), "high": float(r["high"]),
                     "low": float(r["low"]), "close": float(r["close"]),
-                    "volume": float(r["volume"]), "amount": 0.0, "_src": "sina"})
+                    "volume": float(r["volume"]), "amount": None,
+                    "volume_unit": "shares", "amount_unit": "not_provided",
+                    "adjustment": "none", "_src": "sina"})
     return res or None
 
 
@@ -289,7 +296,10 @@ def _from_eastmoney(code, start, end, fq="qfq"):
         if len(p) < 7:
             continue
         out.append({"date": p[0], "open": p[1], "close": p[2], "high": p[3],
-                    "low": p[4], "volume": p[5], "amount": p[6], "_src": "eastmoney"})
+                    "low": p[4], "volume": p[5], "amount": p[6],
+                    "volume_unit": "hands", "amount_unit": "yuan",
+                    "adjustment": {"0": "none", "1": "qfq", "2": "hfq"}.get(fqt, "unknown"),
+                    "_src": "eastmoney"})
     return out or None
 
 
@@ -324,7 +334,9 @@ def _from_baidu(code, start, end, fq="qfq"):
             continue
         out.append({"date": cols[1], "open": float(cols[2]), "close": float(cols[3]),
                     "high": float(cols[5]), "low": float(cols[6]),
-                    "volume": float(cols[4]), "amount": float(cols[7]), "_src": "baidu"})
+                    "volume": float(cols[4]), "amount": float(cols[7]),
+                    "volume_unit": "unknown", "amount_unit": "unknown",
+                    "adjustment": "unknown", "_src": "baidu"})
     return out or None
 
 
@@ -356,6 +368,8 @@ def _from_tushare_relay(code, start, end, fq="qfq"):  # noqa: E302
             "close": float(row.get("close") or 0),
             "volume": float(row.get("vol") or 0) * 100,
             "amount": float(row.get("amount") or 0) * 1000,
+            "volume_unit": "shares", "amount_unit": "yuan",
+            "adjustment": "none",
             "_src": "tushare_relay"})
     return res or None
 

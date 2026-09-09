@@ -36,17 +36,44 @@ def audit_multisource(db_path: str | Path, as_of: str | None = None) -> dict:
             columns = {row[0] for row in con.execute(f"describe {table}").fetchall()}
             date_column = "source_date" if "source_date" in columns else ("trade_date" if "trade_date" in columns else None)
             rows = con.execute(f"select count(*) from {table}").fetchone()[0]
-            latest = con.execute(f"select max({date_column}) from {table}").fetchone()[0] if date_column else None
+            current_rows = rows
+            if date_column:
+                latest = con.execute(
+                    f"select max({date_column}) from {table} "
+                    f"where CAST({date_column} AS DATE)<=CAST(? AS DATE)",
+                    [requested],
+                ).fetchone()[0]
+                current_rows = con.execute(
+                    f"select count(*) from {table} "
+                    f"where CAST({date_column} AS DATE)<=CAST(? AS DATE)",
+                    [requested],
+                ).fetchone()[0]
+            else:
+                latest = None
             providers = []
             if "provider" in columns:
-                providers = [row[0] for row in con.execute(f"select distinct provider from {table} where provider is not null order by 1").fetchall()]
+                provider_filter = f"WHERE provider IS NOT NULL" + (
+                    f" AND CAST({date_column} AS DATE)<=CAST(? AS DATE)" if date_column else ""
+                )
+                providers = [
+                    row[0] for row in con.execute(
+                        f"select distinct provider from {table} {provider_filter} order by 1",
+                        [requested] if date_column else [],
+                    ).fetchall()
+                ]
             age_days = (as_of_date - latest).days if latest else None
             verified_rows = None
             if "date_verified" in columns:
-                verified_rows = con.execute(f"select count(*) from {table} where date_verified").fetchone()[0]
-            status = "empty" if not rows else ("unverified" if verified_rows == 0 else ("stale" if age_days is not None and age_days > 3 else "available"))
+                verified_filter = "WHERE date_verified" + (
+                    f" AND CAST({date_column} AS DATE)<=CAST(? AS DATE)" if date_column else ""
+                )
+                verified_rows = con.execute(
+                    f"select count(*) from {table} {verified_filter}",
+                    [requested] if date_column else [],
+                ).fetchone()[0]
+            status = "empty" if not current_rows else ("unverified" if verified_rows == 0 else ("stale" if age_days is not None and age_days > 3 else "available"))
             result["tables"][table] = {
-                "label": label, "status": status, "rows": rows, "verified_rows": verified_rows,
+                "label": label, "status": status, "rows": rows, "current_rows": current_rows, "verified_rows": verified_rows,
                 "latest": str(latest) if latest else None, "age_days": age_days, "providers": providers,
             }
 
@@ -84,21 +111,47 @@ def audit_multisource(db_path: str | Path, as_of: str | None = None) -> dict:
                 flow[table] = {"status": "missing", "coverage": 0, "latest": None, "stale_rows": 0}
                 continue
             coverage = con.execute(f"select count(distinct {code_column}) from {table}").fetchone()[0]
-            latest = con.execute(f"select max(source_date) from {table}").fetchone()[0]
+            latest = con.execute(
+                f"select max(source_date) from {table} "
+                "where CAST(source_date AS DATE)<=CAST(? AS DATE)",
+                [requested],
+            ).fetchone()[0]
             latest_coverage = con.execute(
-                f"select count(distinct {code_column}) from {table} where source_date=?", [latest]
+                f"select count(distinct {code_column}) from {table} "
+                "where source_date=? AND CAST(source_date AS DATE)<=CAST(? AS DATE)",
+                [latest, requested],
             ).fetchone()[0] if latest else 0
             historical_peak = con.execute(
                 f"select coalesce(max(day_coverage),0) from ("
                 f"select source_date,count(distinct {code_column}) day_coverage from {table} group by source_date)"
             ).fetchone()[0]
             stale = con.execute(f"select count(*) from {table} where is_stale").fetchone()[0]
+            expected = 0
+            batch_table = {
+                "multi_source_stock_flow": "intraday_stock_flow_batch",
+                "multi_source_sector_flow": "intraday_sector_flow_batch",
+            }.get(table)
+            if batch_table and latest:
+                try:
+                    expected = int(con.execute(
+                        f"SELECT coalesce(expected_rows,0) FROM {batch_table} "
+                        "WHERE trade_date=CAST(? AS DATE) ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+                        [latest],
+                    ).fetchone()[0] or 0)
+                except Exception:
+                    expected = 0
+            comparison_base = expected or latest_coverage
             age_days = (as_of_date - latest).days if latest else None
-            partial = bool(latest and historical_peak and latest_coverage < max(1, historical_peak * 0.90))
+            partial = bool(
+                comparison_base
+                and latest_coverage < max(1, int(comparison_base * 0.995 + 0.9999))
+            )
             status = "empty" if not coverage else ("partial" if partial else ("stale" if age_days is not None and age_days > 3 else "available"))
             flow[table] = {"status": status, "coverage": coverage,
                            "latest": str(latest) if latest else None, "age_days": age_days, "stale_rows": stale,
                            "latest_coverage": latest_coverage, "historical_peak_coverage": historical_peak,
+                           "expected_coverage": expected or None,
+                           "coverage_pct_of_expected": round(latest_coverage * 100.0 / comparison_base, 2) if comparison_base else 0.0,
                            "coverage_pct_of_peak": round(latest_coverage * 100.0 / historical_peak, 2) if historical_peak else 0.0}
         if "multi_source_task_checkpoint" in tables:
             result["checkpoints"] = [
@@ -199,10 +252,11 @@ def render_multisource_readiness(result: dict) -> str:
     cp = result.get("concept_checkpoint") or {}
     if cp.get("partial"):
         lines.append(f"- THS 成分分页 checkpoint: `{cp.get('success', 0)}/{cp.get('rows', 0)} success`, partial={cp.get('partial', 0)}; anti-bot/empty pages are not complete.")
-    lines.extend(["", "## 资金流重点", "", "| 表 | 状态 | 历史覆盖标的数 | 最新日覆盖 | 历史峰值覆盖 | 覆盖率 | 最新日期 | 距 as_of 天数 | stale 行数 |", "|---|---|---:|---:|---:|---:|---|---:|---:|"])
+    lines.extend(["", "## 资金流重点", "", "| 表 | 状态 | 历史覆盖标的数 | 最新日覆盖 | 当日预期 | 覆盖率 | 最新日期 | 距 as_of 天数 | stale 行数 |", "|---|---|---:|---:|---:|---:|---|---:|---:|"])
     for table, item in result["capital_flow"].items():
         age = item.get('age_days') if item.get('age_days') is not None else '-'
-        lines.append(f"| {table} | {item['status']} | {item['coverage']} | {item.get('latest_coverage', 0)} | {item.get('historical_peak_coverage', 0)} | {item.get('coverage_pct_of_peak', 0)}% | {item.get('latest') or '-'} | {age} | {item['stale_rows']} |")
+        expected = item.get('expected_coverage') or '-'
+        lines.append(f"| {table} | {item['status']} | {item['coverage']} | {item.get('latest_coverage', 0)} | {expected} | {item.get('coverage_pct_of_expected', 0)}% | {item.get('latest') or '-'} | {age} | {item['stale_rows']} |")
     lines.extend(["", "## 判定规则", "", "- `available` 只表示表内有数据，不等于当前交易日一定完整；必须同时看最新日期、覆盖数和 `stale_rows`。",
                   "- 资金流必须分别看个股表与板块表，不能用个股资金流推断板块资金流。", ""])
     if result.get("checkpoints"):

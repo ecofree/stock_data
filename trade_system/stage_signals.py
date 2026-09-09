@@ -19,6 +19,7 @@ from trade_system.flow_ranking import stock_provider_rank
 from trade_system.quality import table_columns, table_exists
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
+from trade_system.kline_access import canonical_daily_kline_relation
 
 
 STAGE_NAMES = (
@@ -265,16 +266,19 @@ def _auction_candidates(
             """
             SELECT auction_strength, confirmation, source_table, is_fallback, fetched_at
             FROM v_auction_status
-            WHERE trade_date = ? AND (stock_code = ? OR stock_code IS NULL)
+            WHERE trade_date = ? AND stock_code = ?
               AND fetched_at <= ?
-            ORDER BY CASE WHEN stock_code = ? THEN 0 ELSE 1 END, fetched_at DESC NULLS LAST
+            ORDER BY fetched_at DESC NULLS LAST
             LIMIT 1
             """,
-            [trade_date, row["stock_code"], as_of, row["stock_code"]],
+            [trade_date, row["stock_code"], as_of],
         )
         auction = evidence[0] if evidence else {}
         score = float(row.get("source_score") or 0) + float(auction.get("auction_strength") or 0)
-        score += -10.0 if auction.get("is_fallback") is not False else 5.0
+        # Only a real per-stock auction row earns the bonus; a market-wide
+        # summary row (stock_code IS NULL) must never be inherited as the
+        # stock's own auction strength.  No row at all is also a penalty.
+        score += 5.0 if auction.get("is_fallback") is False else -10.0
         row.update(
             {
                 "stage_score": max(0.0, min(100.0, score)),
@@ -705,10 +709,11 @@ def _intraday_candidates(
 
 def _kline_same_date_ready(con: duckdb.DuckDBPyConnection, trade_date: str) -> bool:
     """True when normalized daily bars exist for the trade date."""
-    if table_exists(con, "v_kline_daily"):
+    if table_exists(con, "tushare_daily") or table_exists(con, "v_kline_daily"):
         try:
+            kline_relation = canonical_daily_kline_relation(con)
             count = con.execute(
-                "SELECT count(*) FROM v_kline_daily "
+                f"SELECT count(*) FROM {kline_relation} "
                 "WHERE CAST(trade_date AS VARCHAR)=? AND close IS NOT NULL",
                 [trade_date],
             ).fetchone()[0]
@@ -783,13 +788,14 @@ def _close_candidates(
             """,
             [trade_date, int(limit)],
         )
+    kline_relation = canonical_daily_kline_relation(con)
     output = []
     for row in rows:
         prices = _fetch_dicts(
             con,
-            """
+            f"""
             SELECT open, close, change_pct, fetched_at, source_table
-            FROM v_kline_daily
+            FROM {kline_relation}
             WHERE CAST(trade_date AS VARCHAR) = ?
               AND stock_code = ?
               AND upper(coalesce(ktype, 'D')) = 'D'

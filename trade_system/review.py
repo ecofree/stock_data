@@ -169,8 +169,12 @@ def render_risk_alert_report(trade_date: str, alerts: list[dict]) -> str:
 
 
 
-def load_daily_report_context(db_path: str | Path, trade_date: str | None = None) -> dict:
-    signal_result = generate_signals(db_path, trade_date)
+def load_daily_report_context(
+    db_path: str | Path,
+    trade_date: str | None = None,
+    readiness_stage: str = "close",
+) -> dict:
+    signal_result = generate_signals(db_path, trade_date, readiness_stage=readiness_stage)
     selected_date = signal_result["trade_date"]
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -217,8 +221,13 @@ def load_daily_report_context(db_path: str | Path, trade_date: str | None = None
     }
 
 
-def write_daily_report(db_path: str | Path, out_path: str | Path, trade_date: str | None = None) -> Path:
-    context = load_daily_report_context(db_path, trade_date)
+def write_daily_report(
+    db_path: str | Path,
+    out_path: str | Path,
+    trade_date: str | None = None,
+    readiness_stage: str = "close",
+) -> Path:
+    context = load_daily_report_context(db_path, trade_date, readiness_stage)
     report = render_daily_report(**context)
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,8 +235,13 @@ def write_daily_report(db_path: str | Path, out_path: str | Path, trade_date: st
     return path
 
 
-def write_professional_reports(db_path: str | Path, out_dir: str | Path = "reports", trade_date: str | None = None) -> dict[str, Path]:
-    context = load_daily_report_context(db_path, trade_date)
+def write_professional_reports(
+    db_path: str | Path,
+    out_dir: str | Path = "reports",
+    trade_date: str | None = None,
+    readiness_stage: str = "close",
+) -> dict[str, Path]:
+    context = load_daily_report_context(db_path, trade_date, readiness_stage)
     selected_date = context["trade_date"]
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

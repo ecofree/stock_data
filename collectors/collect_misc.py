@@ -191,7 +191,176 @@ def collect_theme_hot(client: KPLClient, store: DuckDBStore, date: str) -> int:
 
 
 # ============ Auction (2) ============
+def _ensure_auction_market_tables(store: DuckDBStore) -> None:
+    """Ensure the normalized market-auction snapshot exists.
+
+    ``auction_quote_snapshot`` is intentionally distinct from ``auction_tick``:
+    the former is the final matched-market snapshot and the latter is the
+    exchange-provided auction sequence.  Keeping both lets the readiness and
+    review layers explain exactly which evidence was available.
+    """
+    store.conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auction_quote_snapshot (
+            date DATE,
+            stock_code VARCHAR,
+            quote_time VARCHAR,
+            indicative_price DOUBLE,
+            cumulative_volume BIGINT,
+            volume_unit VARCHAR,
+            bid1_price DOUBLE,
+            bid1_volume BIGINT,
+            ask1_price DOUBLE,
+            ask1_volume BIGINT,
+            order_imbalance DOUBLE,
+            provider VARCHAR,
+            raw_json VARCHAR,
+            fetched_at TIMESTAMP DEFAULT current_timestamp
+        )
+        """
+    )
+    store.conn.execute(
+        "ALTER TABLE auction_tick ADD COLUMN IF NOT EXISTS volume_unit VARCHAR"
+    )
+    store.conn.execute(
+        "ALTER TABLE auction_quote_snapshot ADD COLUMN IF NOT EXISTS volume_unit VARCHAR"
+    )
+
+
+def _auction_market_code(value) -> str:
+    text = str(value or "").strip()
+    # KPL returns six-digit codes without the exchange suffix.  Do not
+    # fabricate a suffix: the rest of this database uses the same stock_code
+    # convention for limit-pool and auction evidence.
+    return text if len(text) == 6 and text.isdigit() else ""
+
+
+def collect_auction_market(client: KPLClient, store: DuckDBStore, date: str) -> dict:
+    """Collect the full-market KPL auction payload with one request.
+
+    The current KPL route returns a mapping keyed by stock code.  Each value
+    contains a dedicated ``auction_ticks`` list and final matched fields.  The
+    parser deliberately ignores ``total_ticks`` because those are regular-day
+    trade ticks, not auction evidence.
+    """
+    payload = client.get("/auction/market", {"date": date}, critical=True)
+    result = {
+        "trade_date": date,
+        "source_date": None,
+        "stock_rows": 0,
+        "tick_rows": 0,
+        "quote_rows": 0,
+        "status": "empty",
+    }
+    if not isinstance(payload, dict):
+        return result
+
+    source_date = str(payload.get("date") or date)[:10]
+    result["source_date"] = source_date
+    if source_date != str(date)[:10]:
+        result["status"] = "source_date_mismatch"
+        return result
+
+    market = payload.get("data")
+    if not isinstance(market, dict):
+        # Keep compatibility with a list-shaped deployment without treating a
+        # metadata-only response as a successful snapshot.
+        market = payload.get("stocks") or payload.get("items")
+    if not isinstance(market, dict):
+        if isinstance(market, list):
+            market = {
+                str(item.get("code")): item
+                for item in market
+                if isinstance(item, dict) and item.get("code")
+            }
+        else:
+            market = {}
+
+    _ensure_auction_market_tables(store)
+    tick_rows = []
+    quote_rows = []
+    for raw_code, item in market.items():
+        if not isinstance(item, dict):
+            continue
+        code = _auction_market_code(item.get("code") or raw_code)
+        if not code:
+            continue
+        result["stock_rows"] += 1
+        ticks = item.get("auction_ticks")
+        if isinstance(ticks, list):
+            for tick in ticks:
+                if not isinstance(tick, dict):
+                    continue
+                tick_time = str(tick.get("time") or tick.get("t") or "").strip()
+                if not tick_time:
+                    continue
+                tick_rows.append((
+                    date,
+                    code,
+                    tick_time,
+                    tick.get("price", tick.get("p")),
+                    tick.get("volume", tick.get("v")),
+                    str(tick.get("volume_unit") or tick.get("vol_unit") or "unknown"),
+                ))
+
+        matched_price = item.get("matched_price")
+        matched_volume = item.get("matched_volume")
+        if matched_price is None and matched_volume is None:
+            continue
+        # The endpoint does not expose a separate quote timestamp.  09:25 is
+        # the semantic timestamp for the final auction match; the raw summary
+        # keeps the provider's count/amount auditable without duplicating the
+        # entire nested tick payload in DuckDB.
+        quote_rows.append((
+            date,
+            code,
+            "09:25:00",
+            matched_price,
+            matched_volume,
+            str(item.get("volume_unit") or item.get("vol_unit") or "unknown"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "kpl_auction_market",
+            json.dumps({
+                "source": item.get("source"),
+                "auction_count": item.get("auction_count"),
+                "total_amount": item.get("total_amount"),
+                "semantic": "final_auction_match_snapshot_not_regular_trade_tick",
+            }, ensure_ascii=False, separators=(",", ":")),
+        ))
+
+    if tick_rows:
+        result["tick_rows"] = store.insert_rows(
+            "auction_tick",
+            tick_rows,
+            ["date", "stock_code", "time", "price", "volume", "volume_unit"],
+            replace_on=["date", "stock_code", "time"],
+        )
+        store.log_collect("auction_tick", "/auction/market", result["tick_rows"], "ok")
+    if quote_rows:
+        result["quote_rows"] = store.insert_rows(
+            "auction_quote_snapshot",
+            quote_rows,
+            [
+                "date", "stock_code", "quote_time", "indicative_price",
+                "cumulative_volume", "volume_unit", "bid1_price", "bid1_volume", "ask1_price",
+                "ask1_volume", "order_imbalance", "provider", "raw_json",
+            ],
+            replace_on=["date", "stock_code", "quote_time", "provider"],
+        )
+        store.log_collect(
+            "auction_quote_snapshot", "/auction/market", result["quote_rows"], "ok"
+        )
+    if result["tick_rows"] or result["quote_rows"]:
+        result["status"] = "success"
+    return result
+
+
 def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
+    _ensure_auction_market_tables(store)
     total = 0
     for code in stock_codes:
         data = client.get("/auction/tick", {"code": code, "date": date})
@@ -214,12 +383,13 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
                     str(tk.get("time", tk.get("t", ""))),
                     tk.get("price", tk.get("p", 0)),
                     tk.get("volume", tk.get("v", 0)),
+                    str(tk.get("volume_unit") or tk.get("vol_unit") or "unknown"),
                 ))
             elif isinstance(tk, (list, tuple)) and len(tk) >= 3:
-                rows.append((date, code, str(tk[0]), tk[1], tk[2]))
+                rows.append((date, code, str(tk[0]), tk[1], tk[2], "unknown"))
         if rows:
             n = store.insert_rows("auction_tick", rows,
-                ["date", "stock_code", "time", "price", "volume"],
+                ["date", "stock_code", "time", "price", "volume", "volume_unit"],
                 replace_on=["date", "stock_code", "time"])
             total += n
     if total:

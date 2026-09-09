@@ -19,6 +19,7 @@ import duckdb
 
 from base import DuckDBStore, KPLClient
 from trade_system.schema import init_schema
+from trade_system.trading_calendar import open_session_dates
 
 
 def _iso(value: str | date) -> str:
@@ -186,7 +187,9 @@ class KPLHistoryCollector:
 
     def run(self, start_date: str, end_date: str, *, max_days: int | None = None,
             force: bool = False, mode: str = "ranking") -> dict[str, Any]:
-        dates = _weekday_dates(start_date, end_date)
+        # Never manufacture exchange sessions from weekdays; a missing local
+        # calendar must result in an empty, visible plan.
+        dates = open_session_dates(self.store.conn, start_date, end_date)
         if max_days:
             dates = dates[: max(0, int(max_days))]
         dataset = "kpl_concept_ranking" if mode == "ranking" else "kpl_concept_full_snapshot"

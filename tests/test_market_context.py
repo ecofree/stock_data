@@ -52,7 +52,7 @@ def test_verified_full_market_flow_is_promoted_but_does_not_claim_kpl_source(tmp
     )
     con.execute(
         """
-        CREATE TABLE intraday_stock_flow_batch(
+            CREATE TABLE IF NOT EXISTS intraday_stock_flow_batch(
           trade_date DATE,provider VARCHAR,expected_rows INTEGER,
           fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,
           updated_at TIMESTAMP

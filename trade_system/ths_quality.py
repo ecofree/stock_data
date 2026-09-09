@@ -6,7 +6,9 @@ from datetime import date
 from typing import Any
 
 
-THS_MIN_CONCEPTS = 374
+# The expected catalogue size is source-controlled per snapshot.  A global
+# floor would silently accept a truncated catalogue after the source changed.
+THS_MIN_CONCEPTS: int | None = None
 
 
 def _table_exists(con: Any, name: str) -> bool:
@@ -21,20 +23,21 @@ def canonical_ths_snapshot(
     as_of: str,
     *,
     exact_date: str | None = None,
-    minimum_concepts: int = THS_MIN_CONCEPTS,
+    minimum_concepts: int | None = THS_MIN_CONCEPTS,
 ) -> dict[str, Any] | None:
     """Return the newest globally complete, same-date THS snapshot.
 
     A successful transport/checkpoint is not enough.  Every concept and member
     row must be date-verified, all rows must share one fetched date, every
-    member checkpoint must succeed, and the catalogue must meet the expected
-    374-concept floor.  This deliberately returns no fallback snapshot: callers
+    member checkpoint must succeed, and the catalogue must equal the expected
+    count recorded for that snapshot.  This deliberately returns no fallback snapshot: callers
     must show an explicit unavailable/degraded state instead of mixing dates.
     """
     required = (
         "ths_concept_daily",
         "ths_concept_stock_history",
         "ths_concept_member_checkpoint",
+        "ths_concept_snapshot_expectation",
     )
     if any(not _table_exists(con, name) for name in required):
         return None
@@ -43,6 +46,9 @@ def canonical_ths_snapshot(
     if exact_date:
         date_filter = " AND c.trade_date=CAST(? AS DATE)"
         params.append(exact_date)
+    minimum_filter = " AND c.concept_count>=?" if minimum_concepts is not None else ""
+    if minimum_concepts is not None:
+        params.append(int(minimum_concepts))
     row = con.execute(
         f"""
         WITH concepts AS (
@@ -70,15 +76,20 @@ def canonical_ths_snapshot(
                    sum(CASE WHEN status='success' THEN 1 ELSE 0 END) AS checkpoint_success
             FROM ths_concept_member_checkpoint
             GROUP BY trade_date
+        ), expected AS (
+            SELECT trade_date, expected_concepts
+            FROM ths_concept_snapshot_expectation
+            WHERE status IN ('success', 'bootstrap_observed')
         )
         SELECT CAST(c.trade_date AS VARCHAR), c.concept_count, m.member_rows,
                c.fetched_dates, m.fetched_dates, c.verified_concepts,
                m.verified_members, c.zero_concepts, cp.checkpoint_total,
-               cp.checkpoint_success
+               cp.checkpoint_success, e.expected_concepts
         FROM concepts c
         JOIN members m ON m.trade_date=c.trade_date
         JOIN checkpoints cp ON cp.trade_date=c.trade_date
-        WHERE c.concept_count>=?
+        JOIN expected e ON e.trade_date=c.trade_date
+        WHERE c.concept_count=e.expected_concepts{minimum_filter}
           AND c.fetched_dates=1 AND m.fetched_dates=1
           AND c.verified_concepts=c.concept_rows
           AND m.verified_members=m.member_rows
@@ -89,7 +100,7 @@ def canonical_ths_snapshot(
         ORDER BY c.trade_date DESC
         LIMIT 1
         """,
-        [as_of, *([] if not exact_date else [exact_date]), int(minimum_concepts)],
+        params,
     ).fetchone()
     if not row:
         return None
@@ -107,4 +118,3 @@ def canonical_ths_snapshot(
         "checkpoint_success": int(row[9] or 0),
         "age_days": (date.fromisoformat(as_of) - date.fromisoformat(snapshot_date)).days,
     }
-

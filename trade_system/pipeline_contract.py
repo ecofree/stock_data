@@ -11,11 +11,14 @@ from __future__ import annotations
 
 DEGRADABLE_EXTERNAL_STEPS = {
     "collect_market_context",
+    "check_kpl_connectivity",
     "sync_tushare_close",
     "sync_tushare_ohlc_core",
     "refresh_ths_weekly",
     "collect_realtime_limit_pool",
+    "collect_hithink_limit_pool_daily",
     "collect_auction_evidence",
+    "collect_auction_market_daily",
     "collect_kpl_stock_flow_focus",
     "collect_intraday_stock_flow_market",
     "collect_intraday_sector_flow_full",
@@ -39,7 +42,17 @@ DEGRADABLE_EXTERNAL_STEPS = {
 
 OPTIONAL_CLOSE_STEPS = {"collect_northbound_daily"}
 
-INFORMATIONAL_REVIEW_STEPS = {"audit_p0_p3_acceptance"}
+INFORMATIONAL_REVIEW_STEPS = {
+    "audit_p0_p3_acceptance",
+    "check_capital_flow_health",
+    "audit_source_conflicts",
+    # This step must run in the production close chain.  A warning keeps the
+    # review publishable but leaves flow certification closed.
+    "reconcile_independent_stock_flow",
+    # xiaodefa is supplemental evidence. Empty/late batches must be visible
+    # and retried without being treated as a successful close input.
+    "collect_xiaodefa",
+}
 
 INTRADAY_DIAGNOSTIC_STEPS = {
     "audit_multisource_readiness",
@@ -51,14 +64,11 @@ INTRADAY_DIAGNOSTIC_STEPS = {
 
 CLOSE_DEFERRED_GATES = {
     "check_data_readiness",
-    "check_capital_flow_health",
     "generate_signals",
-    "generate_close_stage_signals",
 }
 
 RESEARCH_CHAIN_STEPS = {
     "audit_stock_flow_contract",
-    "reconcile_independent_stock_flow",
     "run_stage_backtest",
     "run_operator_backtest",
     "build_data_catalog",
@@ -78,6 +88,10 @@ RESEARCH_CHAIN_STEPS = {
 }
 
 REVIEW_CHAIN_STEPS = {
+    "collect_review_supplement",
+    "generate_health_trend",
+    "generate_cycle_analytics",
+    "generate_signal_attribution",
     "audit_multisource_readiness",
     "create_operator_outcome_template",
     "run_daily_operator_loop",

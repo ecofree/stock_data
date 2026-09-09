@@ -43,7 +43,13 @@ def _settings() -> dict:
     merged.update({
         key: value
         for key, value in os.environ.items()
-        if key.startswith("KPL_") or key.startswith("TUSHARE_") or key.startswith("DEEPSEEK_")
+        if (
+            key.startswith("KPL_")
+            or key.startswith("TUSHARE_")
+            or key.startswith("DEEPSEEK_")
+            or key.startswith("XIAODEFA_")
+            or key.startswith("HITHINK_")
+        )
     })
     return merged
 
@@ -86,7 +92,7 @@ def _get_deepseek(name: str, default: str = "") -> str:
     return str(value or default).strip()
 
 
-API_BASE = _get("KPL_API_BASE", "https://kpl.liuhepc.cn/api")
+API_BASE = _get("KPL_API_BASE", "https://www.kpl-api.cn/api")
 API_KEY = _get("KPL_API_KEY", "")
 DB_PATH = _get("KPL_DB_PATH", str(PROJECT_DIR / "kpl_data.duckdb"))
 # Operator-facing concept/member queries use 同花顺 first.  KPL remains a
@@ -97,6 +103,16 @@ REQUEST_TIMEOUT = int(float(_get("KPL_REQUEST_TIMEOUT", "30")))
 REQUEST_DELAY = float(_get("KPL_REQUEST_DELAY", "0.3"))   # seconds between requests
 MAX_RETRIES = int(float(_get("KPL_MAX_RETRIES", "5")))
 RETRY_DELAY = float(_get("KPL_RETRY_DELAY", "3.0"))     # base retry delay
+# Scheduled SYSTEM tasks may use a different certificate store than the
+# interactive account. Keep verification on; use an operator-installed CA
+# bundle only when the Windows trust store lacks the provider root.
+KPL_SSL_CA_BUNDLE = _get("KPL_SSL_CA_BUNDLE", "")
+KPL_SSL_USE_SYSTEM_STORE = _get("KPL_SSL_USE_SYSTEM_STORE", "1")
+# The local interactive proxy currently presents an untrusted interception
+# root, while the provider is reachable directly with normal verification.
+# Prefer verified direct transport and fall back to the configured proxy only
+# when direct networking is unavailable.
+KPL_DIRECT_FIRST = _get("KPL_DIRECT_FIRST", "1")
 
 # Optional AI review provider.  The daily review remains deterministic when
 # the key is absent or the provider is unavailable.
@@ -120,6 +136,26 @@ DUCKDB_THREADS = _get("KPL_DUCKDB_THREADS", "8")
 DUCKDB_TEMP_DIR = _get("KPL_DUCKDB_TEMP_DIR", str(PROJECT_DIR / "tmp" / "duckdb_spill"))
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
+
+
+def default_trade_date(db_path: str | Path | None = None) -> str:
+    """Resolve a default trading date without treating a weekend as a session.
+
+    Explicit CLI dates remain authoritative.  This helper is for unattended
+    defaults only; if a local calendar is unavailable it returns the natural
+    date so the caller can surface the calendar gate rather than silently
+    relabelling old market data.
+    """
+    if db_path:
+        try:
+            from trade_system.trading_calendar import latest_open_session
+
+            resolved = latest_open_session(db_path)
+            if resolved:
+                return resolved
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
 
 # Logging
 LOG_DIR = str(PROJECT_DIR / "logs")

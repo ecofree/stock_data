@@ -21,6 +21,11 @@ def con():
         " turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, source_table VARCHAR,"
         " is_fallback BOOLEAN, fetched_at TIMESTAMP)"
     )
+    conn.execute(
+        "CREATE TABLE ths_concept_member_checkpoint("
+        "trade_date DATE, concept_code VARCHAR, status VARCHAR,"
+        "updated_at TIMESTAMP)"
+    )
     apply_pending(conn)
     # sessions: 08-10 (signal day), 08-11 (outcome day)
     conn.execute(

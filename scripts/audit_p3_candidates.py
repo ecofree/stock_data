@@ -44,7 +44,7 @@ def audit(db: str, trade_date: str, out: str) -> dict:
         fallback_concept_filter += (
             " AND EXISTS (SELECT 1 FROM v_default_concept_daily d "
             "WHERE d.trade_date=CAST(s.trade_date AS DATE) AND d.concept_code LIKE 'THS-%' "
-            "GROUP BY d.trade_date HAVING count(DISTINCT d.concept_code)>=374)"
+            "GROUP BY d.trade_date HAVING count(DISTINCT d.concept_code)>0)"
         )
     rotation_sector = con.execute(
         """

@@ -258,8 +258,13 @@ def run_daily_operator_loop(
     init_trading_tables(db_path)
     con = duckdb.connect(str(db_path))
     try:
-        for table in ("watchlist", "trade_plan", "portfolio_snapshot", "risk_snapshot"):
-            con.execute(f"DELETE FROM {table} WHERE trade_date = ?", [trade_date])
+        con.execute("BEGIN TRANSACTION")
+        # The indexed workflow tables are refreshed idempotently below.  Do
+        # not DELETE and reinsert the same unique keys in one DuckDB
+        # transaction: DuckDB can retain the deleted key in the unique-index
+        # delta until commit and reject the replacement.  Removing stale
+        # candidates after the current pool is known avoids both that failure
+        # mode and duplicate rows on retries.
         con.execute(
             "DELETE FROM trade_journal WHERE trade_date = ? AND coalesce(action, '') != 'operator_outcome'",
             [trade_date],
@@ -309,7 +314,7 @@ def run_daily_operator_loop(
         }
         con.execute(
             """
-            INSERT INTO risk_snapshot (
+                INSERT OR REPLACE INTO risk_snapshot (
                 trade_date, total_position_pct, max_single_position_pct, max_sector_position_pct,
                 daily_loss_limit_pct, current_drawdown_pct, risk_state, evidence_json
             )
@@ -337,6 +342,29 @@ def run_daily_operator_loop(
         candidates = _candidate_rows(
             con, trade_date, limit, signal_stage=signal_stage
         )
+        candidate_codes = [
+            str(row.get("stock_code") or "")
+            for row in candidates
+            if row.get("stock_code")
+        ]
+        for table in ("watchlist", "trade_plan"):
+            if candidate_codes:
+                placeholders = ", ".join(["?"] * len(candidate_codes))
+                con.execute(
+                    f"DELETE FROM {table} WHERE trade_date = ? "
+                    f"AND stock_code NOT IN ({placeholders})",
+                    [trade_date] + candidate_codes,
+                )
+            else:
+                con.execute(f"DELETE FROM {table} WHERE trade_date = ?", [trade_date])
+        # Keep only the current stage's cash snapshot.  The current CASH row
+        # is deliberately retained for an in-transaction upsert; older stage
+        # rows and any stale manual-position rows can be removed safely.
+        con.execute(
+            "DELETE FROM portfolio_snapshot WHERE trade_date = ? "
+            "AND (snapshot_time <> ? OR stock_code <> 'CASH')",
+            [trade_date, stage],
+        )
         watchlist_count = 0
         trade_plan_count = 0
         current_total_position_pct = 0.0
@@ -357,7 +385,7 @@ def run_daily_operator_loop(
                 risk_flags_for_plan.append("sector_position_limit_exceeded")
             con.execute(
                 """
-                INSERT INTO watchlist (
+                INSERT OR REPLACE INTO watchlist (
                     trade_date, stock_code, stock_name, sector_code, thesis, invalidation, priority, status
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -391,7 +419,7 @@ def run_daily_operator_loop(
                     sector_positions[sector_code] = sector_positions.get(sector_code, 0.0) + planned_position
             con.execute(
                 """
-                INSERT INTO trade_plan (
+                INSERT OR REPLACE INTO trade_plan (
                     trade_date, stock_code, stock_name, setup_type, entry_condition, stop_condition,
                     target_condition, max_position_pct, status
                 )
@@ -478,7 +506,7 @@ def run_daily_operator_loop(
 
         con.execute(
             """
-            INSERT INTO portfolio_snapshot (
+                INSERT OR REPLACE INTO portfolio_snapshot (
                 trade_date, snapshot_time, stock_code, stock_name, position_pct, cost_price,
                 last_price, pnl_pct, sector_code
             )
@@ -523,12 +551,20 @@ def run_daily_operator_loop(
             )
             journal_count += 1
 
-        return {
+        result = {
             "watchlist": watchlist_count,
             "trade_plan": trade_plan_count,
             "risk_snapshot": 1,
             "portfolio_snapshot": 1,
             "trade_journal": journal_count,
         }
+        con.commit()
+        return result
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         con.close()

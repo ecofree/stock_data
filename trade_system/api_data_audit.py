@@ -6,12 +6,15 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import duckdb
+
+from trade_system.http_transport import classify_transport_error, open_verified
 
 
 COMMON_ITEM_KEYS = [
@@ -31,6 +34,15 @@ COMMON_ITEM_KEYS = [
     "ladder",
     "etfs",
 ]
+
+# These routes were retired from the production auction path.  They remain
+# available only for an explicit compatibility probe; putting them in the
+# default inventory made a known retired 403 route look like a current data
+# gap on every audit.
+LEGACY_COMPATIBILITY_REQUIREMENTS = frozenset({
+    "auction_tick_legacy",
+    "auction_bidding_anomaly_legacy",
+})
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,36 @@ def count_existing_rows(db_path: str | Path, relation: str | None) -> int | None
         con.close()
 
 
+def latest_local_trade_date(db_path: str | Path, fallback: str = "") -> str:
+    """Return the newest locally stored trading date for live probes.
+
+    Audits often run on weekends or before the new session closes.  Probing
+    ``date.today()`` in that situation creates a false empty/error signal, so
+    use the newest dated core snapshot unless the operator explicitly supplied
+    a date.
+    """
+    candidates: list[str] = []
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        for relation, column in (
+            ("kline", "date"),
+            ("v_limit_pool", "date"),
+            ("daily_summary", "date"),
+            ("multi_source_stock_flow", "trade_date"),
+        ):
+            try:
+                row = con.execute(
+                    f'SELECT max(CAST("{column}" AS DATE)) FROM "{relation}"'
+                ).fetchone()
+            except Exception:
+                continue
+            if row and row[0] is not None:
+                candidates.append(str(row[0])[:10])
+    finally:
+        con.close()
+    return max(candidates) if candidates else str(fallback or "")
+
+
 def build_gap_summary(
     requirement: ApiRequirement,
     *,
@@ -174,6 +216,12 @@ def build_gap_summary(
         elif http_status == "not_probed":
             verdict = "api_not_probed"
             note = "Live API probe was skipped."
+        elif http_status in {"http_401", "http_403"}:
+            verdict = "api_permission_denied"
+            note = (
+                "API route is reachable but the configured Key is not authorized "
+                "for this capability; do not treat this as a transport outage."
+            )
         else:
             verdict = "api_error"
             note = f"API probe failed with status {http_status}."
@@ -235,23 +283,34 @@ def safe_probe_json(
     if query:
         url = f"{url}?{query}"
     req = urllib.request.Request(url, headers={"accept": "application/json", "X-API-Key": key})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-            return "ok", summarize_payload(payload)
-    except urllib.error.HTTPError as exc:
-        return f"http_{exc.code}", None
-    except json.JSONDecodeError:
-        return "invalid_json", None
-    except TimeoutError:
-        return "timeout", None
-    except Exception as exc:
-        return f"error_{type(exc).__name__}", None
+    for attempt in range(2):
+        try:
+            with open_verified(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                return "ok", summarize_payload(payload)
+        except urllib.error.HTTPError as exc:
+            return f"http_{exc.code}", None
+        except json.JSONDecodeError:
+            return "invalid_json", None
+        except TimeoutError:
+            if attempt == 0:
+                time.sleep(0.25)
+                continue
+            return "timeout", None
+        except urllib.error.URLError as exc:
+            status = classify_transport_error(exc)
+            if status == "network_timeout" and attempt == 0:
+                time.sleep(0.25)
+                continue
+            return status, None
+        except Exception as exc:
+            return f"error_{type(exc).__name__}", None
+    return "timeout", None
 
 
-def build_default_requirements() -> list[ApiRequirement]:
+def build_default_requirements(*, include_compatibility: bool = False) -> list[ApiRequirement]:
     """Professional trading data needs mapped to current stock_data access paths."""
-    return [
+    requirements = [
         ApiRequirement("market_state", "daily_summary", "/daily", {"date": "{date}"}, "daily_summary", "core", "GET /daily?date=<YYYY-MM-DD>", "daily market breadth and limit-up/down context"),
         ApiRequirement("market_state", "daily_sentiment", "/daily/sentiment", {"date": "{date}"}, "daily_sentiment", "core", "GET /daily/sentiment?date=<YYYY-MM-DD>", "sentiment-cycle scoring"),
         ApiRequirement("market_state", "daily_new_high", "/daily/new-high", {"date": "{date}"}, "daily_new_high", "important", "GET /daily/new-high?date=<YYYY-MM-DD>", "new-high breadth and risk appetite"),
@@ -269,13 +328,13 @@ def build_default_requirements() -> list[ApiRequirement]:
         ApiRequirement("sector_theme", "sector_capital", "/sector/capital", {"code": "{sector_code}", "date": "{date}"}, "sector_capital", "core", "GET /sector/capital?code=<sector_code>&date=<YYYY-MM-DD>", "sector money flow and mainline confirmation"),
         ApiRequirement("sector_theme", "sector_intraday", "/l2/sector-intraday", {"code": "{sector_code}", "date": "{date}"}, "l2_sector_intraday", "important", "GET /l2/sector-intraday?code=<sector_code>&date=<YYYY-MM-DD>", "sector intraday strength curve"),
         ApiRequirement("sector_theme", "theme_hot", "/theme/hot", {}, "theme_hot", "important", "GET /theme/hot", "hot theme fallback"),
-        ApiRequirement("auction", "advanced_morning_bidding_summary", "/advanced/morning-bidding-summary", {}, "advanced_morning_bidding_summary", "core", "GET /advanced/morning-bidding-summary", "auction-market aggregate strength"),
-        ApiRequirement("auction", "advanced_morning_bidding_list", "/advanced/morning-bidding-list", {}, "advanced_morning_bidding_list", "core", "GET /advanced/morning-bidding-list", "stock-level auction pool"),
-        ApiRequirement("auction", "auction_tick", "/auction/tick", {"code": "{stock_code}", "date": "{date}"}, "auction_tick", "core", "GET /auction/tick?code=<stock_code>&date=<YYYY-MM-DD>", "09:15-09:25 auction confirmation", fallback="Use auction_bidding_anomaly and advanced_morning_bidding_summary until ticks are non-empty."),
-        ApiRequirement("auction", "auction_bidding_anomaly", "/auction/bidding-anomaly", {"code": "{stock_code}", "date": "{date}"}, "auction_bidding_anomaly", "core", "GET /auction/bidding-anomaly?code=<stock_code>&date=<YYYY-MM-DD>", "auction anomaly and large-order confirmation"),
+        ApiRequirement("auction", "auction_market", "/auction/market", {"date": "{date}"}, "auction_tick", "core", "GET /auction/market?date=<YYYY-MM-DD>", "full-market 09:15-09:25 auction sequence and final match", fallback="Use auction_quote_snapshot/Tencent order-book snapshot only when the full-market route is empty."),
+        ApiRequirement("auction", "auction_quote_snapshot", "/auction/market", {"date": "{date}"}, "auction_quote_snapshot", "core", "GET /auction/market?date=<YYYY-MM-DD>", "final matched auction snapshot"),
+        ApiRequirement("auction", "auction_tick_legacy", "/auction/tick", {"code": "{stock_code}", "date": "{date}"}, "auction_tick", "optional", "retired per-stock route; compatibility probe only", "not used by production close chain"),
+        ApiRequirement("auction", "auction_bidding_anomaly_legacy", "/auction/bidding-anomaly", {"code": "{stock_code}", "date": "{date}"}, "auction_bidding_anomaly", "optional", "latest-session compatibility route", "not used by production close chain"),
         ApiRequirement("kline", "stock_kline", "/kline", {"code": "{stock_code}", "ktype": "d", "count": "5"}, "kline", "core", "GET /kline?code=<stock_code>&ktype=d&count=5", "candidate filters and staged backtest"),
         ApiRequirement("index", "l2_realtime_index_list", "/l2/realtime/index-list", {}, "l2_realtime_index_list", "important", "GET /l2/realtime/index-list", "index intraday risk context"),
-        ApiRequirement("index", "index_kline", None, {}, "index_kline", "core", "derived from /daily raw_json", "index trend filter for market-state risk", source_type="derived", fallback="/daily exposes close/change/turnover only; open/high/low remain missing."),
+        ApiRequirement("index", "index_kline", "/index/zhishu-kline", {"code": "SH000001", "ktype": "d", "index": "0"}, "index_kline", "core", "GET /index/zhishu-kline?code=<index_code>&ktype=d&index=0", "index trend filter for market-state risk", fallback="Eastmoney index K-line remains the fallback when the KPL index route is unavailable."),
         ApiRequirement("l2_orderflow", "l2_stock_intraday", "/l2/stock-intraday", {"code": "{stock_code}", "date": "{date}"}, "l2_stock_intraday", "important", "GET /l2/stock-intraday?code=<stock_code>&date=<YYYY-MM-DD>", "intraday price/volume/main-fund curve"),
         ApiRequirement("l2_orderflow", "l2_stock_bigorder", "/l2/stock-bigorder", {"code": "{stock_code}", "date": "{date}"}, "l2_stock_bigorder", "important", "GET /l2/stock-bigorder?code=<stock_code>&date=<YYYY-MM-DD>", "big-order confirmation"),
         ApiRequirement("l2_orderflow", "advanced_main_monitor", "/advanced/main-monitor", {"code": "{stock_code}"}, "advanced_main_monitor", "important", "GET /advanced/main-monitor?code=<stock_code>", "main-fund monitor evidence for intraday strength"),
@@ -295,6 +354,12 @@ def build_default_requirements() -> list[ApiRequirement]:
         ApiRequirement("research_layer", "research_report_file", None, {}, "research_report_file", "optional", "manual/local research-report registry", "report and announcement management", source_type="local"),
         ApiRequirement("ml_shadow", "qlib_prediction", None, {}, "qlib_prediction", "optional", "external CSV via scripts/import_qlib_shadow_predictions.py", "shadow-mode factor/model validation", source_type="external_file", fallback="Do not use as direct trading signal until evaluated."),
     ]
+    if include_compatibility:
+        return requirements
+    return [
+        item for item in requirements
+        if item.name not in LEGACY_COMPATIBILITY_REQUIREMENTS
+    ]
 
 
 def audit_requirements(
@@ -308,9 +373,13 @@ def audit_requirements(
     live_probe: bool = True,
     timeout: int = 12,
     requirements: list[ApiRequirement] | None = None,
+    include_compatibility: bool = False,
 ) -> list[GapSummary]:
     results: list[GapSummary] = []
-    for requirement in requirements or build_default_requirements():
+    selected_requirements = requirements or build_default_requirements(
+        include_compatibility=include_compatibility
+    )
+    for requirement in selected_requirements:
         resolved = materialize_params(
             requirement.params,
             date=date,
@@ -449,8 +518,8 @@ def render_api_data_audit_report(
             "",
             "## 操盘视角判断",
             "",
-            "- `auction_tick` 若持续为 `api_reachable_empty`，不能伪造逐笔竞价，只能把竞价异动、早盘竞价汇总、L2 与盘口作为弱替代证据。",
-            "- `index_kline` 当前是 `/daily` 派生 fallback，能服务市场方向过滤，但不能做严格指数 OHLC 回测。",
+            "- 竞价主证据使用 KPL `/auction/market` 的全市场序列与最终撮合；若该路由为空，不能伪造逐笔竞价，只能把最终盘口快照或 L2 作为明确降级证据。",
+            "- `index_kline` 优先探测 KPL `/index/zhishu-kline`；Eastmoney 仅作为缺口 fallback。",
             "- 新闻、研究记录、研报、qlib shadow 不是当前 KPL API 的直接数据，应通过本地导入/适配器进入，不应混入主交易信号。",
             "- 候选股四阶段信号要优先依赖已验证有数的 K 线、板块强度/资金、涨停梯队、L2/大单和竞价异常；缺口数据必须在信号证据字段里明确降级。",
             "",

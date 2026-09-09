@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
+import shutil
 import sys
 
 import duckdb
@@ -41,7 +42,8 @@ def _query(
     end_date: str,
     *,
     include_flow_features: bool = False,
-    label_mode: str = "legacy",
+    include_adjustment: bool = False,
+    label_mode: str = "t1_exec",
 ) -> str:
     flow_select = ""
     flow_join = ""
@@ -63,12 +65,34 @@ def _query(
     LEFT JOIN qlib_stock_flow_features sf
       ON sf.trade_date = d.datetime AND sf.stock_code = d.instrument
     """
+
     if label_mode == "t1_exec":
         label_expr = "CASE WHEN d.next_open > 0 AND d.next2_close IS NOT NULL THEN (d.next2_close / d.next_open - 1.0) * 100.0 END"
         label_date_expr = "d.next2_date"
     else:
         label_expr = "CASE WHEN d.next_close IS NOT NULL AND d.close > 0 THEN (d.next_close / d.close - 1.0) * 100.0 END"
         label_date_expr = "d.next_date"
+    adjustment_cte = (
+        """
+    adjustments AS (
+        SELECT CAST(date AS DATE) AS datetime,
+               CAST(stock_code AS VARCHAR) AS instrument,
+               max(CAST(adj_factor AS DOUBLE)) AS adj_factor
+        FROM tushare_adj_factor
+        WHERE adj_factor IS NOT NULL AND adj_factor > 0
+        GROUP BY 1, 2
+    ),
+        """
+        if include_adjustment
+        else """
+    adjustments AS (
+        SELECT CAST(NULL AS DATE) AS datetime,
+               CAST(NULL AS VARCHAR) AS instrument,
+               CAST(NULL AS DOUBLE) AS adj_factor
+        WHERE FALSE
+    ),
+        """
+    )
     return f"""
     WITH coverage AS (
         SELECT CAST(date AS DATE) AS datetime, count(DISTINCT stock_code) AS instruments
@@ -82,32 +106,51 @@ def _query(
             ELSE 1
         END
     ),
+    {adjustment_cte}
+    bars AS (
+        SELECT
+            CAST(d.date AS DATE) AS datetime,
+            CAST(d.stock_code AS VARCHAR) AS instrument,
+            CAST(d.open AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS open,
+            CAST(d.high AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS high,
+            CAST(d.low AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS low,
+            CAST(d.close AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS close,
+            CAST(d.volume AS DOUBLE) / nullif(coalesce(a.adj_factor, 1.0), 0) AS volume,
+            CAST(d.turnover AS DOUBLE) AS turnover,
+            coalesce(a.adj_factor, 1.0) AS adj_factor
+        FROM tushare_daily d
+        LEFT JOIN adjustments a
+          ON a.datetime = CAST(d.date AS DATE)
+         AND a.instrument = CAST(d.stock_code AS VARCHAR)
+        WHERE d.date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+          AND d.close IS NOT NULL AND d.close > 0
+    ),
+    daily_base AS (
+        SELECT
+            datetime, instrument, open, high, low, close, volume, turnover,
+            LEAD(close) OVER (PARTITION BY instrument ORDER BY datetime) AS next_close,
+            LEAD(datetime) OVER (PARTITION BY instrument ORDER BY datetime) AS next_date,
+            LEAD(open) OVER (PARTITION BY instrument ORDER BY datetime) AS next_open,
+            LEAD(close, 2) OVER (PARTITION BY instrument ORDER BY datetime) AS next2_close,
+            LEAD(datetime, 2) OVER (PARTITION BY instrument ORDER BY datetime) AS next2_date,
+            LAG(close, 1) OVER (PARTITION BY instrument ORDER BY datetime) AS prev_close,
+            LAG(close, 5) OVER (PARTITION BY instrument ORDER BY datetime) AS prev5_close
+        FROM bars
+        WHERE datetime IN (SELECT datetime FROM valid_dates)
+    ),
     daily AS (
         SELECT
-            CAST(date AS DATE) AS datetime,
-            CAST(stock_code AS VARCHAR) AS instrument,
-            CAST(open AS DOUBLE) AS open,
-            CAST(high AS DOUBLE) AS high,
-            CAST(low AS DOUBLE) AS low,
-            CAST(close AS DOUBLE) AS close,
-            CAST(volume AS DOUBLE) AS volume,
-            CAST(turnover AS DOUBLE) AS turnover,
-            CAST(change_pct AS DOUBLE) AS change_pct,
-            LEAD(CAST(close AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date) AS next_close,
-            LEAD(CAST(date AS DATE)) OVER (PARTITION BY stock_code ORDER BY date) AS next_date,
-            LEAD(CAST(open AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date) AS next_open,
-            LEAD(CAST(close AS DOUBLE), 2) OVER (PARTITION BY stock_code ORDER BY date) AS next2_close,
-            LEAD(CAST(date AS DATE), 2) OVER (PARTITION BY stock_code ORDER BY date) AS next2_date,
-            LAG(CAST(close AS DOUBLE), 1) OVER (PARTITION BY stock_code ORDER BY date) AS prev_close,
-            LAG(CAST(close AS DOUBLE), 5) OVER (PARTITION BY stock_code ORDER BY date) AS prev5_close,
-            AVG(CAST(change_pct AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS avg_ret5,
-            STDDEV_SAMP(CAST(change_pct AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS volatility_5d,
-            AVG(CAST(volume AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20,
-            STDDEV_SAMP(CAST(volume AS DOUBLE)) OVER (PARTITION BY stock_code ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS std_volume20
-        FROM tushare_daily
-        WHERE date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
-          AND close IS NOT NULL AND close > 0
-          AND CAST(date AS DATE) IN (SELECT datetime FROM valid_dates)
+            datetime, instrument, open, high, low, close, volume, turnover,
+            next_close, next_date, next_open, next2_close, next2_date,
+            prev_close, prev5_close,
+            CASE WHEN prev_close > 0
+                 THEN (close / prev_close - 1.0) * 100.0 END AS change_pct,
+            STDDEV_SAMP(CASE WHEN prev_close > 0
+                 THEN (close / prev_close - 1.0) * 100.0 END)
+                 OVER (PARTITION BY instrument ORDER BY datetime ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS volatility_5d,
+            AVG(volume) OVER (PARTITION BY instrument ORDER BY datetime ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_volume20,
+            STDDEV_SAMP(volume) OVER (PARTITION BY instrument ORDER BY datetime ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS std_volume20
+        FROM daily_base
     ),
     basic AS (
         SELECT
@@ -155,6 +198,122 @@ def _query(
     """
 
 
+def _batch_ranges(start: str, end: str, *, max_date: str,
+                  batch_days: int = 45, context_days: int = 25) -> list[tuple[str, str, str, str]]:
+    """Yield bounded feature windows and their requested output windows.
+
+    The feature query contains several window functions.  Running it once for
+    a multi-year range creates a very large intermediate relation in DuckDB,
+    even though the final QLib file is modest.  Each batch keeps enough prior
+    sessions for the 20-day features and a short forward context for labels,
+    then the outer query emits only the requested batch dates.
+    """
+    first = datetime.strptime(start, "%Y-%m-%d").date()
+    last = datetime.strptime(end, "%Y-%m-%d").date()
+    source_last = datetime.strptime(max_date, "%Y-%m-%d").date()
+    if first > last:
+        raise ValueError(f"start date is after end date: {start} > {end}")
+    ranges = []
+    cursor = first
+    while cursor <= last:
+        batch_end = min(cursor + timedelta(days=batch_days - 1), last)
+        context_start = max(first, cursor - timedelta(days=context_days))
+        context_end = min(source_last, batch_end + timedelta(days=7))
+        ranges.append((
+            context_start.isoformat(), context_end.isoformat(),
+            cursor.isoformat(), batch_end.isoformat(),
+        ))
+        cursor = batch_end + timedelta(days=1)
+    return ranges
+
+
+def _remove_generated_target(path: Path) -> None:
+    """Remove only the exact generated export target before a fresh export."""
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _copy_batched(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    start: str,
+    end: str,
+    max_date: str,
+    target: Path,
+    fmt: str,
+    include_flow_features: bool,
+    include_adjustment: bool,
+    label_mode: str,
+) -> dict[str, int | str]:
+    """Export a format without materialising the full history in memory."""
+    _remove_generated_target(target)
+    part_dir = target if fmt == "parquet" else target.with_name(target.name + ".parts")
+    _remove_generated_target(part_dir)
+    part_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    total_rows = 0
+    labeled_rows = 0
+    instrument_values: set[str] = set()
+    ranges = _batch_ranges(start, end, max_date=max_date)
+
+    for index, (context_start, context_end, output_start, output_end) in enumerate(ranges):
+        query = _query(
+            context_start,
+            context_end,
+            include_flow_features=include_flow_features,
+            include_adjustment=include_adjustment,
+            label_mode=label_mode,
+        )
+        bounded_query = (
+            f"SELECT * FROM ({query}) AS feature_batch "
+            f"WHERE datetime BETWEEN DATE '{output_start}' AND DATE '{output_end}' "
+            "ORDER BY datetime, instrument"
+        )
+        part = part_dir / f"part-{index:05d}.{fmt}"
+        target_sql = str(part).replace("'", "''")
+        if fmt == "parquet":
+            con.execute(
+                f"COPY ({bounded_query}) TO '{target_sql}' "
+                "(FORMAT PARQUET, COMPRESSION ZSTD)"
+            )
+        else:
+            con.execute(
+                f"COPY ({bounded_query}) TO '{target_sql}' "
+                "(HEADER, DELIMITER ',')"
+            )
+        summary = con.execute(
+            f"SELECT count(*), count(label_next_ret) FROM ({bounded_query})"
+        ).fetchone()
+        total_rows += int(summary[0] or 0)
+        labeled_rows += int(summary[1] or 0)
+        instrument_values.update(
+            str(row[0]) for row in con.execute(
+                f"SELECT DISTINCT instrument FROM ({bounded_query})"
+            ).fetchall()
+        )
+        parts.append(part)
+
+    if fmt == "csv":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as destination:
+            for index, part in enumerate(parts):
+                with part.open("rb") as source:
+                    if index:
+                        source.readline()
+                    shutil.copyfileobj(source, destination)
+        shutil.rmtree(part_dir)
+
+    return {
+        "rows": total_rows,
+        "labeled_rows": labeled_rows,
+        "instruments": len(instrument_values),
+        "batches": len(parts),
+        "storage": "partitioned_parquet_dataset" if fmt == "parquet" else "single_csv",
+    }
+
+
 def export_features(
     db_path: str | Path,
     output: str | Path,
@@ -162,7 +321,7 @@ def export_features(
     start_date: str | None = None,
     end_date: str | None = None,
     output_format: str = "csv",
-    label_mode: str = "legacy",
+    label_mode: str = "t1_exec",
 ) -> dict[str, object]:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -176,28 +335,34 @@ def export_features(
         flow_features_available = con.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema='main' AND table_name='qlib_stock_flow_features'"
         ).fetchone()[0] > 0
-        query = _query(
-            start,
-            end,
-            include_flow_features=flow_features_available,
-            label_mode=label_mode,
-        )
+        adjustment_available = con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_name='tushare_adj_factor'"
+        ).fetchone()[0] > 0
         feature_columns = BASE_FEATURE_COLUMNS + (FLOW_FEATURE_COLUMNS if flow_features_available else [])
         out = Path(output)
         out.parent.mkdir(parents=True, exist_ok=True)
         formats = {output_format} if output_format != "both" else {"csv", "parquet"}
         outputs: dict[str, str] = {}
+        format_stats: dict[str, dict[str, int | str]] = {}
         for fmt in sorted(formats):
             target = out if out.suffix.lower() == f".{fmt}" else out.with_suffix(f".{fmt}")
-            target_sql = str(target).replace("'", "''")
-            if fmt == "parquet":
-                con.execute(f"COPY ({query}) TO '{target_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-            else:
-                con.execute(f"COPY ({query}) TO '{target_sql}' (HEADER, DELIMITER ',')")
+            format_stats[fmt] = _copy_batched(
+                con,
+                start=start,
+                end=end,
+                max_date=str(max_date)[:10],
+                target=target,
+                fmt=fmt,
+                include_flow_features=flow_features_available,
+                include_adjustment=adjustment_available,
+                label_mode=label_mode,
+            )
             outputs[fmt] = str(target)
-        rows = int(con.execute(f"SELECT count(*) FROM ({query})").fetchone()[0])
-        labeled = int(con.execute(f"SELECT count(*) FROM ({query}) WHERE label_next_ret IS NOT NULL").fetchone()[0])
-        instruments = int(con.execute(f"SELECT count(DISTINCT instrument) FROM ({query})").fetchone()[0])
+        primary_stats = format_stats["parquet" if "parquet" in format_stats else sorted(format_stats)[0]]
+        rows = int(primary_stats["rows"])
+        labeled = int(primary_stats["labeled_rows"])
+        instruments = int(primary_stats["instruments"])
         metadata = {
             "format": output_format,
             "outputs": outputs,
@@ -209,18 +374,29 @@ def export_features(
             "feature_columns": feature_columns,
             "label_column": "label_next_ret",
             "label_definition": (
-                "next open to T+2 close return in percent; T+1 compliant training target only"
+                "adjusted next open to adjusted T+2 close return in percent; T+1 compliant training target only"
                 if label_mode == "t1_exec"
-                else "current close to next available daily close return in percent; legacy research target only"
+                else "adjusted current close to adjusted next available daily close return in percent; legacy research target only"
             ),
             "leakage_guard": "features use data through datetime; label_date/label_next_ret must not be used as model inputs",
             "label_mode": label_mode,
             "execution_assumption": "buy at next session open, sell at following session close" if label_mode == "t1_exec" else "not execution-aware",
             "source_tables": [
-                "tushare_daily", "tushare_daily_basic", "tushare_moneyflow",
+            "tushare_daily", "tushare_daily_basic", "tushare_moneyflow",
+                *( ("tushare_adj_factor",) if adjustment_available else () ),
                 *( ("qlib_stock_flow_features",) if flow_features_available else () ),
             ],
             "flow_features_available": flow_features_available,
+            "adjustment_available": adjustment_available,
+            "price_semantics": (
+                "open/high/low/close and return labels use close*adj_factor; "
+                "volume uses volume/adj_factor; missing factors fall back to 1.0"
+                if adjustment_available else
+                "raw daily prices; tushare_adj_factor is unavailable"
+            ),
+            "export_batches": int(primary_stats["batches"]),
+            "export_storage": primary_stats["storage"],
+            "export_memory_guard": "45 calendar-day batches with 25-day history context",
             "generated_at": date.today().isoformat(),
         }
         meta_path = out.with_suffix(".metadata.json")
@@ -238,7 +414,7 @@ def main() -> int:
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--format", choices=["csv", "parquet", "both"], default="csv")
-    parser.add_argument("--label-mode", choices=["legacy", "t1_exec"], default="legacy")
+    parser.add_argument("--label-mode", choices=["legacy", "t1_exec"], default="t1_exec")
     args = parser.parse_args()
     result = export_features(
         args.db,
