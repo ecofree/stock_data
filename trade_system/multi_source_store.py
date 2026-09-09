@@ -19,7 +19,7 @@ import duckdb
 
 from trade_system import resilient_sources
 from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
-from trade_system.source_authority import provider_rank, provider_rank_sql
+from trade_system.source_authority import provider_rank_sql
 
 
 def _date(value: Any, fallback: str | None = None) -> str | None:

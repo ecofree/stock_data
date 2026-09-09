@@ -1,5 +1,3 @@
-import duckdb
-
 from base import DuckDBStore
 from collectors.collect_misc import collect_auction_market
 from schema import init_schema

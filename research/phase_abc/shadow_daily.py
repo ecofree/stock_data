@@ -5,7 +5,7 @@ r"""影子每日链路：20:30跑，不阻塞收盘主链，只读生产库，�
 from __future__ import annotations
 from pathlib import Path
 from datetime import date
-import duckdb, pandas as pd
+import duckdb
 
 ROOT = Path("D:/accio/stock_data")
 SNAP = ROOT / "research" / "phase_abc" / "snapshot"

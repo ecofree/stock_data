@@ -59,7 +59,6 @@ def main():
 
     # G6 不确定性：配对日收益差块自举95%下界>0；现为负直接不通过（仍计算留痕）
     try:
-        a = pd.read_parquet(SNAP / "test_pred.parquet")
         # 用日频nav差近似
         led2 = duckdb.connect(str(LEDGER), read_only=True)
         nq = led2.execute("SELECT nav FROM nav_qlib_lgbm ORDER BY date").df().nav.pct_change().fillna(0).values

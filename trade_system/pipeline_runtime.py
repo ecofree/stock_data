@@ -500,7 +500,6 @@ h1{{margin-top:0}}code{{color:#e5b96f}}a{{color:#7fb2ff}}.dim{{color:#a89880}}
         # One small, machine-readable pointer makes the root ``*_latest``
         # files auditable as a set.  The pointer itself is included in the
         # transaction snapshot because its name also contains ``latest``.
-        manifest_path = run_path / "run.json"
         pointer = {
             "run_id": manifest.get("run_id"),
             "trade_date": manifest.get("trade_date"),

@@ -4,7 +4,6 @@ import json
 import time
 import logging
 import os
-import ssl
 import urllib.request
 import urllib.error
 import urllib.parse

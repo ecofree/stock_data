@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 import sys

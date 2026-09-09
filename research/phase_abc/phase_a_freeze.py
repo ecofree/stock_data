@@ -158,7 +158,7 @@ def main() -> int:
     ok = True
     lines = []
     for r in check:
-        sd, code, ref, o1, c5, lab, st = r[0], r[1], float(r[2]), float(r[3]), float(r[4]), float(r[5]), r[6]
+        sd, code, o1, c5, lab = r[0], r[1], float(r[3]), float(r[4]), float(r[5])
         py = c5/o1-1.0
         match = abs(py-lab) < 1e-12
         ok = ok and match

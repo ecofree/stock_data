@@ -10,7 +10,7 @@ simultaneous requests and makes an interrupted run safe to resume.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable

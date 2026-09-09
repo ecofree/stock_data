@@ -39,13 +39,10 @@ def simulate(df, score_col, tag, initial=1_000_000.0, cost_bps=COST_BPS):
     dates = sorted(d.signal_date.unique())
     cash = initial; positions = []  # (code, qty, buy_px, sell_date, buy_date)
     navs = []; fills = []; intents = []
-    px = df.set_index(["signal_date", "code"])[["open_t1", "close_t5"]].to_dict("index")
     # 为简化，按信号日分组顺序推进；持有到期自动卖
-    from datetime import timedelta
     for sd in dates:
         # 到期卖出（sell_date<=sd）
         for p in [p for p in positions if p["sell_date"] <= sd]:
-            key = (p["buy_date"], p["code"])
             # 卖出价用买入信号行存的close_t5
             sell_px = p["sell_px"]; qty = p["qty"]
             proceeds = sell_px * qty * (1 - cost_bps / 10000)
@@ -126,8 +123,6 @@ def main(cost_bps: float = COST_BPS, suffix: str = "") -> int:
               callbacks=[])
     te = te.copy(); te["qlib_lgbm"] = model.predict(te[feat])
     tr["qlib_lgbm"] = model.predict(tr[feat]); va["qlib_lgbm"] = model.predict(va[feat])
-    full = pd.concat([tr, va, te])
-
     # 信号评估（测试段，同池）
     rows = []
     for name in ["simple_mom20", "ind_rel20", "qlib_lgbm"]:

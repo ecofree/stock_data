@@ -71,7 +71,7 @@ def main():
         if len(tr)<5000 or len(te)<1000:
             out.append({"seg":name,"note":"样本不足","tr":len(tr),"te":len(te)}); continue
         med=tr[FEAT].median()
-        Xtr,Xva,Xte=tr[FEAT].fillna(med),va[FEAT].fillna(med),te[FEAT].fillna(med)
+        Xtr,Xte=tr[FEAT].fillna(med),te[FEAT].fillna(med)
         mdl=LGBMRegressor(objective="regression",n_estimators=200,learning_rate=0.05,num_leaves=63,subsample=0.8,colsample_bytree=0.8,random_state=7,verbosity=-1)
         mdl.fit(Xtr,tr.label_fwd_ret)
         te=te.copy(); te["qlib"]=mdl.predict(Xte)
