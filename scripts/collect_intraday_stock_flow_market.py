@@ -583,7 +583,8 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         # on a fresh connection so the health dashboard shows why recon is
         # absent, then leave the invalidated connection untouched.
         try:
-            _skip_con = duckdb.connect(str(db_path))
+            from trade_system.db_utils import legacy_connect
+            _skip_con = legacy_connect(str(db_path))
             _skip_con.execute(
                 "INSERT INTO intraday_stock_flow_reconciliation "
                 "(trade_date, primary_provider, primary_rows, status, value_status, last_error, updated_at) "

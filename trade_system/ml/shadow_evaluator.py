@@ -8,7 +8,6 @@ from pathlib import Path
 from math import ceil
 import re
 
-import duckdb
 
 from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables
 from trade_system.quality import table_exists
@@ -83,7 +82,8 @@ def evaluate_qlib_shadow(
     """
     round_trip_cost_bps = max(0.0, float(round_trip_cost_bps))
     ensure_qlib_shadow_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         predictions = _fetch_dicts(
             con,
@@ -170,7 +170,8 @@ def evaluate_qlib_shadow(
     for row in evaluated_rows:
         grouped[row["model_id"]].append(row)
 
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute("BEGIN TRANSACTION")
         # 追加式版本化：只覆盖同一 (model, method, quantile, cost) 的旧行，

@@ -11,7 +11,6 @@ import argparse
 from pathlib import Path
 import sys
 
-import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -22,7 +21,8 @@ from schema import init_schema
 
 
 def collect_advanced_lhb_daily(db_path: str | Path, trade_date: str) -> dict:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         init_schema(con)
     finally:

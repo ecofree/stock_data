@@ -11,6 +11,15 @@ from trade_system.v2.service import Service
 from trade_system.v2.publisher import publish, read_current
 
 
+def test_v2_publisher_never_reuses_legacy_latest_namespace(tmp_path):
+    old=tmp_path/'daily_review_latest.html'
+    old.write_text('retained legacy bytes')
+    with pytest.raises(ValueError,match='separate namespace'):
+        publish(tmp_path,'new',{'index.html':b'new'},generation=1)
+    assert old.read_text()=='retained legacy bytes'
+    assert not (tmp_path/'runs').exists()
+
+
 def test_multiple_workers_share_one_service_connection(tmp_path):
     with Service(tmp_path / 'live.duckdb') as service:
         service.submit('product', dataset='quotes', unit='CNY', semantics='point', consumer='risk', origin='fixture').result(5)

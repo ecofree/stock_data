@@ -76,18 +76,24 @@ def review_desk(store, account_id):
     review = project_review(store,account_id)
     review['fixture_only'] = bool(review['products']) and all(
         p['origin'] in ('synthetic_fixture','fixture') for p in review['products'])
-    actions = []
+    actions,closures = [],[]
     rows = store.con.execute('SELECT action_id,payload FROM operator_action WHERE account_id=? ORDER BY happened_at,action_id',[account_id]).fetchall()
     for action_id,raw in rows:
         action = json.loads(raw)
         result = action['result']
+        if action['request'].get('operation') in ('close_unsent','reconcile_paper_unsent'):
+            if result.get('account_id')!=account_id or identity({k:v for k,v in result.items() if k!='closure_id'})!=result.get('closure_id'):
+                raise ValueError('paper closure fingerprint/account mismatch')
+            closures.append({'request_id':action_id,**action})
+            continue
         if result['account_id'] != account_id or identity({k:v for k,v in result.items() if k!='decision_id'}) != result['decision_id']:
             raise ValueError('operator confirmation fingerprint or account mismatch')
         actions.append({'request_id':action_id,'request':action['request'],'confirmation':result,
             'delivery_status':'see_linked_paper_attribution' if review.get('attribution') else 'not_verified_no_paper_ledger'})
     body = {'schema':1,'scope':'paper_workflow_review_not_actual_operator_performance',
             'generated_at':utc(store.clock()).isoformat(),'account_id':account_id,
-            'review':review,'confirmations':actions,'execution_ready':False,'actual_operator_return':None}
+            'review':review,'confirmations':actions,'reservation_closures':closures,
+            'execution_ready':False,'actual_operator_return':None}
     # Datetimes in the read-only account projection do not enter this payload;
     # project_review exposes the original JSON account declaration.
     canonical(body)
@@ -103,7 +109,8 @@ def render_desk(data):
     orders={o['order_id']:o for o in attr.get('paper_portfolio_ledger',{}).get('orders',[])}
     rows=[]
     names={'confirmation_blocked':'确认被阻止','not_delivered_or_unknown':'未送达或待核对',
-           'paper_order_recorded':'已有纸面订单'}
+           'paper_order_recorded':'已有纸面订单','cancelled':'已撤销未送达预占',
+           'expired_not_sent':'已关闭到期未送达预占','reconciled_not_sent':'纸面全账核对确认未送达'}
     for item in data['confirmations']:
         c=item['confirmation']; outcome=outcomes.get(item['request_id'],{})
         linked=[orders[k] for k in outcome.get('order_ids',[]) if k in orders]

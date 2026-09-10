@@ -9,7 +9,7 @@ import json
 
 from .accounts import latest_account
 from .domain import canonical, identity, number, quantity, utc
-from .strategies import signal
+from .strategies import signal, latest_instance_signal
 
 
 @dataclass(frozen=True)
@@ -48,11 +48,10 @@ class DecisionService:
             blockers.append('signal_not_triggered')
         if at >= expires or utc(sig['asof']) > at:
             blockers.append('signal_expired_or_future')
-        newest = store.con.execute('''SELECT state,signal_id FROM signal_event WHERE instrument=? AND strategy_version=?
-            ORDER BY asof_time DESC, rowid DESC LIMIT 1''', [sig['instrument'], sig['strategy_version']]).fetchone()
-        if newest and newest[0] != 'triggered':
+        newest = latest_instance_signal(store,sig)
+        if newest and newest[1] != 'triggered':
             blockers.append('signal_no_longer_triggered')
-        if newest and newest[1] != signal_id:
+        if newest and newest[0] != signal_id:
             blockers.append('signal_version_superseded')
         if sig['mode'] != 'system_replay':
             blockers.append('historical_assumption_only')
@@ -199,7 +198,106 @@ class DecisionService:
         self.store.check_owner()
         self.store.con.execute("UPDATE reservation SET status='unknown' WHERE reservation_id=? AND status='held'", [reservation_id])
 
+    def close_unsent(self, confirmation_request_id, *, operator, request_id, reason='cancelled'):
+        """Only held V2 paper confirmations are provably unsent.
+
+        The owning actor serializes this transition with submission. A held
+        reservation transferred to a paper order commits atomically there;
+        unknown/submitted reservations cannot be released by this operation.
+        """
+        store = self.store
+        store.check_owner()
+        if reason not in ('cancelled','expired_not_sent') or not all(
+                isinstance(x,str) and x.strip() and len(x)<=120
+                for x in (operator,request_id,confirmation_request_id)):
+            raise ValueError('explicit operator, intent identity and supported close reason required')
+        intent = {'operation':'close_unsent','confirmation_request_id':confirmation_request_id,
+                  'operator':operator,'reason':reason}
+        with store.transaction():
+            prior = store.con.execute('SELECT payload FROM operator_action WHERE action_id=?',[request_id]).fetchone()
+            if prior:
+                payload = json.loads(prior[0])
+                if payload.get('request') != intent:
+                    raise ValueError('close idempotency conflict')
+                return payload['result']
+            row = store.con.execute('SELECT account_id,payload FROM operator_action WHERE action_id=?',
+                                    [confirmation_request_id]).fetchone()
+            if not row:
+                raise ValueError('unknown confirmation')
+            confirmation = json.loads(row[1]).get('result',{})
+            if confirmation.get('account_id')!=row[0] or identity({k:v for k,v in confirmation.items() if k!='decision_id'})!=confirmation.get('decision_id'):
+                raise ValueError('confirmation checksum/account mismatch')
+            if confirmation.get('scope')!='paper_only' or not confirmation.get('hypothetical_ready') or confirmation.get('execution_ready') is not False:
+                raise ValueError('approved paper confirmation required')
+            table = 'exit_reservation' if confirmation.get('side')=='sell' else 'reservation'
+            reservation = confirmation.get('reservation_id')
+            status = store.con.execute(f'SELECT status FROM {table} WHERE reservation_id=? AND account_id=?',
+                                        [reservation,row[0]]).fetchone()
+            if status != ('held',):
+                raise ValueError('only confirmed-not-sent held reservations may close; unknown requires reconciliation')
+            at = utc(store.clock())
+            if reason=='expired_not_sent' and at<utc(confirmation['expires_at']):
+                raise ValueError('confirmation has not expired')
+            store.con.execute(f'UPDATE {table} SET status=? WHERE reservation_id=? AND status=\'held\'',
+                              [reason,reservation])
+            result = {'account_id':row[0],'confirmation_request_id':confirmation_request_id,
+                      'operator':operator,'request_id':request_id,'reservation_id':reservation,
+                      'status':reason,'execution_ready':False,'scope':'paper_only'}
+            result['closure_id']=identity(result)
+            store.con.execute('INSERT INTO operator_action VALUES (?,?,?,?)',
+                              [request_id,row[0],at,canonical({'request':intent,'result':result})])
+            return result
+
     def mark_exit_unknown(self, reservation_id):
         from .exit_policy import ensure_exits
         ensure_exits(self.store)
         self.store.con.execute("UPDATE exit_reservation SET status='unknown' WHERE reservation_id=? AND status='held'",[reservation_id])
+
+    def reconcile_paper_unsent(self, confirmation_request_id, *, operator, request_id):
+        """Close unknown only with a fully verified local paper journal proof.
+
+        Not available for real/imported accounts, broker acknowledgements or
+        delivered paper orders. Absence in a complete local-only ledger is the
+        narrow evidence used here, never a user-supplied not-sent flag.
+        """
+        from .paper_storage import load_paper
+        store=self.store
+        store.check_owner()
+        if not all(isinstance(x,str) and x.strip() and len(x)<=120 for x in (operator,request_id,confirmation_request_id)):
+            raise ValueError('bounded explicit reconciliation identities required')
+        intent={'operation':'reconcile_paper_unsent','confirmation_request_id':confirmation_request_id,'operator':operator}
+        with store.transaction():
+            prior=store.con.execute('SELECT payload FROM operator_action WHERE action_id=?',[request_id]).fetchone()
+            if prior:
+                previous=json.loads(prior[0])
+                if previous.get('request')!=intent:
+                    raise ValueError('reconciliation idempotency conflict')
+                return previous['result']
+            row=store.con.execute('SELECT account_id,payload FROM operator_action WHERE action_id=?',[confirmation_request_id]).fetchone()
+            if not row:
+                raise ValueError('unknown confirmation')
+            confirmed=json.loads(row[1]).get('result',{})
+            if confirmed.get('account_id')!=row[0] or identity({k:v for k,v in confirmed.items() if k!='decision_id'})!=confirmed.get('decision_id'):
+                raise ValueError('confirmation checksum/account mismatch')
+            if not confirmed.get('hypothetical_ready') or confirmed.get('execution_ready') is not False or confirmed.get('scope')!='paper_only':
+                raise ValueError('paper-only confirmation required')
+            # The confirmation was created against an initialized paper ledger;
+            # migrations already exist, so load performs no nested transaction.
+            book=load_paper(store,row[0],full_replay=True)
+            if any(o['decision_ref']==confirmed['decision_id'] for o in book.state['orders'].values()):
+                raise ValueError('delivered paper order requires order reconciliation, not unsent closure')
+            table='exit_reservation' if confirmed.get('side')=='sell' else 'reservation'
+            reservation=confirmed['reservation_id']
+            found=store.con.execute(f'SELECT status FROM {table} WHERE reservation_id=? AND account_id=?',[reservation,row[0]]).fetchone()
+            if found!=('unknown',):
+                raise ValueError('unknown reservation required for explicit reconciliation')
+            result={'account_id':row[0],'confirmation_request_id':confirmation_request_id,'operator':operator,
+                    'request_id':request_id,'reservation_id':reservation,'status':'reconciled_not_sent',
+                    'ledger_hash':identity(book.state),'journal_events_verified':len(book.seen),
+                    'evidence_scope':'complete_local_paper_journal_only_not_broker_or_real_account',
+                    'execution_ready':False,'scope':'paper_only'}
+            result['closure_id']=identity(result)
+            store.con.execute(f'UPDATE {table} SET status=\'reconciled_not_sent\' WHERE reservation_id=?',[reservation])
+            store.con.execute('INSERT INTO operator_action VALUES (?,?,?,?)',[request_id,row[0],utc(store.clock()),
+                              canonical({'request':intent,'result':result})])
+            return result

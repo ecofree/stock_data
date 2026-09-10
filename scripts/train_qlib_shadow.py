@@ -8,7 +8,6 @@ import sys
 import hashlib
 import re
 
-import duckdb
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -88,7 +87,8 @@ def _load_features(path: Path, features: list[str], max_rows: int) -> pd.DataFra
     escaped = str(path / '*.parquet' if path.is_dir() else path).replace('\\', '/').replace("'", "''")
     relation = f"read_parquet('{escaped}')" if path.suffix == '.parquet' else f"read_csv('{escaped}', types={{'instrument':'VARCHAR'}})"
     columns_sql = ', '.join('"' + c.replace('"', '""') + '"' for c in required if c not in ('datetime', 'instrument'))
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     try:
         con.execute(f"""CREATE TEMP VIEW qlib_features AS SELECT CAST(datetime AS DATE) AS datetime,
             CAST(instrument AS VARCHAR) AS instrument, {columns_sql} FROM {relation}

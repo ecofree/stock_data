@@ -131,7 +131,8 @@ def main() -> int:
     args = parser.parse_args()
 
     configure()
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         n = rebuild(con, args.start)
         bounds = con.execute(

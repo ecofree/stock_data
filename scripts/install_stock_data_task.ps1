@@ -11,6 +11,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($Register -or $RegisterAll) {
+    throw "Legacy task registration is retired. Export existing tasks and approve a collector-only deployment first."
+}
 $Root = Split-Path -Parent $PSScriptRoot
 $Runner = Join-Path $Root "scripts\run_stock_data_daily.ps1"
 $Once = Join-Path $Root "scripts\run_phase_once.ps1"

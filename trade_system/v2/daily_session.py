@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .domain import canonical, identity, instrument, now_utc, number, utc
 from .gap_evidence import read_json, write_json
-from .rolling_research import file_hash
+from .domain import file_hash
 
 CST = ZoneInfo('Asia/Shanghai')
 POOL = '/api/a-share/special-data/limit-up-pool'
@@ -382,3 +382,56 @@ def legacy_observations(db, day, codes, *, asof=None):
             'metric_scope':'unadjusted_market_observation_not_realizable_T1_return',
             'source_row_sha256':identity([str(v) for v in values[0]])}
     return result
+
+
+def link_case(store, report_path, candidate_id, strategy_policy=None, event_policy=None,
+              account_id=None, risk_policy=None, quote_dataset=None):
+    """Link a native observation to the existing paper authority, never an order.
+
+    Source pool price is an observation only. It is deliberately not inserted
+    as a quote or as auction/funds/theme evidence. Those products must already
+    exist in the V2 store with their own receipt and product contracts.
+    """
+    from .event_bridge import event_signal
+    from .strategies import signal
+    from .decisions import DecisionService, RiskPolicy
+    store.check_owner()
+    report=verify(report_path)
+    if report['origin']!='hithink_native' or set(report['gaps']) & BLOCKING_SOURCE_GAPS:
+        raise ValueError('verified native observation cohort required; fixtures cannot certify a daily case')
+    selected=[c for c in report['candidates'] if c['candidate_id']==candidate_id]
+    if len(selected)!=1:
+        raise ValueError('candidate is not a member of the frozen cohort')
+    candidate=selected[0]
+    observed=utc(report['generated_at'])
+    if observed>utc(store.clock()):
+        raise ValueError('observation not known at current decision time')
+    dataset='hithink.limit_pool_observation.v1'
+    store.register_product(dataset,'CNY','point','observation_only_not_quote',
+                           'native_response_receipt_not_exchange_event_time')
+    observation={'report_id':report['report_id'],'candidate':candidate,
+                 'source_sha256':report['source_sha256'],'receipt_time':report['generated_at']}
+    fact=store.ingest(dataset,candidate['instrument'],observed,candidate['close_cny'],
+                      report['report_id'],canonical(observation).encode('utf-8'))
+    if any(v is None for v in (strategy_policy,event_policy,account_id,risk_policy,quote_dataset)):
+        result={'report_id':report['report_id'],'candidate_id':candidate_id,
+                'observation_fact_id':fact['fact_id'],'signal_id':None,'decision_id':None,
+                'status':'observation_only_missing_case_policy_or_account',
+                'risks':candidate['risks'],'scope':'native_observation_not_decision_acceptance',
+                'execution_ready':False}
+        return {**result,'case_id':identity(result)}
+    instance=identity([report['report_id'],candidate_id])
+    sig_id=event_signal(store,candidate['instrument'],strategy_policy,event_policy,
+                        setup_id=instance,run_scope='native_daily_paper')
+    sig=signal(store,sig_id)
+    authority=DecisionService(store,RiskPolicy(**risk_policy))
+    # A separate current quote manifest is required by the unchanged risk
+    # authority. Pool membership/price can never fill a missing quote gate.
+    quote_manifest=store.freeze(store.clock(),datasets=[quote_dataset],codes=[candidate['instrument']])
+    certificate=authority.propose(account_id,sig_id,quote_manifest,quote_dataset)
+    result={'report_id':report['report_id'],'candidate_id':candidate_id,'observation_fact_id':fact['fact_id'],
+            'instance_id':sig['instance_id'],'signal_id':sig_id,'decision_id':certificate['decision_id'],
+            'signal_state':sig['state'],'evidence':sig.get('evidence'),
+            'observation_risks':candidate['risks'],'decision':certificate,
+            'scope':'native_observation_linked_paper_case_not_strategy_validation','execution_ready':False}
+    return {**result,'case_id':identity(result)}

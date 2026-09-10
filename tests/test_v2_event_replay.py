@@ -24,6 +24,8 @@ def setup(tmp_path):
 
 
 def event(store,kind,payload,key=None,at=None,mode='system_replay'):
+    if kind=='funds_cumulative':
+        payload={'counter_epoch':'synthetic-fixture-continuous-counter',**payload}
     return ingest_event(store,'fixture.'+kind,CODE,kind,at or store.clock().isoformat(),payload,
                         key or kind,mode=mode)
 
@@ -59,6 +61,19 @@ def test_event_receipt_bridge_and_cumulative_delta(setup):
     with pytest.raises(ValueError,match='idempotency'):
         event(store,'funds_cumulative',{'net_cny':'1251','metric_version':'fixture-net-v1'},'f2')
     assert recheck_signal_evidence(store,sig)==[]
+
+
+def test_funds_counter_reset_is_not_net_outflow(setup):
+    store,_=setup
+    event(store,'funds_cumulative',{'net_cny':'1000','metric_version':'fixture-net-v1','counter_epoch':'before'},
+          'f1','2026-09-10T09:30:00+08:00')
+    event(store,'funds_cumulative',{'net_cny':'100','metric_version':'fixture-net-v1','counter_epoch':'after'},'f2')
+    _,evidence=derive_inputs(store,CODE,EventPolicy(**policies()[1]))
+    assert evidence['fund_delta_cny'] is None
+    assert 'fund_metric_or_counter_epoch_changed' in evidence['blockers']
+    with pytest.raises(ValueError,match='counter epoch'):
+        ingest_event(store,'fixture.funds_cumulative',CODE,'funds_cumulative',store.clock(),
+            {'net_cny':'1','metric_version':'fixture-net-v1'},'missing-counter')
 
 
 def test_indication_never_becomes_final_and_requires_two_times(setup):
@@ -106,7 +121,7 @@ def test_future_and_wrong_product_rejected(setup):
 def test_event_checksum_and_additive_migrations(setup):
     store,_ = setup
     ready(store); open_paper(store,paper_config())
-    assert [r[0] for r in store.con.execute('SELECT version FROM v2_schema ORDER BY version').fetchall()]==[1,3,4]
+    assert [r[0] for r in store.con.execute('SELECT version FROM v2_schema ORDER BY version').fetchall()]==[1,3,4,6]
     store.con.execute("UPDATE market_event SET raw_hash='tampered' WHERE kind='quote'")
     with pytest.raises(ValueError,match='checksum'):
         derive_inputs(store,CODE,EventPolicy(**policies()[1]))

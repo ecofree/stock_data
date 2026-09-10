@@ -22,6 +22,8 @@ def safe_child(root, name):
 
 def publish(root, run_id, artifacts, *, generation):
     root = Path(root).resolve()
+    if any((root/name).exists() for name in ('pipeline_run_latest.json','daily_review_latest.html')):
+        raise ValueError('V2 publisher requires a separate namespace; legacy latest is not a fallback')
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', run_id) or type(generation) is not int or generation < 0:
         raise ValueError('invalid run identity or generation')
     if not artifacts or 'manifest.json' in artifacts:
@@ -48,6 +50,10 @@ def publish(root, run_id, artifacts, *, generation):
     pointer = {'run_id': run_id, 'generation': generation,
                'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()}
     with FileLock(root / 'publish.guard'):
+        owner=root/'v2-publication-owner.json'
+        if not owner.exists():
+            with owner.open('x',encoding='utf-8') as stream:
+                stream.write(canonical({'scope':'v2_versioned_publication_only','legacy_writes':'forbidden'}))
         current = root / 'current.json'
         if current.exists() and json.loads(current.read_text(encoding='utf-8'))['generation'] >= generation:
             raise ValueError('older or equal generation cannot replace current bundle')

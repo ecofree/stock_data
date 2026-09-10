@@ -9,7 +9,6 @@ import csv
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 from trade_system.quality import table_exists
 from trade_system.risk import OPERATOR_PLAN_OUTCOME_VIEW_SQL, init_trading_tables
@@ -57,7 +56,8 @@ def _normalized_status(value: Any) -> str:
 
 def ensure_operator_outcome_tables(db_path: str | Path) -> list[str]:
     init_trading_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -171,7 +171,8 @@ def import_operator_trade_outcomes(
             f"fill execution_status/outcome_tag/mistake_tag before import: {sample}{suffix}"
         )
 
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         rows_imported = 0
         journal_rows = 0

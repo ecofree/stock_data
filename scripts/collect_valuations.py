@@ -12,7 +12,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 from trade_system.hithink_client import HiThinkClient  # noqa: E402
 from trade_system.logging_setup import configure  # noqa: E402
@@ -35,7 +34,8 @@ def main() -> int:
 
     configure()
     client = HiThinkClient(min_interval=0.5)
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         # Get latest limit pool codes + thscodes from official_limit_pool
         codes = con.execute(

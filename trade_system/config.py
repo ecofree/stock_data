@@ -148,7 +148,7 @@ def default_trade_date(db_path: str | Path | None = None) -> str:
     """
     if db_path:
         try:
-            from trade_system.trading_calendar import latest_open_session
+            from trade_system.db_utils import latest_open_session
 
             resolved = latest_open_session(db_path)
             if resolved:

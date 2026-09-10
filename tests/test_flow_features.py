@@ -72,3 +72,20 @@ def test_build_flow_features_uses_canonical_provider_and_trading_windows(tmp_pat
     finally:
         con.close()
 
+
+def test_equal_windows_source_switch_and_old_history_preserved(tmp_path):
+    db=tmp_path/'segmented.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('''CREATE TABLE multi_source_stock_flow(source_date DATE,stock_code VARCHAR,
+            provider VARCHAR,main_net DOUBLE,turnover DOUBLE,close DOUBLE,change_pct DOUBLE,
+            fetched_at TIMESTAMP,is_stale BOOLEAN,flow_definition VARCHAR,turnover_unit VARCHAR,flow_unit VARCHAR)''')
+        con.execute("CREATE TABLE qlib_stock_flow_features(history VARCHAR); INSERT INTO qlib_stock_flow_features VALUES ('frozen v1')")
+        for day in range(1,23):
+            con.execute("INSERT INTO multi_source_stock_flow VALUES (?, '000001', ?,100,1000,10,0,current_timestamp,false,'same-definition','CNY','CNY')",
+                        [f'2026-01-{day:02d}','tushare' if day<22 else 'hithink'])
+    build_flow_features(db)
+    with duckdb.connect(str(db),read_only=True) as con:
+        assert con.execute(f"SELECT flow_acceleration_5d FROM {STOCK_FEATURE_TABLE} WHERE trade_date='2026-01-20'").fetchone()==(0.0,)
+        assert con.execute(f"SELECT observed_days_20d,flow_acceleration_5d FROM {STOCK_FEATURE_TABLE} WHERE trade_date='2026-01-22'").fetchone()==(1,None)
+        assert con.execute("SELECT * FROM qlib_stock_flow_features").fetchall()==[('frozen v1',)]
+

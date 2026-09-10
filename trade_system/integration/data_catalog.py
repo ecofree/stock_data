@@ -277,7 +277,8 @@ def _insert_rows(con: duckdb.DuckDBPyConnection, table: str, columns: list[str],
 def install_data_catalog(db_path: str | Path, audit: dict[str, Any]) -> dict[str, int]:
     data_sources = build_default_data_sources()
     capability_rows = build_capability_registry_rows(audit)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         _create_tables(con)
         _insert_rows(con, "data_source_catalog", DATA_SOURCE_COLUMNS, data_sources)

@@ -85,7 +85,8 @@ def main() -> int:
     print(f"fetching income statements for {len(codes)} stocks...")
     done = failed = 0
 
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         for i, code in enumerate(codes):
             ths = _to_ths(code)

@@ -10,7 +10,8 @@ def project_review(store, account_id, context_id=None):
     store.check_owner()
     account = latest_account(store, account_id)
     signals = [json.loads(r[0]) for r in store.con.execute('''SELECT payload FROM signal_event
-        QUALIFY row_number() OVER (PARTITION BY instrument,strategy_version ORDER BY asof_time DESC,rowid DESC)=1
+        QUALIFY row_number() OVER (PARTITION BY instrument,strategy_version,
+          coalesce(json_extract_string(payload,'$.instance_id'),'legacy_unscoped') ORDER BY asof_time DESC,rowid DESC)=1
         ORDER BY asof_time DESC''').fetchall()]
     decisions = [json.loads(r[0]) for r in store.con.execute('''SELECT payload FROM decision_certificate
         WHERE account_id=? ORDER BY rowid DESC LIMIT 100''', [account_id]).fetchall()]

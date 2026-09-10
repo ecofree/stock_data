@@ -14,20 +14,55 @@ SQL = '''CREATE TABLE paper_account(account_id VARCHAR PRIMARY KEY, config JSON 
 CREATE TABLE paper_ledger_event(account_id VARCHAR NOT NULL, event_id VARCHAR NOT NULL,
  seq BIGINT NOT NULL, known_at TIMESTAMPTZ NOT NULL, payload JSON NOT NULL,
  previous_hash VARCHAR NOT NULL, state_hash VARCHAR NOT NULL, raw_hash VARCHAR NOT NULL,
- PRIMARY KEY(account_id,event_id), UNIQUE(account_id,seq))'''
+PRIMARY KEY(account_id,event_id), UNIQUE(account_id,seq))'''
+
+CHECKPOINT_SQL='''CREATE TABLE paper_checkpoint(account_id VARCHAR NOT NULL, seq BIGINT NOT NULL,
+ config_hash VARCHAR NOT NULL, state_hash VARCHAR NOT NULL, prefix_hash VARCHAR NOT NULL,
+ payload JSON NOT NULL, raw_hash VARCHAR NOT NULL, PRIMARY KEY(account_id,seq))'''
+CHECKPOINT_INTERVAL=64
 
 
-def ensure_paper(store):
+def ensure_checkpoints(store, *, create=True):
+    digest=hashlib.sha256(CHECKPOINT_SQL.encode()).hexdigest()
+    row=store.con.execute('SELECT sha256 FROM v2_schema WHERE version=6').fetchone()
+    if row:
+        if row[0]!=digest:
+            raise ValueError('paper checkpoint migration checksum mismatch')
+        return
+    if not create:
+        return
+    with store.transaction():
+        store.con.execute(CHECKPOINT_SQL)
+        store.con.execute('INSERT INTO v2_schema VALUES (6,?)',[digest])
+
+
+def journal_prefix(store,account_id,seq):
+    # Still O(history) SQL verification, but no repeated Python event replay.
+    # The prefix commitment detects deletion, edited payloads and chain edits.
+    count,invalid,digest=store.con.execute('''SELECT count(*),
+        count(*) FILTER (WHERE sha256(CAST(payload AS VARCHAR))<>raw_hash),
+        sha256(coalesce(string_agg(CAST(seq AS VARCHAR)||':'||raw_hash||':'||previous_hash||':'||state_hash,
+            '|' ORDER BY seq),'')) FROM paper_ledger_event WHERE account_id=? AND seq<=?''',[account_id,seq]).fetchone()
+    if count!=seq or invalid:
+        raise ValueError('paper checkpoint journal prefix checksum mismatch')
+    return digest
+
+
+def ensure_paper(store, *, create=True):
     store.check_owner()
     digest = hashlib.sha256(SQL.encode()).hexdigest()
     row = store.con.execute('SELECT sha256 FROM v2_schema WHERE version=4').fetchone()
     if row:
         if row[0] != digest:
             raise ValueError('paper ledger migration checksum mismatch')
+        ensure_checkpoints(store,create=create)
         return
+    if not create:
+        raise ValueError('unknown paper ledger; read projections never initialize it')
     with store.transaction():
         store.con.execute(SQL)
         store.con.execute('INSERT INTO v2_schema VALUES (4,?)',[digest])
+    ensure_checkpoints(store)
 
 
 def _projection(store, book):
@@ -74,8 +109,8 @@ def open_paper(store, config):
     return book.summary()
 
 
-def load_paper(store, account_id):
-    ensure_paper(store)
+def load_paper(store, account_id, *, full_replay=False):
+    ensure_paper(store,create=False)
     row = store.con.execute('SELECT config,config_hash,last_seq,last_hash FROM paper_account WHERE account_id=?',[account_id]).fetchone()
     if not row:
         raise ValueError('unknown paper ledger')
@@ -83,20 +118,38 @@ def load_paper(store, account_id):
     if identity(config)!=row[1]:
         raise ValueError('paper config checksum mismatch')
     book = PaperBook(config)
+    start_seq=0
+    has_checkpoints=store.con.execute('SELECT count(*) FROM v2_schema WHERE version=6').fetchone()[0]
+    checkpoint=None if full_replay or not has_checkpoints else store.con.execute('''SELECT seq,config_hash,state_hash,prefix_hash,payload,raw_hash
+        FROM paper_checkpoint WHERE account_id=? ORDER BY seq DESC LIMIT 1''',[account_id]).fetchone()
+    if checkpoint:
+        start_seq,config_hash,state_hash,prefix_hash,body,raw_hash=checkpoint
+        if config_hash!=row[1] or start_seq>row[2] or hashlib.sha256(body.encode()).hexdigest()!=raw_hash:
+            raise ValueError('paper checkpoint checksum/head mismatch')
+        archived=store.path.parent/(store.path.name+'.raw')/raw_hash
+        if not archived.is_file() or hashlib.sha256(archived.read_bytes()).hexdigest()!=raw_hash:
+            raise ValueError('paper checkpoint raw archive checksum mismatch')
+        if journal_prefix(store,account_id,start_seq)!=prefix_hash:
+            raise ValueError('paper checkpoint journal prefix checksum mismatch')
+        restored=json.loads(body)
+        if identity(restored['state'])!=state_hash or len(restored['seen'])!=start_seq:
+            raise ValueError('paper checkpoint state checksum mismatch')
+        book.state,book.seen=restored['state'],restored['seen']
     events = store.con.execute('''SELECT seq,payload,previous_hash,state_hash,raw_hash FROM paper_ledger_event
-        WHERE account_id=? ORDER BY seq''',[account_id]).fetchall()
-    for i,(seq,body,previous_hash,state_hash,raw_hash) in enumerate(events,1):
+        WHERE account_id=? AND seq>? ORDER BY seq''',[account_id,start_seq]).fetchall()
+    for i,(seq,body,previous_hash,state_hash,raw_hash) in enumerate(events,start_seq+1):
         if seq!=i or previous_hash!=identity(book.state) or hashlib.sha256(body.encode()).hexdigest()!=raw_hash:
             raise ValueError('paper journal sequence/input checksum mismatch')
         book.apply(json.loads(body))
         if identity(book.state)!=state_hash:
             raise ValueError('paper deterministic replay checksum mismatch')
-    if len(events)!=row[2] or identity(book.state)!=row[3]:
+    if start_seq+len(events)!=row[2] or identity(book.state)!=row[3]:
         raise ValueError('paper journal head mismatch; do not silently roll back facts')
     return book
 
 
 def _append(store, book, event, *, transferred_reservation=None, transferred_exit_reservation=None):
+    ensure_paper(store)
     account_id = book.config['account_id']
     prior = identity(book.state)
     book.apply(event)
@@ -114,6 +167,12 @@ def _append(store, book, event, *, transferred_reservation=None, transferred_exi
         if transferred_exit_reservation:
             store.con.execute("UPDATE exit_reservation SET status='paper_order' WHERE reservation_id=? AND status='held'",[transferred_exit_reservation])
         _projection(store,book)
+        if (head[0]+1)%CHECKPOINT_INTERVAL==0:
+            body=canonical({'state':book.state,'seen':book.seen})
+            raw=store.archive(body.encode())
+            store.con.execute('INSERT INTO paper_checkpoint VALUES (?,?,?,?,?,?,?)',
+                [account_id,head[0]+1,identity(book.config),identity(book.state),
+                 journal_prefix(store,account_id,head[0]+1),body,raw])
     return book.summary()
 
 
@@ -159,11 +218,10 @@ def submit_confirmed_buy(store, account_id, confirmation_request_id, order_id):
     if store.con.execute('SELECT count(*) FROM account_event WHERE account_id=? AND happened_at>=?',
                          [account_id,latest['imported_at']]).fetchone()[0]:
         raise ValueError('account event requires reconciliation before paper submission')
-    from .strategies import signal
+    from .strategies import signal, latest_instance_signal
     from .event_bridge import recheck_signal_evidence
     sig = signal(store,confirmed['signal_id'])
-    newest = store.con.execute('''SELECT signal_id,state FROM signal_event WHERE instrument=? AND strategy_version=?
-        ORDER BY asof_time DESC,rowid DESC LIMIT 1''',[sig['instrument'],sig['strategy_version']]).fetchone()
+    newest = latest_instance_signal(store,sig)
     if newest!=(confirmed['signal_id'],'triggered') or at>=utc(sig['policy']['expires_at']):
         raise ValueError('signal superseded or expired; reconfirm required')
     if recheck_signal_evidence(store,sig):

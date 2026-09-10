@@ -44,7 +44,6 @@ def test_integrated_daily_command_plan_contains_required_steps():
     steps = command_plan("kpl_data.duckdb")
     names = [step[0] for step in steps]
     assert names == [
-        "repair_critical_integrity",
         "build_normalized_views",
         "audit_multisource_readiness",
         "audit_source_conflicts",
@@ -53,10 +52,7 @@ def test_integrated_daily_command_plan_contains_required_steps():
         "build_operator_views",
         "build_auction_evidence",
         "check_capital_flow_health",
-        "generate_signals",
-        "generate_close_stage_signals",
         "create_operator_outcome_template",
-        "run_daily_operator_loop",
         "check_data_readiness",
         "generate_health_trend",
         "generate_cycle_analytics",
@@ -127,10 +123,8 @@ def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection
     ]
     assert "collect_capital_flow_focus" not in by_name
     assert "collect_multisource_capital_flow" not in by_name
-    assert by_name["generate_signals"][-4:] == ["--date", "2026-07-09", "--readiness-stage", "close"]
-    operator_cmd = by_name["run_daily_operator_loop"]
-    assert operator_cmd[operator_cmd.index("--trade-date") + 1] == "2026-07-09"
-    assert operator_cmd[operator_cmd.index("--stage") + 1] == "close"
+    assert 'generate_signals' not in by_name
+    assert 'run_daily_operator_loop' not in by_name
 
 
 def test_priority_collection_profile_avoids_duplicate_fanout():
@@ -158,10 +152,8 @@ def test_auction_plan_retains_blocked_diagnostics():
     by_name = {name: cmd for name, cmd, _ in steps}
     names = [name for name, _, _ in steps]
 
-    assert "--allow-blocked" in by_name["generate_auction_stage_signals"]
-    assert names.index("generate_auction_stage_signals") < names.index(
-        "check_data_readiness"
-    )
+    assert 'generate_auction_stage_signals' not in by_name
+    assert names.index('collect_realtime_limit_pool') < names.index('check_data_readiness')
     assert "generate_web_dashboard" in by_name
 
 
@@ -177,13 +169,9 @@ def test_intraday_plan_collects_executable_quotes_before_signals():
     names = [step[0] for step in steps]
     assert "collect_executable_quotes" in names
     assert "collect_l2_focus" in names
-    assert names.index("collect_executable_quotes") < names.index(
-        "generate_intraday_stage_signals"
-    )
-    assert names.index("collect_l2_focus") < names.index("generate_intraday_stage_signals")
-    assert names.index("run_daily_operator_loop") < names.index(
-        "check_data_readiness"
-    )
+    assert names.index('collect_executable_quotes') < names.index('check_data_readiness')
+    assert names.index('collect_l2_focus') < names.index('check_data_readiness')
+    assert not {'generate_intraday_stage_signals','run_daily_operator_loop'} & set(names)
     by_name = {name: cmd for name, cmd, _ in steps}
     quote_cmd = by_name["collect_executable_quotes"]
     assert quote_cmd[quote_cmd.index("--limit") + 1] == "120"
@@ -231,7 +219,6 @@ def test_close_recovery_as_of_is_applied_to_all_freshness_gates():
     )
     by_name = {name: command for name, command, _ in steps}
     for name in (
-        "generate_close_stage_signals",
         "check_capital_flow_health",
         "check_data_readiness",
         "audit_p0_p3_acceptance",
@@ -284,11 +271,19 @@ def test_integrated_collection_exits_before_network_on_verified_holiday(
         ["SSE", date.today().isoformat()],
     )
     con.close()
+    from tools.v2.backup_verify import backup_verify
+    migration_root=tmp_path/'migration'
+    verified=backup_verify(db,migration_root)
+    db=verified['backup']
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "run_integrated_daily.py",
+            "--migration-root",
+            str(migration_root),
+            "--reports-dir",
+            str(migration_root/'reports'),
             "--db",
             str(db),
             "--trade-date",
@@ -406,9 +401,7 @@ def test_close_readiness_gate_is_tightened_to_2h():
     for gate in ("check_data_readiness", "check_capital_flow_health"):
         cmd = by_name[gate]
         assert cmd[cmd.index("--max-age-seconds") + 1] == "7200"
-    close_sig = by_name["generate_close_stage_signals"]
-    assert close_sig[close_sig.index("--freshness-seconds") + 1] == "21600"
-    assert "--allow-blocked" in close_sig
+    assert 'generate_close_stage_signals' not in by_name
 
 
 def test_close_as_of_is_propagated_into_both_daily_reports():

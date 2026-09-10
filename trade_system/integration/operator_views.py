@@ -36,7 +36,8 @@ def _empty_candidates_sql() -> str:
 
 
 def build_operator_views(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         native_columns = (
             {row[1] for row in con.execute("PRAGMA table_info('stock_candidate_stage_signal')").fetchall()}

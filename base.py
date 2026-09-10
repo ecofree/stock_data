@@ -9,7 +9,6 @@ import urllib.error
 import urllib.parse
 from datetime import datetime
 
-import duckdb
 
 from config import (
     API_BASE, API_KEY, DB_PATH, REQUEST_TIMEOUT,
@@ -52,6 +51,9 @@ def connect_duckdb(db_path=None, *, read_only=False):
     KPL_DUCKDB_THREADS / KPL_DUCKDB_TEMP_DIR).
     """
     path = db_path or DB_PATH
+    if not read_only:
+        from trade_system.db_utils import refuse_v2_writes
+        refuse_v2_writes(path)
     try:
         os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
     except Exception:
@@ -62,10 +64,12 @@ def connect_duckdb(db_path=None, *, read_only=False):
         "temp_directory": DUCKDB_TEMP_DIR,
     }
     try:
-        conn = duckdb.connect(path, read_only=read_only, config=config)
+        from trade_system.db_utils import legacy_connect
+        conn = legacy_connect(path, read_only=read_only, config=config)
     except TypeError:
         # Older duckdb without the config kwarg: fall back to a bare connection.
-        conn = duckdb.connect(path, read_only=read_only)
+        from trade_system.db_utils import legacy_connect
+        conn = legacy_connect(path, read_only=read_only)
     _attach_cold_storage(conn)
     return conn
 

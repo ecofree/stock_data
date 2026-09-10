@@ -49,7 +49,8 @@ class MultiSourceStore:
 
     def __init__(self, db_path: str | Path, fetcher: Callable[..., tuple[Any, dict]] | None = None):
         self.db_path = str(db_path)
-        self.con = duckdb.connect(self.db_path)
+        from trade_system.db_utils import legacy_connect
+        self.con = legacy_connect(self.db_path)
         self.fetcher = fetcher or resilient_sources.get
         self._ensure_tables()
 

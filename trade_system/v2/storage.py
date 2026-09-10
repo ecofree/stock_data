@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 import uuid
 
 import duckdb
@@ -50,6 +51,7 @@ class Store:
         self.clock = clock
         self.con = None
         self.owner = None
+        self.command_deadline = None
         self.guard = FileLock(self.path.with_suffix(self.path.suffix + '.owner.guard'))
 
     def __enter__(self):
@@ -85,6 +87,11 @@ class Store:
     def check_owner(self):
         if self.con is None or self.owner != threading.get_ident():
             raise RuntimeError('only the owning service thread may access the live connection')
+        self.check_deadline()
+
+    def check_deadline(self):
+        if self.command_deadline is not None and time.monotonic()>=self.command_deadline:
+            raise TimeoutError('command deadline exceeded at safe boundary; inspect durable state before retry')
 
     @contextmanager
     def transaction(self):
@@ -92,6 +99,7 @@ class Store:
         self.con.execute('BEGIN TRANSACTION')
         try:
             yield
+            self.check_deadline()
             self.con.execute('COMMIT')
         except BaseException:
             self.con.execute('ROLLBACK')
@@ -141,30 +149,58 @@ class Store:
             raise ValueError('source revision required')
         value = float(number(value))
         canonical(value)  # reject Decimal overflow when converted to DOUBLE
-        raw_hash = self.archive(raw)
-        key = identity([dataset, code, event.isoformat(), value, revision])
-        if self.con.execute('SELECT count(*) FROM fact WHERE fact_id=?', [key]).fetchone()[0]:
-            return {'fact_id': key, 'inserted': 0, 'deduplicated': 1}
         if effective_at is not None and product[2] != 'announced_event':
             raise ValueError('effective_at is only for announced events')
+        effective = utc(effective_at) if effective_at is not None else None
+        if not isinstance(raw, bytes):
+            raise ValueError('raw response must be bytes')
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        # Source revision is the idempotency boundary, not the numeric value.
+        # Validate the entire semantic content before deduplication or raw I/O.
+        previous = self.con.execute('''SELECT fact_id,value,raw_hash,effective_at FROM fact
+            WHERE dataset=? AND instrument=? AND event_time=? AND revision=?''',
+            [dataset,code,event,revision]).fetchall()
+        if previous:
+            if len(previous) != 1 or previous[0][1:] != (value,raw_hash,effective):
+                raise ValueError('source revision content conflict; a new explicit revision is required')
+            return {'fact_id': previous[0][0], 'inserted': 0, 'deduplicated': 1}
+        key = identity([dataset,code,event.isoformat(),value,revision,
+                        effective.isoformat() if effective else None,raw_hash])
+        self.archive(raw)
         with self.transaction():
             seq = self.con.execute('SELECT coalesce(max(seq),0)+1 FROM fact').fetchone()[0]
             self.con.execute('INSERT INTO fact VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                              [key, dataset, code, event, received, utc(self.clock()), seq, value,
-                              revision, raw_hash, utc(effective_at) if effective_at else None])
+                              revision, raw_hash, effective])
         return {'fact_id': key, 'inserted': 1, 'deduplicated': 0}
 
-    def freeze(self, asof, *, mode='system_replay'):
+    def freeze(self, asof, *, mode='system_replay', datasets=None, codes=None, since=None):
         self.check_owner()
         asof = utc(asof)
         if mode not in ('system_replay', 'historical_research') or asof > utc(self.clock()):
             raise ValueError('invalid query context')
+        filters, params = '', [asof,asof,asof]
+        for name,values in (('dataset',datasets),('instrument',codes)):
+            if values is not None:
+                if not isinstance(values,(list,tuple)) or not 0<len(values)<=1000 or not all(isinstance(v,str) and v for v in values):
+                    raise ValueError('bounded nonempty snapshot scope required')
+                filters += f' AND {name} IN (SELECT unnest(?))'
+                params.append(list(values))
+        if since is not None:
+            since = utc(since)
+            if since > asof:
+                raise ValueError('snapshot window starts after cutoff')
+            filters += ' AND event_time>=?'
+            params.append(since)
         # Historical imports are known only at import time. Backdating a
         # mode never makes them available to actual system replay.
         ids = [r[0] for r in self.con.execute('''SELECT fact_id FROM fact
             WHERE event_time<=? AND received_at<=? AND known_at<=?
+            ''' + filters + '''
             QUALIFY row_number() OVER (PARTITION BY dataset,instrument,event_time ORDER BY seq DESC)=1
-            ORDER BY seq''', [asof, asof, asof]).fetchall()]
+            ORDER BY seq LIMIT 100001''', params).fetchall()]
+        if len(ids)>100000:
+            raise ValueError('snapshot exceeds 100000 facts; supply dataset/instrument/time scope')
         key = identity([asof.isoformat(), mode, ids])
         self.con.execute('INSERT INTO input_manifest VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
                          [key, asof, mode, canonical(ids)])

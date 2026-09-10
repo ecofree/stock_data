@@ -2193,7 +2193,8 @@ def _create_data_coverage(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def build_normalized_views(db_path: str | Path) -> list[str]:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         _refresh_default_concept_views(con)
         _create_market_daily(con)

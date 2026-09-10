@@ -57,6 +57,8 @@ def ingest_event(store, dataset, code, kind, event_at, payload, source_event_id,
         number(payload['net_cny'])  # signed cumulative amount, never sum samples
         if not payload.get('metric_version'):
             raise ValueError('frozen funds metric definition required')
+        if not isinstance(payload.get('counter_epoch'),str) or not payload['counter_epoch'].strip():
+            raise ValueError('explicit cumulative counter epoch required; resets cannot be inferred from a decrease')
     elif kind == 'theme_breadth':
         expected, observed, advancing = (quantity(payload[k]) for k in ('expected','observed','advancing'))
         if not 0 <= advancing <= observed <= expected or not expected or not payload.get('theme_id') or not payload.get('membership_version'):
@@ -99,6 +101,7 @@ class EventPolicy:
     fresh_seconds: int
     min_theme_coverage: str
     min_theme_advancing: str
+    fund_boundary_tolerance_seconds: int = 0
 
     def validate(self):
         if not all((self.version,self.theme_id,self.membership_version,self.fund_metric_version)):
@@ -112,6 +115,8 @@ class EventPolicy:
         for value in (self.fund_window_seconds,self.fresh_seconds):
             if type(value) is not int or value <= 0:
                 raise ValueError('positive observation budgets required')
+        if type(self.fund_boundary_tolerance_seconds) is not int or not 0<=self.fund_boundary_tolerance_seconds<self.fund_window_seconds:
+            raise ValueError('explicit bounded funds window boundary tolerance required')
         for value in (self.min_theme_coverage,self.min_theme_advancing):
             if not 0 < number(value) <= 1:
                 raise ValueError('finite theme fractions required')
@@ -120,10 +125,10 @@ class EventPolicy:
         number(self.min_fund_delta_cny)
 
 
-def derive_inputs(store, code, policy):
+def derive_inputs(store, code, policy, *, at=None):
     ensure_events(store)
     policy.validate()
-    at = utc(store.clock())
+    at = utc(store.clock() if at is None else at)
     day = at.astimezone(ZoneInfo('Asia/Shanghai')).date()
     selected, ids, blockers, expires = {}, [], [], []
     for kind,dataset in policy.datasets.items():
@@ -136,8 +141,12 @@ def derive_inputs(store, code, policy):
             ORDER BY event_at,received_at''',[dataset,code,at,at]).fetchall()
         records = [r for r in records if r[1].astimezone(ZoneInfo('Asia/Shanghai')).date()==day]
         if kind == 'funds_cumulative':
-            records = [r for r in records if (at-r[1]).total_seconds()<=policy.fund_window_seconds]
-        records = records[-2:] if kind == 'funds_cumulative' else records[-1:]
+            boundary = at-timedelta(seconds=policy.fund_window_seconds)
+            starts = [r for r in records if 0<=(boundary-r[1]).total_seconds()<=policy.fund_boundary_tolerance_seconds]
+            ends = [r for r in records if r[1]>boundary]
+            records = [starts[-1],ends[-1]] if starts and ends else []
+        else:
+            records = records[-1:]
         selected[kind] = records
         for row in records:
             body = json.loads(row[3])
@@ -172,10 +181,11 @@ def derive_inputs(store, code, policy):
     fund_rows = selected['funds_cumulative']
     if len(fund_rows) == 2:
         older,newer = (json.loads(r[3])['payload'] for r in fund_rows)
-        if older['metric_version'] == newer['metric_version'] == policy.fund_metric_version:
+        if (older['metric_version'] == newer['metric_version'] == policy.fund_metric_version
+                and older.get('counter_epoch') and older['counter_epoch']==newer.get('counter_epoch')):
             delta = number(newer['net_cny'])-number(older['net_cny'])
         else:
-            blockers.append('fund_metric_binding_changed')
+            blockers.append('fund_metric_or_counter_epoch_changed')
     if delta is None:
         blockers.append('two_distinct_cumulative_observations_required')
     if quote and quote['phase'] != 'continuous':
@@ -191,15 +201,20 @@ def derive_inputs(store, code, policy):
               'auction_confirmed':confirmed, 'theme_supported':theme_ok,
               'funds_supported':delta is not None and delta >= number(policy.min_fund_delta_cny) and not blockers}
     return inputs, {'kind':'auction_funds_v1','policy':policy.__dict__,'event_ids':sorted(ids),
+                    'fund_window_definition':'fixed_cutoff_window_v2',
+                    'fund_observed_span_seconds':(fund_rows[-1][1]-fund_rows[0][1]).total_seconds() if len(fund_rows)==2 else None,
                     'valid_until':min(expires).isoformat() if expires else at.isoformat(),
                     'fund_delta_cny':str(delta) if delta is not None else None,'blockers':sorted(set(blockers))}
 
 
-def event_signal(store, code, strategy_policy, event_policy):
+def event_signal(store, code, strategy_policy, event_policy, *, setup_id='daily', run_scope='default'):
     policy = EventPolicy(**event_policy)
-    inputs,evidence = derive_inputs(store,code,policy)
-    manifest = store.freeze(store.clock())
-    return record_signal(store,code,manifest,StrategyPolicy(**strategy_policy),evidence=evidence,**inputs)
+    cutoff = utc(store.clock())
+    inputs,evidence = derive_inputs(store,code,policy,at=cutoff)
+    manifest = store.freeze(cutoff,datasets=list(policy.datasets.values()),codes=[code],
+                            since=cutoff.astimezone(ZoneInfo('Asia/Shanghai')).replace(hour=0,minute=0,second=0,microsecond=0))
+    return record_signal(store,code,manifest,StrategyPolicy(**strategy_policy),evidence=evidence,
+                         setup_id=setup_id,run_scope=run_scope,**inputs)
 
 
 def recheck_signal_evidence(store, signal):

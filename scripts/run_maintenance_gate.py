@@ -193,7 +193,6 @@ def check_cleanup_boundaries() -> list[Check]:
         "trade_system/candidate_pool.py": "def build_candidate_pool",
         "trade_system/ml/qlib_shadow.py": "def import_qlib_predictions",
         "trade_system/ml/shadow_evaluator.py": "def evaluate_qlib_shadow",
-        "trade_system/daily_loop.py": "def run_daily_operator_loop",
         "trade_system/auction_evidence.py": "def persist_auction_evidence_snapshot",
     }
     transactional_ok = True
@@ -228,13 +227,14 @@ def check_cleanup_boundaries() -> list[Check]:
         Check(
             "test_surface_inventory",
             bool(test_files) and test_functions > 0,
-            f"test files={len(test_files)}; test functions={test_functions}; inventory only, no tests deleted",
+            f"test files={len(test_files)}; test functions={test_functions}; inventory only, not coverage or equivalence proof",
             status="INFO",
         ),
         Check(
             "critical_persistence_transactions",
             transactional_ok,
-            "critical delete/replace writers have explicit BEGIN/ROLLBACK boundaries",
+            "static transaction markers only; behavior requires persistence and retirement tests",
+            status="INFO",
         ),
         Check(
             "lifecycle_registry_boundary",
@@ -265,6 +265,16 @@ def run_gate(run_tests: bool, test_timeout: int) -> tuple[list[Check], list[str]
         test_lines = combined.splitlines()[-12:]
         checks.append(Check("pytest", completed.returncode == 0, " ".join(test_lines[-2:])))
     else:
+        # Source markers do not prove retirement. Always exercise the stopped
+        # DB and manual-data counterexamples on temporary files.
+        completed = subprocess.run(
+            [sys.executable, '-m', 'pytest', '-o', 'addopts=', '-q',
+             'tests/test_retirement_remediation.py', 'tests/test_daily_operator_loop.py',
+             'tests/test_paper_execution.py'], cwd=ROOT, text=True,
+            capture_output=True, timeout=test_timeout, check=False)
+        test_lines = (completed.stdout+'\n'+completed.stderr).strip().splitlines()[-12:]
+        checks.append(Check('retirement_behavior', completed.returncode==0,
+                            'temporary DB counterexamples: '+' '.join(test_lines[-2:])))
         checks.append(Check(
             "pytest", True,
             "not run; use --pytest for full regression",

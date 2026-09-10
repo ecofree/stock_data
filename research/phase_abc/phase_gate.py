@@ -24,7 +24,8 @@ def main():
     gates.append({"gate": "G1数据与时点", "pass": bool(g1), "detail": f"handcheck={manifest.get('handcheck_ok')} label={manifest.get('label_mode')} adj缺失pending隔离"})
 
     # G2 覆盖：期望全集5547 vs 当日n/nu，>=99%才算全市场能力
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     cov = con.execute("SELECT trade_date, count(*) n, sum(CASE WHEN in_universe THEN 1 ELSE 0 END) nu FROM read_parquet(?) GROUP BY 1 ORDER BY 1 DESC LIMIT 30",
                       [(SNAP / "universe.parquet").as_posix()]).df()
     cov["coverage"] = cov.nu / cov.n
@@ -87,7 +88,8 @@ def main():
     (REPORTS / "gate.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 影子登记（新库可写）
-    ledw = duckdb.connect(str(LEDGER))
+    from trade_system.db_utils import legacy_connect
+    ledw = legacy_connect(str(LEDGER))
     ledw.execute("CREATE TABLE IF NOT EXISTS shadow_registry(model_id VARCHAR, start_date DATE, target_days INT, status VARCHAR)")
     if not ledw.execute("SELECT count(*) FROM shadow_registry WHERE model_id=?", [MODEL_ID]).fetchone()[0]:
         ledw.execute("INSERT INTO shadow_registry VALUES (?, '2026-09-06', 40, 'observing')", [MODEL_ID])

@@ -4,7 +4,6 @@ import argparse
 from pathlib import Path
 import sys
 
-import duckdb
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trade_system.quality import DEFAULT_DUPLICATE_KEYS, dedupe_table
@@ -27,7 +26,8 @@ def main() -> int:
             f"would_remove={result.get('would_remove_rows', 0)}"
         )
     if not args.dry_run:
-        con = duckdb.connect(args.db)
+        from trade_system.db_utils import legacy_connect
+        con = legacy_connect(args.db)
         try:
             for name in (
                 "uq_multi_source_stock_flow", "uq_multi_source_sector_flow",

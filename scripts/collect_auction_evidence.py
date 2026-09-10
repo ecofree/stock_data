@@ -225,7 +225,8 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
         return result
     now = datetime.now().time()
     in_window = time(8, 25) <= now <= time(9, 35)
-    con = duckdb.connect(db_path)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(db_path)
     try:
         _ensure_batch(con)
         if not in_window:
@@ -282,7 +283,8 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
             "tick_rows": tick_rows, "anomaly_rows": anomaly_rows,
             "quote_rows": quote_rows,
         })
-        con = duckdb.connect(db_path)
+        from trade_system.db_utils import legacy_connect
+        con = legacy_connect(db_path)
         try:
             _ensure_batch(con)
             con.execute(
@@ -304,7 +306,8 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
             con.close()
     except Exception as exc:
         result.update({"status": "error", "error": str(exc)})
-        con = duckdb.connect(db_path)
+        from trade_system.db_utils import legacy_connect
+        con = legacy_connect(db_path)
         try:
             _ensure_batch(con)
             con.execute(

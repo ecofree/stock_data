@@ -187,13 +187,5 @@ def latest_open_session(
     as_of: str | None = None,
 ) -> str | None:
     """Return the latest verified session on or before ``as_of``."""
-    upper = _calendar_date(as_of or date.today().isoformat())
-    try:
-        con = duckdb.connect(str(db_path), read_only=True)
-    except Exception:
-        return None
-    try:
-        dates = open_session_dates(con, "1900-01-01", upper)
-        return dates[-1] if dates else None
-    finally:
-        con.close()
+    from trade_system.db_utils import latest_open_session as lookup
+    return lookup(db_path,as_of)

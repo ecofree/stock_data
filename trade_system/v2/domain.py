@@ -54,3 +54,13 @@ def canonical(value):
 
 def identity(value):
     return hashlib.sha256(canonical(value).encode('utf-8')).hexdigest()
+
+
+def file_hash(path):
+    """Streaming file digest without importing the research stack."""
+    from pathlib import Path
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -17,9 +17,9 @@ import duckdb
 
 from trade_system.source_authority import provider_rank_sql
 
-STOCK_FEATURE_TABLE = "qlib_stock_flow_features"
-SECTOR_FEATURE_TABLE = "qlib_sector_flow_features"
-FEATURE_VERSION = "flow_features_v1"
+STOCK_FEATURE_TABLE = "qlib_stock_flow_features_v2"
+SECTOR_FEATURE_TABLE = "qlib_sector_flow_features_v2"
+FEATURE_VERSION = "flow_features_v2_equal_observation_windows"
 
 
 def _columns(con: duckdb.DuckDBPyConnection, relation: str) -> set[str]:
@@ -111,6 +111,10 @@ def _bounds(con: duckdb.DuckDBPyConnection, relation: str, column: str, end_date
 
 def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[str, list[Any]]:
     cols = _columns(con, "multi_source_stock_flow")
+    definition = "flow_definition" if "flow_definition" in cols else "CAST(NULL AS VARCHAR)"
+    ratio = "main_net / NULLIF(turnover,0)" if {'turnover_unit','flow_unit'}.issubset(cols) else "CAST(NULL AS DOUBLE)"
+    if ratio != "CAST(NULL AS DOUBLE)":
+        ratio = "CASE WHEN turnover_unit='CNY' AND flow_unit='CNY' THEN " + ratio + " END"
     net_total = "CAST(net_total AS DOUBLE)" if "net_total" in cols else "CAST(NULL AS DOUBLE)"
     source_end = "AND source_date <= CAST(? AS DATE)" if end_date else ""
     params: list[Any] = [end_date] if end_date else []
@@ -118,6 +122,7 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
     query = f"""
     WITH canonical AS (
         SELECT source_date AS trade_date, stock_code, provider, main_net,
+               {definition} AS flow_definition, {ratio} AS certified_ratio,
                {net_total} AS net_total, turnover, close, change_pct,
                row_number() OVER (
                    PARTITION BY source_date, stock_code
@@ -126,10 +131,16 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
                ) AS rn
         FROM multi_source_stock_flow
         WHERE main_net IS NOT NULL AND coalesce(is_stale,FALSE)=FALSE {source_end}
-    ), base AS (
+    ), chosen AS (
         SELECT * FROM canonical WHERE rn=1
+    ), boundaries AS (
+        SELECT *, CASE WHEN provider IS DISTINCT FROM lag(provider) OVER w
+            OR flow_definition IS DISTINCT FROM lag(flow_definition) OVER w THEN 1 ELSE 0 END AS boundary
+        FROM chosen WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
+    ), base AS (
+        SELECT *, sum(boundary) OVER (PARTITION BY stock_code ORDER BY trade_date) AS source_segment FROM boundaries
     ), features AS (
-        SELECT trade_date, stock_code, provider,
+        SELECT trade_date, stock_code, provider, flow_definition,
                main_net AS main_net_1d,
                SUM(main_net) OVER w3 AS main_net_3d,
                SUM(main_net) OVER w5 AS main_net_5d,
@@ -140,21 +151,24 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
                SUM(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) OVER w10 AS positive_days_10d,
                SUM(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) OVER w20 AS positive_days_20d,
                COUNT(*) OVER w20 AS observed_days_20d,
-               main_net - (SUM(main_net) OVER w10 - SUM(main_net) OVER w5) AS flow_acceleration_5d,
-               CASE WHEN turnover IS NOT NULL AND turnover <> 0 THEN main_net / turnover END AS main_net_ratio_1d,
+               CASE WHEN COUNT(*) OVER w10=10 THEN 2*SUM(main_net) OVER w5-SUM(main_net) OVER w10 END AS flow_acceleration_5d,
+               certified_ratio AS main_net_ratio_1d,
                net_total, close, change_pct
         FROM base
         WINDOW
-            w3 AS (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
-            w5 AS (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
-            w10 AS (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
-            w20 AS (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+            w3 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+            w5 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
+            w10 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
+            w20 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
     )
     SELECT trade_date, stock_code, provider, main_net_1d, main_net_3d, main_net_5d,
            main_net_10d, main_net_20d, positive_days_3d, positive_days_5d,
            positive_days_10d, positive_days_20d, observed_days_20d,
            flow_acceleration_5d, main_net_ratio_1d, net_total, close, change_pct,
-           'usable' AS quality_status, '{FEATURE_VERSION}' AS feature_version
+           CASE WHEN flow_definition IS NULL THEN 'source_definition_unverified'
+                WHEN observed_days_20d<20 THEN 'insufficient_history'
+                WHEN main_net_ratio_1d IS NULL THEN 'ratio_unit_or_denominator_unverified'
+                ELSE 'research_candidate_not_certified' END AS quality_status, '{FEATURE_VERSION}' AS feature_version
     FROM features
     """
     return query, params
@@ -162,6 +176,7 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
 
 def _sector_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[str, list[Any]]:
     cols = _columns(con, "multi_source_sector_flow")
+    definition = "flow_definition" if "flow_definition" in cols else "CAST(NULL AS VARCHAR)"
     sector_type = "coalesce(sector_type,'unknown')" if "sector_type" in cols else "'unknown'"
     source_end = "AND source_date <= CAST(? AS DATE)" if end_date else ""
     params: list[Any] = [end_date] if end_date else []
@@ -169,6 +184,7 @@ def _sector_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple
     WITH canonical AS (
         SELECT source_date AS trade_date, sector_code, sector_name,
                {sector_type} AS sector_type, provider, main_net, change_pct,
+               {definition} AS flow_definition,
                row_number() OVER (
                    PARTITION BY source_date, sector_code, {sector_type}
                    ORDER BY CASE
@@ -181,8 +197,14 @@ def _sector_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple
                ) AS rn
         FROM multi_source_sector_flow
         WHERE main_net IS NOT NULL AND coalesce(is_stale,FALSE)=FALSE {source_end}
-    ), base AS (
+    ), chosen AS (
         SELECT * FROM canonical WHERE rn=1
+    ), boundaries AS (
+        SELECT *, CASE WHEN provider IS DISTINCT FROM lag(provider) OVER w
+            OR flow_definition IS DISTINCT FROM lag(flow_definition) OVER w THEN 1 ELSE 0 END AS boundary
+        FROM chosen WINDOW w AS (PARTITION BY sector_code,sector_type ORDER BY trade_date)
+    ), base AS (
+        SELECT *, sum(boundary) OVER (PARTITION BY sector_code,sector_type ORDER BY trade_date) AS source_segment FROM boundaries
     ), features AS (
         SELECT trade_date, sector_code, sector_name, sector_type, provider,
                main_net AS main_net_1d,
@@ -195,20 +217,20 @@ def _sector_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple
                SUM(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) OVER w10 AS positive_days_10d,
                SUM(CASE WHEN main_net > 0 THEN 1 ELSE 0 END) OVER w20 AS positive_days_20d,
                COUNT(*) OVER w20 AS observed_days_20d,
-               main_net - (SUM(main_net) OVER w10 - SUM(main_net) OVER w5) AS flow_acceleration_5d,
+               CASE WHEN COUNT(*) OVER w10=10 THEN 2*SUM(main_net) OVER w5-SUM(main_net) OVER w10 END AS flow_acceleration_5d,
                change_pct
         FROM base
         WINDOW
-            w3 AS (PARTITION BY sector_code, sector_type ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
-            w5 AS (PARTITION BY sector_code, sector_type ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
-            w10 AS (PARTITION BY sector_code, sector_type ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
-            w20 AS (PARTITION BY sector_code, sector_type ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+            w3 AS (PARTITION BY sector_code, sector_type,source_segment ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+            w5 AS (PARTITION BY sector_code, sector_type,source_segment ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
+            w10 AS (PARTITION BY sector_code, sector_type,source_segment ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
+            w20 AS (PARTITION BY sector_code, sector_type,source_segment ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
     )
     SELECT trade_date, sector_code, sector_name, sector_type, provider,
            main_net_1d, main_net_3d, main_net_5d, main_net_10d, main_net_20d,
            positive_days_3d, positive_days_5d, positive_days_10d, positive_days_20d,
            observed_days_20d, flow_acceleration_5d, CAST(NULL AS DOUBLE) AS main_net_ratio_1d,
-           change_pct, 'usable' AS quality_status, '{FEATURE_VERSION}' AS feature_version
+           change_pct, 'sector_source_definition_unverified' AS quality_status, '{FEATURE_VERSION}' AS feature_version
     FROM features
     """
     return query, params
@@ -226,7 +248,8 @@ def build_flow_features(
     retains the preceding 20 trading observations needed for rolling windows.
     """
 
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         ensure_flow_feature_tables(con)
         stock_min, stock_max = _bounds(con, "multi_source_stock_flow", "source_date", end_date)

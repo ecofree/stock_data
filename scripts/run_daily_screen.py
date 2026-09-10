@@ -211,7 +211,8 @@ def main() -> int:
     args = parser.parse_args()
 
     configure()
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         rows, phase = gather(con, args.trade_date)
         if not rows:

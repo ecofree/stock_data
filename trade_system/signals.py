@@ -834,7 +834,8 @@ def _generate_signals_once(
     require_ready: bool,
     readiness_stage: str,
 ) -> dict:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     in_transaction = False
     indexes_dropped = False
     try:

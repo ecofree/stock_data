@@ -55,7 +55,8 @@ def _relation_count(con: duckdb.DuckDBPyConnection, relation: str, trade_date: s
 
 
 def ensure_auction_evidence_tables(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -321,7 +322,8 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
 
 def persist_auction_evidence_snapshot(db_path: str | Path, rows: list[dict[str, Any]]) -> int:
     ensure_auction_evidence_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute("BEGIN TRANSACTION")
         for row in rows:

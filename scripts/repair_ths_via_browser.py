@@ -206,7 +206,8 @@ def repair(db_path: str | Path, trade_date: str, target: str, codes: list[str],
            delay_ms: int = 120, allow_stale_cache: bool = False,
            blockrank_map: dict[str, str] | None = None) -> dict[str, object]:
     db_path = str(db_path)
-    con = duckdb.connect(db_path)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(db_path)
     try:
         init_schema(con)
         date_text = str(trade_date)[:10]

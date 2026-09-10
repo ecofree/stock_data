@@ -4,7 +4,6 @@ import argparse
 from pathlib import Path
 import sys
 
-import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -15,7 +14,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Create all schema.py tables in the DuckDB database.")
     parser.add_argument("--db", default="kpl_data.duckdb")
     args = parser.parse_args()
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         init_schema(con)
     finally:

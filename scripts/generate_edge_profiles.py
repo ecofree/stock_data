@@ -8,7 +8,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 from trade_system.edge_profiles import (  # noqa: E402
     build_auction_pattern_stats,
@@ -24,7 +23,8 @@ def main() -> int:
     args = parser.parse_args()
 
     configure()
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         hm = build_hot_money_profile(con, min_appearances=args.min_appearances)
         ap = build_auction_pattern_stats(con)

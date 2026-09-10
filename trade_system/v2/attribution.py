@@ -66,15 +66,26 @@ def project_attribution(store, account_id):
     confirmations, outcomes = [],[]
     for action_id,payload in store.con.execute('SELECT action_id,payload FROM operator_action WHERE account_id=? ORDER BY happened_at,action_id',[account_id]).fetchall():
         action = json.loads(payload)
+        if action['request'].get('operation') in ('close_unsent','reconcile_paper_unsent'):
+            result=action['result']
+            if result.get('account_id')!=account_id or identity({k:v for k,v in result.items() if k!='closure_id'})!=result.get('closure_id'):
+                raise ValueError('paper closure checksum/account mismatch')
+            continue
         certificate = {k:v for k,v in action['result'].items() if k!='decision_id'}
         if identity(certificate)!=action['result']['decision_id'] or certificate['account_id']!=account_id:
             raise ValueError('confirmation evidence checksum/account mismatch')
         confirmations.append({'action_id':action_id,**action})
         linked = [o for o in orders if o['decision_id']==action['result']['decision_id']]
+        table='exit_reservation' if certificate.get('side')=='sell' else 'reservation'
+        reservation=None
+        if certificate.get('reservation_id'):
+            reservation=store.con.execute(f'SELECT status FROM {table} WHERE reservation_id=?',
+                                          [certificate['reservation_id']]).fetchone()
+        closure=reservation[0] if reservation and reservation[0] in ('cancelled','expired_not_sent','reconciled_not_sent') else None
         outcomes.append({'action_id':action_id,'side':certificate.get('side','buy'),'instrument':certificate['instrument'],
             'hypothetical_ready':certificate['hypothetical_ready'],'blockers':certificate['blockers'],
             'order_ids':[o['order_id'] for o in linked],
-            'outcome':'paper_order_recorded' if linked else 'not_delivered_or_unknown' if certificate['hypothetical_ready'] else 'confirmation_blocked'})
+            'outcome':'paper_order_recorded' if linked else closure or ('not_delivered_or_unknown' if certificate['hypothetical_ready'] else 'confirmation_blocked')})
     result = {'schema_version':1,'account_id':account_id,'asof':book.state['last_at'],'generated_at':now.isoformat(),
         'scope':'paper_observed_capacity_proxy_not_actual_performance','execution_ready':False,
         'ledger_state_hash':identity(book.state),'ledger_config_hash':identity(book.config),

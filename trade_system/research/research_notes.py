@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-import duckdb
 
 from trade_system.research.schema import ensure_research_tables
 
@@ -27,7 +26,8 @@ def upsert_research_note(
 ) -> str:
     ensure_research_tables(db_path)
     note_id = _note_id(trade_date, symbol, sector, theme, note_type, content)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute("DELETE FROM research_note WHERE note_id = ?", [note_id])
         con.execute(

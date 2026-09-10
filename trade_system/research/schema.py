@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
 
 
 def ensure_research_tables(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """

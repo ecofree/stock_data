@@ -15,7 +15,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 from trade_system.hithink_client import HiThinkClient, HiThinkError  # noqa: E402
 from trade_system.logging_setup import configure, get_logger  # noqa: E402
@@ -88,7 +87,8 @@ def main() -> int:
 
     configure()
     client = HiThinkClient(min_interval=args.min_interval)
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         pending = _missing_days(con, args.start, args.end)
         todo = pending[: max(0, args.max_days)]

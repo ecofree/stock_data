@@ -6,7 +6,7 @@ r"""W1-H1：反转市分组验证。假设：20日动量在反转市（市场中
 from __future__ import annotations
 import json
 from pathlib import Path
-import duckdb, pandas as pd, numpy as np
+import pandas as pd, numpy as np
 
 ROOT = Path("D:/accio/stock_data")
 SNAP = ROOT / "research" / "phase_abc" / "snapshot"
@@ -49,7 +49,8 @@ def main():
     out["windows"]["FINAL_2026-06~08"] = w
 
     # S4复现（仅基线，快照重建，无模型训练）
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     s4 = con.execute("""
     SELECT l.signal_date::DATE AS signal_date, l.code, l.open_t1, l.close_t5, l.ref_close,
            l.label_fwd_ret, l.industry, u.in_universe

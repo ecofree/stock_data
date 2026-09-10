@@ -29,7 +29,17 @@ def main():
     confirm.add_argument('--operator',required=True);confirm.add_argument('--request-id',required=True)
     confirm.add_argument('--quote-manifest',required=True);confirm.add_argument('--acknowledge-paper',action='store_true',required=True)
     review=sub.add_parser('review');review.add_argument('--account-id',required=True);review.add_argument('--output',required=True)
+    review.add_argument('--publish-root');review.add_argument('--generation',type=int)
+    close=sub.add_parser('close-unsent',help='Cancel or expire a provably unsent paper confirmation')
+    close.add_argument('--confirmation-request-id',required=True)
+    close.add_argument('--operator',required=True);close.add_argument('--request-id',required=True)
+    close.add_argument('--reason',choices=['cancelled','expired_not_sent'],required=True)
+    reconcile=sub.add_parser('reconcile-paper-unsent',help='Full local paper-journal proof required; never real accounts')
+    reconcile.add_argument('--confirmation-request-id',required=True)
+    reconcile.add_argument('--operator',required=True);reconcile.add_argument('--request-id',required=True)
     args=parser.parse_args()
+    if args.command=='review' and bool(args.publish_root)!=(args.generation is not None):
+        parser.error('publish-root and generation are required together')
     if not Path(args.db).is_file():
         parser.error('existing V2 database required; no account is created by this command')
     # Fail before taking a writer handle if output cannot be a new artifact.
@@ -44,6 +54,12 @@ def main():
         elif args.command=='confirm':
             response=service.submit('paper_plan_confirm',packet=packet,quantity_requested=args.quantity,
                 operator=args.operator,request_id=args.request_id,quote_manifest=args.quote_manifest,acknowledgement=ACK).result(35)
+        elif args.command=='close-unsent':
+            response=service.submit('close_unsent',confirmation_request_id=args.confirmation_request_id,
+                                    operator=args.operator,request_id=args.request_id,reason=args.reason).result(35)
+        elif args.command=='reconcile-paper-unsent':
+            response=service.submit('reconcile_paper_unsent',confirmation_request_id=args.confirmation_request_id,
+                                    operator=args.operator,request_id=args.request_id).result(35)
         else:
             result=service.submit('paper_desk_review',account_id=args.account_id).result(35)
             folder=Path(args.output);folder.mkdir(parents=True,exist_ok=False)
@@ -51,7 +67,12 @@ def main():
             with (folder/'index.html').open('x',encoding='utf-8') as stream:
                 stream.write(render_desk(result))
             response={'report_id':result['report_id'],'output':str(folder),'execution_ready':False}
-    print(json.dumps(response,ensure_ascii=False))
+            if args.publish_root:
+                from .publisher import publish
+                response['publication']=publish(args.publish_root,result['report_id'],
+                    {'review.json':(folder/'review.json').read_bytes(),'index.html':(folder/'index.html').read_bytes()},
+                    generation=args.generation)
+    print(json.dumps(response,ensure_ascii=True))
     return 0
 
 

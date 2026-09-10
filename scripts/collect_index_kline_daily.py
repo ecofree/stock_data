@@ -6,7 +6,6 @@ import argparse
 from pathlib import Path
 import sys
 
-import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,7 +24,8 @@ DEFAULT_INDEX_CODES = ["SH000001", "SZ399001", "SZ399006", "SH000688"]
 def collect_index_kline_daily(db_path: str | Path, trade_date: str,
                               index_codes: list | None = None) -> dict:
     codes = index_codes or DEFAULT_INDEX_CODES
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         init_schema(con)
     finally:

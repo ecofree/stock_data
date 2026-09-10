@@ -1,5 +1,21 @@
 # scripts/ entry points
 
+## Retirement override · 2026-09-10
+
+This is a historical script catalog, not an approved V2 deployment list.
+Use `stock-data-v2`, `stock-data-daily`, and `stock-data-paper-desk` from the
+allowlisted core wheel. `paper_order.py` and the old automatic operator loop
+are reject-only; task registration and `run_integrated_daily.py --report-only`
+are disabled. Daily plans filter old signal generation and schema repair steps.
+Other retained collectors are migration adapters, with legacy connections that
+refuse V2/account database identity even when the V2 service is stopped.
+This does not sandbox arbitrary programs or grant source-table deletion.
+
+`archive_legacy_tables.py` defaults to read-only inventory. An explicit table
+list and a new output directory permit verified export only; `--execute` is
+rejected. Export success does not certify full-schema restore or source deletion.
+See [implementation and remaining acceptance](../docs/v2/RETIREMENT_REMEDIATION_20260910.md).
+
 ## CLI conventions
 
 - Database: `--db <path>` (default `kpl_data.duckdb` at project root).
@@ -7,8 +23,8 @@
   accepted; inside the script the value is always `args.trade_date`.
   New scripts should use `trade_system.cli.add_trade_date_argument` /
   `add_db_argument` instead of hand-rolling flags.
-- Every script is runnable standalone and exits nonzero when the requested
-  stage is not actionable (fail-closed).
+- Retained scripts have different lifecycle states; presence in this catalog
+  does not imply authority to run. Retired entry points intentionally reject.
 
 ## Daily operation
 

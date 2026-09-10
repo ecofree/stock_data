@@ -8,7 +8,6 @@ r"""PhaseB 公平赛：同快照同池同账本。
 from __future__ import annotations
 import json, logging
 from pathlib import Path
-import duckdb
 import pandas as pd
 import numpy as np
 
@@ -81,7 +80,8 @@ def simulate(df, score_col, tag, initial=1_000_000.0, cost_bps=COST_BPS):
 
 def main(cost_bps: float = COST_BPS, suffix: str = "") -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     df = con.execute("""
     SELECT l.signal_date::DATE AS signal_date, l.code, l.ref_close, l.open_t1, l.close_t5,
            l.date_t1, l.date_t5, l.label_fwd_ret, l.amount_yuan, l.avg_amt_20d, l.industry,
@@ -138,7 +138,8 @@ def main(cost_bps: float = COST_BPS, suffix: str = "") -> int:
         log.info("%s total=%.4f dd=%.4f trades=%d", name, tot if tot else 0, dd if dd else 0, len(fills))
 
     # 写ledger.duckdb（新库；非默认成本用独立表名，不覆盖主账本）
-    led = duckdb.connect(str(LEDGER))
+    from trade_system.db_utils import legacy_connect
+    led = legacy_connect(str(LEDGER))
     rdf = pd.DataFrame(rows)
     rdf["cost_bps"] = cost_bps
     led.execute(f"CREATE OR REPLACE TABLE strategy_test{suffix} AS SELECT * FROM rdf")

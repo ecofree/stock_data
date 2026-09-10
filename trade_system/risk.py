@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
 
 # Canonical definition shared with trade_system.operator_outcomes (which
 # already imports this module).  Both ensure-paths execute the same
@@ -34,7 +33,8 @@ FULL OUTER JOIN operator_trade_outcome o
 
 
 def init_trading_tables(db_path: str | Path) -> list[str]:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """

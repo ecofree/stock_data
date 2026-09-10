@@ -316,7 +316,8 @@ def build_operator_report_snapshot(db_path: str | Path, trade_date: str) -> dict
 
 
 def persist_operator_report_snapshot(db_path: str | Path, report_type: str, snapshot: dict[str, Any]) -> int:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """

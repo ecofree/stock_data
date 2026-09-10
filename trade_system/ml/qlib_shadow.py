@@ -34,7 +34,8 @@ def _relation_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
 
 
 def ensure_qlib_shadow_tables(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -163,7 +164,8 @@ def import_qlib_predictions(
     notes: str = "",
 ) -> dict[str, int]:
     ensure_qlib_shadow_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute("BEGIN TRANSACTION")
         con.execute("DELETE FROM qlib_model_registry WHERE model_id = ?", [model_id])
@@ -253,7 +255,8 @@ def import_qlib_predictions_for_date(
     champion's registry status.  This helper is intentionally date-scoped.
     """
     ensure_qlib_shadow_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute("BEGIN TRANSACTION")
         con.execute(

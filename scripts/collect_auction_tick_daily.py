@@ -49,7 +49,8 @@ def collect_auction_tick_daily(db_path: str | Path, trade_date: str) -> dict:
     if not codes:
         return {"trade_date": trade_date, "codes": 0, "tick_rows": 0,
                 "status": "no_candidates"}
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         init_schema(con)
     finally:

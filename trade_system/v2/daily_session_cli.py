@@ -13,15 +13,34 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='command',required=True)
     c = sub.add_parser('capture'); c.add_argument('--date',required=True); c.add_argument('--output',required=True)
+    run=sub.add_parser('run',help='Bounded current post-close workflow; before close records pending without network')
+    run.add_argument('--output',required=True);run.add_argument('--parent');run.add_argument('--archive')
+    run.add_argument('--publish-root');run.add_argument('--generation',type=int)
     v = sub.add_parser('view'); v.add_argument('--report',required=True); v.add_argument('--output',required=True)
+    pub=sub.add_parser('publish',help='Verify and publish a sealed observation into a separate V2 namespace')
+    pub.add_argument('--report',required=True);pub.add_argument('--root',required=True)
+    pub.add_argument('--run-id',required=True);pub.add_argument('--generation',required=True,type=int)
     n = sub.add_parser('judge'); n.add_argument('--report',required=True); n.add_argument('--note',required=True); n.add_argument('--archive',required=True)
+    case = sub.add_parser('case',help='Link a native cohort to the existing V2 paper authority; never submit an order')
+    case.add_argument('--db',required=True);case.add_argument('--request',required=True);case.add_argument('--output',required=True)
     r = sub.add_parser('review'); r.add_argument('--parent',required=True); r.add_argument('--following'); r.add_argument('--archive'); r.add_argument('--legacy-db'); r.add_argument('--output',required=True)
     a = p.parse_args()
     try:
-        if a.command == 'capture':
+        if a.command=='run':
+            from .daily_workflow import run
+            result=run(a.output,parent=a.parent,archive=a.archive,publish_root=a.publish_root,generation=a.generation)
+        elif a.command == 'capture':
             r = capture(a.date,a.output)
             result = {k:r[k] for k in ('report_id','status','trade_date','pool_total','gaps')}
             result['candidates'] = len(r['candidates'])
+        elif a.command == 'publish':
+            from .publisher import publish
+            from .domain import canonical
+            report=verify(a.report)
+            pointer=publish(a.root,a.run_id,{'index.html':render(report).encode('utf-8'),
+                'observation.json':canonical(report).encode('utf-8')},generation=a.generation)
+            result={'pointer':pointer,'report_id':report['report_id'],
+                    'scope':'sealed_observation_publication_not_current_quote_or_decision'}
         elif a.command == 'view':
             report = verify(a.report)
             output = Path(a.output).resolve()
@@ -37,6 +56,22 @@ def main():
             if path.stat().st_size > 32000:
                 raise ValueError('judgement byte budget exceeded')
             result = import_judgement(path.read_bytes(),a.report,a.archive)
+        elif a.command == 'case':
+            from .gap_evidence import read_json
+            from .service import Service
+            target=Path(a.output)
+            if target.exists() or not Path(a.db).is_file():
+                raise ValueError('new output and an existing isolated V2 database required')
+            if Path(a.request).stat().st_size>64000:
+                raise ValueError('case request exceeds 64 KB')
+            request=read_json(a.request)[0]
+            with Service(a.db) as service:
+                result=service.submit('daily_case',**request).result(35)
+            # A retry reuses observation facts, but can create a newer proposal.
+            # This entry point never confirms, reserves or sends an order.
+            with target.open('x',encoding='utf-8') as stream:
+                from .domain import canonical
+                stream.write(canonical(result))
         else:
             parent = verify(a.parent)
             output = Path(a.output)

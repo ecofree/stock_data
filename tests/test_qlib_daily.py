@@ -12,7 +12,7 @@ def test_qlib_daily_is_fail_closed_without_champion(tmp_path):
     con = duckdb.connect(str(db), read_only=True)
     try:
         names = {row[0] for row in con.execute("select table_name from information_schema.tables").fetchall()}
-        assert {"paper_order", "paper_position"}.issubset(names)
+        assert not {"paper_order", "paper_position"} & names
     finally:
         con.close()
 

@@ -162,7 +162,8 @@ def import_professional_csvs(db_path: str | Path, table_to_csv: dict[str, str | 
     The importer uses delete+insert keys per table, so repeated imports of the same
     file refresh rows without duplicating them.
     """
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         result = {}
         for table_name, csv_path in table_to_csv.items():

@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 from trade_system.research.schema import ensure_research_tables
 
@@ -79,7 +78,8 @@ def upsert_news_items(db_path: str | Path, rows: list[dict[str, Any]]) -> int:
     ensure_research_tables(db_path)
     if not rows:
         return 0
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         for row in rows:
             con.execute("DELETE FROM news_radar_item WHERE news_id = ?", [row["news_id"]])

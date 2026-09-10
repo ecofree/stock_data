@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'native_process.ps1')
 $Python = "D:\anaconda\python.exe"
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
@@ -32,9 +33,9 @@ if ($TradeDate) { $args += @("--trade-date", $TradeDate) }
 
 Push-Location $Root
 try {
-    $output = & $Python @args 2>&1
-    $output | Tee-Object -FilePath $Log -Append
-    $code = $LASTEXITCODE
+    $result = Invoke-StockDataProcess -Executable $Python -Arguments $args -WorkingDirectory $Root
+    $code = $result.ExitCode
+    ($result.Stdout + $result.Stderr) | Tee-Object -FilePath $Log -Append
 } finally {
     Pop-Location
 }

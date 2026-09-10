@@ -424,5 +424,5 @@ def test_intraday_plan_includes_l2_focus_and_boosted_quotes():
     by_name = {n: cmd for n, cmd, _ in steps}
     assert "--auto-boost-if-kpl-stale" in by_name["collect_l2_focus"]
     assert "--auto-boost-if-kpl-stale" in by_name["collect_executable_quotes"]
-    # L2 focus happens during collection, before signal generation.
-    assert names.index("collect_l2_focus") < names.index("generate_intraday_stage_signals")
+    # Collection remains available during migration; old decisions are retired.
+    assert "generate_intraday_stage_signals" not in names

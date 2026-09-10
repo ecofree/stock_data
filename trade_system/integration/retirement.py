@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 
 RETIREMENT_COLUMNS = [
@@ -70,7 +69,8 @@ def build_retirement_checklist(
 
 
 def persist_retirement_checklist(db_path: str | Path, rows: list[dict[str, Any]]) -> int:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """

@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sys
 
-import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -22,7 +21,8 @@ from trade_system.stock_data_sources import _from_em_zt_pool
 
 
 def collect_realtime_limit_pool(db_path: str | Path, trade_date: str) -> dict:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     init_schema(con)
     con.close()
     source = "l2_realtime_all_boards"
@@ -51,7 +51,8 @@ def collect_realtime_limit_pool(db_path: str | Path, trade_date: str) -> dict:
         try:
             rows = _from_em_zt_pool("".join(ch for ch in trade_date if ch.isdigit())) or []
             if rows:
-                con = duckdb.connect(str(db_path))
+                from trade_system.db_utils import legacy_connect
+                con = legacy_connect(str(db_path))
                 try:
                     con.execute("BEGIN TRANSACTION")
                     try:
@@ -82,7 +83,8 @@ def collect_realtime_limit_pool(db_path: str | Path, trade_date: str) -> dict:
             errors.append(f"Eastmoney push2ex: {str(exc)[:400]}")
 
     build_normalized_views(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         row_count, stock_count = con.execute(
             "SELECT count(*), count(DISTINCT stock_code) FROM v_limit_pool WHERE trade_date=?",

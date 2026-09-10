@@ -23,7 +23,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 # Candidates are append-only history families that dominate size but are
 # rarely needed for intraday decisions.  Extend deliberately.
@@ -70,7 +69,8 @@ def main() -> int:
         print(f"refusing to run while pipeline lock exists: {lock}")
         return 1
 
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     failed = False
     try:
         cold_lit = args.cold_db.replace("'", "''")

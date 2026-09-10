@@ -110,7 +110,7 @@ def _is_degradable_failure(selected_phase: str, name: str) -> bool:
     )
 
 
-def command_plan(
+def _unfiltered_legacy_plan(
     db_path: str,
     trade_date: str | None = None,
     *,
@@ -621,6 +621,19 @@ def command_plan(
     return steps
 
 
+RETIRED_DAILY_TASKS = frozenset({
+    'run_daily_operator_loop', 'generate_signals', 'generate_stage_signals',
+    'generate_auction_stage_signals','generate_intraday_stage_signals','generate_close_stage_signals',
+    'repair_critical_integrity', 'repair_critical_integrity_pre_sector',
+})
+
+
+def command_plan(*args, **kwargs):
+    """Migration-only producer graph; revoked decision/repair tasks cannot run."""
+    return [step for step in _unfiltered_legacy_plan(*args, **kwargs)
+            if step[0] not in RETIRED_DAILY_TASKS]
+
+
 def _script_exists(cmd: list[str]) -> bool:
     if len(cmd) < 2 or not cmd[1].startswith("scripts/"):
         return True
@@ -774,6 +787,7 @@ def main() -> int:
     )
     parser.add_argument("--as-of", default="", help="ISO timestamp used by the close-stage cutoff gate.")
     parser.add_argument("--reports-dir", default="reports")
+    parser.add_argument('--migration-root',help='Verified disposable backup directory; required for any legacy execution')
     parser.add_argument(
         "--collection-profile",
         choices=("priority",),
@@ -792,6 +806,14 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    if args.report_only:
+        parser.error('legacy report recovery is retired; use stock-data-daily view on a sealed observation package')
+    if not args.dry_run:
+        if not args.migration_root:
+            parser.error('legacy execution retired outside a verified disposable copy; use the V2 core entry points')
+        from trade_system.migration_boundary import require_copy
+        require_copy(args.migration_root,args.db,args.reports_dir)
 
     selected_phase = resolve_phase(args.phase)
     skip_collection = bool(args.skip_collect or args.report_only or args.render_only)
@@ -872,10 +894,10 @@ def main() -> int:
             # Schema bootstrap/migrations are part of the lock owner's work;
             # children receive KPL_RUNTIME_SCHEMA_READY and therefore never
             # race DDL against the writer.
-            import duckdb
             from trade_system.schema import init_schema
 
-            schema_con = duckdb.connect(str(args.db))
+            from trade_system.db_utils import legacy_connect
+            schema_con = legacy_connect(str(args.db))
             try:
                 init_schema(schema_con)
             finally:

@@ -29,16 +29,12 @@ def test_intraday_plan_excludes_after_close_fanout():
         "collect_realtime_limit_pool",
         "collect_intraday_stock_flow_market",
         "collect_l2_focus",
-        "repair_critical_integrity_pre_sector",
         "collect_intraday_sector_flow_full",
         "derive_market_context",
         "build_normalized_views",
         "collect_executable_quotes",
         "audit_multisource_readiness",
         "check_capital_flow_health",
-        "generate_signals",
-        "generate_intraday_stage_signals",
-        "run_daily_operator_loop",
         "check_data_readiness",
         "audit_p3_candidates",
         "generate_web_dashboard",
@@ -47,14 +43,12 @@ def test_intraday_plan_excludes_after_close_fanout():
     assert "collect_finance_gapfill" not in names
     assert "evaluate_qlib_shadow" not in names
     assert "run_news_radar" not in names
-    generate = next(command for name, command, _ in steps if name == "generate_signals")
-    assert generate[generate.index("--readiness-stage") + 1] == "intraday"
+    assert not {'generate_signals','generate_intraday_stage_signals','run_daily_operator_loop'} & set(names)
 
 
-def test_auction_generate_signals_uses_auction_readiness_stage():
+def test_auction_migration_plan_has_no_old_decision_authority():
     steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase="auction")
-    generate = next(command for name, command, _ in steps if name == "generate_signals")
-    assert generate[generate.index("--readiness-stage") + 1] == "auction"
+    assert not {'generate_signals','generate_auction_stage_signals','run_daily_operator_loop'} & {s[0] for s in steps}
 
 
 def test_profile_declares_full_market_flow_sources():

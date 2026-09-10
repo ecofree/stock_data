@@ -33,7 +33,8 @@ def main() -> int:
     else:
         run_id = f"repair_ths_checkpoint_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         with PipelineLock(db_path, run_id):
-            con = duckdb.connect(str(db_path))
+            from trade_system.db_utils import legacy_connect
+            con = legacy_connect(str(db_path))
             try:
                 result = repair_ths_checkpoint_storage(con)
             finally:

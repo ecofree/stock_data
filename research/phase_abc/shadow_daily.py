@@ -5,14 +5,14 @@ r"""影子每日链路：20:30跑，不阻塞收盘主链，只读生产库，�
 from __future__ import annotations
 from pathlib import Path
 from datetime import date
-import duckdb
 
 ROOT = Path("D:/accio/stock_data")
 SNAP = ROOT / "research" / "phase_abc" / "snapshot"
 LEDGER = ROOT / "research" / "phase_abc" / "ledger" / "ledger.duckdb"
 
 def main():
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     df = con.execute("""
     SELECT signal_date::DATE d, count(*) n, sum(CASE WHEN label_status='mature' THEN 1 ELSE 0 END) m
     FROM read_parquet(?) GROUP BY 1 ORDER BY 1 DESC LIMIT 10
@@ -24,7 +24,8 @@ def main():
     WHERE label_status!='mature' GROUP BY 1 ORDER BY 1 DESC LIMIT 5
     """, [(SNAP / "labels.parquet").as_posix()]).df()
     print("PENDING(前向观察对象):"); print(pend.to_string())
-    led = duckdb.connect(str(LEDGER))
+    from trade_system.db_utils import legacy_connect
+    led = legacy_connect(str(LEDGER))
     led.execute("""CREATE TABLE IF NOT EXISTS shadow_pred(
       signal_date DATE, code VARCHAR, model_id VARCHAR, score DOUBLE, created_at TIMESTAMP DEFAULT now())""")
     led.execute("""CREATE TABLE IF NOT EXISTS shadow_runs(run_date DATE PRIMARY KEY, n_pending INT, note VARCHAR)""")

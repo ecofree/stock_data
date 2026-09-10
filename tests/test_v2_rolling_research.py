@@ -81,11 +81,12 @@ def test_training_only_medians_and_test_labels_hidden(inputs):
     frames,_ = fold_frames(frame,fold,days[-1]+'T18:00:00+08:00',days[40])
     frames['train']['g']=np.nan
     frames['test']['f']=10**9
-    ds = FoldDataset(frames,['f','g'])
-    assert ds.medians['f']==frames['train'].f.median() and ds.medians['g']==0
-    assert ds.all_missing_features==['g']
+    with pytest.raises(ValueError,match='all_missing'):
+        FoldDataset(frames,['f','g'])
+    ds = FoldDataset(frames,['f'])
+    assert ds.medians['f']==frames['train'].f.median()
     with pytest.raises(ValueError,match='unavailable'): ds.prepare('test')
-    predict = FoldDataset(frames,['f','g'],fitting=False)
+    predict = FoldDataset(frames,['f'],fitting=False)
     with pytest.raises(ValueError,match='labels unavailable'): predict.prepare('test',col_set='label')
 
 

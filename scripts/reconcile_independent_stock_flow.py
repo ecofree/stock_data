@@ -71,7 +71,8 @@ def reconcile(
     primary_provider: str = "eastmoney_intraday_clist_delay",
     reference_provider: str = "tushare",
 ) -> dict:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         _ensure_table(con)
         primary = _rows(con, trade_date, primary_provider)

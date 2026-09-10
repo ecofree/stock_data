@@ -6,16 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "stock-data-trading-assistant"
 version = "0.1.0"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "duckdb==1.5.4",
   "requests>=2.34.2,<3",
-  "pandas>=2.2,<3",
-  "akshare>=1.18.64",
-  "baostock==0.9.3",
+  "tzdata==2026.3",
 ]
-
 [project.optional-dependencies]
+research = ["pandas>=2.2,<3", "numpy>=1.26", "pyqlib==0.9.7", "lightgbm==4.6.0"]
+legacy_collectors = ["pandas>=2.2,<3", "akshare>=1.18.64", "baostock==0.9.3"]
 dev = [
   "pytest==9.1.1",
   "ruff>=0.6",
@@ -23,9 +22,9 @@ dev = [
 
 [project.scripts]
 stock-data-v2 = "trade_system.v2.__main__:main"
-stock-data-research = "trade_system.v2.research_workbench_cli:main"
 stock-data-paper-desk = "trade_system.v2.operator_workflow_cli:main"
 stock-data-daily = "trade_system.v2.daily_session_cli:main"
+stock-data-recovery = "trade_system.v2.recovery:main"
 
 [tool.ruff]
 line-length = 110
@@ -66,7 +65,20 @@ module = [
 disallow_untyped_defs = true
 
 [tool.setuptools.packages.find]
-include = ["trade_system*", "collectors*"]
+include = ["trade_system", "trade_system.v2"]
 
-[tool.setuptools.data-files]
-"share/stock_data/migrations" = ["migrations/*.sql"]
+[tool.stock_data.release]
+scope = "operational_core_only_research_from_isolated_source"
+modules = [
+  "trade_system.__init__", "trade_system.config", "trade_system.db_utils",
+  "trade_system.file_lock", "trade_system.hithink_client", "trade_system.http_transport",
+  "trade_system.logging_setup", "trade_system.v2.__init__", "trade_system.v2.__main__",
+  "trade_system.v2.accounts", "trade_system.v2.attribution", "trade_system.v2.context_storage",
+  "trade_system.v2.daily_session", "trade_system.v2.daily_session_cli", "trade_system.v2.daily_session_view",
+  "trade_system.v2.decisions", "trade_system.v2.domain", "trade_system.v2.event_bridge",
+  "trade_system.v2.exit_policy", "trade_system.v2.gap_evidence", "trade_system.v2.market_context",
+  "trade_system.v2.operator_workflow", "trade_system.v2.operator_workflow_cli",
+  "trade_system.v2.paper_ledger", "trade_system.v2.paper_storage", "trade_system.v2.reporting",
+  "trade_system.v2.publisher", "trade_system.v2.recovery", "trade_system.v2.daily_workflow",
+  "trade_system.v2.service", "trade_system.v2.storage", "trade_system.v2.strategies"
+]

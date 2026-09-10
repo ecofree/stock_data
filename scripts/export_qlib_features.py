@@ -69,8 +69,9 @@ def _query(
         sf.flow_acceleration_5d AS flow_acceleration_5d,
         sf.main_net_ratio_1d AS flow_main_net_ratio_1d"""
         flow_join = """
-    LEFT JOIN qlib_stock_flow_features sf
+    LEFT JOIN qlib_stock_flow_features_v2 sf
       ON sf.trade_date = d.datetime AND sf.stock_code = d.instrument
+      AND sf.quality_status='research_candidate_not_certified'
     """
 
     if label_mode == "t1_exec":
@@ -351,7 +352,7 @@ def export_features(
         start = _date_literal(start_date, str(min_date)[:10])
         end = _date_literal(end_date, str(max_date)[:10])
         flow_features_available = con.execute(
-            "SELECT count(*) FROM information_schema.tables WHERE table_schema='main' AND table_name='qlib_stock_flow_features'"
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='main' AND table_name='qlib_stock_flow_features_v2'"
         ).fetchone()[0] > 0
         adjustment_available = con.execute(
             "SELECT count(*) FROM information_schema.tables "
@@ -412,7 +413,7 @@ def export_features(
             "source_tables": [
             "tushare_daily", "tushare_daily_basic", "tushare_moneyflow",
                 *( ("tushare_adj_factor",) if adjustment_available else () ),
-                *( ("qlib_stock_flow_features",) if flow_features_available else () ),
+                *( ("qlib_stock_flow_features_v2",) if flow_features_available else () ),
             ],
             "flow_features_available": flow_features_available,
             "adjustment_available": adjustment_available,

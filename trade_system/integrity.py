@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
 
 from trade_system.quality import dedupe_table, table_columns, table_exists
 
@@ -83,7 +82,8 @@ REBUILDABLE_INDEX_SPECS = (
 
 
 def normalize_kline_periods(db_path: str | Path) -> dict[str, int]:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     changed: dict[str, int] = {}
     try:
         for table in KTYPE_TABLES:
@@ -117,7 +117,8 @@ def normalize_ths_member_codes(
     transaction before the surviving codes are updated.  Current collectors
     already write bare codes, so subsequent close runs are a cheap no-op.
     """
-    con = duckdb.connect(str(db_path), read_only=dry_run)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path), read_only=dry_run)
     try:
         if not table_exists(con, "ths_concept_stock_history"):
             return {
@@ -237,7 +238,8 @@ def normalize_ths_member_codes(
 
 
 def ensure_unique_indexes(db_path: str | Path) -> list[str]:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     created: list[str] = []
     try:
         for index_name, table, columns in UNIQUE_INDEX_SPECS:
@@ -264,7 +266,8 @@ def ensure_unique_indexes(db_path: str | Path) -> list[str]:
 
 def rebuild_operational_indexes(db_path: str | Path) -> list[str]:
     """Rebuild non-unique indexes whose writers replace same-day snapshots."""
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     rebuilt: list[str] = []
     try:
         for index_name, table, columns in REBUILDABLE_INDEX_SPECS:
@@ -300,7 +303,8 @@ def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dic
     if not dry_run:
         from trade_system.stage_signals import ensure_stage_signal_schema
 
-        con = duckdb.connect(str(db_path))
+        from trade_system.db_utils import legacy_connect
+        con = legacy_connect(str(db_path))
         try:
             ensure_stage_signal_schema(con)
             if table_exists(con, "trade_plan"):

@@ -59,7 +59,8 @@ def main() -> int:
     configure()
     snap = (args.snapshot_date or datetime.now().strftime("%Y-%m-%d"))
     client = HiThinkClient(min_interval=0.35)
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         # Keep standalone repair/backfill runs safe on an older database.  The
         # integrated close runner already applies schema under PipelineLock;

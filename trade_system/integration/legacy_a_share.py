@@ -110,7 +110,8 @@ def import_legacy_tables(
     if not legacy_db.exists():
         raise FileNotFoundError(str(legacy_db))
 
-    con = duckdb.connect(str(stock_db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(stock_db_path))
     attached = False
     copied: dict[str, int] = {}
     try:

@@ -65,18 +65,18 @@ def test_export_qlib_features_includes_canonical_flow_windows_when_available(tmp
         "buy_elg_amount DOUBLE, sell_elg_amount DOUBLE, net_mf_amount DOUBLE)"
     )
     con.execute(
-        "CREATE TABLE qlib_stock_flow_features (trade_date DATE, stock_code VARCHAR, main_net_1d DOUBLE, "
+        "CREATE TABLE qlib_stock_flow_features_v2 (trade_date DATE, stock_code VARCHAR, main_net_1d DOUBLE, "
         "main_net_3d DOUBLE, main_net_5d DOUBLE, main_net_10d DOUBLE, main_net_20d DOUBLE, "
         "positive_days_3d INTEGER, positive_days_5d INTEGER, positive_days_10d INTEGER, "
         "positive_days_20d INTEGER, observed_days_20d INTEGER, flow_acceleration_5d DOUBLE, "
-        "main_net_ratio_1d DOUBLE)"
+        "main_net_ratio_1d DOUBLE, quality_status VARCHAR)"
     )
     for day, close in [("2026-01-02", 10), ("2026-01-05", 11), ("2026-01-06", 10.5)]:
         con.execute("INSERT INTO tushare_daily VALUES (?, '000001', 10, 11, 9, ?, 100, 1000, 1)", [day, close])
         con.execute("INSERT INTO tushare_daily_basic VALUES (?, '000001', 1, 1, 10, 1, 100, 80)", [day])
         con.execute("INSERT INTO tushare_moneyflow VALUES (?, '000001', 10, 5, 20, 10, 15)", [day])
         con.execute(
-            "INSERT INTO qlib_stock_flow_features VALUES (?, '000001', 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 0.5, 0.001)",
+            "INSERT INTO qlib_stock_flow_features_v2 VALUES (?, '000001', 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 0.5, 0.001, 'research_candidate_not_certified')",
             [day],
         )
     con.close()

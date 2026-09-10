@@ -10,7 +10,10 @@ def test_close_to_next_close_demo_preserves_separate_ledgers(tmp_path):
     assert result['signal_events'] == 6
     _, artifacts = read_current(output/'reports')
     data = json.loads(artifacts['evidence.json'])
-    assert {s['state'] for s in data['signals']} == {'expired','invalidated','armed'}
+    # Previous-session observation is retained separately, not overwritten by
+    # today's terminal state for the same algorithm/instrument.
+    assert {s['state'] for s in data['signals'] if s['session_id']=='2026-09-10'} == {'expired','invalidated','armed'}
+    assert {s['state'] for s in data['signals'] if s['session_id']=='2026-09-09'} == {'watch'}
     assert data['account']['positions'][0]['quantity'] == 600
     assert data['reserved_fen'] == 100000
     assert data['execution_ready'] is False and data['fixture_only'] is True

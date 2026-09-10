@@ -121,8 +121,10 @@ def empty_table_collection_plan(
 
 def script_lifecycle(name: str, *, mentioned_by_runner: bool = False) -> str:
     lower = name.lower()
+    if lower in {"paper_order.py", "run_daily_operator_loop.py"}:
+        return "retired_reject_only"
     if lower == "run_integrated_daily.py":
-        return "canonical_production"
+        return "migration_only"
     if lower.startswith("audit_") or lower.startswith("check_"):
         return "audit_or_gate"
     if lower.startswith("backfill_") or "repair" in lower or lower.startswith("sync_"):

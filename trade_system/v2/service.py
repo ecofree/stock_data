@@ -18,15 +18,23 @@ class ServiceBusy(RuntimeError):
 
 
 class Service:
-    def __init__(self, path, *, capacity=64, clock=now_utc):
+    def __init__(self, path, *, capacity=64, critical_reserve=8, clock=now_utc):
         if type(capacity) is not int or capacity <= 0:
             raise ValueError('positive queue capacity required')
+        if type(critical_reserve) is not int or critical_reserve < 1:
+            raise ValueError('positive critical command reserve required')
         self.path, self.clock = path, clock
-        self.queue = PriorityQueue(capacity)
+        self.capacity, self.critical_reserve = capacity, critical_reserve
+        # One additional slot is exclusively for orderly stop/drain.
+        self.queue = PriorityQueue(capacity + critical_reserve + 1)
         self.sequence = itertools.count()
         self.ready = Future()
         self.closed = False
+        self.close_future = None
         self.submit_lock = threading.Lock()
+        self.runtime_lock = threading.Lock()
+        self.active_runtime = None
+        self.last_runtime = None
         self.thread = threading.Thread(target=self._run, name='stock-data-v2-writer', daemon=True)
         self.thread.start()
         self.ready.result(timeout=30)
@@ -48,9 +56,19 @@ class Service:
                         future.set_exception(TimeoutError('command expired before execution; not applied'))
                         continue
                     try:
+                        started=time.monotonic()
+                        with self.runtime_lock:
+                            self.active_runtime={'command':command,'started':started,'deadline':deadline}
+                        store.command_deadline=deadline
                         future.set_result(self._dispatch(store, command, payload))
                     except Exception as exc:
                         future.set_exception(exc)
+                    finally:
+                        store.command_deadline=None
+                        with self.runtime_lock:
+                            self.last_runtime={'command':command,'elapsed_seconds':time.monotonic()-started,
+                                               'budget_exceeded':time.monotonic()>=deadline}
+                            self.active_runtime=None
         except BaseException as exc:
             # Exclude submit while closing and draining. Otherwise a producer
             # can enqueue after the drain, leaving its Future unresolved.
@@ -69,6 +87,7 @@ class Service:
 
     @staticmethod
     def _dispatch(store, command, data):
+        store.check_owner()
         if command == 'product':
             return store.register_product(**data)
         if command == 'ingest':
@@ -94,6 +113,9 @@ class Service:
         if command == 'event_signal':
             from .event_bridge import event_signal
             return event_signal(store, **data)
+        if command == 'daily_case':
+            from .daily_session import link_case
+            return link_case(store, **data)
         if command == 'paper_open':
             from .paper_storage import open_paper
             return open_paper(store, **data)
@@ -112,9 +134,22 @@ class Service:
         if command == 'paper_status':
             from .paper_storage import load_paper
             return load_paper(store, **data).summary()
+        if command == 'paper_verify':
+            from .paper_storage import load_paper
+            return load_paper(store, data['account_id'], full_replay=True).summary()
         if command == 'context':
             from .context_storage import get_context
             return get_context(store, **data)
+        if command in ('close_unsent','reconcile_paper_unsent'):
+            import json
+            row = store.con.execute('SELECT payload FROM operator_action WHERE action_id=?',
+                                    [data['confirmation_request_id']]).fetchone()
+            if not row:
+                raise ValueError('unknown confirmation')
+            policy = json.loads(row[0]).get('result',{}).get('policy')
+            if not policy:
+                raise ValueError('original paper confirmation policy required')
+            return getattr(DecisionService(store,RiskPolicy(**policy)),command)(**data)
         if command in ('propose', 'confirm', 'propose_exit', 'mark_exit_unknown'):
             args = dict(data)
             decisions = DecisionService(store, RiskPolicy(**args.pop('risk_policy')))
@@ -135,17 +170,37 @@ class Service:
                     'paper_desk_review':review_desk}[command](store,**data)
         raise ValueError('unsupported service command')
 
+    def health(self):
+        """Non-queued telemetry remains available during a slow owning command.
+
+        Deadlines are cooperative safe-boundary checks, not hard realtime.
+        A slow native call is never killed or treated as not applied.
+        """
+        with self.runtime_lock:
+            active=dict(self.active_runtime) if self.active_runtime else None
+            last=dict(self.last_runtime) if self.last_runtime else None
+        now=time.monotonic()
+        if active:
+            active={'command':active['command'],'elapsed_seconds':now-active['started'],
+                    'deadline_exceeded':now>=active['deadline']}
+        return {'writer_alive':self.thread.is_alive(),'admission_closed':self.closed,
+                'queued':self.queue.qsize(),'active':active,'last':last,
+                'deadline_mode':'cooperative_safe_boundaries_not_hard_realtime','execution_ready':False}
+
     def submit(self, command, *, budget_seconds=30, **payload):
         if command == '__stop__' or not 0 < budget_seconds <= 300:
             raise ValueError('invalid command/budget')
         # Account and confirmation jobs precede new discoveries; cold model
         # training is not an actor command and cannot block this queue.
         priority = 0 if command in ('account_import', 'account_event', 'account', 'confirm','paper_event','paper_buy',
-                                    'paper_sell','propose_exit','mark_exit_unknown','paper_plan_confirm') else 1
+                                    'paper_sell','propose_exit','mark_exit_unknown','paper_plan_confirm','close_unsent','reconcile_paper_unsent') else 1
         future = Future()
         with self.submit_lock:
             if self.closed or not self.thread.is_alive():
                 raise RuntimeError('service closed')
+            limit = self.capacity + (self.critical_reserve if priority == 0 else 0)
+            if self.queue.qsize() >= limit:
+                raise ServiceBusy('admission capacity reached; critical and shutdown capacity remain reserved')
             try:
                 self.queue.put_nowait((priority, next(self.sequence), future, command, copy.deepcopy(payload),
                                        time.monotonic() + budget_seconds))
@@ -155,11 +210,12 @@ class Service:
 
     def close(self):
         with self.submit_lock:
-            if self.closed:
-                return
-            self.closed = True
-        future = Future()
-        self.queue.put((2, next(self.sequence), future, '__stop__', {}, float('inf')), timeout=30)
+            if not self.closed:
+                self.closed = True
+                self.close_future = Future()
+                self.queue.put_nowait((2, next(self.sequence), self.close_future, '__stop__', {}, float('inf')))
+        # A timed-out close is retryable: never return merely because closed
+        # means no new admissions. The owning thread may still be draining.
         self.thread.join(timeout=30)
         if self.thread.is_alive():
             raise TimeoutError('writer still draining; do not launch another writer')

@@ -116,7 +116,8 @@ def collect(db_path: str | Path, trade_date: str) -> dict[str, Any]:
     datetime_date = date.fromisoformat(trade_date)
     client = HiThinkClient()
     items = _clean_items(client.limit_up_pool(datetime_date.isoformat()))
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         count = _write_snapshot(con, trade_date, items)
     finally:

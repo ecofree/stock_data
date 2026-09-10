@@ -8,7 +8,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 from trade_system.logging_setup import configure  # noqa: E402
 
@@ -98,7 +97,8 @@ def main() -> int:
     args = parser.parse_args()
 
     configure()
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         {"add": lambda: cmd_add(con, args),
          "remove": lambda: cmd_remove(con, args),

@@ -5,7 +5,7 @@ r"""下一步1：4段滚动+终验+双倍成本+分组（历史可做部分）�
 from __future__ import annotations
 import json
 from pathlib import Path
-import duckdb, pandas as pd, numpy as np
+import pandas as pd, numpy as np
 
 ROOT = Path("D:/accio/stock_data")
 SNAP = ROOT / "research" / "phase_abc" / "snapshot"
@@ -14,7 +14,8 @@ COST = 25
 FEAT = ["ret_1d","ret_5d","ret_20d","vol_20d","amt_z20","ind_rel20"]
 
 def build_frame():
-    con = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect()
     df = con.execute("""
     SELECT l.signal_date::DATE AS signal_date, l.code, l.open_t1, l.close_t5, l.ref_close,
            l.label_fwd_ret, l.amount_yuan, l.industry, u.in_universe

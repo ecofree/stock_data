@@ -643,7 +643,8 @@ def install_endpoint_inventory(
     probe_date: str | None = None,
     run_id: str | None = None,
 ) -> int:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         started_at = datetime.now()
         effective_run_id = run_id or f"api_probe_{started_at.strftime('%Y%m%d_%H%M%S_%f')}"

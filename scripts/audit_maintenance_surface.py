@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 import sys
+import subprocess
 from typing import Any
 
 import duckdb
@@ -28,11 +29,14 @@ def _q(name: str) -> str:
 
 
 def _source_files(root: Path) -> list[Path]:
-    skipped = {".git", ".venv", ".venv-qlib", "__pycache__", ".pytest_cache", "mlruns"}
+    skipped = {".git", ".venv", ".venv-qlib", "__pycache__", ".pytest_cache", "mlruns", "tmp", "backups", "build", "dist", "tests"}
+    tracked = subprocess.run(['git','ls-files','-z'],cwd=root,capture_output=True)
+    paths = [root/p for p in tracked.stdout.decode('utf-8').split('\0') if p] if tracked.returncode==0 else root.rglob('*')
     return [
         path
-        for path in root.rglob("*.py")
-        if not any(part in skipped for part in path.parts)
+        for path in paths
+        if path.is_file() and path.suffix.lower() in {'.py','.ps1','.bat','.cmd','.toml','.yml','.yaml'}
+        and not any(part in skipped for part in path.relative_to(root).parts)
     ]
 
 
@@ -48,7 +52,7 @@ def collect_script_catalog(root: Path) -> dict[str, Any]:
         and "/" in str(node.value).replace("\\", "/")
     }
     rows: list[dict[str, Any]] = []
-    for path in sorted(root.glob("scripts/*.py")):
+    for path in sorted(_source_files(root)):
         text = path.read_text(encoding="utf-8", errors="replace")
         name = path.name
         if name == "run_integrated_daily.py":
@@ -74,6 +78,9 @@ def collect_script_catalog(root: Path) -> dict[str, Any]:
         rows.append(
             {
                 "name": name,
+                "path":path.relative_to(root).as_posix(),
+                "evidence_scope":"static_reference_not_runtime_permission",
+                "dynamic_targets":"UNKNOWN" if any(t in text for t in ('subprocess','importlib','Invoke-Expression','Start-Process')) else 'not_detected_not_proof_of_absence',
                 "category": category,
                 "imports_trade_system": "trade_system" in text,
                 "mentioned_by_integrated_runner": name in runner_commands,
@@ -109,7 +116,7 @@ def collect_relation_catalog(db_path: Path, source_files: list[Path]) -> dict[st
             refs = len(re.findall(rf"\b{token}\b", source_blob, flags=re.IGNORECASE))
             writes = len(
                 re.findall(
-                    rf"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE[^\n]*?)\s+{token}\b",
+                    rf'(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+(?:[\w\"]+\.)?[\"]?{token}\b',
                     source_blob,
                     flags=re.IGNORECASE,
                 )

@@ -15,7 +15,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import duckdb
 import pandas as pd
 
 from schema import init_schema
@@ -42,7 +41,8 @@ def main() -> int:
     catalog.extend((code, row["ths_name"]) for code, row in missing.items())
     catalog.sort(key=lambda x: x[0])
 
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     init_schema(con)
     old_date = con.execute("SELECT max(trade_date) FROM ths_concept_stock_history").fetchone()[0]
     old_members = {}

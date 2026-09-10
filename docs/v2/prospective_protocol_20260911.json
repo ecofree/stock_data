@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "scope": "prospective_research_only",
+  "start_date": "2026-09-14",
+  "end_date": "2026-12-31",
+  "minimum_paired_sessions": 20,
+  "max_fits": 16,
+  "historical_design_sha256": "fdb451325149391ac77eefafdbfd34245b5c881e5a3f4c5f7962e3915d697490",
+  "variants": {
+    "price_baseline": [
+      "ret_1d",
+      "ret_5d",
+      "volatility_5d",
+      "volume_z20",
+      "turnover_rate",
+      "volume_ratio",
+      "change_pct"
+    ],
+    "price_plus_moneyflow": [
+      "ret_1d",
+      "ret_5d",
+      "volatility_5d",
+      "volume_z20",
+      "turnover_rate",
+      "volume_ratio",
+      "change_pct",
+      "net_mf_amount",
+      "large_net_mf",
+      "extra_large_net_mf",
+      "moneyflow_5d"
+    ],
+    "price_plus_flow": [
+      "ret_1d",
+      "ret_5d",
+      "volatility_5d",
+      "volume_z20",
+      "turnover_rate",
+      "volume_ratio",
+      "change_pct",
+      "flow_main_net_1d",
+      "flow_main_net_5d",
+      "flow_main_net_20d",
+      "flow_positive_days_5d",
+      "flow_acceleration_5d",
+      "flow_main_net_ratio_1d"
+    ],
+    "price_plus_funds": [
+      "ret_1d",
+      "ret_5d",
+      "volatility_5d",
+      "volume_z20",
+      "turnover_rate",
+      "volume_ratio",
+      "change_pct",
+      "net_mf_amount",
+      "large_net_mf",
+      "extra_large_net_mf",
+      "moneyflow_5d",
+      "flow_main_net_1d",
+      "flow_main_net_5d",
+      "flow_main_net_20d",
+      "flow_positive_days_5d",
+      "flow_acceleration_5d",
+      "flow_main_net_ratio_1d"
+    ]
+  },
+  "label_definition": "Adjusted next-session open to adjusted T+2 close return in percent. Training target only; available after actual label receipt, never before T+2 16:00 Asia/Shanghai. Missing/delisted/nontradable cases retained with explicit reason, not silently dropped.",
+  "selection_policy": "Freeze point-in-time universe including lifecycle and suspension status before each forecast. Use a common paired qualified cohort for all four groups, expanding 40-session train and 15-session validation with purged overlapping labels; reserve final 20 eligible observations untouched. Top 10 equal-weight simulated ranking, A-share T+1 and actual price-limit/lot/cost rules required for portfolio claims. Missing unit/definition/receipt evidence blocks fitting. Do not tune on the historical 2026-09-10 ablation or on this future holdout.",
+  "round_trip_cost_bps": [
+    0,
+    10,
+    30,
+    50
+  ],
+  "seed": 20260911,
+  "num_boost_round": 20,
+  "num_threads": 2,
+  "acceptance": {
+    "automatic_promotion": false,
+    "negative_results_retained": true,
+    "paired_common_cohort": true,
+    "train_only_preprocessing": true,
+    "actual_receipt_time_required": true,
+    "untouched_holdout_required": true
+  }
+}

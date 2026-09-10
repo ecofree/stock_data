@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables
 
@@ -41,7 +40,8 @@ COMBINED_METHOD = "experimental_unweighted_ranks_v1"
 
 
 def ensure_candidate_pool_table(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -82,7 +82,8 @@ def build_candidate_pool(
 ) -> dict[str, Any]:
     ensure_qlib_shadow_tables(db_path)
     ensure_candidate_pool_table(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         status_row = con.execute("SELECT status FROM qlib_model_registry WHERE model_id = ?", [model_id]).fetchone()
         if not status_row:

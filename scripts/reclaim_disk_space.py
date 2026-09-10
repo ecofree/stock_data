@@ -92,7 +92,8 @@ def _writer_active(db_path: Path) -> str | None:
     # Probe for an active writer by attempting a read-write connect (DuckDB holds an
     # exclusive file lock while a writer is attached, so this fails if one is active).
     try:
-        probe = duckdb.connect(str(db_path))
+        from trade_system.db_utils import legacy_connect
+        probe = legacy_connect(str(db_path))
         probe.close()
     except duckdb.IOException as exc:
         return f"database file is locked by another process ({str(exc)[:80]})"

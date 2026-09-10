@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 from trade_system.strategy.definition import StrategyDefinition
 
@@ -26,7 +25,8 @@ SCAN_COLUMNS = [
 
 
 def install_strategy_tables(db_path: str | Path) -> None:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -97,7 +97,8 @@ def install_strategy_tables(db_path: str | Path) -> None:
 
 def persist_strategy_scan_results(db_path: str | Path, rows: list[dict[str, Any]]) -> int:
     install_strategy_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         # A scan is a complete materialized snapshot of the currently
         # actionable operator candidates.  Keeping rows that disappeared from
@@ -122,7 +123,8 @@ def persist_strategy_scan_results(db_path: str | Path, rows: list[dict[str, Any]
 
 def persist_strategy_definitions(db_path: str | Path, strategies: list[StrategyDefinition]) -> int:
     install_strategy_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         for strategy in strategies:
             con.execute("DELETE FROM strategy_definition WHERE strategy_id = ?", [strategy.strategy_id])
@@ -153,7 +155,8 @@ def persist_strategy_definitions(db_path: str | Path, strategies: list[StrategyD
 
 def persist_strategy_backtest_summary(db_path: str | Path, rows: list[dict[str, Any]]) -> int:
     install_strategy_tables(db_path)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         for row in rows:
             con.execute(

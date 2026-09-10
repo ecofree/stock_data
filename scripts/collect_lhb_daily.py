@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 import sys
 
-import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -89,7 +88,8 @@ def enrich_lhb_reason(db_path: str | Path, trade_date: str) -> int:
     stocks = payload.get("stocks") or []
     if not stocks:
         return 0
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     updated = 0
     try:
         for row in stocks:
@@ -109,7 +109,8 @@ def enrich_lhb_reason(db_path: str | Path, trade_date: str) -> int:
 
 
 def collect_lhb_daily(db_path: str | Path, trade_date: str) -> dict:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         init_schema(con)
     finally:

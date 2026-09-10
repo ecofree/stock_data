@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import duckdb
 
 
 INDEX_SPECS = (
@@ -18,7 +17,8 @@ INDEX_SPECS = (
 
 
 def ensure_indexes(db_path: str | Path) -> dict[str, int]:
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     created = 0
     skipped = 0
     try:

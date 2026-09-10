@@ -165,7 +165,8 @@ def dedupe_table(
     Keeps the latest row by fetched_at/updated_at when present, otherwise by rowid.
     """
     keys = list(key_columns)
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         if not table_exists(con, table_name):
             return {"table": table_name, "status": "missing_table", "removed_rows": 0}

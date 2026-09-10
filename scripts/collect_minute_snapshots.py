@@ -79,7 +79,8 @@ def main() -> int:
 
     from easy_tdx import TdxClient
 
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         codes = _universe(con, day, args.source, args.max_stocks)
         print(f"universe: {len(codes)} stocks for {day}")

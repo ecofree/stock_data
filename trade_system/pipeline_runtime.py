@@ -265,6 +265,8 @@ class LatestReportTransaction:
     """
 
     def __init__(self, reports_dir: str | Path, run_id: str, staging_dir: str | Path | None = None) -> None:
+        if (Path(reports_dir)/'v2-publication-owner.json').exists():
+            raise ValueError('legacy publisher cannot write the V2 publication namespace')
         self.reports_dir = Path(reports_dir).resolve()
         self.snapshot_dir = self.reports_dir / f".rollback_{run_id}"
         self.staging_dir = Path(staging_dir).resolve() if staging_dir else self.reports_dir

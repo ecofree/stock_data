@@ -979,7 +979,8 @@ def generate_stage_signals(
     last_open_err: Exception | None = None
     for attempt in range(20):
         try:
-            con = duckdb.connect(str(db_path))
+            from trade_system.db_utils import legacy_connect
+            con = legacy_connect(str(db_path))
             break
         except Exception as exc:
             last_open_err = exc
@@ -1248,7 +1249,8 @@ def refresh_close_signals_if_needed(
     as_of_time: str | datetime | None = None,
 ) -> dict:
     """Rebuild close_decision rows when kline arrived after the first close pass."""
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         ensure_stage_signal_schema(con)
         needed = _close_signals_need_refresh(con, trade_date)

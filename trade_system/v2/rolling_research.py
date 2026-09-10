@@ -1,6 +1,5 @@
 """Frozen, bounded QLib walk-forward diagnostics. No order or champion writes."""
 from datetime import datetime
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -12,19 +11,11 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from .domain import canonical, identity, utc
+from .domain import canonical, identity, utc, file_hash
 from .ml_protocol import rolling_partitions
 
 
 RESERVED = {'datetime','instrument','label_next_ret','label_date','label_end_time','label_available_time'}
-
-
-def file_hash(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for block in iter(lambda:stream.read(1024*1024),b''):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def dump(path, value):
@@ -132,8 +123,12 @@ class FoldDataset:
         columns = ['datetime','instrument',*features]+(['label_next_ret'] if fitting else [])
         self.frames = {key:frames[key][columns].copy() for key in self.segments}
         train = frames['train'][features]
-        self.medians = train.median().fillna(0.0)
         self.all_missing_features = list(train.columns[train.isna().all()])
+        self.constant_features = list(train.columns[(train.nunique(dropna=True)==1)])
+        if self.all_missing_features or self.constant_features:
+            raise ValueError('invalid training features: '+canonical({
+                'all_missing':self.all_missing_features,'constant':self.constant_features}))
+        self.medians = train.median()
 
     def prepare(self, segment, col_set='feature', data_key=None):
         if segment not in self.segments:

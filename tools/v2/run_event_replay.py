@@ -46,7 +46,7 @@ def policies():
               'theme_id':'fixture-theme','membership_version':'fixture-members-v1','fund_metric_version':'fixture-net-v1',
               'entry_not_before':'2026-09-10T09:30:00+08:00','auction_not_before':'2026-09-10T09:25:00+08:00',
               'min_auction_relative_volume':'1.5','min_fund_delta_cny':'100',
-              'fund_window_seconds':300,'fresh_seconds':30,'min_theme_coverage':'.8','min_theme_advancing':'.6'}
+              'fund_window_seconds':60,'fresh_seconds':30,'min_theme_coverage':'.8','min_theme_advancing':'.6'}
     return strategy,events
 
 
@@ -72,6 +72,8 @@ def run_replay(output):
             call('product',dataset='fixture.'+kind,unit=unit,semantics=semantics,consumer='event:'+kind,origin='synthetic_fixture')
         call('paper_open',config=paper_config())
         def event(kind, at, payload, key):
+            if kind=='funds_cumulative':
+                payload={**payload,'counter_epoch':'synthetic-fixture-continuous-counter'}
             return call('market_event',dataset='fixture.'+kind,code=CODE,kind=kind,event_at=at,payload=payload,source_event_id=key)
         event('auction_indicative','2026-09-10T09:24:00+08:00',{'price':'10','final':False,'relative_volume':'2'},'indication')
         call('event_signal',code=CODE,strategy_policy=strategy,event_policy=event_policy)

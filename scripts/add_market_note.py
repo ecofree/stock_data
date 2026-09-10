@@ -13,7 +13,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import duckdb  # noqa: E402
 
 
 def main() -> int:
@@ -24,7 +23,8 @@ def main() -> int:
     parser.add_argument("--tags", default="", help="逗号分隔标签")
     args = parser.parse_args()
 
-    con = duckdb.connect(args.db)
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(args.db)
     try:
         con.execute(
             """INSERT INTO market_journal (trade_date, note, tags)

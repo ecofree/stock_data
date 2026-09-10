@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables
 
@@ -33,7 +32,8 @@ def audit_model_promotion(
     """
     ensure_qlib_shadow_tables(db_path)
     thresholds = {**DEFAULT_GATES, **(gates or {})}
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         where = "WHERE r.model_id = ?" if model_id else ""
         params = [model_id] if model_id else []

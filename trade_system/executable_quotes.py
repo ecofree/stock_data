@@ -259,7 +259,8 @@ def collect_executable_quotes(
         if boost_meta.get("boost"):
             effective_limit = boosted_quote_limit(limit, boost=True)
 
-    con = duckdb.connect(str(db_path))
+    from trade_system.db_utils import legacy_connect
+    con = legacy_connect(str(db_path))
     try:
         ensure_executable_quote_schema(con)
         targets = codes or candidate_codes_for_quotes(

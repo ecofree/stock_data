@@ -1,5 +1,6 @@
 import importlib
 import sys
+from pathlib import Path
 
 
 def reload_config(monkeypatch, tmp_path, env=None, dotenv_text="", dotenv_example_text=""):
@@ -20,7 +21,7 @@ def reload_config(monkeypatch, tmp_path, env=None, dotenv_text="", dotenv_exampl
     # evicted so the re-import picks up the new environment.
     sys.modules.pop("config", None)
     sys.modules.pop("trade_system.config", None)
-    sys.path.insert(0, "D:/accio/stock_data")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     return importlib.import_module("config")
 
 

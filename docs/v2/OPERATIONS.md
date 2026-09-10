@@ -1,5 +1,7 @@
 # V2 运行与恢复边界
 
+当前操作边界见本文末尾“2026-09-10 整改运行说明”和 [新整改台账](RETIREMENT_REMEDIATION_20260910.md)。以下“最新”小节是历史记录，不能作为当前核心包或现网部署说明。
+
 ## 最新：历史日线病例登记与版本绑定
 
 [第 12 段](STAGE_DAILY_CASES_20260910.md)使用 `tools/v2/run_daily_cases.py verify --folder reports/v2-daily-cases-20260910`。新病例必须先 `register --plan <JSON> --folder <新目录>`，再 `run --folder <目录>`。这是声明初始持仓的病例诊断，不是策略组合入口。
@@ -175,3 +177,14 @@ register 解析并验证不可变导出，不允许无元数据/摘要的临时�
 预算限制抽样输出、折数、轮数和模型线程，不是全流程硬超时/内存隔离。不要向单 writer actor 投递训练任务。QLib recorder 使用实验目录内的本地 file URI；不会把多折结果导入真实信号、旧模型库或生产数据库。
 
 excluded_tail 不评分，但当前快照曾经检查过，不能认证 untouched；配置中的评价上限不等于实际接收时间。成本是标签均值敏感性，portfolio_return=null，不能用它替代纸面结算。详见 STAGE_ROLLING_20260910.md 的实际负结果和剩余范围。
+# 2026-09-10 整改运行说明（优先于下方历史命令）
+
+整改在 `D:/accio/stock_data-retirement` 隔离工作树中实施，原 `D:/accio/stock_data` 和已注册任务未切换。核心包与研究环境分离。核心入口只提供观察、纸面证书、显式人工纸面确认和复盘，不提供真实委托。
+
+已确认但从未送达的预占，可经 `stock-data-paper-desk --db <已有纸面库> close-unsent --confirmation-request-id <原确认ID> --operator <声明身份> --request-id <固定取消意向ID> --reason cancelled` 显式关闭。到期未送达使用 `expired_not_sent`；`unknown` 或已送达禁止走此路径，不能因过期自动解冻。
+
+`stock-data-daily case` 只能链接已验证原生观察包；没有独立事件证据、规则或纸面账户时保持仅观察，不能把涨停池价格冒充当前可成交报价。原生证据被保留不等于当前仍新鲜。
+
+锁恢复：正常关闭写者；不删除永久 `.guard` 文件，不凭 `.pipeline.lock` 元数据抢锁。旧任务注册、旧下单、旧人工计划自动写入已在整改版本撤销。实际任务修改、数据退役和生产切换另行审批。
+
+完整进度与限制：[整改台账](RETIREMENT_REMEDIATION_20260910.md)。以下为历史阶段说明，研究命令仅用于保留的隔离源码环境，不代表核心 wheel 内可用。

@@ -1,5 +1,23 @@
 # stock_data
 
+## Current remediation boundary (2026-09-11)
+
+The current implementation record is [the four-stage continuation](docs/v2/FOUR_STAGES_20260911.md), extending [the retirement remediation ledger](docs/v2/RETIREMENT_REMEDIATION_20260910.md).
+This checkout is an isolated remediation branch, **not a deployed replacement**.
+The operational wheel contains only the explicit V2 core allowlist and supports
+Python 3.11–3.12. Install `requirements-core.lock` plus the verified wheel in a
+fresh environment; research runs from a separate source environment.
+
+Approved core commands: `stock-data-v2`, `stock-data-daily`,
+`stock-data-paper-desk`, and offline `stock-data-recovery`. Broker routing is absent.
+The old paper order CLI, automatic manual-plan loop, task registration, and
+`--report-only` recovery are rejected. Historical raw collection is transitional,
+not a second decision authority. Existing Windows tasks have **not** been changed.
+
+Sections below describe the **historical source system**, not installation,
+deployment, or retirement instructions for the new core. Do not register its
+tasks, delete tables, or use its broad dependency set as the core runtime.
+
 `stock_data` is an A-share short-term/theme/emotion-cycle trading assistant.
 It is designed for pre-market preparation, auction confirmation, intraday
 monitoring, close review, post-market journaling, backtest validation, and
@@ -35,10 +53,10 @@ D:\anaconda\python.exe -m pytest -q -p no:cacheprovider
 `pytest.ini` sets `pythonpath = .`, so tests can be run from the project root
 without manually setting `PYTHONPATH`.
 
-The supported runtime range is Python 3.11 through 3.14. Use the lock file for
-reproducible production installs; `requirements.txt` delegates to it.
+The declared core runtime range is Python 3.11 through 3.12. The legacy
+`requirements.txt` is for whole-source development, not minimal core deployment.
 
-## Daily Operator Workflow
+## Historical Daily Workflow (migration reference, not the V2 default)
 
 The integrated runner is phase-aware. By default `--phase auto` selects the
 current China-market window and skips fresh snapshots; it does not run the

@@ -74,7 +74,8 @@ def main() -> int:
     """)
 
     # 4. 用DuckDB在parquet上构建universe + 特征 + 标签（T+1开/T+5收，按交易日历序号，不按下一条记录）
-    con2 = duckdb.connect()
+    from trade_system.db_utils import legacy_connect
+    con2 = legacy_connect()
     con2.execute(f"""
     CREATE OR REPLACE TABLE px AS SELECT * FROM read_parquet('{ (SNAP/'px_raw.parquet').as_posix()}');
     CREATE OR REPLACE TABLE info AS SELECT * FROM read_parquet('{ (SNAP/'stock_basic.parquet').as_posix()}');
@@ -184,7 +185,8 @@ def main() -> int:
     # 7. 新建ledger.duckdb（新库，可写），登记快照，不碰生产库
     if LEDGER.exists():
         LEDGER.unlink()
-    led = duckdb.connect(str(LEDGER))
+    from trade_system.db_utils import legacy_connect
+    led = legacy_connect(str(LEDGER))
     led.execute("CREATE TABLE dataset_manifest(snapshot_id VARCHAR PRIMARY KEY, manifest_json VARCHAR)");
     led.execute("INSERT INTO dataset_manifest VALUES (?, ?)", [SNAPSHOT_ID, json.dumps(manifest, ensure_ascii=False)])
     led.execute("CREATE TABLE universe_daily AS SELECT * FROM read_parquet(?)", [(SNAP/"universe.parquet").as_posix()])
