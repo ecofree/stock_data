@@ -26,6 +26,9 @@ from trade_system.http_transport import (
 from trade_system.source_validation import validate_kpl
 
 logger = logging.getLogger("kpl_collector")
+# A fresh checkout has no ignored logs directory. Create it before FileHandler
+# opens the file; do not depend on a previous collector run or CI preparation.
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
