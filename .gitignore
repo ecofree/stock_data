@@ -24,7 +24,7 @@ tmp/
 
 # Generated runtime output (regenerated each run; large)
 logs/*.log
-reports/
+/reports/
 
 # ML / browser-automation runtime artifacts
 mlruns/

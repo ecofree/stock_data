@@ -8,12 +8,15 @@ import tempfile
 import trade_system
 from trade_system.v2.account_admission import inspect_account
 from trade_system.v2.research_workbench import render
+from trade_system.reports.real_data_backfill import build_real_data_backfill_status
+from trade_system.reports.operator_report import SIGNAL_TABLES
 
 
 def main():
     module = Path(trade_system.__file__).resolve()
     if 'site-packages' not in module.parts:
         raise RuntimeError('probe must use installed package, not checkout')
+    assert callable(build_real_data_backfill_status) and 'kline' in SIGNAL_TABLES
     assert inspect_account()['status']=='missing_real_account'
     assert 'connect-src' in render({'probe':'synthetic'})
     with tempfile.TemporaryDirectory(prefix='v2-release-probe-') as folder:

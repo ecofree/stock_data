@@ -41,3 +41,5 @@ python -m trade_system.v2.operator_workflow_cli --db <纸面库> review --accoun
 分支 `codex/remaining-work-20260910`，首个交付提交 `79f9081ee8c79ba4124ba4b9cfa3b246a243c8c2`。该提交本地两套环境各 992 项测试通过，但 [首轮远端 CI](https://github.com/ecofree/stock_data/actions/runs/34454472176) 在测试收集阶段出现 33 个同源错误：`base.py` 的 FileHandler 依赖本机已有的忽略目录。修复在初始化处创建日志目录，并用独立进程和临时空目录验证；保留失败记录，不把本机绿色冒充远端通过。
 
 新增生命周期证据详见 [SZ300029_LIFECYCLE_20260910.md](SZ300029_LIFECYCLE_20260910.md)。它补充官方摘牌日期，不解决账户持仓清算，也不改变原冻结实验。
+
+第二轮远端检出进一步发现旧 `.gitignore` 将 `trade_system/reports/` 源码包当作生成物排除。修复为仅忽略根目录 `/reports/`，补入原有三个源码文件；另从 Git 提交导出干净副本验证，禁止依赖本机忽略文件。失败记录：[第二轮 CI](https://github.com/ecofree/stock_data/actions/runs/34455061351)。
