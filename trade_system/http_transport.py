@@ -120,3 +120,17 @@ def open_verified(request: urllib.request.Request, *, timeout: float):
         raise
     except urllib.error.URLError:
         return _verified_opener(False).open(request, timeout=timeout)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # API credentials must never follow an unapproved redirect destination.
+        raise urllib.error.HTTPError(req.full_url,code,'provider redirect refused',headers,fp)
+
+
+def open_verified_once(request: urllib.request.Request, *, timeout: float):
+    """One selected transport, no redirect or fallback. Timeout is socket-level."""
+    handlers=[_NoRedirect(),urllib.request.HTTPSHandler(context=default_ssl_context())]
+    if _direct_first():
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers).open(request,timeout=timeout)

@@ -171,7 +171,7 @@ def capture(day, folder, *, client=None, clock=now_utc):
     origin = 'synthetic_fixture' if client is not None else 'hithink_native'
     if client is None:
         from trade_system.hithink_client import HiThinkClient
-        client = HiThinkClient(timeout=15)
+        client = HiThinkClient(timeout=15,max_response_bytes=8_000_000,single_attempt=True)
     folder = Path(folder).resolve()
     folder.mkdir(parents=True, exist_ok=False)
     write_json(folder/'registration.json', {'trade_date':day, 'created_at':created.isoformat(),

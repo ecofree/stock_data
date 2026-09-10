@@ -148,6 +148,43 @@ def test_prospective_registration_never_auto_qualifies_with_time(tmp_path):
         prospective_registry.register(source,tmp_path/'late',clock=lambda:moment('2026-09-14'))
 
 
+def test_native_client_caps_read_before_decode_without_fallback(monkeypatch):
+    import trade_system.hithink_client as native
+    sizes=[]
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self,*args):
+            pass
+        def read(self,size):
+            sizes.append(size)
+            return b'x'*size
+    monkeypatch.setattr(native,'open_verified_once',lambda *a,**k:Response())
+    monkeypatch.setattr(native,'open_verified',lambda *a,**k:pytest.fail('no legacy fallback'))
+    client=native.HiThinkClient(api_key='synthetic',min_interval=0,max_response_bytes=10,single_attempt=True)
+    with pytest.raises(native.HiThinkError,match='budget'):
+        client._get('/test')
+    assert sizes==[11] and client.call_count==1
+
+
+def test_strict_transport_refuses_redirects_and_propagates_failure(monkeypatch):
+    import urllib.request
+    import urllib.error
+    from trade_system import http_transport as transport
+    request=urllib.request.Request('https://example.invalid/api',headers={'X-api-key':'synthetic'})
+    with pytest.raises(urllib.error.HTTPError):
+        transport._NoRedirect().redirect_request(request,None,302,'redirect',{},'https://other.invalid/')
+    calls=[]
+    class Failing:
+        def open(self,*a,**k):
+            calls.append(1)
+            raise urllib.error.URLError('synthetic failure')
+    monkeypatch.setattr(transport.urllib.request,'build_opener',lambda *a:Failing())
+    with pytest.raises(urllib.error.URLError):
+        transport.open_verified_once(request,timeout=1)
+    assert calls==[1]
+
+
 @pytest.mark.parametrize('change',[{'start_date':'2026-09-10'},{'max_fits':100},
     {'round_trip_cost_bps':[0]},{'scope':'production'},{'minimum_paired_sessions':2}])
 def test_prospective_plan_rejects_weakened_boundaries(tmp_path,change):

@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trade_system.logging_setup import get_logger
-from trade_system.http_transport import open_verified
+from trade_system.http_transport import open_verified, open_verified_once
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,8 @@ class HiThinkError(RuntimeError):
 class HiThinkClient:
     def __init__(self, api_key: str | None = None,
                  min_interval: float = _DEFAULT_INTERVAL,
-                 timeout: float = 30.0):
+                 timeout: float = 30.0, *, max_response_bytes: int | None = None,
+                 single_attempt: bool = False):
         import os
 
         from trade_system.config import SETTINGS
@@ -48,6 +49,10 @@ class HiThinkClient:
                 "HITHINK_FINANCE_API_KEY is not configured (.env or env)")
         self.min_interval = min_interval
         self.timeout = timeout
+        if max_response_bytes is not None and (type(max_response_bytes) is not int or not 1<=max_response_bytes<=8_000_000):
+            raise ValueError('response budget must be 1..8000000 bytes')
+        self.max_response_bytes=max_response_bytes
+        self.single_attempt=single_attempt
         self._last_call = 0.0
         self.call_count = 0
 
@@ -66,8 +71,12 @@ class HiThinkClient:
             url += "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"X-api-key": self.api_key})
         try:
-            with open_verified(req, timeout=self.timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+            opener=open_verified_once if self.single_attempt else open_verified
+            with opener(req, timeout=self.timeout) as resp:
+                raw=resp.read() if self.max_response_bytes is None else resp.read(self.max_response_bytes+1)
+                if self.max_response_bytes is not None and len(raw)>self.max_response_bytes:
+                    raise HiThinkError('native response byte budget exceeded')
+                payload = json.loads(raw.decode("utf-8"))
         finally:
             self._last_call = time.time()
             self.call_count += 1

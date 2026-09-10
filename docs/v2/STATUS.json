@@ -9,10 +9,10 @@
     "prospective_protocol": "registered_future_data_and_fit_adapter_pending",
     "restore": "installed_synthetic_partial_fill_backup_restore_verified",
     "capacity": "256_cash_events_only_not_long_history_acceptance",
-    "evidence": "tmp/delivery-20260911-r2/verification.json",
+    "evidence": "tmp/delivery-20260911-r3/verification.json",
     "local_checks_passed": true,
-    "local_tests": {"passed": 1079, "failed": 0, "errors": 0, "skipped": 0},
-    "source_sha256": "aafdd0f4632e90f11031059052ac3947f53b086febdc833754bac93701fc661e",
+    "local_tests": {"passed": 1081, "failed": 0, "errors": 0, "skipped": 0},
+    "source_sha256": "3882247ef06ec0df53bf988b0f563c473a06ce30bbfeaf47815f8ddd37cd0d79",
     "production_cutover": false,
     "execution_ready": false
   },
@@ -985,6 +985,6 @@
     "planned": "未完成",
     "disabled_optional": "未授权的可选扩展"
   },
-  "latest_stage_document": "docs/v2/STAGE_DAILY_SESSION_20260910.md",
-  "latest_verified_scope": "current_native_limit_pool_observation_and_frozen_qlib_ablation_not_real_human_or_next_session_acceptance"
+  "latest_stage_document": "docs/v2/FOUR_STAGES_20260911.md",
+  "latest_verified_scope": "local_core_daily_time_gate_prospective_registration_and_synthetic_restore_not_four_stages_acceptance"
 }
