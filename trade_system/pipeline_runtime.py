@@ -14,10 +14,7 @@ import shutil
 import subprocess
 import sys
 
-try:
-    import psutil
-except Exception:  # pragma: no cover - optional on minimal runtimes
-    psutil = None
+from trade_system.file_lock import FileLock, FileLockBusy
 
 
 STALE_LOCAL_LOCK_GRACE_SECONDS = 120
@@ -89,10 +86,32 @@ class PipelineLock:
         db = Path(db_path).resolve()
         self.path = db.with_name(f"{db.name}.pipeline.lock")
         self.run_id = run_id
+        self._guard = FileLock(self.path.with_suffix(self.path.suffix + '.guard'))
 
     def __enter__(self) -> "PipelineLock":
+        try:
+            self._guard.__enter__()
+        except FileLockBusy as exc:
+            raise PipelineAlreadyRunning(str(exc)) from exc
+        try:
+            if self.path.exists():
+                try:
+                    previous = json.loads(self.path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    previous = {}
+                if not isinstance(previous, dict) or previous.get('lock_protocol') != 'os_handle_v2':
+                    raise PipelineAlreadyRunning(
+                        f"Legacy/unknown lock requires coordinated maintenance: {self.path}"
+                    )
+            return self._write_owner()
+        except BaseException:
+            self._guard.__exit__(None, None, None)
+            raise
+
+    def _write_owner(self) -> "PipelineLock":
         payload = json.dumps(
             {
+                "lock_protocol": "os_handle_v2",
                 "run_id": self.run_id,
                 "pid": os.getpid(),
                 "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -100,80 +119,25 @@ class PipelineLock:
             },
             ensure_ascii=False,
         )
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            existing_text = self.path.read_text(encoding="utf-8", errors="replace")[:500]
-            try:
-                existing_payload = json.loads(existing_text)
-                existing_pid = int(existing_payload.get("pid") or 0)
-                started_at = datetime.fromisoformat(str(existing_payload.get("started_at")))
-                age_seconds = max(0.0, (datetime.now() - started_at).total_seconds())
-            except (TypeError, ValueError, json.JSONDecodeError, OSError):
-                existing_pid, existing_payload = 0, {}
-                # A truncated lock from a hard power loss is still recoverable
-                # once its filesystem mtime is older than the local grace
-                # period.  Treating malformed content as age zero otherwise
-                # leaves the scheduler blocked forever.
-                try:
-                    age_seconds = max(
-                        0.0, (datetime.now() - datetime.fromtimestamp(self.path.stat().st_mtime)).total_seconds()
-                    )
-                except OSError:
-                    age_seconds = 0.0
-            # Recover a demonstrably stale local lock.  A process that died
-            # during a reboot/provider crash must not block the next market
-            # phase for six hours; the short grace period protects a just-
-            # created lock from racing with the owner process.
-            process_alive = False
-            if existing_pid and existing_pid != os.getpid():
-                try:
-                    if psutil is not None:
-                        process = psutil.Process(existing_pid)
-                        process_started = datetime.fromtimestamp(process.create_time())
-                        process_alive = process.is_running() and process_started <= started_at
-                    else:
-                        os.kill(existing_pid, 0)
-                        process_alive = True
-                # Windows can surface dead/reused PIDs as SystemError instead
-                # of OSError (for example when the scheduler account no
-                # longer owns the process).  Any failure to prove liveness is
-                # treated as not alive; the age threshold below still protects
-                # a young lock from accidental recovery.
-                except Exception:
-                    process_alive = False
-            current_host = str(os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "unknown")
-            lock_host = str(existing_payload.get("host") or "")
-            recovery_age = (
-                STALE_LOCAL_LOCK_GRACE_SECONDS
-                if lock_host in {"", current_host, "unknown"}
-                else 6 * 3600
-            )
-            if (
-                not process_alive
-                and age_seconds > recovery_age
-            ):
-                try:
-                    self.path.unlink()
-                    return self.__enter__()
-                except FileNotFoundError:
-                    return self.__enter__()
-            raise PipelineAlreadyRunning(
-                f"Pipeline lock already exists at {self.path}: {existing_text}"
-            ) from exc
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Write/replace metadata only after the permanent guard is held.
+        temp = self.path.with_suffix(self.path.suffix + '.tmp')
+        with temp.open('w', encoding='utf-8') as handle:
             handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp.replace(self.path)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if not self.path.exists():
+        if self._guard.fd is None:
             return
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {}
-        if payload.get("run_id") == self.run_id:
-            self.path.unlink()
+            if self.path.exists():
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                if payload.get("run_id") == self.run_id:
+                    self.path.unlink()
+        finally:
+            self._guard.__exit__(exc_type, exc, tb)
 
 
 class RunManifest:

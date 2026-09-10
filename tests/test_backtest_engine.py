@@ -129,6 +129,8 @@ def test_equity_curve_compounds_and_drawdown_nonnegative(con):
     result = simulate(universe, load_kline(con), SESSIONS,
                       BacktestParams(hold_days=1))
     curve = result["equity_curve"]
-    assert len(curve) == 2
+    # One initial value plus one end-of-session valuation, not one per exit.
+    assert len(curve) == len(SESSIONS) + 1
+    assert [row['date'] for row in result['daily_ledger']] == SESSIONS
     assert all(x >= 0 for x in curve)
     assert result["stats"]["max_drawdown_pct"] >= 0

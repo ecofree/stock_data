@@ -39,7 +39,7 @@ def test_run_manifest_is_written_atomically(tmp_path):
     assert not manifest.path.with_suffix(".json.tmp").exists()
 
 
-def test_pipeline_lock_recovers_stale_lock_when_windows_pid_probe_errors(tmp_path, monkeypatch):
+def test_pipeline_lock_does_not_steal_unknown_legacy_lock(tmp_path, monkeypatch):
     db_path = tmp_path / "stale.duckdb"
     db_path.touch()
     lock_path = db_path.with_name("stale.duckdb.pipeline.lock")
@@ -57,17 +57,20 @@ def test_pipeline_lock_recovers_stale_lock_when_windows_pid_probe_errors(tmp_pat
         raise SystemError("Windows PID probe failed")
 
     monkeypatch.setattr(os, "kill", broken_kill)
-    with PipelineLock(db_path, "recovered"):
-        assert lock_path.exists()
+    with pytest.raises(PipelineAlreadyRunning, match='maintenance'):
+        with PipelineLock(db_path, "recovered"):
+            pass
+    assert json.loads(lock_path.read_text(encoding='utf-8'))['run_id'] == 'abandoned'
 
 
-def test_pipeline_lock_recovers_recent_dead_local_process(tmp_path, monkeypatch):
+def test_pipeline_lock_recovers_abandoned_handle_protocol_without_pid_probe(tmp_path, monkeypatch):
     db_path = tmp_path / "rebooted.duckdb"
     db_path.touch()
     lock_path = db_path.with_name("rebooted.duckdb.pipeline.lock")
     lock_path.write_text(
         json.dumps({
             "run_id": "abandoned-after-reboot",
+            "lock_protocol": "os_handle_v2",
             "pid": 999999,
             "started_at": (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds"),
             "host": os.environ.get("COMPUTERNAME") or "unknown",
@@ -84,7 +87,7 @@ def test_pipeline_lock_recovers_recent_dead_local_process(tmp_path, monkeypatch)
         assert payload["run_id"] == "recovered-after-reboot"
 
 
-def test_pipeline_lock_recovers_old_malformed_local_lock(tmp_path):
+def test_pipeline_lock_does_not_delete_malformed_legacy_lock(tmp_path):
     db_path = tmp_path / "malformed.duckdb"
     db_path.touch()
     lock_path = db_path.with_name("malformed.duckdb.pipeline.lock")
@@ -92,9 +95,10 @@ def test_pipeline_lock_recovers_old_malformed_local_lock(tmp_path):
     old = (datetime.now() - timedelta(minutes=5)).timestamp()
     os.utime(lock_path, (old, old))
 
-    with PipelineLock(db_path, "recovered-malformed"):
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        assert payload["run_id"] == "recovered-malformed"
+    with pytest.raises(PipelineAlreadyRunning, match='maintenance'):
+        with PipelineLock(db_path, "recovered-malformed"):
+            pass
+    assert lock_path.read_text(encoding='utf-8') == '{truncated'
 
 
 def test_reap_stale_running_manifest_marks_parent_and_running_step_aborted(tmp_path):

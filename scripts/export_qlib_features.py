@@ -6,10 +6,14 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import shutil
 import sys
+import uuid
+import hashlib
+import os
 
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from trade_system.file_lock import FileLock
 
 
 BASE_FEATURE_COLUMNS = [
@@ -45,6 +49,9 @@ def _query(
     include_adjustment: bool = False,
     label_mode: str = "t1_exec",
 ) -> str:
+    if label_mode not in ('t1_exec', 'legacy'):
+        raise ValueError('unsupported label mode')
+    factor = 'a.adj_factor' if include_adjustment else '1.0'
     flow_select = ""
     flow_join = ""
     if include_flow_features:
@@ -67,7 +74,7 @@ def _query(
     """
 
     if label_mode == "t1_exec":
-        label_expr = "CASE WHEN d.next_open > 0 AND d.next2_close IS NOT NULL THEN (d.next2_close / d.next_open - 1.0) * 100.0 END"
+        label_expr = "CASE WHEN d.close > 0 AND d.next_open > 0 AND d.next2_close IS NOT NULL THEN (d.next2_close / d.next_open - 1.0) * 100.0 END"
         label_date_expr = "d.next2_date"
     else:
         label_expr = "CASE WHEN d.next_close IS NOT NULL AND d.close > 0 THEN (d.next_close / d.close - 1.0) * 100.0 END"
@@ -111,13 +118,13 @@ def _query(
         SELECT
             CAST(d.date AS DATE) AS datetime,
             CAST(d.stock_code AS VARCHAR) AS instrument,
-            CAST(d.open AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS open,
-            CAST(d.high AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS high,
-            CAST(d.low AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS low,
-            CAST(d.close AS DOUBLE) * coalesce(a.adj_factor, 1.0) AS close,
-            CAST(d.volume AS DOUBLE) / nullif(coalesce(a.adj_factor, 1.0), 0) AS volume,
+            CAST(d.open AS DOUBLE) * {factor} AS open,
+            CAST(d.high AS DOUBLE) * {factor} AS high,
+            CAST(d.low AS DOUBLE) * {factor} AS low,
+            CAST(d.close AS DOUBLE) * {factor} AS close,
+            CAST(d.volume AS DOUBLE) / nullif({factor}, 0) AS volume,
             CAST(d.turnover AS DOUBLE) AS turnover,
-            coalesce(a.adj_factor, 1.0) AS adj_factor
+            {factor} AS adj_factor
         FROM tushare_daily d
         LEFT JOIN adjustments a
           ON a.datetime = CAST(d.date AS DATE)
@@ -136,7 +143,6 @@ def _query(
             LAG(close, 1) OVER (PARTITION BY instrument ORDER BY datetime) AS prev_close,
             LAG(close, 5) OVER (PARTITION BY instrument ORDER BY datetime) AS prev5_close
         FROM bars
-        WHERE datetime IN (SELECT datetime FROM valid_dates)
     ),
     daily AS (
         SELECT
@@ -189,7 +195,9 @@ def _query(
         CASE WHEN d.std_volume20 > 0 THEN (d.volume - d.avg_volume20) / d.std_volume20 END AS volume_z20
         {flow_select},
         {label_expr} AS label_next_ret,
-        {label_date_expr} AS label_date
+        {label_date_expr} AS label_date,
+        {label_date_expr} AS label_end_time,
+        CAST({label_date_expr} AS TIMESTAMP) + INTERVAL '16 hours' AS label_available_time
     FROM daily d
     LEFT JOIN basic b ON b.datetime = d.datetime AND b.instrument = d.instrument
     LEFT JOIN money m ON m.datetime = d.datetime AND m.instrument = d.instrument
@@ -246,6 +254,7 @@ def _copy_batched(
     include_flow_features: bool,
     include_adjustment: bool,
     label_mode: str,
+    materialized_table: str | None = None,
 ) -> dict[str, int | str]:
     """Export a format without materialising the full history in memory."""
     _remove_generated_target(target)
@@ -259,7 +268,7 @@ def _copy_batched(
     ranges = _batch_ranges(start, end, max_date=max_date)
 
     for index, (context_start, context_end, output_start, output_end) in enumerate(ranges):
-        query = _query(
+        query = f'SELECT * FROM {materialized_table}' if materialized_table else _query(
             context_start,
             context_end,
             include_flow_features=include_flow_features,
@@ -271,6 +280,8 @@ def _copy_batched(
             f"WHERE datetime BETWEEN DATE '{output_start}' AND DATE '{output_end}' "
             "ORDER BY datetime, instrument"
         )
+        con.execute(f'CREATE OR REPLACE TEMP TABLE export_batch AS {bounded_query}')
+        bounded_query = 'SELECT * FROM export_batch ORDER BY datetime,instrument'
         part = part_dir / f"part-{index:05d}.{fmt}"
         target_sql = str(part).replace("'", "''")
         if fmt == "parquet":
@@ -323,8 +334,15 @@ def export_features(
     output_format: str = "csv",
     label_mode: str = "t1_exec",
 ) -> dict[str, object]:
-    con = duckdb.connect(str(db_path), read_only=True)
+    out = Path(output).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    guard = FileLock(out.with_suffix('.export.guard'))
+    guard.__enter__()
+    con = None
     try:
+        con = duckdb.connect(str(db_path), read_only=True)
+        con.execute("SET memory_limit='1GB'")
+        con.execute('SET threads=2')
         min_date, max_date = con.execute(
             "SELECT min(date), max(date) FROM tushare_daily WHERE close IS NOT NULL AND close > 0"
         ).fetchone()
@@ -340,13 +358,22 @@ def export_features(
             "WHERE table_schema='main' AND table_name='tushare_adj_factor'"
         ).fetchone()[0] > 0
         feature_columns = BASE_FEATURE_COLUMNS + (FLOW_FEATURE_COLUMNS if flow_features_available else [])
-        out = Path(output)
-        out.parent.mkdir(parents=True, exist_ok=True)
+        run_dir = out.parent / (out.stem + '.versions') / uuid.uuid4().hex
+        run_dir.mkdir(parents=True)
         formats = {output_format} if output_format != "both" else {"csv", "parquet"}
+        if not formats <= {'csv', 'parquet'}:
+            raise ValueError('unsupported export format')
+        # Compute the complete observation windows exactly once, from source
+        # history (including pre-start warmup), then partition the materialized
+        # result. Calendar-day padding is not a trading-observation window.
+        query = _query(str(min_date)[:10], str(max_date)[:10],
+                       include_flow_features=flow_features_available,
+                       include_adjustment=adjustment_available, label_mode=label_mode)
+        con.execute(f'CREATE TEMP TABLE all_features AS {query}')
         outputs: dict[str, str] = {}
         format_stats: dict[str, dict[str, int | str]] = {}
         for fmt in sorted(formats):
-            target = out if out.suffix.lower() == f".{fmt}" else out.with_suffix(f".{fmt}")
+            target = run_dir / out.with_suffix(f'.{fmt}').name
             format_stats[fmt] = _copy_batched(
                 con,
                 start=start,
@@ -357,6 +384,7 @@ def export_features(
                 include_flow_features=flow_features_available,
                 include_adjustment=adjustment_available,
                 label_mode=label_mode,
+                materialized_table='all_features',
             )
             outputs[fmt] = str(target)
         primary_stats = format_stats["parquet" if "parquet" in format_stats else sorted(format_stats)[0]]
@@ -390,20 +418,43 @@ def export_features(
             "adjustment_available": adjustment_available,
             "price_semantics": (
                 "open/high/low/close and return labels use close*adj_factor; "
-                "volume uses volume/adj_factor; missing factors fall back to 1.0"
+                "volume uses volume/adj_factor; missing factors remain NULL and affected labels are excluded"
                 if adjustment_available else
                 "raw daily prices; tushare_adj_factor is unavailable"
             ),
             "export_batches": int(primary_stats["batches"]),
             "export_storage": primary_stats["storage"],
-            "export_memory_guard": "45 calendar-day batches with 25-day history context",
+            "export_memory_guard": "single materialization with full observation warmup; 1GB DuckDB limit; bounded output batches",
+            "scope": "historical_research_only",
+            "availability_assumption": "label available at 16:00 Asia/Shanghai on label end date; no actual historical receipt evidence",
             "generated_at": date.today().isoformat(),
         }
-        meta_path = out.with_suffix(".metadata.json")
-        meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        metadata['artifact_hashes'] = {}
+        for artifact in run_dir.rglob('*'):
+            if artifact.is_file():
+                digest = hashlib.sha256()
+                with artifact.open('rb') as handle:
+                    for block in iter(lambda: handle.read(8*1024*1024), b''):
+                        digest.update(block)
+                metadata['artifact_hashes'][artifact.relative_to(run_dir).as_posix()] = digest.hexdigest()
+        meta_path = run_dir / out.with_suffix('.metadata.json').name
+        with meta_path.open('x', encoding='utf-8') as handle:
+            json.dump(metadata, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        pointer = {'outputs': {fmt: Path(path).relative_to(out.parent).as_posix() for fmt, path in outputs.items()},
+                   'metadata_sha256': hashlib.sha256(meta_path.read_bytes()).hexdigest()}
+        temp = out.with_suffix('.current.' + uuid.uuid4().hex + '.tmp')
+        with temp.open('x', encoding='utf-8') as handle:
+            json.dump(pointer, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp.replace(out.with_suffix('.current.json'))
         return metadata
     finally:
-        con.close()
+        if con is not None:
+            con.close()
+        guard.__exit__(None, None, None)
 
 
 def main() -> int:

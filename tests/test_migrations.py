@@ -86,3 +86,18 @@ def test_dry_run_does_not_touch_database(tmp_path, con):
     applied = apply_pending(con, tmp_path, dry_run=True)
     assert applied == [5]
     assert applied_versions(con) == set()
+    assert con.execute('SHOW TABLES').fetchall() == []
+
+
+def test_missing_migration_directory_fails(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        discover_migrations(tmp_path / 'missing')
+
+
+def test_applied_migration_bytes_cannot_change(tmp_path, con):
+    file = _write_migration(tmp_path, '0002_demo.sql', 'CREATE TABLE demo(i INT)')
+    apply_pending(con, tmp_path)
+    file.write_text('CREATE TABLE another(i INT)', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='checksum mismatch'):
+        apply_pending(con, tmp_path)
+    assert con.execute('SELECT count(*) FROM demo').fetchone()[0] == 0

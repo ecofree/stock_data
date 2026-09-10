@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def main() -> int:
     parser.add_argument(
         "--out-prefix",
         default=str(PROJECT_ROOT / "reports" / "strategy_backtest"),
-        help="Writes <prefix>_latest.md and <prefix>_trades_latest.csv",
+        help="Writes <prefix>_latest.md, <prefix>_trades_latest.csv and <prefix>_ledger_latest.json",
     )
     args = parser.parse_args()
 
@@ -63,6 +64,7 @@ def main() -> int:
 
     out_md = Path(f"{args.out_prefix}_latest.md")
     out_csv = Path(f"{args.out_prefix}_trades_latest.csv")
+    out_ledger = Path(f"{args.out_prefix}_ledger_latest.json")
     out_md.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
@@ -77,8 +79,14 @@ def main() -> int:
         "|---|---|",
         *[f"| {k} | {v} |" for k, v in stats.items()],
         "",
-        "Limitations: no partial fills/intraday stops; 10cm boards only;"
-        " equal-slot compounding.",
+        "Scope: research_only_daily_bar_proxy; not a validated A-share execution simulator.",
+        "Accounting: daily cash/quantity ledger, equal slots sized from prior-close equity;"
+        " open positions are marked to available closes and retained at the end of the sample.",
+        "Limitations: fractional quantities, no lot-size/fees/corporate-action handling,"
+        " no partial fills/intraday stops or limit-down exit constraints;"
+        " fixed 10cm-board entry proxy uses the full daily bar. Missing marks are carried"
+        " forward and set valuation_complete=false; sessions come from observed kline dates.",
+        f"Ledger: [{out_ledger.name}]({out_ledger.name})",
         "",
     ]
     out_md.write_text("\n".join(lines), encoding="utf-8")
@@ -86,15 +94,21 @@ def main() -> int:
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=[
             "stock_code", "signal_date", "entry_date", "exit_date",
-            "entry_price", "exit_price", "ret_pct"])
+            "entry_price", "exit_price", "ret_pct", "quantity", "pnl"])
         writer.writeheader()
         for t in result["trades"]:
             writer.writerow(t.__dict__)
+
+    out_ledger.write_text(json.dumps(
+        {k: v for k, v in result.items() if k != "trades"},
+        ensure_ascii=False, indent=2, allow_nan=False,
+    ), encoding="utf-8")
 
     print(f"trades={stats['n_trades']} win_rate={stats['win_rate']} "
           f"cum_return%={stats['cumulative_return_pct']}")
     print(f"report: {out_md}")
     print(f"trades csv: {out_csv}")
+    print(f"daily ledger: {out_ledger}")
     return 0
 
 

@@ -67,7 +67,7 @@ def build_operator_state(
         operator_status = "data_only"
     else:
         operator_status = "uncertified"
-    effective_execution_ready = bool(execution_ready) and analysis_ready
+    effective_execution_ready = operator_status == "executable"
     return {
         "operator_state_version": OPERATOR_STATE_VERSION,
         "operator_status": operator_status,

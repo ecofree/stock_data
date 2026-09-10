@@ -57,6 +57,7 @@ def test_daily_operator_loop_populates_manual_workflow_and_caps_weak_market_posi
     con.close()
 
     result = run_daily_operator_loop(db_path, "2026-07-06")
+    run_daily_operator_loop(db_path, "2026-07-06")
 
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -74,7 +75,7 @@ def test_daily_operator_loop_populates_manual_workflow_and_caps_weak_market_posi
         "watchlist": 1,
         "trade_plan": 1,
         "risk_snapshot": 1,
-        "portfolio_snapshot": 1,
+        "portfolio_snapshot": 0,
         "trade_journal": 1,
     }
     assert max_position <= 5
@@ -220,5 +221,42 @@ def test_daily_operator_loop_is_idempotent_for_repeated_stage_refresh(tmp_path):
         "watchlist": 1,
         "trade_plan": 1,
         "risk_snapshot": 1,
-        "portfolio_snapshot": 1,
+        "portfolio_snapshot": 0,
     }
+
+
+def test_refresh_preserves_account_and_manual_journal_and_blocks_unknown_account(tmp_path):
+    db_path = tmp_path / "protected_facts.duckdb"
+    init_trading_tables(db_path)
+    con = duckdb.connect(str(db_path))
+    con.execute("CREATE TABLE market_regime_snapshot(trade_date VARCHAR, regime VARCHAR, "
+                "regime_score DOUBLE, suggested_position_pct INTEGER, evidence_json VARCHAR, generated_at TIMESTAMP)")
+    con.execute("INSERT INTO market_regime_snapshot VALUES ('2026-07-10','normal',90,80,'{}',now())")
+    con.execute("CREATE TABLE stock_candidate_score(trade_date VARCHAR, stock_code VARCHAR, stock_name VARCHAR, "
+                "score DOUBLE, source VARCHAR, sector_code VARCHAR, evidence_json VARCHAR)")
+    con.execute("INSERT INTO stock_candidate_score VALUES ('2026-07-10','NEW','New',90,'test','S','{}')")
+    con.execute("CREATE TABLE stock_candidate_stage_signal(trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, "
+                "stock_name VARCHAR, score DOUBLE, decision VARCHAR, evidence_json VARCHAR, generated_at TIMESTAMP)")
+    con.execute("INSERT INTO portfolio_snapshot(trade_date,snapshot_time,stock_code,stock_name,position_pct) "
+                "VALUES ('2026-07-10','manual','HELD','Held',60),('2026-07-10','close','CASH','Actual cash',40)")
+    con.execute("INSERT INTO trade_journal(trade_date,stock_code,action,reason) "
+                "VALUES ('2026-07-10','HELD','manual_note','keep this'),"
+                "('2026-07-10','HELD','auction_confirmation','manual amendment')")
+    con.execute("INSERT INTO trade_journal(trade_date,stock_code,action,reason,mistake_tag) "
+                "VALUES ('2026-07-10','HELD','close_decision','decision=hold score=90.00','pending_review'),"
+                "('2026-07-10','HELD','intraday_strength','[daily_loop:v2] decision=watch score=70.00','pending_review')")
+    before = con.execute("SELECT * FROM portfolio_snapshot ORDER BY stock_code").fetchall()
+    journal = con.execute("SELECT * FROM trade_journal ORDER BY action").fetchall()
+    con.close()
+    run_daily_operator_loop(db_path, '2026-07-10')
+    run_daily_operator_loop(db_path, '2026-07-10')
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        assert con.execute("SELECT * FROM portfolio_snapshot ORDER BY stock_code").fetchall() == before
+        assert con.execute("SELECT * FROM trade_journal ORDER BY action").fetchall() == journal
+        assert con.execute("SELECT max_position_pct, status FROM trade_plan").fetchone() == (0.0, 'review_required')
+        total, evidence = con.execute("SELECT total_position_pct,evidence_json FROM risk_snapshot").fetchone()
+        assert total is None
+        assert json.loads(evidence)['account_state'] == 'unverified'
+    finally:
+        con.close()

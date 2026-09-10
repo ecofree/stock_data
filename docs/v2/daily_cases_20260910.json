@@ -1,0 +1,36 @@
+{
+  "scope": "historical_daily_case_hypothesis_not_selection_backtest",
+  "assumptions": {
+    "version": "daily-case-v1",
+    "knowledge_mode": "historical_repair_not_system_replay",
+    "initial_holding": "100_settled_unrestricted_shares_costed_at_previous_raw_close",
+    "fill": "case_day_close_or_first_later_known_raw_close",
+    "capacity": "unconstrained_hypothesis_not_observed_liquidity",
+    "cash_payment": "csdc_delegated_schedule_assumed_receipt_not_actual",
+    "missing_share_delivery": "assume_declared_unrestricted_listing_day_not_source_fact",
+    "share_allocation": "exact_per_lot_only_reject_fractional_shares",
+    "tax": "flat_20_percent_gross_cash_at_ex_withheld_at_assumed_payment_not_legal_rate",
+    "share_tax": "zero_capitalization_tax_scenario_not_account_assessment",
+    "halt": "only_explicit_bounded_span_or_exact_start_day_never_extend_unknown",
+    "missing_price": "retain_assets_and_null_valuation_never_impute",
+    "max_stale_sessions": 1,
+    "exit_wait_sessions": 2,
+    "initial_cash_fen": 10000000,
+    "fees": {
+      "version": "case_sensitivity_not_broker_schedule",
+      "commission_bps": "3",
+      "minimum_commission_fen": 500,
+      "transfer_bps": "0.1",
+      "sell_tax_bps": "5"
+    }
+  },
+  "parent": "D:/accio/stock_data/reports/v2-disclosure-fields-20260910",
+  "legacy_wheel": "D:/accio/stock_data/tmp/v2-disclosure-wheel-20260910/stock_data_trading_assistant-0.1.0-py3-none-any.whl",
+  "legacy_wheel_sha256": "0d60c8ecd704f726261f3c9e715dc37618c73d922402ff3a517f4c1fa4f76425",
+  "case_ids": [
+    "17d490ff078d8433a8640e7e0e0903d65eba2018db00193be9bfe83f0103904e",
+    "bdad2e3451085193701a25e87caf797e624d1c7dc3f399f611898b4dc18e9baf",
+    "a536b5d58894acbc6a303b7d89fd022a20296744f0620cd6b9b82b3093cc1b99"
+  ],
+  "exposure_status": "previously_inspected_not_untouched"
+}

@@ -1,0 +1,635 @@
+{
+  "scope": "manual_disclosure_fields_not_historical_account_replay",
+  "adapter": "D:/accio/stock_data/reports/v2-historical-adapter-20260910",
+  "documents": [
+    {
+      "id": "sz000609-suspension",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-07/1225280039.PDF",
+      "title": "北京中迪投资股份有限公司关于公司股票交易异常波动的公告",
+      "published_date": "2026-05-07",
+      "instrument": "SZ.000609",
+      "date": "2026-04-22",
+      "kind": "halt",
+      "archive_id": "sz000609-suspension",
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "后续公告回述停牌一天及复牌日；不是当日系统已知或行情收据。",
+      "fields": {
+        "halt_start_date": {
+          "value": "2026-04-22",
+          "pages": [
+            3
+          ],
+          "basis": "正文回述04-22停牌一天。"
+        },
+        "halt_end_date_inclusive": {
+          "value": "2026-04-22",
+          "pages": [
+            3
+          ],
+          "basis": "仅在原文明确一天时给出闭区间终点；否则未知。"
+        },
+        "resumption_date": {
+          "value": "2026-04-23",
+          "pages": [
+            4
+          ],
+          "basis": "原文明确复牌日才填写；条件性未来安排不推算日期。"
+        },
+        "terminal_date": {
+          "value": null,
+          "pages": [],
+          "basis": "没有已发生摘牌的确切日期，保留未知。"
+        }
+      }
+    },
+    {
+      "id": "sh600193-suspension",
+      "url": "https://dataclouds.cninfo.com.cn/shgonggao/hsomarket/2026/20260427/a46ce88475f14840ae9add82944710ff.PDF",
+      "title": "上海创兴资源开发股份有限公司关于公司收到终止上市相关事项监管工作函的公告",
+      "published_date": "2026-04-28",
+      "instrument": "SH.600193",
+      "date": "2026-04-28",
+      "kind": "halt",
+      "archive_id": "sh600193-suspension",
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "监管工作函只明确停牌开始，不把拟终止上市当已摘牌。",
+      "fields": {
+        "halt_start_date": {
+          "value": "2026-04-28",
+          "pages": [
+            1
+          ],
+          "basis": "正文明确目标日开市起停牌。"
+        },
+        "halt_end_date_inclusive": {
+          "value": null,
+          "pages": [],
+          "basis": "仅在原文明确一天时给出闭区间终点；否则未知。"
+        },
+        "resumption_date": {
+          "value": null,
+          "pages": [],
+          "basis": "原文明确复牌日才填写；条件性未来安排不推算日期。"
+        },
+        "terminal_date": {
+          "value": null,
+          "pages": [],
+          "basis": "没有已发生摘牌的确切日期，保留未知。"
+        }
+      }
+    },
+    {
+      "id": "sz300029-suspension",
+      "url": "https://disc.static.szse.cn/download/disc/disk03/finalpage/2026-04-30/ad79f58a-95de-48fa-85fb-5a5005115bc5.PDF",
+      "title": "江苏华盛天龙光电设备股份有限公司关于公司股票将被终止上市暨停牌的风险提示公告",
+      "published_date": "2026-04-30",
+      "instrument": "SZ.300029",
+      "date": "2026-04-30",
+      "kind": "halt",
+      "archive_id": "sz300029-suspension",
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "公告目录日期04-30，落款04-29，页首编号2025-035。保留差异；条件性退市整理安排不是实际复牌或摘牌日期。",
+      "fields": {
+        "halt_start_date": {
+          "value": "2026-04-30",
+          "pages": [
+            1
+          ],
+          "basis": "正文明确目标日开市起停牌。"
+        },
+        "halt_end_date_inclusive": {
+          "value": null,
+          "pages": [],
+          "basis": "仅在原文明确一天时给出闭区间终点；否则未知。"
+        },
+        "resumption_date": {
+          "value": null,
+          "pages": [],
+          "basis": "原文明确复牌日才填写；条件性未来安排不推算日期。"
+        },
+        "terminal_date": {
+          "value": null,
+          "pages": [],
+          "basis": "没有已发生摘牌的确切日期，保留未知。"
+        }
+      }
+    },
+    {
+      "id": "sz002170-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-08/1225282499.PDF",
+      "title": "深圳市芭田生态工程股份有限公司关于2025年年度分红派息的实施公告",
+      "published_date": "2026-05-08",
+      "instrument": "SZ.002170",
+      "date": "2026-05-15",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。",
+      "fields": {
+        "record_date": {
+          "value": "2026-05-14",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-05-15",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-05-15",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.57",
+          "pages": [
+            1
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            2
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            2
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sh605499-mixed",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-12/1225292031.PDF",
+      "title": "东鹏饮料（集团）股份有限公司2025年年度A股权益分派实施公告",
+      "published_date": "2026-05-12",
+      "instrument": "SH.605499",
+      "date": "2026-05-18",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。 完整方案为现金加资本公积转增，原生现金组成并非完整行为；公告只明列新增无限售股上市日，未据此推造股份记账日期。",
+      "fields": {
+        "record_date": {
+          "value": "2026-05-15",
+          "pages": [
+            1
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-05-18",
+          "pages": [
+            1
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-05-18",
+          "pages": [
+            1,
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "2.5",
+          "pages": [
+            1
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            2,
+            4
+          ],
+          "basis": "完整分配方案及股本变动表仅包含现金和资本公积转增，人工解释红股组成为零，待独立复核。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0.3",
+          "pages": [
+            2
+          ],
+          "basis": "每股以资本公积金转增0.3股。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "按登记数量计入账户，但本公告未明确股份记账日期；不得由上市日推造。"
+        },
+        "share_listing_date": {
+          "value": "2026-05-18",
+          "pages": [
+            1
+          ],
+          "basis": "表列新增无限售条件流通股份上市日；不适用受限股解禁。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sz300534-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-15/1225308343.PDF",
+      "title": "甘肃陇神戎发药业股份有限公司2025年度分红派息实施公告",
+      "published_date": "2026-05-15",
+      "instrument": "SZ.300534",
+      "date": "2026-05-22",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。",
+      "fields": {
+        "record_date": {
+          "value": "2026-05-21",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-05-22",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-05-22",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.02",
+          "pages": [
+            1
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sz301188-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-06-02/1225347003.PDF",
+      "title": "山东力诺医药包装股份有限公司2025年年度权益分派实施公告",
+      "published_date": "2026-06-02",
+      "instrument": "SZ.301188",
+      "date": "2026-06-09",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。 股东每股税前0.10，除息参考价折算0.0969788不可代替股东现金；回购专户不参与。",
+      "fields": {
+        "record_date": {
+          "value": "2026-06-08",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-06-09",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-06-09",
+          "pages": [
+            2,
+            3
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.1",
+          "pages": [
+            2
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            3
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sz002538-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-06-18/1225376580.PDF",
+      "title": "安徽省司尔特肥业股份有限公司2025年年度权益分派实施公告",
+      "published_date": "2026-06-18",
+      "instrument": "SZ.002538",
+      "date": "2026-06-25",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。 公告目录发布日期06-18，落款06-17，分别保留，不回写成精确接收时间。",
+      "fields": {
+        "record_date": {
+          "value": "2026-06-24",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-06-25",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-06-25",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.12",
+          "pages": [
+            2
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sh601666-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-06-24/1225383470.PDF",
+      "title": "平顶山天安煤业股份有限公司2025年年度权益分派实施公告",
+      "published_date": "2026-06-24",
+      "instrument": "SH.601666",
+      "date": "2026-06-30",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。",
+      "fields": {
+        "record_date": {
+          "value": "2026-06-29",
+          "pages": [
+            1
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-06-30",
+          "pages": [
+            1
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-06-30",
+          "pages": [
+            1,
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.06",
+          "pages": [
+            1
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    },
+    {
+      "id": "sz002851-cash",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-07-16/1225426212.PDF",
+      "title": "深圳麦格米特电气股份有限公司2025年年度权益分派实施公告",
+      "published_date": "2026-07-16",
+      "instrument": "SZ.002851",
+      "date": "2026-07-24",
+      "kind": "distribution",
+      "archive_id": null,
+      "method": "assistant_manual_transcription_independent_review_pending",
+      "notes": "税前股东权利与除息参考价参数分开；代派安排仅适用中登代派/已指定交易A股持有人，不覆盖自行派发对象；不认证个体账户到账、税额或使用权。",
+      "fields": {
+        "record_date": {
+          "value": "2026-07-23",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告登记日；不等于个体账户登记数量。"
+        },
+        "ex_date": {
+          "value": "2026-07-24",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告除权除息日。"
+        },
+        "cash_pay_date": {
+          "value": "2026-07-24",
+          "pages": [
+            2
+          ],
+          "basis": "实施公告代派/指定交易现金发放日；非所有自派对象到账日。"
+        },
+        "gross_cny_per_share": {
+          "value": "0.03",
+          "pages": [
+            1
+          ],
+          "basis": "公告税前现金；按每10股公布时除以10，不用除息参考价折算金额。"
+        },
+        "bonus_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不送红股。"
+        },
+        "capitalization_shares_per_share": {
+          "value": "0",
+          "pages": [
+            1
+          ],
+          "basis": "本次方案明确不进行资本公积转增。"
+        },
+        "share_delivery_date": {
+          "value": null,
+          "pages": [],
+          "basis": "送股及转增均为0，股份到账日期不适用。"
+        },
+        "share_listing_date": {
+          "value": null,
+          "pages": [],
+          "basis": "无新增股份，上市日不适用。"
+        },
+        "cash_payment_scope": {
+          "value": "csdc_delegated_A_share_holders_not_self_distribution",
+          "pages": [
+            2
+          ],
+          "basis": "分配实施办法适用中登代派及已办指定交易的A股股东，不替自派对象保证支付日。"
+        }
+      }
+    }
+  ]
+}

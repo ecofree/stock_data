@@ -1,0 +1,70 @@
+{
+  "scope": "manual_announcement_research_supplement_not_account_authority",
+  "audit": "D:/accio/stock_data/reports/v2-gap-audit-20260910",
+  "native_parent": "D:/accio/stock_data/reports/v2-native-gap-continuation-20260910",
+  "documents": [
+    {
+      "id": "sz000609-suspension",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-07/1225280039.PDF",
+      "title": "北京中迪投资股份有限公司关于公司股票交易异常波动的公告",
+      "published_date": "2026-05-07",
+      "pages": [3, 4],
+      "instrument": "SZ.000609",
+      "date": "2026-04-22",
+      "kind": "session_status",
+      "value": {"status": "suspended", "coverage": "full_session"},
+      "interpretation": "后续发行人公告回述4月22日停牌一天、4月23日复牌；只支持目标日停牌，不生成行情或历史知识时间。",
+      "method": "assistant_manual_transcription_independent_review_pending"
+    },
+    {
+      "id": "sh600193-suspension",
+      "url": "https://dataclouds.cninfo.com.cn/shgonggao/hsomarket/2026/20260427/a46ce88475f14840ae9add82944710ff.PDF",
+      "title": "上海创兴资源开发股份有限公司关于公司收到终止上市相关事项监管工作函的公告",
+      "published_date": "2026-04-28",
+      "pages": [1],
+      "instrument": "SH.600193",
+      "date": "2026-04-28",
+      "kind": "session_status",
+      "value": {"status": "suspended", "coverage": "full_session"},
+      "interpretation": "发行人披露的交易所工作函明确4月28日开市起停牌；该日不是已摘牌，不能由停牌生成成交价格。",
+      "method": "assistant_manual_transcription_independent_review_pending"
+    },
+    {
+      "id": "sz300029-suspension",
+      "url": "https://disc.static.szse.cn/download/disc/disk03/finalpage/2026-04-30/ad79f58a-95de-48fa-85fb-5a5005115bc5.PDF",
+      "title": "江苏华盛天龙光电设备股份有限公司关于公司股票将被终止上市暨停牌的风险提示公告",
+      "published_date": "2026-04-30",
+      "pages": [1, 2],
+      "instrument": "SZ.300029",
+      "date": "2026-04-30",
+      "kind": "session_status",
+      "value": {"status": "suspended", "coverage": "full_session"},
+      "interpretation": "公告明确4月30日开市起停牌；页首编号写2025-035、落款4月29日，保留原文差异不更正。只提取正文明确日期，不推导摘牌日。",
+      "method": "assistant_manual_transcription_independent_review_pending"
+    },
+    {
+      "id": "sz301232-capitalization",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-05-12/1225291279.PDF",
+      "title": "湖南飞沃新能源科技股份有限公司关于2025年度资本公积金转增股本实施公告",
+      "published_date": "2026-05-12",
+      "pages": [1, 3, 4],
+      "instrument": "SZ.301232",
+      "date": "2026-05-19",
+      "kind": "entitlement_terms",
+      "value": {
+        "action_id": "capitalization:301232.SZ:2026-05-19",
+        "instrument": "SZ.301232",
+        "action_type": "capitalization",
+        "record_date": "2026-05-18",
+        "ex_date": "2026-05-19",
+        "cash_pay_date": null,
+        "share_delivery_date": "2026-05-19",
+        "share_listing_date": "2026-05-19",
+        "gross_cny_per_share": "0",
+        "shares_per_share": "0.4"
+      },
+      "interpretation": "股票溢价资本公积10转4、不送红股不派现金。5月18日登记、5月19日计划记入账户，无限售转股同日起始交易。回购专户不享权益；碎股由登记结算全体账户尾数排序及随机规则分配。本账户数量未知。权益比例0.4不等于含回购股的除权参考价比例0.3987099；不推算税率。",
+      "method": "assistant_manual_transcription_independent_review_pending"
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
 
 jobs:
@@ -17,11 +17,32 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install ruff pytest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --require-hashes -r requirements-dev.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Lint (ruff)
         run: python -m ruff check --select E9,F63,F7,F82,F401,F841 .
       - name: Lint (migrations)
         run: python scripts/lint_migrations.py
       - name: Test (pytest)
-        run: python -m pytest -q -p no:cacheprovider
+        run: python -m pytest -o addopts='' -q -p no:cacheprovider --junitxml=tmp/pytest-results.xml
+      - name: Installed package entry points (offline build)
+        run: |
+          python -m pip install --require-hashes -r requirements-build.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip wheel --no-index --no-deps --no-build-isolation . --wheel-dir tmp/wheels
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $taskWheel = Get-ChildItem tmp/wheels/stock_data_trading_assistant-*.whl
+          if ($taskWheel.Count -ne 1) { throw 'Expected exactly one project wheel' }
+          python -m pip install --no-index --no-deps --force-reinstall $taskWheel.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I tools/v2/probe_installed.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ github.sha }}
+          path: tmp/pytest-results.xml

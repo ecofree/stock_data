@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import duckdb
+import json
 
 from trade_system.daily_loop import run_daily_operator_loop
 from trade_system.risk import init_trading_tables
@@ -40,7 +41,7 @@ def test_daily_operator_loop_uses_actionable_stage_pool_when_scores_absent(tmp_p
         con.close()
 
 
-def test_intraday_risk_loop_promotes_actionable_candidate_to_executable(
+def test_intraday_risk_loop_requires_verified_account_even_for_actionable_candidate(
     tmp_path, monkeypatch
 ):
     db = tmp_path / "daily-loop-risk.duckdb"
@@ -74,7 +75,7 @@ def test_intraday_risk_loop_promotes_actionable_candidate_to_executable(
         )
         VALUES (
             '2026-07-31','intraday_strength','000001','Alpha',88,'follow','{}',
-            true,true,true,true,false,false
+            true,true,true,true,true,true
         )
         """
     )
@@ -108,10 +109,19 @@ def test_intraday_risk_loop_promotes_actionable_candidate_to_executable(
             "FROM stock_candidate_stage_signal "
             "WHERE stage='intraday_strength' ORDER BY stock_code"
         ).fetchall()
+        total, drawdown, evidence = con.execute(
+            "SELECT total_position_pct,current_drawdown_pct,evidence_json FROM risk_snapshot"
+        ).fetchone()
+        plan = con.execute("SELECT max_position_pct,status FROM trade_plan").fetchone()
     finally:
         con.close()
     assert result["trade_plan"] == 1
     assert promoted == [
-        ("000001", True, True),
+        ("000001", False, False),
         ("000002", False, False),
     ]
+    # Actionable market data is not a complete account. Old approvals must
+    # be revoked, not implicitly interpreted as a verified zero position.
+    assert total is None and drawdown is None
+    assert json.loads(evidence)["execution_blockers"] == ["account_snapshot_unverified"]
+    assert plan == (0.0, "review_required")

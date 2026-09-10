@@ -1,0 +1,952 @@
+{
+  "schema_version": 1,
+  "plan_sha256": "14BD6AE5830A6B9AADD73A3648B0E9140D845709F011FC35782478BBACCC684C",
+  "baseline": "78324ba622bf6c5fc6cbb736a490e5818788d824",
+  "production_cutover": false,
+  "broker_routing": "disabled_optional_not_authorized",
+  "latest_stage_evidence": [
+    "docs/v2/REMAINING_TASKS.md",
+    "trade_system/v2/operator_workflow.py",
+    "trade_system/v2/operator_workflow_cli.py",
+    "tests/test_v2_operator_workflow.py",
+    "reports/v2-operator-desk-20260910/completed.json",
+    "docs/v2/STAGE_SIX_LINES_20260910.md",
+    "reports/v2-six-lines-verification-20260910/six_lines.json",
+    "docs/v2/STAGE_DAILY_CASES_20260910.md",
+    "docs/v2/daily_cases_20260910.json",
+    "trade_system/v2/daily_account.py",
+    "trade_system/v2/daily_case_run.py",
+    "tools/v2/run_daily_cases.py",
+    "tests/test_v2_daily_cases.py",
+    "reports/v2-daily-cases-20260910/registration.json",
+    "reports/v2-daily-cases-20260910/run/completed.json",
+    "reports/v2-daily-cases-verification-20260910/verification.json",
+    "reports/v2-daily-cases-verification-20260910/historical_runtime_boundary.json",
+    "docs/v2/STAGE_DISCLOSURE_20260910.md",
+    "docs/v2/disclosure_fields_20260910.json",
+    "trade_system/v2/disclosure_fields.py",
+    "tools/v2/run_disclosure_fields.py",
+    "tests/test_v2_disclosure_fields.py",
+    "reports/v2-disclosure-fields-20260910/completed.json",
+    "reports/v2-disclosure-verification-20260910/verification.json",
+    "docs/v2/STAGE_ADAPTER_20260910.md",
+    "docs/v2/historical_adapter_20260910.json",
+    "trade_system/v2/historical_adapter.py",
+    "tools/v2/run_historical_adapter.py",
+    "tests/test_v2_historical_adapter.py",
+    "reports/v2-historical-adapter-20260910/completed.json",
+    "reports/v2-adapter-verification-20260910/verification.json",
+    "docs/v2/STAGE_INTEGRATED_20260910.md",
+    "trade_system/v2/integrated_account.py",
+    "trade_system/v2/integrated_run.py",
+    "tools/v2/run_integrated_account.py",
+    "tests/test_v2_integrated_account.py",
+    "reports/v2-integrated-golden-20260910/completed.json",
+    "reports/v2-integrated-verification-20260910/verification.json",
+    "docs/v2/STAGE_ENTITLEMENT_20260910.md",
+    "docs/v2/announcement_supplement_20260910.json",
+    "trade_system/v2/entitlements.py",
+    "trade_system/v2/entitlement_run.py",
+    "trade_system/v2/case_supplement.py",
+    "tools/v2/run_entitlements.py",
+    "tools/v2/run_case_supplement.py",
+    "tests/test_v2_entitlements.py",
+    "tests/test_v2_case_supplement.py",
+    "reports/v2-entitlement-golden-20260910/completed.json",
+    "reports/v2-announcement-supplement-20260910/completed.json",
+    "reports/v2-entitlement-verification-20260910/verification.json",
+    "docs/v2/STAGE_NATIVE_20260910.md",
+    "trade_system/v2/native_gap_sources.py",
+    "trade_system/v2/native_gap_run.py",
+    "tools/v2/run_native_gap.py",
+    "tests/test_v2_native_gap.py",
+    "reports/v2-native-gap-20260910/completed.json",
+    "reports/v2-native-code-v1-20260910/native_gap_run.py",
+    "reports/v2-native-gap-continuation-20260910/completed.json",
+    "reports/v2-native-verification-20260910/verification.json",
+    "docs/v2/STAGE_GAP_20260910.md",
+    "docs/v2/GAP_EVIDENCE_CONTRACT.md",
+    "trade_system/v2/gap_audit.py",
+    "trade_system/v2/gap_evidence.py",
+    "tools/v2/run_gap_evidence.py",
+    "tests/test_v2_gap_evidence.py",
+    "reports/v2-gap-audit-20260910/completed.json",
+    "reports/v2-gap-adjudication-20260910/completed.json",
+    "reports/v2-gap-verification-20260910/verification.json",
+    "docs/v2/STAGE_PORTFOLIO_20260910.md",
+    "docs/v2/portfolio_policy_20260910.json",
+    "trade_system/v2/portfolio_diagnostic.py",
+    "trade_system/v2/portfolio_experiment.py",
+    "tools/v2/run_portfolio_diagnostic.py",
+    "tests/test_v2_portfolio_diagnostic.py",
+    "reports/v2-portfolio-research-20260910/historical-portfolio-20260910-v1/registration.json",
+    "reports/v2-portfolio-research-20260910/historical-portfolio-20260910-v1/run/completed.json",
+    "reports/v2-portfolio-verification-20260910/verification.json",
+    "docs/v2/STAGE_ROLLING_20260910.md",
+    "docs/v2/rolling_experiment_20260910.json",
+    "trade_system/v2/rolling_research.py",
+    "tools/v2/run_rolling_research.py",
+    "tests/test_v2_rolling_research.py",
+    "reports/v2-rolling-research-20260910/historical-rolling-20260910-v1/registration.json",
+    "reports/v2-rolling-research-20260910/historical-rolling-20260910-v1/run/completed.json",
+    "reports/v2-rolling-verification-20260910/verification.json",
+    "docs/v2/STAGE_EXIT_20260910.md",
+    "trade_system/v2/exit_policy.py",
+    "trade_system/v2/attribution.py",
+    "tests/test_v2_exit_attribution.py",
+    "reports/v2-exit-attribution-20260910/reports/runs/replay/attribution.json",
+    "reports/v2-exit-verification-20260910/verification.json",
+    "docs/v2/STAGE_REPLAY_20260910.md",
+    "trade_system/v2/event_bridge.py",
+    "trade_system/v2/paper_ledger.py",
+    "trade_system/v2/paper_storage.py",
+    "tools/v2/run_event_replay.py",
+    "tests/test_v2_event_replay.py",
+    "reports/v2-replay-sources-20260910/capabilities.json",
+    "reports/v2-replay-verification-20260910/verification.json"
+  ],
+  "work_packages": [
+    {
+      "id": "WP00",
+      "name": "冻结基线、保护数据并建立项目台账",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-00-01",
+          "description": "确认远端与工作区 SHA、未提交改动、当前任务及数据库/报告路径；保存实际配置指纹，密钥仅保存引用，不导出值。",
+          "status": "partial",
+          "evidence": [
+            "docs/v2/BASELINE.md"
+          ],
+          "note": "本地 HEAD 与 origin/main 缓存均为基线 SHA；脏工作树按源码文件摘要绑定，未联网刷新远端。"
+        },
+        {
+          "id": "SD2-00-02",
+          "description": "在协调停写并正常关闭数据库后备份；另外备份人工计划、持仓、成交和操作记录。做恢复演练，保存校验和、行数、唯一键及账户控制总额。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/backup_verify.py"
+          ],
+          "note": "源库只读锁保护下复制并验证 SHA、全表行数及人工表导出；不代表真实账户对账或唯一键全面审计。"
+        },
+        {
+          "id": "SD2-00-03",
+          "description": "将现有输出标为研究参考，禁用已知不可信的执行资格入口；停止自动覆盖人工持仓的路径。冻结策略参数，不停止经授权且不会触碰旧事实的原始数据采集。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/daily_loop.py"
+          ],
+          "note": "保护旧人工持仓、收紧门禁；V2 全路径 paper_only。未进行现网切换。"
+        },
+        {
+          "id": "SD2-00-04",
+          "description": "把原51项审计问题导入台账；按本次实际源码复验，保留缺陷/条件风险/边界缺口性质；创建依赖任务和待核实权益清单。",
+          "status": "partial",
+          "evidence": [
+            "docs/v2/audit_traceability.json"
+          ],
+          "note": "已导入 51 项摘要和 80 项任务；完整原审计附件未在当前 Git 树找到，未伪造基线包。"
+        }
+      ]
+    },
+    {
+      "id": "WP01",
+      "name": "可重复安装、CI与安全依赖",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-01-01",
+          "description": "统一依赖声明，核实 baostock 等真实可安装版本；生产、开发、Qlib 分开锁定传递依赖；更新受影响的安全依赖并做兼容回归。",
+          "status": "partial",
+          "evidence": [
+            "requirements-dev.lock"
+          ],
+          "note": "core/dev 传递哈希锁安装成功；QLib 哈希锁已解析，尚未用此锁重建研究环境。"
+        },
+        {
+          "id": "SD2-01-02",
+          "description": "Windows CI每条安装命令失败立即终止；运行 pip check、全量 pytest，并保存收集/执行/跳过数量与当前提交，不能引用旧提交通过数。",
+          "status": "partial",
+          "evidence": [
+            ".github/workflows/ci.yml"
+          ],
+          "note": "CI fail-fast 已修改；当前版本本地双环境全量验证，未推送触发远端 CI。"
+        },
+        {
+          "id": "SD2-01-03",
+          "description": "先正式支持经过验证的 Windows Python 3.11 维护补丁版本；其他版本仅实验。将代码资源和迁移资源纳入包，离开源码目录验证 wheel 安装及离线建库。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/verify_delivery.py"
+          ],
+          "note": "Windows Python 3.11.15 wheel 可离开源码导入、建库、启动 paper 服务；其他版本未正式验收。"
+        },
+        {
+          "id": "SD2-01-04",
+          "description": "配置在启动时显式加载，使用绝对可写数据目录和交易时钟；移除导入创建目录、日志日期冻结；加入关键域类型检查、依赖审计及秘密扫描。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/config.py"
+          ],
+          "note": "删除导入创建目录；V2 显式路径/时钟。旧配置延迟加载、日期日志、类型和秘密扫描仍待完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP02",
+      "name": "单写者运行时、可靠锁与版本化发布",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-02-01",
+          "description": "用经过真实Windows验证的操作系统文件锁替换删除式抢锁；禁止 os.kill(pid,0) 探测；锁以句柄所有权为准，权限未知不抢占。",
+          "status": "implemented_locally_verified",
+          "evidence": [
+            "tests/test_os_handle_lock.py"
+          ],
+          "note": "Windows 真双进程与异常退出验证句柄锁；未知旧元数据保守阻塞，不做 PID 探测。"
+        },
+        {
+          "id": "SD2-02-02",
+          "description": "建立单一 service 进程拥有 live.duckdb；网络工作者不持有数据库连接，仅交付有界批次或原子spool文件；CLI和本地界面通过service命令/查询访问。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/service.py"
+          ],
+          "note": "独立 V2 单线程数据库 actor、有界队列、JSONL CLI 已实现；源采集 spool 和 UI API 尚未接入。"
+        },
+        {
+          "id": "SD2-02-03",
+          "description": "所有步骤统一请求预算、任务预算、队列背压、子进程退出和日志捕获；进程内渲染同样受监控。迁移与维护另有显式停写模式。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_service_publisher.py"
+          ],
+          "note": "队列背压、开始前预算、异常 Future 完成已实现；执行中硬超时、统一子进程及维护模式尚待接入。"
+        },
+        {
+          "id": "SD2-02-04",
+          "description": "报告写入不可变 run 目录；产物显式登记，包括日期命名CSV；校验后在发布锁内原子切换 current 指针。失败状态独立保存，旧任务不能恢复覆盖新版本。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/publisher.py"
+          ],
+          "note": "V2 不可变 bundle、显式 CSV 清单、哈希和发布锁/指针已验证；旧生产发布器未迁移。"
+        }
+      ]
+    },
+    {
+      "id": "WP03",
+      "name": "不可变事实、类型语义与迁移契约",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-03-01",
+          "description": "实现批次、原始观察、事实版本和输入manifest；区分业务时间、接收时间、验证提交时间、未来事件生效时间与数据修订版本。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/storage.py"
+          ],
+          "note": "事实原始字节、多时间语义和修订已有实现；新增离线缺口证据原字节/精确行绑定、程序赋值本地已知时间及不可变裁决包。原生源响应适配、独立认证与批次隔离未完整。见 STAGE_GAP_20260910.md。"
+        },
+        {
+          "id": "SD2-03-02",
+          "description": "字段级单位、累计/增量、调整价/原始价、0/null/非法值明确；NaN/Inf拒绝。累计序列取末值和同源差分；重复采样不增加经济量。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_core.py"
+          ],
+          "note": "明确单位与累计/增量语义、拒绝非有限值、0 保留与重复去重；完整跨源/调整价特征契约待完成。"
+        },
+        {
+          "id": "SD2-03-03",
+          "description": "已发布事实追加修订不覆盖；MERGE只用于最新投影。写入失败必须显式返回失败/隔离，计数区分输入、合法、去重、更新和落盘。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/storage.py"
+          ],
+          "note": "V2 追加事实和实际去重计数；旧写入接口异常吞噬及投影迁移尚未整体替换。"
+        },
+        {
+          "id": "SD2-03-04",
+          "description": "集中DDL与迁移校验和；禁止业务代码动态全VARCHAR建表；缺迁移目录报错。旧数据按来源和时间可信度分级导入，不伪造历史接收时间。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/migrations.py"
+          ],
+          "note": "缺迁移目录报错，新迁移校验精确执行字节；旧无摘要版本保持未认证，V2 初始 schema 禁止隐式升级。"
+        }
+      ]
+    },
+    {
+      "id": "WP04",
+      "name": "权益核查、来源身份与按需采集",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-04-01",
+          "description": "逐个核对实际已购KPL网关与TuShare权益：授权用途、历史范围、字段、限制、实测时效。只做GET/只读受控探测；不批量调用可能具有写入效果的目录项。",
+          "status": "partial",
+          "evidence": ["docs/v2/STAGE_NATIVE_20260910.md", "reports/v2-native-gap-continuation-20260910/completed.json"],
+          "note": "已有凭据、官方字段和精确日期只读请求已核对；两轮16次传输尝试，同花顺得7现金候选/1送股观察，中继HTTP429后停止。未认证完整授权用途、历史覆盖或上游独立来源；未购买升级或写行情。"
+        },
+        {
+          "id": "SD2-04-02",
+          "description": "区分delivery_provider、origin_family、source_api和metric_definition；相同原始数据经不同网关不算独立证据，未知同源关系显式保留。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/legacy_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "已连接原生同花顺响应到引用行/原字节SHA/规范化证据，TuShare映射本地测试通过但真实请求受429阻塞。明确HTTP响应观测时间不等于历史发布时间；交付TLS链不替代独立上游/权益认证。经独立认证来源仍为0，见 STAGE_NATIVE_20260910.md。"
+        },
+        {
+          "id": "SD2-04-03",
+          "description": "建立数据产品到特征/规则/验证消费者的登记与运行时血缘；把仅连通、仅入库、仅展示、参与决策、通过验证分别统计。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "产品、规范化输入哈希、记录证据 ID 与消费者已进入历史上下文链；生产采集贡献与 paid 消融仍待完成。"
+        },
+        {
+          "id": "SD2-04-04",
+          "description": "按全市场基础、活跃题材、候选、已有持仓分层采集；同请求合并、共享限流和预算，优先账户及持仓；缺失通过能力矩阵影响相关模式，不能靠降低分母伪装覆盖。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        }
+      ]
+    },
+    {
+      "id": "WP05",
+      "name": "KPL题材/梯队与多维市场环境",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-05-01",
+          "description": "把题材催化、概念归属、当天原因和价格反应分开建模；实体关系有版本和首次可知时间，不把当前成员快照倒灌历史。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "按当日已核验成员与首次导入可知时间保存不可变上下文，晚到修订隔离；真实催化/关系首次历史可知与生命周期仍缺。"
+        },
+        {
+          "id": "SD2-05-02",
+          "description": "构建题材生命周期及高度/承载/跟随角色证据；先输出可解释维度与支持/反对项，禁止“最高板必为唯一龙头”。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "高度/成交额承载角色分开且允许并列，支持/反对显式；390 组真实历史观察已生成，生命周期/唯一核心有效性未验收。"
+        },
+        {
+          "id": "SD2-05-03",
+          "description": "市场环境拆为广度、梯队晋级、失败样本表现、主题集中与轮动；维度组合限制模式，不只套用涨停数量阈值。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "广度、观测梯队晋级、未晋级样本、重叠归属分摊集中度和条件组轮动已计算；正式市场模式限制/真实完整性仍未验收。"
+        },
+        {
+          "id": "SD2-05-04",
+          "description": "模型仅做带证据的文本抽取/归类，保存模型/提示/输出版本；数值和硬风控确定性计算。异常文本不能触发工具、改规则或拼接可执行SQL。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        }
+      ]
+    },
+    {
+      "id": "WP06",
+      "name": "TuShare历史、证券主数据与风险事件",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-06-01",
+          "description": "建立证券代码+交易所身份、上市退市生命周期、交易日历及规则生效版本；买卖单位、涨跌幅、T+1等不由股票代码前缀随意硬编码。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/legacy_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "明确后缀证券身份、声明股票池与源 pretrade_date 接通历史研究；49 条无法映射成员保留缺口，退市生命周期/认证规则未完成。"
+        },
+        {
+          "id": "SD2-06-02",
+          "description": "保存原始OHLC与复权因子、每日指标、历史涨跌停/炸板专题及各自覆盖限制；部分因子缺失不填1伪造完整复权。",
+          "status": "partial",
+          "evidence": [
+            "scripts/export_qlib_features.py"
+          ],
+          "note": "QLib 导出不再把缺复权因子补 1；完整证券历史/专题覆盖仍待接入。"
+        },
+        {
+          "id": "SD2-06-03",
+          "description": "解禁、公告、财务、龙虎榜等按可获知时间进入风险/上下文。预告未来生效事件允许已知后提示，不把未来实际结果当已知。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_core.py"
+          ],
+          "note": "允许已公告未来生效事件，事实首次接收有记录；真实风险源适配尚未接入。"
+        },
+        {
+          "id": "SD2-06-04",
+          "description": "按第一条策略所需字段和日期范围做可恢复历史补采；保存已退市和失败样本，按来源定义分开保留资金流，不硬做不同口径金额等式认证。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        }
+      ]
+    },
+    {
+      "id": "WP07",
+      "name": "统一时点特征、候选与报价证据",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-07-01",
+          "description": "所有候选、主题、数值和报价从同一 QueryContext 读取，强制 snapshot_id/asof/mode；分析环境无法调用无截止latest事实入口。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "新增上下文显式 asof/mode 与接收/已知时间筛选，按 ID 持久化；尚未统一替换旧候选链及首条真实策略输入。"
+        },
+        {
+          "id": "SD2-07-02",
+          "description": "建立真实系统重放与历史假设可用性两种模式；后者明确假设，禁止向真实执行资格传播。候选先按同股优先规则去重再限量。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "真实接收重放与历史假设隔离，题材候选先按证券去重再限量；真实副本仅 historical_research，未赋予执行资格。"
+        },
+        {
+          "id": "SD2-07-03",
+          "description": "个股报价分别检查源事件年龄、接收年龄、连续竞价/竞价阶段与流动性证据；价格与盘口可分别补齐但时间/来源不混淆。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/decisions.py"
+          ],
+          "note": "报价源时间和接收时间双 TTL 校验；盘口/交易阶段/流动性适配待完成。"
+        },
+        {
+          "id": "SD2-07-04",
+          "description": "实现注册特征的单位、缺失处理、质量标记和输入血缘；滚动窗口按交易观测而非固定自然日；增量、分批与全量算子结果一致。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_qlib_temporal.py"
+          ],
+          "note": "QLib 跨批次全历史预热和 CSV/Parquet 采样一致性通过；全局特征注册尚未完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP08",
+      "name": "真实账户、人工事实与对账",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-08-01",
+          "description": "账户快照保存现金、持仓批次、可卖数量、冻结资金、未完成委托、源时间和reconciliation状态；未知值保持null。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/accounts.py"
+          ],
+          "note": "显式账户快照和控制总额已实现；本轮 paper_ledger 增加整数批次/FIFO成本/T+N/挂单冻结投影，真实分批账户导入仍待验收。见 STAGE_REPLAY_20260910.md。"
+        },
+        {
+          "id": "SD2-08-02",
+          "description": "首期支持真实券商导出/明确人工声明的导入，后续只读适配；导入原文件hash、账户标识、有效期和控制总额。手工导入不是持续实时账户。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/accounts.py"
+          ],
+          "note": "结构化导入、原文件摘要与控制总额检查已实现；用户暂时无真实资料，真实验收待办。"
+        },
+        {
+          "id": "SD2-08-03",
+          "description": "账户事件追加保存成交、费用、出入金、公司行为与人工纠正；纠正引用原事件而非覆盖。实际快照作为权威对账，账本推导与其不一致即告警。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/accounts.py"
+          ],
+          "note": "已有纸面结算账和权益子账；本段复用子账接入隔离合成父账，原子成本转移/到账/税款和跨账回滚金标准通过。未替换 Service 或真实账户，真实批次导入/结算仍缺。见 STAGE_INTEGRATED_20260910.md。"
+        },
+        {
+          "id": "SD2-08-04",
+          "description": "隔离paper账户与live账户；自动重建不能改人工决定。系统外操作后必须再对账，人工已执行但未有成交确认保持未知。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_core.py"
+          ],
+          "note": "paper/live 身份隔离，外部动作后要求再对账；未确认预占保持 unknown。真实源验证待办。"
+        }
+      ]
+    },
+    {
+      "id": "WP09",
+      "name": "分模式状态机与不可变信号",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-09-01",
+          "description": "定义setup、watch、armed、triggered、invalidated、expired的确定性状态转换；每次信号追加保存输入、策略版本和原因码，latest只是投影。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/strategies.py"
+          ],
+          "note": "六状态确定性转换、不可变信号和 latest 投影已实现；生产策略集成待办。"
+        },
+        {
+          "id": "SD2-09-02",
+          "description": "首期实现theme_core_auction_follow_v1：收盘题材假设、次日竞价结果确认、开盘后价格/题材/资金条件；不在竞价结果收到前触发。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/run_paper_demo.py"
+          ],
+          "note": "新增竞价最终性分道、同口径累计资金差、固定分母题材广度到冻结条件的事件桥接；合成服务入口跑通 watch/armed/triggered，真实候选适配与源最终性仍待完成。"
+        },
+        {
+          "id": "SD2-09-03",
+          "description": "打板、半路、回封、低吸各自注册数据前提和失效条件；未测时效或无真实过程数据的模式只research_only，不靠总分共享触发。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-09-04",
+          "description": "策略函数只接收有时点输入，不联网、不直接读写数据库或真实账户；阈值和模型版本通过配置注册，未校准参数保持未批准，不能为出信号降低门槛。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/strategies.py"
+          ],
+          "note": "纯转换函数无 I/O，参数显式、版本不可变、默认 test_only；生产校准批准注册未实现。"
+        }
+      ]
+    },
+    {
+      "id": "WP10",
+      "name": "统一决策证书、预算预占与重新校验",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-10-01",
+          "description": "唯一DecisionService组合策略、必需数据、账户、风险和许可；研究资格/人工计划资格/真实执行资格明确区分，展示不得独立拼接ready。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/decisions.py"
+          ],
+          "note": "同一 DecisionService 已覆盖入场与 reduce-only 退出，卖出直通封闭，可卖量预占/确认/订单交付重验通过；许可、全局风险策略及题材风险仍未完整。见 STAGE_EXIT_20260910.md。"
+        },
+        {
+          "id": "SD2-10-02",
+          "description": "写入绑定信号、输入manifest、账户版本、规则版本、允许动作、最大数量/金额、有效期、硬阻塞和证据引用的证书；缺必需字段拒绝。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/decisions.py"
+          ],
+          "note": "入场绑定事件依据；退出绑定冻结理由/政策、报价、账本配置/快照/可卖数量。退出无需买入信号，仍检查报价版本/T+N/账户一致性；全局风险及许可证据待接入。"
+        },
+        {
+          "id": "SD2-10-03",
+          "description": "人工确认时再次检查当前报价、账户版本、交易状态、策略未失效；原子预占可用资金与风险额度，重复确认使用相同幂等键。多个计划不可重复花同一余额。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_core.py"
+          ],
+          "note": "买入资金与卖出数量分表预占；两方向预占转移/事件/投影同事务，新增卖出投影故障注入验证完整回滚。重复接收不重扣，unknown 拒绝转入，仅 paper。"
+        },
+        {
+          "id": "SD2-10-04",
+          "description": "收盘补价只解除价格缺失原因；新增仓位与减仓分开检查。成交/委托状态不明不能因超时自动释放预占；kill switch关闭新执行但保留风险观察。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/gate_contract.py"
+          ],
+          "note": "reduce-only 减仓不被入场仓位比例误拦，仍受规则/可卖数量/报价限制；unknown 不自动释放。未知预占人工解决、完整自动退出策略及全局杀开关待完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP11",
+      "name": "共用策略的事件重放与真实结算回测",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-11-01",
+          "description": "以事件顺序驱动与线上相同的策略和风控函数；输入模式、到账延迟、样本范围和交易规则版本固定。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/run_paper_demo.py"
+          ],
+          "note": "run_event_replay.py 买卖两方向均经过同一 DecisionService 确认再交付，重启重演与归因核对通过；实际原始事件适配、任意历史批次重放和认证规则仍未完成。"
+        },
+        {
+          "id": "SD2-11-02",
+          "description": "按入场数量、现金、冻结、成本、公司行为与逐观测市值结算；计算净值和回撤，不再逐平仓对总权益复利。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/backtest_engine.py"
+          ],
+          "note": "合成父账三条金标准已完成；新增冻结历史只读准备适配，保留全部3变体/2400窗口，输出3603/3606日线覆盖及11案来源/政策/推导缺口。未生成历史父账事件，新作用域与日线假设政策、停复牌跨度、分红税费仍待完成；原3组账户中止/收益null。见 STAGE_ADAPTER_20260910.md。"
+        },
+        {
+          "id": "SD2-11-03",
+          "description": "成交模拟按实际可观察报价、下一可成交时刻、可卖日期和费用版本；无过程证据的回封/排队成交标记不可识别，不从日线制造分钟成交。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/backtest_engine.py"
+          ],
+          "note": "显式日历 T+N、版本化费用/整手、同日新鲜且委托后的盘口容量代理已实现；无盘口不成交，重复快照不复用容量。真实盘口源、队列/冲击及规则认证未完成。"
+        },
+        {
+          "id": "SD2-11-04",
+          "description": "准备可手算的金标准与敏感性测试：重叠仓位、同日不可卖、跳空、封死、部分成交、停牌、费用；结果区分机会回报、模拟策略回报和人工真实回报。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_remediation_correctness.py"
+          ],
+          "note": "新增 36 项事件/结算等测试，包含部分成交最低费用、T+N、零股、无对手盘、停牌、回撤和三账隔离。测试费率/规则是夹具，不是市场有效性或全部敏感性验收。"
+        }
+      ]
+    },
+    {
+      "id": "WP12",
+      "name": "首条业务闭环与已有持仓优先管理",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-12-01",
+          "description": "收盘构建题材候选与不同竞价情景，包含支持、反对、取消条件和历史样本；计划是条件式，不是提前批准次日买入。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "真实副本生成 20 个 watch 条件观察并绑定题材/报价证据、反对项和竞价/资金/账户后续条件；未形成真实竞价触发闭环。"
+        },
+        {
+          "id": "SD2-12-02",
+          "description": "竞价结果实际到达后更新相对自身历史/同类/题材基准，9:26以后数据不得回放为9:24已知；过程与最终结果分通道。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/run_paper_demo.py"
+          ],
+          "note": "事件桥接将预估/最终竞价分产品并按实际接收时间推导，合成反例通过；旧库无明确最终性，真实相对基准/过程源适配待办。"
+        },
+        {
+          "id": "SD2-12-03",
+          "description": "开盘后根据已冻结条件触发、失效或等待，调用统一账户风控；对已有持仓先评估可行动的风险提示，再处理新候选。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "已有持仓 reduce-only 退出提案优先队列、账户/报价/T+N/数量预占重验已接通；纸面账户完整示例通过。真实账户、自动退出政策校准及操作界面仍待完成。"
+        },
+        {
+          "id": "SD2-12-04",
+          "description": "盘后关联人工确认、未执行原因、实际成交和后续状态；事实修订/晚到补价生成新版本，不追改当时建议。",
+          "status": "partial",
+          "evidence": [
+            "tools/v2/run_paper_demo.py"
+          ],
+          "note": "新增三账归因 JSON/Markdown：组合控制数、确认价偏差/费用、延迟、blocked/未交付显式；真实成交/收益保持 null。未估计选股alpha/未成交机会成本，交互归因界面与真实复盘仍待完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP13",
+      "name": "作战卡界面、人工操作与完整发布",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-13-01",
+          "description": "界面固定为账户风险、市场模式、题材机会、个股计划、数据证据五区；优先已有持仓与需要处理的状态变化，减少同卡重复提醒。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/reporting.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "五区页市场与题材从占位更新为真实历史证据、条件观察与持仓风险提示，桌面/手机浏览器检查；不是实时生产页面接管。"
+        },
+        {
+          "id": "SD2-13-02",
+          "description": "计划显示触发/未满足/硬阻塞/有效期/账户版本/数量上限/反对证据与paid贡献；只显示研究支持时不得使用真实执行绿色状态。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/reporting.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "新增角色并列、实验支持/反对/催化缺失、中文后续条件；不提供操作权限或 paid 贡献结论。"
+        },
+        {
+          "id": "SD2-13-03",
+          "description": "人工确认、拒绝、备注、更正追加事件，自动刷新不得覆盖；有状态更改的本地API做身份认证、CSRF/Origin检查、幂等和审计；远程访问另行授权。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/service.py"
+          ],
+          "note": "JSONL 服务确认事件幂等；无 HTTP/远程访问，身份认证/CSRF/备注纠正 UI 待办。"
+        },
+        {
+          "id": "SD2-13-04",
+          "description": "所有页面、CSV及证据文件使用显式artifact清单和单指针版本；静态页面只能查看，不能以旧缓存确认；断开服务时操作按钮禁用。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/publisher.py"
+          ],
+          "note": "V2 bundle+只读禁用按钮经过浏览器验证；旧主复盘页发布链待迁移。"
+        }
+      ]
+    },
+    {
+      "id": "WP14",
+      "name": "付费数据贡献、消融实验与续费决策",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-14-01",
+          "description": "冻结共同安全底座C与免费基线F，分别跑C+F、C+F+K、C+F+T、C+F+K+T；评估标签可共用，但不能偷偷作为基线决策输入。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-14-02",
+          "description": "同时做固定候选池比较与允许候选变化的完整系统比较；每个实验独立paper账户和预算，输入到达、成本、规则及候选限制一致。",
+          "status": "partial",
+          "evidence": ["trade_system/v2/portfolio_experiment.py", "docs/v2/STAGE_PORTFOLIO_20260910.md"],
+          "note": "价格/价格加资金/身份哈希三组固定 OOS 样本，以同预算、持有期、假设费用和日历运行独立诊断账；实际三组均因缺持仓日线中止，不作不等区间优劣比较。仍非 C/F/K/T 完整系统消融或经 DecisionService 的可执行纸面回测。"
+        },
+        {
+          "id": "SD2-14-03",
+          "description": "每次决策记录增量作用：新增候选、否决、时机、仓位、风险与恢复；收集未执行和被否决样本，改变决策不是有效性证明。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-14-04",
+          "description": "预登记主要指标、经济最小改善、实验数量和保留区间；按交易日/题材相关性评估不确定性与多次试验偏差，测量成本、人工耗时和容灾价值；产生继续/降频/仅容灾/停用建议。",
+          "status": "partial",
+          "evidence": ["trade_system/v2/rolling_research.py", "docs/v2/STAGE_ROLLING_20260910.md"],
+          "note": "已冻结本次两组特征/预算/基线/成本场景与历史暴露声明，执行日级移动块描述区间。不是 C/F/K/T 完整付费消融；经济最小改善、多重检验、题材相关性/人工耗时/容灾价值及续费建议仍未完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP15",
+      "name": "Qlib数据和实验整改，保持影子模式",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-15-01",
+          "description": "标签保留label_end_time与可用时点；训练集只能包含当时已完整可知标签，清除跨验证边界样本，按交易观测为滚动特征预热。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_qlib_temporal.py"
+          ],
+          "note": "逐折训练/验证双时间戳隔离、训练中位数、模型接口隐藏测试标签及共同样本检查通过；历史 16:00 可用性仍是研究假设，不是实际接收记录。"
+        },
+        {
+          "id": "SD2-15-02",
+          "description": "独立训练/调参验证/最终保留测试与滚动样本外评价；早停用验证不等于最终样本外，所有尝试记入模型注册。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/ml_protocol.py"
+          ],
+          "note": "新增不可变实验登记与实际 4 折/8 次 QLib 拟合，共同评分 14319 行/80 日，尾段不评分。当前快照曾被观察，不宣称未触碰保留集；完整组合回测/正式统计与新前向区间仍缺。"
+        },
+        {
+          "id": "SD2-15-03",
+          "description": "CSV代码字符串、部分复权缺失、跨批次特征一致性和导出原子性修复；每批重用物化结果避免重复重型查询。",
+          "status": "implemented_locally_verified",
+          "evidence": [
+            "tests/test_qlib_temporal.py"
+          ],
+          "note": "CSV 字符串、因子缺失、跨批次稳定及不可变指针导出通过；真实快照导出 918490 行。"
+        },
+        {
+          "id": "SD2-15-04",
+          "description": "模型只提供影子排名或说明，输出冻结模型/数据版本；没有独立增益、稳定性和批准证据，不可修改真实执行权重或风险规则。",
+          "status": "partial",
+          "evidence": [
+            "scripts/predict_qlib_daily.py"
+          ],
+          "note": "本轮价格/价格加资金两组日均 Rank IC 均负、MSE 均差于训练均值常数，未证明优势；原生文本模型和逐折预测不可变保存，未更新旧 champion 或信号权重，signal_impact disabled。"
+        }
+      ]
+    },
+    {
+      "id": "WP16",
+      "name": "按能力逐项扩展半路、回封、低吸和打板",
+      "status": "planned",
+      "tasks": [
+        {
+          "id": "SD2-16-01",
+          "description": "每种模式先写交易问题、证据前提、行为有效窗口、成交不确定性和退出管理；不直接复用首条策略阈值。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-16-02",
+          "description": "测量实际已购过程数据的更新间隔、源延迟、端到端P95/P99和人工确认延迟；能力不达标保留研究，不能按L2名称推断逐笔能力。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-16-03",
+          "description": "盘口快照仅支持可观察变化，缺订单事件不声称撤单/排队归因；用真实时间序列及受控缺数反例验证。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-16-04",
+          "description": "各模式独立走样本外、影子、账户容量和升降级流程；已有持仓退出和失败处理必须同时交付，不能只有入场信号。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        }
+      ]
+    },
+    {
+      "id": "WP17",
+      "name": "旁路迁移、灰度切换与旧链退役",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-17-01",
+          "description": "旧库协调冻结副本作为迁移源，新live库写入v2事实；兼容读取通过视图/API，旧程序不得写v2账户与决策。来源相同原始流可扇出两套计算，避免重复付费请求。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_core.py"
+          ],
+          "note": "旧库验证副本、独立 V2 库及拒绝旧库写入已实现；真实源扇出/兼容迁移尚未接通。"
+        },
+        {
+          "id": "SD2-17-02",
+          "description": "影子运行对比应有差异及错误差异，不要求新旧错误结果完全相等；保存逐项解释和51条整改关闭证据。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-17-03",
+          "description": "先切只读展示，再切少量已批准证券/模式的人工计划，再扩范围；观察门槛与样本外价值门槛分开，未达标留在影子。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-17-04",
+          "description": "完整演练故障降级、关闭新开仓、保留既有成交、向前恢复与人工对账；移除旧writer、弱ready别名和正常路径的自动修复旁路。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        }
+      ]
+    },
+    {
+      "id": "WP18",
+      "name": "跨模块验收、可观测性与恢复",
+      "status": "in_progress",
+      "tasks": [
+        {
+          "id": "SD2-18-01",
+          "description": "把本方案行为场景落实成单元/契约/端到端/Windows真实双进程/故障注入测试；合成样本仅证明正确性，不冒充真实源和盈利验证。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/market_context.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "本段新增 29 项登记/时间隔离/预处理/样本一致性/失败与产物保护测试；最终全量与安装证据见 reports/v2-rolling-verification-20260910/verification.json，实际 QLib 训练单独保留实验登记/产物。完整方案独立验收未完成。"
+        },
+        {
+          "id": "SD2-18-02",
+          "description": "记录实际代码发行物hash、有效非秘密配置hash、数据/规则/模型版本和时钟；费用请求、数据到达年龄、队列积压、证书冲突、账户对账与用户操作完整可观测。",
+          "status": "partial",
+          "evidence": [
+            "trade_system/v2/context_storage.py",
+            "docs/v2/STAGE_CONTEXT_20260910.md"
+          ],
+          "note": "新增规范化输入/派生输出/上下文迁移摘要，当前发行物和测试摘要独立保存；完整生产可观测性和有效配置仍待完成。"
+        },
+        {
+          "id": "SD2-18-03",
+          "description": "运维日志和长期决策证据分别保留；保留期限依据授权、监管和项目政策确定，不能按latest运行目录上限清掉持仓证据；账户与密钥最小权限。",
+          "status": "planned",
+          "evidence": [],
+          "note": "尚未实现或缺少当前验收证据；不能因其他工作包测试通过自动关闭。"
+        },
+        {
+          "id": "SD2-18-04",
+          "description": "演练断网、断电等价进程崩溃、磁盘满、源修订、队列过载、未知委托和服务重启；建议20个连续交易日作为运行稳定性初筛，不作为盈利或充分样本的证明。",
+          "status": "partial",
+          "evidence": [
+            "tests/test_v2_service_publisher.py"
+          ],
+          "note": "覆盖进程崩溃、发布失败、未知预占和服务重启；20 交易日稳定性、断网/磁盘满等完整演练尚未完成。"
+        }
+      ]
+    },
+    {
+      "id": "WP19",
+      "name": "可选券商受控委托扩展",
+      "status": "disabled_optional",
+      "tasks": [
+        {
+          "id": "SD2-19-01",
+          "description": "核实实际券商授权、账户权限、程序化交易适用要求、数据许可证与内部责任；人工确认不自动等于合规豁免；未核实前路由保持disabled。",
+          "status": "planned",
+          "evidence": [],
+          "note": "可选券商扩展未授权，保持 disabled。"
+        },
+        {
+          "id": "SD2-19-02",
+          "description": "先完成只读账户/委托/成交对账与券商测试环境适配，再接写入；确认前后有同一证书重新校验和预占，默认显式人工确认。",
+          "status": "planned",
+          "evidence": [],
+          "note": "可选券商扩展未授权，保持 disabled。"
+        },
+        {
+          "id": "SD2-19-03",
+          "description": "提交使用持久化outbox与客户端幂等标识；超时记UNKNOWN并查询，不盲目重发；若券商无幂等/查询保证，转人工解决而非宣称端到端exactly once。",
+          "status": "planned",
+          "evidence": [],
+          "note": "可选券商扩展未授权，保持 disabled。"
+        },
+        {
+          "id": "SD2-19-04",
+          "description": "验证部分成交、拒单、撤单请求与撤单结果、重连和状态逆序；杀开关禁止新委托但不谎称已经撤单/平仓，开启必须有独立批准记录。",
+          "status": "planned",
+          "evidence": [],
+          "note": "可选券商扩展未授权，保持 disabled。"
+        }
+      ]
+    }
+  ],
+  "overall_status": "in_progress_not_production_ready",
+  "real_account_acceptance": "pending_user_temporarily_has_no_export",
+  "status_semantics": {
+    "partial": "存在已实现部分和明确余项",
+    "implemented_locally_verified": "仅此子任务当前实现验证，不代表整个工作包/生产验收完成",
+    "planned": "未完成",
+    "disabled_optional": "未授权的可选扩展"
+  },
+  "latest_stage_document": "docs/v2/REMAINING_TASKS.md",
+  "latest_verified_scope": "offline_paper_plan_confirmation_review_synthetic_cli_not_real_operator_acceptance"
+}

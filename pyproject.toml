@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,10 +9,10 @@ description = "Manual A-share trading data, evidence, risk, and review assistant
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "duckdb==1.5.4",
-  "requests>=2.31,<3",
+  "requests>=2.34.2,<3",
   "pandas>=2.2,<3",
   "akshare>=1.18.64",
-  "baostock>=0.9.30",
+  "baostock==0.9.3",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +20,11 @@ dev = [
   "pytest==9.1.1",
   "ruff>=0.6",
 ]
+
+[project.scripts]
+stock-data-v2 = "trade_system.v2.__main__:main"
+stock-data-research = "trade_system.v2.research_workbench_cli:main"
+stock-data-paper-desk = "trade_system.v2.operator_workflow_cli:main"
 
 [tool.ruff]
 line-length = 110
@@ -61,3 +66,6 @@ disallow_untyped_defs = true
 
 [tool.setuptools.packages.find]
 include = ["trade_system*", "collectors*"]
+
+[tool.setuptools.data-files]
+"share/stock_data/migrations" = ["migrations/*.sql"]

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
+from numbers import Real
 
 
 WEAK_MARKET_REGIMES = {"退潮", "冰点", "weak", "risk_off"}
@@ -21,7 +23,7 @@ class TradePlanInput:
     stock_code: str
     score: float
     planned_position_pct: float
-    current_total_position_pct: float
+    current_total_position_pct: float | None
     market_regime: str
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
 
@@ -36,6 +38,23 @@ class RiskDecision:
 
 def evaluate_trade_plan(plan: TradePlanInput, config: OperatorRiskConfig | None = None) -> RiskDecision:
     cfg = config or OperatorRiskConfig()
+    # Validate before arithmetic/comparisons: NaN makes both < and > false.
+    values = {
+        "score": plan.score,
+        "planned_position_pct": plan.planned_position_pct,
+        "current_total_position_pct": plan.current_total_position_pct,
+        "max_total_position_pct": cfg.max_total_position_pct,
+        "max_single_stock_pct": cfg.max_single_stock_pct,
+        "min_score": cfg.min_score,
+        "weak_regime_single_stock_pct": cfg.weak_regime_single_stock_pct,
+    }
+    invalid = tuple(
+        name for name, value in values.items()
+        if isinstance(value, bool) or not isinstance(value, Real)
+        or not isfinite(value) or not 0 <= value <= 100
+    )
+    if invalid:
+        return RiskDecision(False, "P0", "invalid risk input or policy", invalid)
     projected_total = plan.current_total_position_pct + plan.planned_position_pct
 
     if plan.planned_position_pct <= 0:

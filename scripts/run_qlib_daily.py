@@ -15,6 +15,7 @@ from scripts.predict_qlib_daily import predict_daily
 from trade_system.candidate_pool import build_candidate_pool
 from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables
 from trade_system.paper_execution import ensure_paper_tables
+from trade_system.ml.feature_artifacts import resolve_feature_path
 
 
 def run(db_path: str | Path, *, feature_file: str | Path, trade_date: str | None = None,
@@ -41,7 +42,7 @@ def run(db_path: str | Path, *, feature_file: str | Path, trade_date: str | None
         con.close()
     if not row:
         result = {"status": "no_champion", "signal_impact": "disabled", "reason": "model_promotion_gate_closed"}
-    elif not Path(feature_file).exists():
+    elif not resolve_feature_path(feature_file).exists():
         result = {"status": "missing_features", "signal_impact": "disabled", "reason": str(feature_file)}
     else:
         model_id, model_file, model_status = str(row[0]), Path(str(row[1])), str(row[2] or "shadow")

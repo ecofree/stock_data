@@ -12,6 +12,8 @@ __pycache__/
 .venv/
 .venv-qlib/
 venv/
+build/
+*.egg-info/
 trade_system/.stock_cache/
 
 # Runtime databases and recovery copies (DB, WAL, backups, export/compacted/old)

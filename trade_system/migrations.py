@@ -21,6 +21,8 @@ Conventions
 from __future__ import annotations
 
 import re
+import sys
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
@@ -31,6 +33,8 @@ from trade_system.logging_setup import get_logger
 logger = get_logger(__name__)
 
 _DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+if not _DEFAULT_MIGRATIONS_DIR.is_dir():
+    _DEFAULT_MIGRATIONS_DIR = Path(sys.prefix) / 'share' / 'stock_data' / 'migrations'
 
 _FILENAME_RE = re.compile(r"^(\d{4})_[A-Za-z0-9_]+\.sql$")
 
@@ -39,7 +43,7 @@ def discover_migrations(directory: str | Path = _DEFAULT_MIGRATIONS_DIR) -> list
     """Return ``(version, path)`` pairs sorted by version."""
     root = Path(directory)
     if not root.is_dir():
-        return []
+        raise FileNotFoundError(f"required migration directory missing: {root}")
     found: list[tuple[int, Path]] = []
     for path in root.iterdir():
         match = _FILENAME_RE.match(path.name)
@@ -65,7 +69,8 @@ def ensure_migration_table(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def applied_versions(con: duckdb.DuckDBPyConnection) -> set[int]:
-    ensure_migration_table(con)
+    if not con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name='schema_migration'").fetchone()[0]:
+        return set()
     rows = con.execute("SELECT version FROM schema_migration").fetchall()
     return {int(row[0]) for row in rows}
 
@@ -82,14 +87,33 @@ def apply_pending(
     ``schema_migration`` bookkeeping row, so a failed migration leaves no
     partial state behind.
     """
+    discovered = discover_migrations(directory)
+    done = applied_versions(con)
+    has_checksums = con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name='schema_migration_checksum'"
+    ).fetchone()[0]
+    checksums = dict(con.execute('SELECT version, sha256 FROM schema_migration_checksum').fetchall()) if has_checksums else {}
+    for version, path in discovered:
+        if version in checksums and checksums[version] != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise RuntimeError(f"migration {version} checksum mismatch: {path.name}")
+        if version in done and version not in checksums:
+            # Historical versions remain explicitly unverified. Do not
+            # retroactively certify bytes that may differ from what ran.
+            logger.warning('legacy migration %s has no checksum; maintenance verification required', version)
     pending = [
         (version, path)
-        for version, path in discover_migrations(directory)
-        if version not in applied_versions(con)
+        for version, path in discovered
+        if version not in done
     ]
+    if not dry_run:
+        ensure_migration_table(con)
+        con.execute('CREATE TABLE IF NOT EXISTS schema_migration_checksum(version INTEGER PRIMARY KEY, sha256 VARCHAR NOT NULL)')
     applied: list[int] = []
     for version, path in pending:
-        script = path.read_text(encoding="utf-8")
+        # Bind the recorded digest to the exact bytes executed, even if the
+        # file changes on disk while this migration is running.
+        script_bytes = path.read_bytes()
+        script = script_bytes.decode("utf-8")
         description = path.stem
         if dry_run:
             logger.info("dry-run migration %s (%s)", version, description)
@@ -103,6 +127,8 @@ def apply_pending(
                 "INSERT INTO schema_migration(version, description) VALUES (?, ?)",
                 [version, description],
             )
+            con.execute('INSERT INTO schema_migration_checksum VALUES (?, ?)',
+                        [version, hashlib.sha256(script_bytes).hexdigest()])
             con.execute("COMMIT")
         except Exception as exc:
             con.execute("ROLLBACK")

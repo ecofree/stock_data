@@ -1,0 +1,8 @@
+{
+  "scope": "frozen_historical_input_staging_not_account_replay",
+  "mode": "historical_repair_with_separate_knowledge_replay",
+  "portfolio": "D:/accio/stock_data/reports/v2-portfolio-research-20260910/historical-portfolio-20260910-v1",
+  "audit": "D:/accio/stock_data/reports/v2-gap-audit-20260910",
+  "supplement": "D:/accio/stock_data/reports/v2-announcement-supplement-20260910",
+  "replay_asof": "2026-07-29T18:00:00+08:00"
+}

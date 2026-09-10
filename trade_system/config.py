@@ -159,4 +159,3 @@ def default_trade_date(db_path: str | Path | None = None) -> str:
 
 # Logging
 LOG_DIR = str(PROJECT_DIR / "logs")
-os.makedirs(LOG_DIR, exist_ok=True)

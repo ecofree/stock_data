@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "rows": [
+    {
+      "instrument": "SZ.000001",
+      "date": "2020-01-02",
+      "kind": "session_status",
+      "value": {
+        "status": "suspended",
+        "coverage": "full_session"
+      }
+    }
+  ]
+}

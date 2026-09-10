@@ -8,6 +8,7 @@ import json
 import pickle
 from pathlib import Path
 import sys
+import hashlib
 
 import pandas as pd
 
@@ -16,9 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.train_qlib_shadow import QlibFrameDataset
 from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables, import_qlib_predictions_for_date
 import duckdb
+from trade_system.ml.feature_artifacts import resolve_feature_path
 
 
 def _load_frame(path: Path, selected_date: str | None = None) -> tuple[pd.DataFrame, dict]:
+    path = resolve_feature_path(path)
     metadata_path = path.with_suffix(".metadata.json")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     if path.suffix.lower() == ".parquet" and selected_date:
@@ -34,7 +37,7 @@ def _load_frame(path: Path, selected_date: str | None = None) -> tuple[pd.DataFr
     elif path.suffix.lower() == ".parquet":
         frame = pd.read_parquet(path)
     else:
-        frame = pd.read_csv(path)
+        frame = pd.read_csv(path, dtype={'instrument': 'string'})
     frame["datetime"] = pd.to_datetime(frame["datetime"]).dt.strftime("%Y-%m-%d")
     frame["instrument"] = frame["instrument"].astype(str)
     return frame, metadata
@@ -68,9 +71,22 @@ def predict_daily(
     if status == "shadow" and not allow_shadow:
         raise RuntimeError("shadow model prediction is disabled by policy")
     path = Path(feature_file)
+    artifact_path = Path(model_file).resolve(strict=True)
+    model_metadata = json.loads(artifact_path.with_suffix('.metadata.json').read_text(encoding='utf-8'))
+    if model_metadata.get('model_id') != model_id or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != model_metadata.get('model_sha256'):
+        raise ValueError('model identity/hash is not verified; pickle will not be loaded')
+    with duckdb.connect(str(db), read_only=True) as registry:
+        model_ref = registry.execute('SELECT model_file_ref FROM qlib_model_registry WHERE model_id=?', [model_id]).fetchone()
+    registered_path = Path(model_ref[0]) if model_ref and model_ref[0] else None
+    if registered_path is None:
+        raise ValueError('model artifact is not registered')
+    if not registered_path.is_absolute():
+        registered_path = db.parent / registered_path
+    if registered_path.resolve() != artifact_path:
+        raise ValueError('model path differs from registered artifact')
     requested_date = str(trade_date)[:10] if trade_date else None
     frame, metadata = _load_frame(path, requested_date)
-    features = list(metadata.get("feature_columns") or [])
+    features = list(model_metadata.get("feature_columns") or [])
     if not features:
         raise RuntimeError("feature metadata has no feature_columns")
     missing = [column for column in features if column not in frame.columns]
@@ -80,7 +96,9 @@ def predict_daily(
     daily = frame[frame["datetime"] == selected_date].copy()
     if daily.empty:
         raise RuntimeError(f"no feature rows for trade_date={selected_date}")
-    medians = metadata.get("feature_medians") or {}
+    medians = model_metadata.get("feature_medians") or {}
+    if not set(features) <= set(medians):
+        raise ValueError('model is missing frozen training imputation values')
     for column in features:
         daily[column] = pd.to_numeric(daily[column], errors="coerce")
         fallback = float(medians.get(column, 0.0) or 0.0)
@@ -99,7 +117,7 @@ def predict_daily(
         selected_date,
         selected_date,
     )
-    with Path(model_file).open("rb") as handle:
+    with artifact_path.open("rb") as handle:
         model = pickle.load(handle)
     prediction = model.predict(dataset, segment="all")
     pred_frame = pd.DataFrame({"score": prediction}).reset_index()
@@ -111,8 +129,8 @@ def predict_daily(
         db,
         model_id=model_id,
         trade_date=selected_date,
-        rows=[{**row, "horizon": metadata.get("prediction_horizon", "t1_exec")} for row in rows],
-        predict_horizon=str(metadata.get("prediction_horizon", "t1_exec")),
+        rows=[{**row, "horizon": model_metadata.get("prediction_horizon", "t1_exec")} for row in rows],
+        predict_horizon=str(model_metadata.get("prediction_horizon", "t1_exec")),
     )
     return {
         "model_id": model_id,

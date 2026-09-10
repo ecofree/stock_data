@@ -266,8 +266,9 @@ def run_daily_operator_loop(
         # candidates after the current pool is known avoids both that failure
         # mode and duplicate rows on retries.
         con.execute(
-            "DELETE FROM trade_journal WHERE trade_date = ? AND coalesce(action, '') != 'operator_outcome'",
-            [trade_date],
+            "DELETE FROM trade_journal WHERE trade_date = ? AND action = ? "
+            "AND mistake_tag = 'pending_review' AND starts_with(reason, '[daily_loop:v2] ')",
+            [trade_date, signal_stage],
         )
 
         regime = _latest_regime(con, trade_date)
@@ -310,6 +311,9 @@ def run_daily_operator_loop(
             "suggested_position_pct": int(regime.get("suggested_position_pct") or 0),
             "acute_drop_risk_score": (regime.get("evidence") or {}).get("acute_drop_risk_score"),
             "data_readiness": data_readiness,
+            "account_state": "unverified",
+            "execution_blockers": ["account_snapshot_unverified"],
+            "scope": "research_only",
             "note": "manual planning guardrail; no automatic order execution",
         }
         con.execute(
@@ -320,7 +324,7 @@ def run_daily_operator_loop(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [trade_date, 0.0, max_single, max_sector, 2.0 if risk_state == "defensive" else 3.0, 0.0, risk_state, json.dumps(risk_evidence, ensure_ascii=False)],
+            [trade_date, None, max_single, max_sector, 2.0 if risk_state == "defensive" else 3.0, None, risk_state, json.dumps(risk_evidence, ensure_ascii=False)],
         )
 
         if (
@@ -357,18 +361,12 @@ def run_daily_operator_loop(
                 )
             else:
                 con.execute(f"DELETE FROM {table} WHERE trade_date = ?", [trade_date])
-        # Keep only the current stage's cash snapshot.  The current CASH row
-        # is deliberately retained for an in-transaction upsert; older stage
-        # rows and any stale manual-position rows can be removed safely.
-        con.execute(
-            "DELETE FROM portfolio_snapshot WHERE trade_date = ? "
-            "AND (snapshot_time <> ? OR stock_code <> 'CASH')",
-            [trade_date, stage],
-        )
+        # Portfolio rows are account facts, not generated planning output.
+        # The legacy table cannot prove account completeness, freshness or
+        # reserved cash. Preserve it and fail closed until a verified account
+        # snapshot contract is wired in; absent evidence does not mean flat.
         watchlist_count = 0
         trade_plan_count = 0
-        current_total_position_pct = 0.0
-        sector_positions: dict[str, float] = {}
         for priority, row in enumerate(candidates, start=1):
             evidence = _loads(row.get("evidence_json"))
             risk_points = evidence.get("risk_points") or []
@@ -378,11 +376,9 @@ def run_daily_operator_loop(
                 evidence.get("invalidation")
                 or "Invalidate if score/fallback/risk evidence deteriorates."
             )
-            planned_position = 0.0 if data_blocked else max_single
-            sector_code = str(row.get("sector_code") or "")
+            planned_position = 0.0
             risk_flags_for_plan = list(risk_points if risk_state == "defensive" and float(row.get("score") or 0) < 70 else ())
-            if sector_code and sector_positions.get(sector_code, 0.0) + planned_position > max_sector:
-                risk_flags_for_plan.append("sector_position_limit_exceeded")
+            risk_flags_for_plan.append("account_snapshot_unverified")
             con.execute(
                 """
                 INSERT OR REPLACE INTO watchlist (
@@ -409,14 +405,10 @@ def run_daily_operator_loop(
                     score=float(row.get("score") or 0),
                     market_regime=str(regime.get("regime") or "unknown"),
                     planned_position_pct=planned_position,
-                    current_total_position_pct=current_total_position_pct,
+                    current_total_position_pct=None,
                     risk_flags=tuple(risk_flags_for_plan),
                 )
             )
-            if decision.allowed:
-                current_total_position_pct += planned_position
-                if sector_code:
-                    sector_positions[sector_code] = sector_positions.get(sector_code, 0.0) + planned_position
             con.execute(
                 """
                 INSERT OR REPLACE INTO trade_plan (
@@ -432,7 +424,7 @@ def run_daily_operator_loop(
                     "manual_shortline_plan",
                     zh_text(
                         f"Only consider after auction/intraday evidence confirms; "
-                        f"risk_gate={decision.reason}"
+                        f"risk_gate={decision.reason}; account_snapshot_unverified"
                     ),
                     zh_text(invalidation),
                     zh_text("Review at close; no automatic execution."),
@@ -499,22 +491,6 @@ def run_daily_operator_loop(
                     )
             trade_plan_count += 1
 
-        con.execute(
-            "UPDATE risk_snapshot SET total_position_pct=? WHERE trade_date=?",
-            [current_total_position_pct, trade_date],
-        )
-
-        con.execute(
-            """
-                INSERT OR REPLACE INTO portfolio_snapshot (
-                trade_date, snapshot_time, stock_code, stock_name, position_pct, cost_price,
-                last_price, pnl_pct, sector_code
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [trade_date, stage, "CASH", "No automatic position", 0.0, None, None, 0.0, None],
-        )
-
         stage_rows = _stage_rows(
             con,
             trade_date,
@@ -545,7 +521,7 @@ def run_daily_operator_loop(
                     stage_time.get(row.get("stage"), "review"),
                     None,
                     0.0,
-                    f"decision={row.get('decision')} score={float(row.get('score') or 0):.2f}",
+                    f"[daily_loop:v2] decision={row.get('decision')} score={float(row.get('score') or 0):.2f}",
                     "pending_review",
                 ],
             )
@@ -555,7 +531,7 @@ def run_daily_operator_loop(
             "watchlist": watchlist_count,
             "trade_plan": trade_plan_count,
             "risk_snapshot": 1,
-            "portfolio_snapshot": 1,
+            "portfolio_snapshot": 0,
             "trade_journal": journal_count,
         }
         con.commit()

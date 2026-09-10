@@ -304,7 +304,8 @@ def run(db_path: str | Path, trade_date: str, reports_dir: str | Path,
                     _atomic_json(out, result)
                     return result
 
-            metadata = feature_file.with_suffix(".metadata.json")
+            from trade_system.ml.feature_artifacts import resolve_feature_path
+            metadata = resolve_feature_path(feature_file).with_suffix(".metadata.json")
             if metadata.exists():
                 try:
                     result["feature_metadata"] = json.loads(metadata.read_text(encoding="utf-8"))

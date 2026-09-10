@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_family": "other",
+  "source_api": "synthetic_fixture_not_market_data",
+  "origin_family": "synthetic_fixture",
+  "reference": "fixture_only_not_a_claim_about_actual_stock_history",
+  "source_revision": "fixture-v1",
+  "source_event_at": "2020-01-02T16:00:00+08:00",
+  "provider_received_at": "2020-01-02T16:01:00+08:00",
+  "license_status": "unverified",
+  "row_index": 0,
+  "raw_sha256": "86807d9c93515c8973a5450b0e80ea247d154761a92113707e23775252f03ea8"
+}

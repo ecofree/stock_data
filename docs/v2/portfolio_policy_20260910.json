@@ -1,0 +1,22 @@
+{
+  "scope": "historical_daily_price_assumption_not_executable",
+  "exposure_status": "previously_inspected_not_untouched",
+  "fill_assumption": "unconstrained_next_open_and_due_close",
+  "calendar_assumption": "SSE_sessions_shared_not_exchange_certified",
+  "missing_mark_policy": "stop_account",
+  "corporate_action_policy": "stop_on_held_factor_change",
+  "initial_cash_fen": 10000000,
+  "top_k": 10,
+  "max_positions": 20,
+  "ticket_bps": 500,
+  "buy_lot": 100,
+  "hold_sessions": 2,
+  "t_plus_sessions": 1,
+  "fees": {
+    "version": "diagnostic-assumption-v1-not-certified-tariff",
+    "commission_bps": "3",
+    "minimum_commission_fen": 500,
+    "transfer_bps": "0.1",
+    "sell_tax_bps": "5"
+  }
+}

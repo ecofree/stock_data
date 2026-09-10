@@ -1,0 +1,722 @@
+{
+  "schema_version": 1,
+  "source": "MASTER_PLAN.md appendix B, not independently recovered full original audit",
+  "base_commit": "78324ba622bf6c5fc6cbb736a490e5818788d824",
+  "original_full_audit_bundle": "not_located_in_current_git_tree",
+  "items": [
+    {
+      "id": "BUILD-01",
+      "severity": "P0",
+      "work_package": "WP01",
+      "original_evidence_nature": "依赖版本不可解析，当前 CI 无法进入业务测试（当前 CI 日志确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BUILD-02",
+      "severity": "P1",
+      "work_package": "WP01",
+      "original_evidence_nature": "PowerShell 安装步骤掩盖前一条 pip 失败（当前 CI 日志确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BUILD-03",
+      "severity": "P2",
+      "work_package": "WP01",
+      "original_evidence_nature": "所谓 lock 只锁了六个直接包，且与项目元数据、CI 工具版本不一致（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BUILD-04",
+      "severity": "P1",
+      "work_package": "WP01",
+      "original_evidence_nature": "Requests 固定在已知安全修复之前（源码与上游安全公告确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BUILD-05",
+      "severity": "P2",
+      "work_package": "WP01",
+      "original_evidence_nature": "安装包与“在源码目录运行”不是同一个交付物（静态交付风险）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BUILD-06",
+      "severity": "P2",
+      "work_package": "WP01",
+      "original_evidence_nature": "支持范围和质量门禁超出实际 CI 证据（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-01",
+      "severity": "P0",
+      "work_package": "WP02",
+      "original_evidence_nature": "Windows 无 psutil 回退不是安全探测，特定解释器路径可能终止进程（源码与平台契约确认）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-02",
+      "severity": "P0",
+      "work_package": "WP02",
+      "original_evidence_nature": "锁时间截断至秒会把真实活进程判成死进程（源码确认＋最小逻辑反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-03",
+      "severity": "P1",
+      "work_package": "WP02",
+      "original_evidence_nature": "“无法证明活着”被当作“已证明死亡”，抢锁还有检查/删除竞态（源码确认／并发触发风险）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-04",
+      "severity": "P1",
+      "work_package": "WP02",
+      "original_evidence_nature": "异常回滚发生在退出流水线锁之后（源码控制流确认／并发触发风险）",
+      "status": "open",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-05",
+      "severity": "P1",
+      "work_package": "WP02",
+      "original_evidence_nature": "单文件替换不等于整套报告原子发布（源码确认／崩溃一致性风险）",
+      "status": "partial",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-06",
+      "severity": "P1",
+      "work_package": "WP02",
+      "original_evidence_nature": "日期命名的人工结果模板不会被发布，暂存清理会删掉它（源码确认＋最小命名反例）",
+      "status": "partial",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-07",
+      "severity": "P2",
+      "work_package": "WP02",
+      "original_evidence_nature": "进程内渲染绕过统一超时与输出捕获（源码确认）",
+      "status": "open",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "RUN-08",
+      "severity": "P2",
+      "work_package": "WP02",
+      "original_evidence_nature": "用户指定 run_id 缺少严格校验和不可复用约束（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-01",
+      "severity": "P0",
+      "work_package": "WP03",
+      "original_evidence_nature": "累计资金流被盘中评分重复求和（跨模块源码确认＋最小反例）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-02",
+      "severity": "P1",
+      "work_package": "WP09",
+      "original_evidence_nature": "信号表的唯一键只允许最新状态，无法保留每次决策版本（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-09-01",
+        "SD2-09-02",
+        "SD2-09-03",
+        "SD2-09-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-03",
+      "severity": "P1",
+      "work_package": "WP03",
+      "original_evidence_nature": "资金流事实表按日覆盖，补一个 as-of 条件不能恢复丢失的快照（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-04",
+      "severity": "P1",
+      "work_package": "WP07",
+      "original_evidence_nature": "候选池取数没有一致执行 as-of 截止（源码确认／条件性前视风险）",
+      "status": "partial",
+      "tasks": [
+        "SD2-07-01",
+        "SD2-07-02",
+        "SD2-07-03",
+        "SD2-07-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-05",
+      "severity": "P1",
+      "work_package": "WP07",
+      "original_evidence_nature": "同日实时标签被误当作报价仍然新鲜（源码确认／场景需端到端验证）",
+      "status": "partial",
+      "tasks": [
+        "SD2-07-01",
+        "SD2-07-02",
+        "SD2-07-03",
+        "SD2-07-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-06",
+      "severity": "P1",
+      "work_package": "WP10",
+      "original_evidence_nature": "收盘补价例外扩大成了绕过所有就绪条件（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-10-01",
+        "SD2-10-02",
+        "SD2-10-03",
+        "SD2-10-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-07",
+      "severity": "P2",
+      "work_package": "WP07",
+      "original_evidence_nature": "先 LIMIT 再股票去重，候选数量缩水且阶段优先级隐含（源码确认＋最小反例）",
+      "status": "open",
+      "tasks": [
+        "SD2-07-01",
+        "SD2-07-02",
+        "SD2-07-03",
+        "SD2-07-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-08",
+      "severity": "P2",
+      "work_package": "WP07",
+      "original_evidence_nature": "盘前上文选择是“最后一个有数据的日期”，不是已证实的上一交易日（静态场景风险）",
+      "status": "open",
+      "tasks": [
+        "SD2-07-01",
+        "SD2-07-02",
+        "SD2-07-03",
+        "SD2-07-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-09",
+      "severity": "P2",
+      "work_package": "WP07",
+      "original_evidence_nature": "先拿到 live 价格就提前返回，错过可用的买卖盘补全（源码确认）",
+      "status": "open",
+      "tasks": [
+        "SD2-07-01",
+        "SD2-07-02",
+        "SD2-07-03",
+        "SD2-07-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-10",
+      "severity": "P2",
+      "work_package": "WP03",
+      "original_evidence_nature": "数值零被 or 回退当作缺失（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-11",
+      "severity": "P2",
+      "work_package": "WP03",
+      "original_evidence_nature": "缺少来源日期和单位时仍能推定日期/单位入库（源码确认／上游可达性待验证）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-12",
+      "severity": "P1",
+      "work_package": "WP03",
+      "original_evidence_nature": "模式所有权分散，动态全 VARCHAR 建表仍可绕开类型约束（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-13",
+      "severity": "P1",
+      "work_package": "WP03",
+      "original_evidence_nature": "旧写入接口和同步函数会把数据库错误降格成部分成功或0（源码确认）",
+      "status": "open",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-14",
+      "severity": "P2",
+      "work_package": "WP03",
+      "original_evidence_nature": "插入计数报告输入长度，而非去重后的实际行数（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-15",
+      "severity": "P2",
+      "work_package": "WP03",
+      "original_evidence_nature": "迁移目录缺失被当成没有待迁移，已应用迁移缺少内容校验（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-03-01",
+        "SD2-03-02",
+        "SD2-03-03",
+        "SD2-03-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "DATA-16",
+      "severity": "P2",
+      "work_package": "WP02",
+      "original_evidence_nature": "统一连接工厂被关键模块绕过（源码确认）",
+      "status": "open",
+      "tasks": [
+        "SD2-02-01",
+        "SD2-02-02",
+        "SD2-02-03",
+        "SD2-02-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "GATE-01",
+      "severity": "P1",
+      "work_package": "WP10",
+      "original_evidence_nature": "统一状态函数可以同时返回 blocked 和 execution_ready=true（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-10-01",
+        "SD2-10-02",
+        "SD2-10-03",
+        "SD2-10-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "GATE-02",
+      "severity": "P1",
+      "work_package": "WP10",
+      "original_evidence_nature": "弱 ready/source_ready 仍被执行链采用，资金流认证可能只在展示层拦截（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-10-01",
+        "SD2-10-02",
+        "SD2-10-03",
+        "SD2-10-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "GATE-03",
+      "severity": "P0",
+      "work_package": "WP08",
+      "original_evidence_nature": "风控从零仓位起算，并删除当天非现金持仓快照（源码确认）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-08-01",
+        "SD2-08-02",
+        "SD2-08-03",
+        "SD2-08-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "GATE-04",
+      "severity": "P1",
+      "work_package": "WP13",
+      "original_evidence_nature": "自动重建覆盖人工工作流和先前阶段日志（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-13-01",
+        "SD2-13-02",
+        "SD2-13-03",
+        "SD2-13-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "GATE-05",
+      "severity": "P1",
+      "work_package": "WP10",
+      "original_evidence_nature": "风控缺少 finite 校验，NaN可绕过拒绝分支（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-10-01",
+        "SD2-10-02",
+        "SD2-10-03",
+        "SD2-10-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BT-01",
+      "severity": "P1",
+      "work_package": "WP11",
+      "original_evidence_nature": "重叠持仓的资金结算错误：用结算时总权益逐笔复利（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-11-01",
+        "SD2-11-02",
+        "SD2-11-03",
+        "SD2-11-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BT-02",
+      "severity": "P1",
+      "work_package": "WP11",
+      "original_evidence_nature": "最大回撤只来自平仓后收益曲线，不是持仓期间净值（源码确认）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-11-01",
+        "SD2-11-02",
+        "SD2-11-03",
+        "SD2-11-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BT-03",
+      "severity": "P2",
+      "work_package": "WP11",
+      "original_evidence_nature": "T+1只靠默认 hold_days=1，函数未拒绝0或负数（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-11-01",
+        "SD2-11-02",
+        "SD2-11-03",
+        "SD2-11-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BT-04",
+      "severity": "P2",
+      "work_package": "WP11",
+      "original_evidence_nature": "偶数样本的收益中位数计算错误（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-11-01",
+        "SD2-11-02",
+        "SD2-11-03",
+        "SD2-11-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "BT-05",
+      "severity": "P2",
+      "work_package": "WP11",
+      "original_evidence_nature": "研究引擎的成交与费用边界不足以支持实盘收益承诺（范围缺口）",
+      "status": "partial",
+      "tasks": [
+        "SD2-11-01",
+        "SD2-11-02",
+        "SD2-11-03",
+        "SD2-11-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-01",
+      "severity": "P1",
+      "work_package": "WP15",
+      "original_evidence_nature": "标签结束日期未进入训练过滤，训练/验证相邻切分存在交叉（源码确认／研究泄漏风险）",
+      "status": "partial",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-02",
+      "severity": "P1",
+      "work_package": "WP15",
+      "original_evidence_nature": "用于早停的 valid 又用于预测评估，缺独立最终测试层（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-03",
+      "severity": "P1",
+      "work_package": "WP15",
+      "original_evidence_nature": "20日特征的批次热身仅25个自然日，跨批次数值不稳定（源码确认＋最小反例）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-04",
+      "severity": "P2",
+      "work_package": "WP15",
+      "original_evidence_nature": "CSV读入未指定股票代码字符串类型（源码确认／导入下游是否补零需另查）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-05",
+      "severity": "P1",
+      "work_package": "WP15",
+      "original_evidence_nature": "部分复权因子缺失静默填1，可能制造虚假价格跳变（源码确认／数据场景风险）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ML-06",
+      "severity": "P2",
+      "work_package": "WP15",
+      "original_evidence_nature": "特征导出先删旧目标，且每批重复执行重型查询（源码确认）",
+      "status": "implemented_locally_verified",
+      "tasks": [
+        "SD2-15-01",
+        "SD2-15-02",
+        "SD2-15-03",
+        "SD2-15-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "OPS-01",
+      "severity": "P2",
+      "work_package": "WP01",
+      "original_evidence_nature": "导入配置即创建日志目录，日志日期在导入时冻结（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-01-01",
+        "SD2-01-02",
+        "SD2-01-03",
+        "SD2-01-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "OPS-02",
+      "severity": "P2",
+      "work_package": "WP18",
+      "original_evidence_nature": "运行指纹不足以复现真实生效配置和脏工作树算法（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-18-01",
+        "SD2-18-02",
+        "SD2-18-03",
+        "SD2-18-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "OPS-03",
+      "severity": "P2",
+      "work_package": "WP13",
+      "original_evidence_nature": "失败以外的状态页统一使用绿色完成语义（源码确认）",
+      "status": "partial",
+      "tasks": [
+        "SD2-13-01",
+        "SD2-13-02",
+        "SD2-13-03",
+        "SD2-13-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "OPS-04",
+      "severity": "P2",
+      "work_package": "WP18",
+      "original_evidence_nature": "运行目录保留策略不是长期决策审计存储（源码确认）",
+      "status": "open",
+      "tasks": [
+        "SD2-18-01",
+        "SD2-18-02",
+        "SD2-18-03",
+        "SD2-18-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    },
+    {
+      "id": "ARCH-01",
+      "severity": "P1",
+      "work_package": "WP17",
+      "original_evidence_nature": "运行编排、领域策略、兼容修复和发布约定形成巨型耦合（架构判断，基于多条已确认缺陷）",
+      "status": "partial",
+      "tasks": [
+        "SD2-17-01",
+        "SD2-17-02",
+        "SD2-17-03",
+        "SD2-17-04"
+      ],
+      "evidence": "See STATUS.json task evidence and IMPLEMENTATION_PROGRESS.md; no production closure implied"
+    }
+  ]
+}

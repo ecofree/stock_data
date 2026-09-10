@@ -6,6 +6,7 @@ import duckdb
 
 from scripts.export_qlib_features import export_features
 from scripts.train_qlib_shadow import QlibFrameDataset, _load_features
+from trade_system.ml.feature_artifacts import resolve_feature_path
 
 
 def test_export_qlib_features_has_target_only_label(tmp_path):
@@ -33,7 +34,7 @@ def test_export_qlib_features_has_target_only_label(tmp_path):
     result = export_features(db, out, start_date="2026-01-02", end_date="2026-01-06", label_mode="legacy")
     assert result["rows"] == 3
     assert result["labeled_rows"] == 2
-    metadata = json.loads(out.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+    metadata = json.loads(resolve_feature_path(out).with_suffix(".metadata.json").read_text(encoding="utf-8"))
     assert metadata["label_column"] == "label_next_ret"
     assert "label_next_ret" not in metadata["feature_columns"]
 
@@ -43,7 +44,7 @@ def test_export_qlib_features_has_target_only_label(tmp_path):
         db, exec_out, start_date="2026-01-02", end_date="2026-01-06"
     )
     assert exec_result["labeled_rows"] == 1
-    exec_metadata = json.loads(exec_out.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+    exec_metadata = json.loads(resolve_feature_path(exec_out).with_suffix(".metadata.json").read_text(encoding="utf-8"))
     assert exec_metadata["label_mode"] == "t1_exec"
     assert "T+1 compliant" in exec_metadata["label_definition"]
 
@@ -86,7 +87,7 @@ def test_export_qlib_features_includes_canonical_flow_windows_when_available(tmp
     assert "flow_main_net_20d" in result["feature_columns"]
     import pandas as pd
 
-    frame = pd.read_csv(out)
+    frame = pd.read_csv(resolve_feature_path(out))
     assert frame.loc[0, "flow_main_net_1d"] == 1
 
 
@@ -123,7 +124,7 @@ def test_export_qlib_features_applies_adjustment_factor_to_prices_and_labels(tmp
     assert "tushare_adj_factor" in result["source_tables"]
     import pandas as pd
 
-    frame = pd.read_csv(out)
+    frame = pd.read_csv(resolve_feature_path(out))
     assert frame.loc[1, "close"] == 10
     assert frame.loc[1, "volume"] == 50
     assert frame.loc[0, "label_next_ret"] == 0
@@ -138,6 +139,8 @@ def test_qlib_frame_dataset_returns_multiindex_feature_label():
             "instrument": ["000001", "000001"],
             "f": [1.0, 2.0],
             "label_next_ret": [1.0, -1.0],
+            'label_end_time': ['2026-01-03', '2026-01-06'],
+            'label_available_time': ['2026-01-03', '2026-01-06'],
         }
     )
     dataset = QlibFrameDataset(frame, ["f"], "2026-01-02", "2026-01-05", "2026-01-05")
