@@ -25,6 +25,7 @@ dev = [
 stock-data-v2 = "trade_system.v2.__main__:main"
 stock-data-research = "trade_system.v2.research_workbench_cli:main"
 stock-data-paper-desk = "trade_system.v2.operator_workflow_cli:main"
+stock-data-daily = "trade_system.v2.daily_session_cli:main"
 
 [tool.ruff]
 line-length = 110

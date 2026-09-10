@@ -5,6 +5,12 @@
   "production_cutover": false,
   "broker_routing": "disabled_optional_not_authorized",
   "latest_stage_evidence": [
+    "docs/v2/STAGE_DAILY_SESSION_20260910.md",
+    "trade_system/v2/daily_session.py",
+    "trade_system/v2/daily_session_cli.py",
+    "tests/test_v2_daily_session.py",
+    "reports/v2-daily-session-20260910/completed.json",
+    "reports/v2-source-ablation-20260910/historical-source-groups-20260910-v1/run/completed.json",
     "docs/v2/REMAINING_TASKS.md",
     "trade_system/v2/operator_workflow.py",
     "trade_system/v2/operator_workflow_cli.py",
@@ -947,6 +953,6 @@
     "planned": "未完成",
     "disabled_optional": "未授权的可选扩展"
   },
-  "latest_stage_document": "docs/v2/REMAINING_TASKS.md",
-  "latest_verified_scope": "offline_paper_plan_confirmation_review_synthetic_cli_not_real_operator_acceptance"
+  "latest_stage_document": "docs/v2/STAGE_DAILY_SESSION_20260910.md",
+  "latest_verified_scope": "current_native_limit_pool_observation_and_frozen_qlib_ablation_not_real_human_or_next_session_acceptance"
 }

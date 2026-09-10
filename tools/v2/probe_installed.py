@@ -33,6 +33,9 @@ def main():
         desk = subprocess.run([sys.executable,'-I','-m','trade_system.v2.operator_workflow_cli','--help'],
             text=True,capture_output=True,cwd=folder,timeout=20)
         assert desk.returncode==0 and 'confirm' in desk.stdout
+        daily = subprocess.run([sys.executable,'-I','-m','trade_system.v2.daily_session_cli','--help'],
+            text=True,capture_output=True,cwd=folder,timeout=20)
+        assert daily.returncode==0 and 'capture' in daily.stdout and 'judge' in daily.stdout
     print(json.dumps({'installed_package':str(module),'jsonl_status':True,'account_missing_fails_closed':True,
         'execution_ready':False,'scope':'synthetic_installed_entrypoint_not_live_acceptance'}))
 

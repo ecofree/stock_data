@@ -1,0 +1,26 @@
+{
+  "experiment_id": "historical-source-groups-20260910-v1",
+  "scope": "historical_research_only",
+  "exposure_status": "previously_inspected_not_untouched",
+  "evaluation_asof": "2026-09-10T08:45:26+00:00",
+  "label_definition": "adjusted next open to adjusted T+2 close return in percent; T+1 compliant training target only",
+  "availability_assumption": "label available at 16:00 Asia/Shanghai on label end date; no actual historical receipt evidence",
+  "max_rows": 30000,
+  "train_observations": 40,
+  "valid_observations": 15,
+  "test_observations": 20,
+  "excluded_tail_observations": 20,
+  "max_folds": 5,
+  "num_boost_round": 20,
+  "num_threads": 2,
+  "seed": 20260910,
+  "top_k": 10,
+  "round_trip_cost_bps": [0, 10, 30, 50],
+  "comparison_baseline": "price_baseline",
+  "variants": {
+    "price_baseline": ["ret_1d", "ret_5d", "volatility_5d", "volume_z20", "turnover_rate", "volume_ratio", "change_pct"],
+    "price_plus_moneyflow": ["ret_1d", "ret_5d", "volatility_5d", "volume_z20", "turnover_rate", "volume_ratio", "change_pct", "net_mf_amount", "large_net_mf", "extra_large_net_mf", "moneyflow_5d"],
+    "price_plus_flow": ["ret_1d", "ret_5d", "volatility_5d", "volume_z20", "turnover_rate", "volume_ratio", "change_pct", "flow_main_net_1d", "flow_main_net_5d", "flow_main_net_20d", "flow_positive_days_5d", "flow_acceleration_5d", "flow_main_net_ratio_1d"],
+    "price_plus_funds": ["ret_1d", "ret_5d", "volatility_5d", "volume_z20", "turnover_rate", "volume_ratio", "change_pct", "net_mf_amount", "large_net_mf", "extra_large_net_mf", "moneyflow_5d", "flow_main_net_1d", "flow_main_net_5d", "flow_main_net_20d", "flow_positive_days_5d", "flow_acceleration_5d", "flow_main_net_ratio_1d"]
+  }
+}
