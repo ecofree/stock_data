@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -213,7 +214,8 @@ def test_actual_cli_pending_review_does_not_create_operator(tmp_path):
     assert saved['status']=='awaiting_next_native_session' and saved['judgements_received']==0
 
 
-def test_actual_cli_judge_retry_followup_synthetic_only(tmp_path):
+@pytest.mark.parametrize('pipe_encoding',['utf-8','cp1252','ascii'])
+def test_actual_cli_judge_retry_followup_synthetic_only(tmp_path,pipe_encoding):
     parent=tmp_path/'day8';following=tmp_path/'day9';archive=tmp_path/'notes'
     r=capture('2026-09-08',parent,client=Fixture('2026-09-08',['2026-09-08']),clock=lambda:moment('2026-09-08'))
     capture('2026-09-09',following,client=Fixture('2026-09-09',['2026-09-08','2026-09-09']),clock=lambda:moment('2026-09-09'))
@@ -223,8 +225,12 @@ def test_actual_cli_judge_retry_followup_synthetic_only(tmp_path):
     judge=['judge','--report',str(parent),'--note',str(path),'--archive',str(archive)]
     for args in [judge,judge,['review','--parent',str(parent),'--following',str(following),
                             '--archive',str(archive),'--output',str(tmp_path/'review')]]:
-        result=subprocess.run(base+args,cwd=Path(__file__).resolve().parents[1],capture_output=True,text=True,timeout=30)
+        result=subprocess.run(base+args,cwd=Path(__file__).resolve().parents[1],capture_output=True,text=True,
+                              env={**os.environ,'PYTHONIOENCODING':pipe_encoding},timeout=30)
         assert result.returncode==0,result.stdout+result.stderr
+        decoded=json.loads(result.stdout)
+        if args[0]=='judge':
+            assert decoded['note']['hypothesis']=='解释依据'
     saved=json.loads((tmp_path/'review/review.json').read_text(encoding='utf-8'))
     assert saved['cohort_size']==1 and len(list(archive.glob('*.json')))==1
     assert saved['rows'][0]['judgements'][0]['timing']=='retrospective_not_prospective'

@@ -70,7 +70,9 @@ def main():
             write_json(output/'review.json',result)
             (output/'index.html').write_text(render_followup(result),encoding='utf-8')
             result = {'output':str(output),'scope':result['scope'],'cohort_size':result['cohort_size']}
-        print(json.dumps({**result,'execution_ready':False},ensure_ascii=False))
+        # JSON is a machine protocol: escaped Unicode survives Windows ANSI
+        # pipes without changing the UTF-8 files or the decoded note content.
+        print(json.dumps({**result,'execution_ready':False},ensure_ascii=True))
         return 0
     except Exception as exc:
         # Persisted incomplete capture retains its own failure class, no secret-bearing text.
