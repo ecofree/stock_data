@@ -6,10 +6,7 @@ import duckdb
 
 from trade_system.flow_ranking import is_mega_sector_name, stock_provider_rank
 from trade_system.normalize import build_normalized_views
-from trade_system.stage_signals import (
-    generate_stage_signals,
-    refresh_close_signals_if_needed,
-)
+from legacy_diagnostics import generate_stage_signals, refresh_close_signals_if_needed
 from trade_system.web_report import render_dashboard_html
 
 

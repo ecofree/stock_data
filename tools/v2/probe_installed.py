@@ -19,6 +19,7 @@ def paper_restart_probe(folder):
         at=utc(service.clock()).isoformat()
         day=utc(at).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
         config={'account_id':'installed-fixture','mode':'paper','trading_days':[day],
+                'state_format':'bounded_hot_v3','hot_limits':{'orders':32,'lots':32,'instruments':4},
                 'opened_at':at,'initial_cash_fen':100000,'initial_lots':[],
                 'quote_ttl_seconds':30,'mark_ttl_seconds':60,'account_ttl_seconds':60,
                 'fees':{'version':'synthetic','effective_from':day,'effective_to':day,

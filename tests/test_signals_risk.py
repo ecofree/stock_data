@@ -2,7 +2,7 @@ import duckdb
 
 from trade_system.normalize import build_normalized_views
 from trade_system.risk import init_trading_tables
-from trade_system.signals import generate_signals
+from legacy_diagnostics import generate_signals
 
 
 def make_signal_db(path):

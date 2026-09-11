@@ -19,7 +19,7 @@ from trade_system.source_authority import provider_rank_sql
 
 STOCK_FEATURE_TABLE = "qlib_stock_flow_features_v2"
 SECTOR_FEATURE_TABLE = "qlib_sector_flow_features_v2"
-FEATURE_VERSION = "flow_features_v2_equal_observation_windows"
+FEATURE_VERSION = "flow_features_v3_fieldwise_observation_windows"
 
 
 def _columns(con: duckdb.DuckDBPyConnection, relation: str) -> set[str]:
@@ -112,6 +112,11 @@ def _bounds(con: duckdb.DuckDBPyConnection, relation: str, column: str, end_date
 def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[str, list[Any]]:
     cols = _columns(con, "multi_source_stock_flow")
     definition = "flow_definition" if "flow_definition" in cols else "CAST(NULL AS VARCHAR)"
+    declared_unit = "CASE WHEN amount_unit IN ('CNY','yuan','yuan_from_10000','yuan_from_100m_yuan') THEN 'CNY' END" if 'amount_unit' in cols else 'CAST(NULL AS VARCHAR)'
+    flow_unit = f'coalesce(flow_unit,{declared_unit})' if 'flow_unit' in cols else declared_unit
+    lineage = "concat_ws('|'," + ','.join(
+        f"coalesce(CAST({c} AS VARCHAR),'unknown')" if c in cols else "'unknown'"
+        for c in ('origin_provider','source_api','amount_unit','flow_unit','turnover_unit','field_mapping_version')) + ')'
     ratio = "main_net / NULLIF(turnover,0)" if {'turnover_unit','flow_unit'}.issubset(cols) else "CAST(NULL AS DOUBLE)"
     if ratio != "CAST(NULL AS DOUBLE)":
         ratio = "CASE WHEN turnover_unit='CNY' AND flow_unit='CNY' THEN " + ratio + " END"
@@ -123,6 +128,7 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
     WITH canonical AS (
         SELECT source_date AS trade_date, stock_code, provider, main_net,
                {definition} AS flow_definition, {ratio} AS certified_ratio,
+               {lineage} AS lineage, {flow_unit} AS flow_unit,
                {net_total} AS net_total, turnover, close, change_pct,
                row_number() OVER (
                    PARTITION BY source_date, stock_code
@@ -135,12 +141,13 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
         SELECT * FROM canonical WHERE rn=1
     ), boundaries AS (
         SELECT *, CASE WHEN provider IS DISTINCT FROM lag(provider) OVER w
-            OR flow_definition IS DISTINCT FROM lag(flow_definition) OVER w THEN 1 ELSE 0 END AS boundary
+            OR flow_definition IS DISTINCT FROM lag(flow_definition) OVER w
+            OR lineage IS DISTINCT FROM lag(lineage) OVER w THEN 1 ELSE 0 END AS boundary
         FROM chosen WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
     ), base AS (
         SELECT *, sum(boundary) OVER (PARTITION BY stock_code ORDER BY trade_date) AS source_segment FROM boundaries
     ), features AS (
-        SELECT trade_date, stock_code, provider, flow_definition,
+        SELECT trade_date, stock_code, provider, flow_definition, flow_unit,
                main_net AS main_net_1d,
                SUM(main_net) OVER w3 AS main_net_3d,
                SUM(main_net) OVER w5 AS main_net_5d,
@@ -161,13 +168,19 @@ def _stock_query(con: duckdb.DuckDBPyConnection, end_date: str | None) -> tuple[
             w10 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
             w20 AS (PARTITION BY stock_code,source_segment ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
     )
-    SELECT trade_date, stock_code, provider, main_net_1d, main_net_3d, main_net_5d,
-           main_net_10d, main_net_20d, positive_days_3d, positive_days_5d,
-           positive_days_10d, positive_days_20d, observed_days_20d,
+    SELECT trade_date, stock_code, provider, main_net_1d,
+           CASE WHEN observed_days_20d>=3 THEN main_net_3d END AS main_net_3d,
+           CASE WHEN observed_days_20d>=5 THEN main_net_5d END AS main_net_5d,
+           CASE WHEN observed_days_20d>=10 THEN main_net_10d END AS main_net_10d,
+           CASE WHEN observed_days_20d>=20 THEN main_net_20d END AS main_net_20d,
+           CASE WHEN observed_days_20d>=3 THEN positive_days_3d END AS positive_days_3d,
+           CASE WHEN observed_days_20d>=5 THEN positive_days_5d END AS positive_days_5d,
+           CASE WHEN observed_days_20d>=10 THEN positive_days_10d END AS positive_days_10d,
+           CASE WHEN observed_days_20d>=20 THEN positive_days_20d END AS positive_days_20d, observed_days_20d,
            flow_acceleration_5d, main_net_ratio_1d, net_total, close, change_pct,
            CASE WHEN flow_definition IS NULL THEN 'source_definition_unverified'
-                WHEN observed_days_20d<20 THEN 'insufficient_history'
-                WHEN main_net_ratio_1d IS NULL THEN 'ratio_unit_or_denominator_unverified'
+                WHEN flow_unit IS DISTINCT FROM 'CNY' THEN 'flow_unit_unverified'
+                WHEN observed_days_20d<20 OR main_net_ratio_1d IS NULL THEN 'research_partial_features_not_certified'
                 ELSE 'research_candidate_not_certified' END AS quality_status, '{FEATURE_VERSION}' AS feature_version
     FROM features
     """

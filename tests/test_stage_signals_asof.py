@@ -3,8 +3,9 @@ import json
 import duckdb
 
 from trade_system.normalize import build_normalized_views
-from trade_system.signals import generate_signals
-from trade_system.stage_signals import ensure_stage_signal_schema, generate_stage_signals
+from legacy_diagnostics import generate_signals
+from trade_system.stage_signals import ensure_stage_signal_schema
+from legacy_diagnostics import generate_stage_signals
 
 
 def _build_context(db_path, trade_date="2026-07-08"):

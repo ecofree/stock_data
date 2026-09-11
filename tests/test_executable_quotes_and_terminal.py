@@ -15,9 +15,9 @@ from trade_system.executable_quotes import (
     upsert_executable_quotes,
 )
 from trade_system.normalize import build_normalized_views
+from legacy_diagnostics import generate_stage_signals
 from trade_system.stage_signals import (
     ensure_stage_signal_schema,
-    generate_stage_signals,
 )
 from trade_system.terminal_report import (
     _health_section,

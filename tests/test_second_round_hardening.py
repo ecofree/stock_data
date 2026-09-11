@@ -50,7 +50,7 @@ def test_sync_index_list_from_real_kline_publishes_requested_date_only(tmp_path)
 from trade_system.data_chain import assess_data_chains
 from trade_system.normalize import build_normalized_views
 from trade_system.quality import dedupe_table, find_duplicate_keys
-from trade_system.signals import generate_signals
+from legacy_diagnostics import generate_signals
 
 
 def test_dedupe_table_archives_old_duplicate_rows(tmp_path):

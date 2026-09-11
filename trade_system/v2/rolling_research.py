@@ -15,7 +15,7 @@ from .domain import canonical, identity, utc, file_hash
 from .ml_protocol import rolling_partitions
 
 
-RESERVED = {'datetime','instrument','label_next_ret','label_date','label_end_time','label_available_time'}
+RESERVED = {'datetime','instrument','label_next_ret','label_date','label_end_time','label_available_time','label_status'}
 
 
 def dump(path, value):
@@ -51,6 +51,13 @@ def validate_plan(plan):
             raise ValueError('explicit feature identifiers required')
     if plan['comparison_baseline'] not in variants:
         raise ValueError('explicit paired feature baseline required')
+    roles = plan.get('feature_roles', {})
+    declared_features = {f for fs in variants.values() for f in fs}
+    if not isinstance(roles,dict) or not set(roles)<=declared_features or any(r not in {'required','optional_event','structural_constant'} for r in roles.values()):
+        raise ValueError('invalid predeclared feature role policy')
+    requirements=plan.get('required_export_contract',{})
+    if not isinstance(requirements,dict) or not set(requirements)<= {'label_version','calendar_evidence','adjustment_available','flow_feature_versions'}:
+        raise ValueError('unsupported export contract requirement')
     costs = plan['round_trip_cost_bps']
     if not costs or costs!=sorted(set(costs)) or any(type(c) is not int or not 0<=c<=1000 for c in costs):
         raise ValueError('sorted explicit proxy cost scenarios required')
@@ -69,6 +76,9 @@ def load_frame(path, features, max_rows):
         raise ValueError('explicit CSV or Parquet artifact required')
     columns = ','.join('"'+f+'"' for f in [*features,'label_next_ret','label_end_time','label_available_time'])
     with duckdb.connect(':memory:') as con:
+        if con.execute(f'''SELECT count(*) FROM {relation}
+            WHERE CAST(datetime AS TIMESTAMP)<>CAST(CAST(datetime AS DATE) AS TIMESTAMP)''',[source]).fetchone()[0]:
+            raise ValueError('daily experiment rejects intraday identities; a separate timestamp-preserving protocol is required')
         con.execute(f'''CREATE TABLE features AS SELECT CAST(datetime AS DATE) AS datetime,
                     CAST(instrument AS VARCHAR) AS instrument,{columns} FROM {relation}''',[source])
         if con.execute('SELECT count(*) FROM features WHERE datetime IS NULL OR instrument IS NULL OR instrument=\'\'').fetchone()[0]:
@@ -117,18 +127,23 @@ def fold_frames(frame, fold, evaluation_asof, tail_start):
 
 class FoldDataset:
     """QLib-compatible, already purged dataset; no test labels exposed during fit."""
-    def __init__(self, frames, features, *, fitting=True):
-        self.features = features
+    def __init__(self, frames, features, *, fitting=True, roles=None):
+        roles = roles or {}
         self.segments = {'train':None,'valid':None} if fitting else {'test':None}
         columns = ['datetime','instrument',*features]+(['label_next_ret'] if fitting else [])
         self.frames = {key:frames[key][columns].copy() for key in self.segments}
         train = frames['train'][features]
         self.all_missing_features = list(train.columns[train.isna().all()])
         self.constant_features = list(train.columns[(train.nunique(dropna=True)==1)])
-        if self.all_missing_features or self.constant_features:
+        invalid = set(self.all_missing_features+self.constant_features)
+        self.dropped_features = sorted(f for f in invalid if roles.get(f) in {'optional_event','structural_constant'})
+        if invalid-set(self.dropped_features):
             raise ValueError('invalid training features: '+canonical({
                 'all_missing':self.all_missing_features,'constant':self.constant_features}))
-        self.medians = train.median()
+        self.features = [f for f in features if f not in self.dropped_features]
+        if not self.features:
+            raise ValueError('no usable training features remain')
+        self.medians = train[self.features].median()
 
     def prepare(self, segment, col_set='feature', data_key=None):
         if segment not in self.segments:
@@ -146,15 +161,16 @@ class FoldDataset:
 def fit_qlib(frames, features, plan, output):
     from qlib.contrib.model.gbdt import LGBModel
     from qlib.workflow import R
-    dataset = FoldDataset(frames,features)
+    dataset = FoldDataset(frames,features,roles=plan.get('feature_roles'))
     model = LGBModel(loss='mse',num_boost_round=plan['num_boost_round'],early_stopping_rounds=5,
         learning_rate=.05,num_leaves=15,feature_fraction=1.0,verbosity=-1,num_threads=plan['num_threads'],
         seed=plan['seed'],deterministic=True,force_col_wise=True)
     with R.start(experiment_name=plan['experiment_id'],recorder_name=output.parent.name+'-'+output.name):
         model.fit(dataset,verbose_eval=0)
-    prediction = model.predict(FoldDataset(frames,features,fitting=False),segment='test')
+    prediction = model.predict(FoldDataset(frames,dataset.features,fitting=False),segment='test')
     model.model.save_model(str(output/'model.txt'))
     return prediction,{'medians':dataset.medians.to_dict(),'all_missing_features':dataset.all_missing_features,
+                       'dropped_features':dataset.dropped_features,'used_features':dataset.features,
                        'best_iteration':model.model.best_iteration,'model_class':'qlib.contrib.model.gbdt.LGBModel'}
 
 
@@ -230,6 +246,8 @@ def register_experiment(root, feature_path, plan, *, registered_at=None):
     if not metadata.is_file():
         raise ValueError('feature metadata required')
     meta = json.loads(metadata.read_text(encoding='utf-8'))
+    if any(meta.get(k)!=v for k,v in plan.get('required_export_contract',{}).items()):
+        raise ValueError('export does not satisfy frozen source/label version requirements')
     hashes = {str(p):file_hash(p) for p in files}
     declared = {str((metadata.parent/relative).resolve()):digest for relative,digest in meta.get('artifact_hashes',{}).items()}
     if any(declared.get(p)!=digest for p,digest in hashes.items()):
@@ -305,6 +323,9 @@ def run_experiment(folder, *, fit=None):
         all_daily = {name:[] for name in [*plan['variants'],'constant']}; reports = []
         for index,fold in enumerate(partition['folds']):
             frames,coverage = fold_frames(frame,fold,plan['evaluation_asof'],partition['final_holdout'][0])
+            # Validate every paired group before spending this fold's fit budget.
+            for columns in plan['variants'].values():
+                FoldDataset(frames,columns,roles=plan.get('feature_roles'))
             target = frames['test'].set_index(['datetime','instrument']).sort_index()
             ids = [[str(d),str(i)] for d,i in target.index]
             folder_fold = out/f'fold-{index:02d}'; folder_fold.mkdir()

@@ -78,6 +78,7 @@ class Store:
             raise
 
     def __exit__(self, *_):
+        self.paper_hot_cache = {}
         if self.con is not None:
             self.con.close()
             self.con = None

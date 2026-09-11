@@ -970,7 +970,10 @@ def generate_stage_signals(
     limit: int = 20,
     freshness_seconds: int | None = None,
     strict_tradability: bool = False,
+    migration_root: str | Path | None = None,
 ) -> dict:
+    from trade_system.migration_boundary import require_signal_copy
+    require_signal_copy(migration_root, db_path)
     if stage not in STAGE_NAMES:
         raise ValueError(f"Unsupported stage: {stage}")
     as_of = _parse_datetime(as_of_time)
@@ -1247,12 +1250,13 @@ def refresh_close_signals_if_needed(
     freshness_seconds: int | None = None,
     strict_tradability: bool = True,
     as_of_time: str | datetime | None = None,
+    migration_root: str | Path | None = None,
 ) -> dict:
     """Rebuild close_decision rows when kline arrived after the first close pass."""
-    from trade_system.db_utils import legacy_connect
-    con = legacy_connect(str(db_path))
+    from trade_system.migration_boundary import require_signal_copy
+    require_signal_copy(migration_root, db_path)
+    con = duckdb.connect(str(db_path), read_only=True)
     try:
-        ensure_stage_signal_schema(con)
         needed = _close_signals_need_refresh(con, trade_date)
     finally:
         con.close()
@@ -1269,6 +1273,7 @@ def refresh_close_signals_if_needed(
         db_path,
         trade_date,
         "close_decision",
+        migration_root=migration_root,
         as_of_time=as_of_time or datetime.now(),
         run_id=run_id,
         limit=limit,

@@ -9,7 +9,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-from .domain import canonical, instrument, number, quantity, utc
+from .domain import canonical, identity, instrument, number, quantity, utc
 
 
 ACTIVE = {'open','partial','cancel_pending','unknown'}
@@ -28,6 +28,19 @@ def rounded(value):
 class PaperBook:
     def __init__(self, config):
         self.config = deepcopy(config)
+        self.bounded = config.get('state_format') == 'bounded_hot_v3'
+        if config.get('state_format') not in (None, 'bounded_hot_v3'):
+            raise ValueError('unsupported paper state format')
+        self.identity_used = lambda kind, key: False
+        if self.bounded:
+            self.identity_used = None
+        self.cold_batch = {}
+        if self.bounded:
+            limits = config.get('hot_limits', {})
+            if set(limits) != {'orders','lots','instruments'} or any(type(v) is not int or not 1 <= v <= 10000 for v in limits.values()):
+                raise ValueError('explicit bounded active entity limits required')
+            if len(config['instruments']) > limits['instruments']:
+                raise ValueError('instrument hot limit exceeded')
         canonical(config)
         if config.get('mode') != 'paper' or not config.get('account_id'):
             raise ValueError('explicit paper account required; live is unsupported')
@@ -74,6 +87,9 @@ class PaperBook:
         if initial <= 0:
             raise ValueError('positive declared starting equity required')
         self.state.update(initial_equity_fen=initial,units=str(initial),high_water_nav='1')
+        if self.bounded:
+            self.state.update(history_hash=identity({'format':'bounded_hot_v3'}), history_count=0,
+                              max_drawdown='0')
         self._snapshot('initial',at)
 
     def day(self, at):
@@ -125,6 +141,8 @@ class PaperBook:
                    for lot in self.state['lots'] if lot['quantity'])
 
     def apply(self, event):
+        if self.bounded and not callable(self.identity_used):
+            raise ValueError('bounded ledger requires durable identity backend')
         canonical(event)
         key = event['event_id']
         if not isinstance(key,str) or not key:
@@ -157,7 +175,7 @@ class PaperBook:
             qty = quantity(p['quantity']); price = fen(p['limit_price_fen']); side = p['side']
             if side not in ('buy','sell') or not qty or not price or not p.get('decision_ref'):
                 raise ValueError('explicit side, quantity, price and paper decision reference required')
-            if not isinstance(p['order_id'],str) or not p['order_id'] or p['order_id'] in self.state['orders']:
+            if not isinstance(p['order_id'],str) or not p['order_id'] or p['order_id'] in self.state['orders'] or self.identity_used('order',p['order_id']):
                 raise ValueError('order identity already used')
             if side=='buy' and qty%rule['buy_lot']:
                 raise ValueError('buy quantity violates frozen lot rule')
@@ -199,7 +217,7 @@ class PaperBook:
             self.state['external_cash_fen'] += amount
         elif kind in ('cash_dividend','split'):
             code = instrument(p['instrument']); self._rule(code,at)
-            if not p.get('action_id') or not p.get('evidence_id') or p['action_id'] in self.state['corporate_actions']:
+            if not p.get('action_id') or not p.get('evidence_id') or p['action_id'] in self.state['corporate_actions'] or self.identity_used('action',p['action_id']):
                 raise ValueError('unique corporate action and entitlement evidence required')
             if kind=='cash_dividend':
                 # Entitlement is explicit, not incorrectly inferred from
@@ -310,6 +328,20 @@ class PaperBook:
         self.state['nav_history'].append({'event_id':event_id,'at':at,'cash_fen':self.state['cash_fen'],
             'equity_fen':self.equity(),'frozen_fen':self.frozen(),'unit_nav':str(nav),
             'drawdown':str((peak-nav)/peak),'valuation_complete':self.complete_valuation(at)})
+        if self.bounded:
+            terminal = {k:v for k,v in self.state['orders'].items() if v['status'] not in ACTIVE}
+            self.cold_batch = {'nav':self.state['nav_history'][-1], 'orders':terminal,
+                               'fills':self.state['fills'], 'actions':self.state['corporate_actions']}
+            self.state['history_hash'] = identity({'previous':self.state['history_hash'],'batch':self.cold_batch})
+            self.state['history_count'] += 1
+            self.state['max_drawdown'] = str(max(Decimal(self.state['max_drawdown']), (peak-nav)/peak))
+            self.state['nav_history'] = self.state['nav_history'][-1:]
+            self.state['orders'] = {k:v for k,v in self.state['orders'].items() if k not in terminal}
+            self.state['lots'] = [lot for lot in self.state['lots'] if lot['quantity']]
+            self.state['fills'], self.state['corporate_actions'] = [], []
+            for key in ('orders','lots'):
+                if len(self.state[key]) > self.config['hot_limits'][key]:
+                    raise ValueError('active '+key+' hot limit exceeded; no existing exposure discarded')
 
     def summary(self):
         return {'account_id':self.config['account_id'],'mode':'paper','execution_ready':False,
@@ -318,6 +350,6 @@ class PaperBook:
                 'free_cash_fen':self.state['cash_fen']-self.frozen(),'fees_fen':self.state['fees_fen'],
                 'realized_pnl_fen':self.state['realized_pnl_fen'],'income_fen':self.state['income_fen'],
                 'profit_ex_external_cash_fen':self.equity()-self.state['initial_equity_fen']-self.state['external_cash_fen'],
-                'max_observed_drawdown':str(max(Decimal(r['drawdown']) for r in self.state['nav_history'])),
+                'max_observed_drawdown':self.state['max_drawdown'] if self.bounded else str(max(Decimal(r['drawdown']) for r in self.state['nav_history'])),
                 'valuation_complete':self.complete_valuation(self.state['last_at']),
                 'scope':'paper_observed_capacity_proxy_not_actual_fills'}

@@ -3,7 +3,7 @@ from decimal import Decimal
 import json
 
 from .domain import identity, utc
-from .paper_storage import load_paper
+from .paper_storage import load_paper, paper_history
 
 
 def project_attribution(store, account_id):
@@ -15,8 +15,9 @@ def project_attribution(store, account_id):
     if utc(book.state['last_at'])>now:
         raise ValueError('cannot project future ledger knowledge as current evidence')
     orders,signals,missing = [],{},[]
-    for order in book.state['orders'].values():
-        fills = [f for f in book.state['fills'] if f['order_id']==order['order_id']]
+    all_orders,all_fills=paper_history(store,book)
+    for order in all_orders.values():
+        fills = [f for f in all_fills if f['order_id']==order['order_id']]
         row = store.con.execute('SELECT payload FROM decision_certificate WHERE decision_id=?',[order['decision_ref']]).fetchone()
         certificate = json.loads(row[0]) if row else None
         if certificate is not None and (identity(certificate)!=order['decision_ref'] or

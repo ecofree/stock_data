@@ -8,7 +8,7 @@ from .gap_evidence import write_json
 from .publisher import publish
 
 
-def run(output,*,clock=now_utc,client=None,parent=None,archive=None,publish_root=None,generation=None):
+def run(output,*,clock=now_utc,client=None,parent=None,archive=None,publish_root=None,generation=None,observation_db=None,themes=()):
     output=Path(output).resolve()
     moment=utc(clock())
     day=daily.local_day(moment)
@@ -18,6 +18,8 @@ def run(output,*,clock=now_utc,client=None,parent=None,archive=None,publish_root
             raise ValueError('run output must be separate from source and publication directories')
     if (publish_root is None)!=(generation is None):
         raise ValueError('publication root and generation must be specified together')
+    if observation_db is not None and parent is None:
+        raise ValueError('price review input requires a frozen parent cohort')
     output.mkdir(parents=True,exist_ok=False)
     base={'scope':'daily_observation_workflow_not_validated_selection','trade_date':day,
           'started_at':moment.isoformat(),'execution_ready':False,'actual_operator_return':None}
@@ -44,15 +46,37 @@ def run(output,*,clock=now_utc,client=None,parent=None,archive=None,publish_root
         write_json(output/'human_queue.json',queue)
         artifacts={'index.html':render(report).encode('utf-8'),'observation.json':canonical(report).encode('utf-8')}
         review=None
+        enrichment=None
+        if (parent and observation_db is None) or themes:
+            from . import native_enrichment
+            cohort=daily.verify(parent) if parent else report
+            native_enrichment.capture(cohort,day,output/'native-enrichment',themes=themes,client=client,clock=clock)
+            enrichment=native_enrichment.verify(output/'native-enrichment')
+            artifacts['native-enrichment.json']=canonical(enrichment).encode('utf-8')
+        write_json(output/'judgement_template.json',{'schema':1,'scope':'daily_judgement_no_execution',
+            'report_id':report['report_id'],'candidate_id':'','note_id':'','created_at':'',
+            'operator':'','intent':'','hypothesis':'','invalidation':''})
         if parent:
             previous=daily.verify(parent)
-            review=daily.next_review(previous,report,daily.read_judgements(archive,previous,asof=utc(clock())),created=utc(clock()))
+            prices = daily.legacy_observations(observation_db,day,[c['instrument'] for c in previous['candidates']],asof=utc(clock())) if observation_db and previous['candidates'] else {}
+            if enrichment:
+                prices=enrichment['observations']
+            write_json(output/'price_observations.json',{'scope':enrichment['scope'] if enrichment else 'legacy_table_not_native_authenticated',
+                'trade_date':day,'parent_report_id':previous['report_id'],'observations':prices,
+                'input_sha256':identity(prices),'source_supplied':observation_db is not None})
+            review=daily.next_review(previous,report,daily.read_judgements(archive,previous,asof=utc(clock())),created=utc(clock()),observations=prices,enrichment=enrichment)
             write_json(output/'next_session_review.json',review)
             artifacts['review.html']=render_followup(review).encode('utf-8')
             artifacts['review.json']=canonical(review).encode('utf-8')
         result={**base,'status':'observation_ready_awaiting_human','daily_close_complete':True,
                 'report_id':report['report_id'],'candidate_count':len(report['candidates']),
                 'judgements_received':len(notes),'next_session_review_created':review is not None,
+                'review_prices_observed':sum(r['observation'] is not None for r in review['rows']) if review else 0,
+                'review_prices_missing':sum(r['observation'] is None for r in review['rows']) if review else 0,
+                'price_source_native_authenticated':bool(enrichment and enrichment['origin']=='hithink_native'),
+                'native_enrichment_id':enrichment['enrichment_id'] if enrichment else None,
+                'declared_judgement_observation_loop_complete':bool(review and review['rows'] and all(
+                    r['observation'] and any(n['timing']=='recorded_before_next_open' for n in r['judgements']) for r in review['rows'])),
                 'human_loop_complete':False,'publication':None}
         if publish_root is not None:
             result['publication']=publish(publish_root,identity([day,report['report_id']]),artifacts,generation=generation)

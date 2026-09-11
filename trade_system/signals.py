@@ -797,7 +797,10 @@ def generate_signals(
     *,
     require_ready: bool = True,
     readiness_stage: str = "close",
+    migration_root: str | Path | None = None,
 ) -> dict:
+    from trade_system.migration_boundary import require_signal_copy
+    require_signal_copy(migration_root, db_path)
     build_normalized_views(db_path)
     try:
         return _generate_signals_once(

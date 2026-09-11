@@ -12,6 +12,7 @@ from trade_system.signals import generate_signals
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate trading signal tables.")
     parser.add_argument("--db", default="kpl_data.duckdb")
+    parser.add_argument("--migration-root", help="Verified disposable diagnostic copy; never production")
     parser.add_argument("--trade-date", "--date", dest="trade_date")
     parser.add_argument(
         "--allow-partial",
@@ -27,6 +28,7 @@ def main() -> int:
     result = generate_signals(
         args.db,
         args.trade_date,
+        migration_root=args.migration_root,
         # Readiness is the default gate now; --allow-partial is the explicit
         # research-only escape hatch.
         require_ready=not args.allow_partial,

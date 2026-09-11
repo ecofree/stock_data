@@ -5,7 +5,7 @@ import duckdb
 from trade_system.backfill import import_professional_csvs
 from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.normalize import build_normalized_views
-from trade_system.signals import generate_signals
+from legacy_diagnostics import generate_signals
 
 
 def _write_csv(path, rows):

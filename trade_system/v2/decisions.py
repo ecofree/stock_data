@@ -284,7 +284,8 @@ class DecisionService:
             # The confirmation was created against an initialized paper ledger;
             # migrations already exist, so load performs no nested transaction.
             book=load_paper(store,row[0],full_replay=True)
-            if any(o['decision_ref']==confirmed['decision_id'] for o in book.state['orders'].values()):
+            from .paper_storage import paper_history
+            if any(o['decision_ref']==confirmed['decision_id'] for o in paper_history(store,book)[0].values()):
                 raise ValueError('delivered paper order requires order reconciliation, not unsent closure')
             table='exit_reservation' if confirmed.get('side')=='sell' else 'reservation'
             reservation=confirmed['reservation_id']

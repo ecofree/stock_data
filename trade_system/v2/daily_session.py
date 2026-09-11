@@ -277,7 +277,36 @@ def read_judgements(archive, report, *, asof):
     return records
 
 
-def next_review(parent, following, notes, *, created, observations=None):
+def review_learning(rows):
+    """Descriptive fixed-cohort review, never automatic hypothesis truth or returns."""
+    groups={k:[] for k in ('observe','reject','paper_hypothesis','conflicting_declarations','no_prior_judgement')}
+    for row in rows:
+        prior=[n for n in row['judgements'] if n['timing']=='recorded_before_next_open']
+        latest={}
+        for n in prior:
+            operator=n['note']['operator'];at=utc(n['received_at'])
+            if operator not in latest or at>latest[operator][0]:latest[operator]=(at,{n['note']['intent']})
+            elif at==latest[operator][0]:latest[operator][1].add(n['note']['intent'])
+        intents=set().union(*(v[1] for v in latest.values())) if latest else set()
+        group=next(iter(intents)) if len(intents)==1 else 'conflicting_declarations' if intents else 'no_prior_judgement'
+        row['review_group']=group
+        row['hypothesis_verdict']='requires_human_evidence_review_not_inferred_from_price'
+        bar=row['observation']
+        row['next_session_open_to_low_pct']=str((number(bar['low'])/number(bar['open'])-1)*100) if bar else None
+        row['next_session_open_to_high_pct']=str((number(bar['high'])/number(bar['open'])-1)*100) if bar else None
+        groups[group].append(row)
+    result={}
+    for group,items in groups.items():
+        values=[number(r['next_session_open_close_pct']) for r in items if r['next_session_open_close_pct'] is not None]
+        result[group]={'cohort_count':len(items),'observed_count':len(values),'missing_count':len(items)-len(values),
+                       'mean_open_close_pct':str(sum(values)/len(values)) if values else None}
+    return {'scope':'descriptive_fixed_cohort_not_prediction_accuracy_or_operator_performance',
+            'group_rule':'latest_preopen_receipt_per_declared_operator_conflicts_retained_late_notes_excluded',
+            'groups':result,'cohort_count':len(rows),'actual_operator_return':None,
+            'automatic_strategy_update':False,'execution_ready':False}
+
+
+def next_review(parent, following, notes, *, created, observations=None,enrichment=None):
     validate_report(parent)
     validate_report(following)
     if (set(parent['gaps']) | set(following['gaps'])) & BLOCKING_SOURCE_GAPS:
@@ -295,6 +324,11 @@ def next_review(parent, following, notes, *, created, observations=None):
     # Top-N absence never implies absence from full source pool or a price loss.
     all_pool = set(later) | set(following['not_selected_instruments'])
     observations = observations or {}
+    if enrichment is not None:
+        if (identity({k:v for k,v in enrichment.items() if k!='enrichment_id'})!=enrichment.get('enrichment_id')
+            or enrichment['parent_report_id']!=parent['report_id'] or enrichment['trade_date']!=day
+            or enrichment['observations']!=observations):
+            raise ValueError('native enrichment must bind exact parent, day and observations')
     rows = []
     for n in notes:
         check_note(n['note'],parent)
@@ -318,17 +352,29 @@ def next_review(parent, following, notes, *, created, observations=None):
                 'received_at':n['received_at']})
         bar = observations.get(code)
         if bar:
-            if bar.get('date') != day or bar.get('source_status') != 'legacy_table_not_native_authenticated':
+            native_ok=enrichment is not None and bar.get('source_status') in ('native_daily_bar_receipt','synthetic_daily_bar_receipt')
+            if bar.get('date') != day or (bar.get('source_status') != 'legacy_table_not_native_authenticated' and not native_ok):
                 raise ValueError('exact next-session observation provenance required')
+            if native_ok and utc(bar['received_at'])>utc(created):
+                raise ValueError('future native price receipt')
             if any(number(bar[k])<=0 for k in ('open','high','low','close')):
                 raise ValueError('invalid next-session prices')
+            if number(bar['low'])>min(number(bar['open']),number(bar['close'])) or number(bar['high'])<max(number(bar['open']),number(bar['close'])):
+                raise ValueError('invalid next-session OHLC bounds')
         rows.append({'candidate_id':candidate['candidate_id'],'instrument':code,'name':candidate['name'],
+            'original_case':{'support':candidate['support'],'risks':candidate['risks'],
+                             'provider_reason':candidate['provider_reason'],'reason_status':candidate['reason_status']},
+            'topics_at_receipt':[{ 'theme_id':key,**value} for key,value in enrichment['topics'].items()
+                                 if code in value['cohort_members']] if enrichment else [],
             'next_date':day,'in_following_observed_pool':code in all_pool,
             'pool_absence_semantics':'not_in_observed_pool_is_not_suspension_or_loss',
             'observation':bar,'observation_status':'observed' if bar else 'daily_bar_missing_not_zero',
             'judgements':decisions,'judgement_status':'recorded' if decisions else 'no_human_judgement',
+            'next_session_open_close_pct':str((number(bar['close'])/number(bar['open'])-1)*100) if bar else None,
+            'return_scope':'market_observation_not_T1_executable_or_operator_return',
             'actual_operator_return':None,'execution_ready':False})
-    body = {'schema':1,'scope':'next_session_observation_not_actual_return',
+    learning=review_learning(rows)
+    body = {'schema':1,'scope':'next_session_observation_not_actual_return','learning':learning,
         'parent_report_id':parent['report_id'],'following_report_id':following['report_id'],
         'created_at':utc(created).isoformat(),'trade_date':day,'cohort_size':len(rows),'rows':rows,
         'execution_ready':False,'actual_operator_return':None,

@@ -231,17 +231,17 @@ class MultiSourceStore:
             # Pre-open/blocked sector and quote endpoints sometimes return a
             # syntactically valid row with every capital-flow field missing.
             # Do not persist that placeholder as usable money-flow evidence.
-            flow_fields = ("main_net", "super_net", "large_net", "mid_net", "small_net")
-            if not any(row.get(field) not in (None, "", "-") for field in flow_fields):
-                continue
             canonical = normalize_stock_flow_row(row, provider)
+            flow_fields = ("main_net", "net_total", "super_net", "large_net", "mid_net", "small_net")
+            if not any(canonical.get(field) is not None for field in flow_fields):
+                continue
             d = _date(row.get("date") or row.get("trade_date"))
             stock = str(code or row.get("code") or "")
             values = [
                 canonical["main_net"], canonical["net_total"], canonical["super_net"],
                 canonical["large_net"], canonical["mid_net"], canonical["small_net"],
                 _number(row.get("close")), _number(row.get("change_pct") or row.get("pct")),
-                _number(row.get("turnover")), canonical["amount_unit"],
+                _number(row.get("turnover")), canonical["amount_unit"], canonical['flow_unit'], canonical['turnover_unit'],
                 canonical["flow_definition"], canonical["source_api"],
                 canonical["origin_provider"], canonical["field_mapping_version"], stale,
                 _json(row), d, stock, provider,
@@ -255,15 +255,15 @@ class MultiSourceStore:
             self.con.execute(
                 "UPDATE multi_source_stock_flow SET "
                 "main_net=?,net_total=?,super_net=?,large_net=?,mid_net=?,small_net=?,"
-                "close=?,change_pct=?,turnover=?,amount_unit=?,flow_definition=?,source_api=?,"
+                "close=?,change_pct=?,turnover=?,amount_unit=?,flow_unit=?,turnover_unit=?,flow_definition=?,source_api=?,"
                 "origin_provider=?,field_mapping_version=?,is_stale=?,raw_json=?,"
                 "fetched_at=current_timestamp "
                 "WHERE source_date=? AND stock_code=? AND provider=?",
                 values,
             )
             self.con.execute(
-                "INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,net_total,super_net,large_net,mid_net,small_net,close,change_pct,turnover,provider,amount_unit,flow_definition,source_api,origin_provider,field_mapping_version,is_stale,raw_json) "
-                "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
+                "INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,net_total,super_net,large_net,mid_net,small_net,close,change_pct,turnover,provider,amount_unit,flow_unit,turnover_unit,flow_definition,source_api,origin_provider,field_mapping_version,is_stale,raw_json) "
+                "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
                 "WHERE NOT EXISTS (SELECT 1 FROM multi_source_stock_flow "
                 "WHERE source_date=? AND stock_code=? AND provider=?)",
                 [
@@ -271,7 +271,7 @@ class MultiSourceStore:
                     canonical["super_net"], canonical["large_net"], canonical["mid_net"],
                     canonical["small_net"], _number(row.get("close")),
                     _number(row.get("change_pct") or row.get("pct")),
-                    _number(row.get("turnover")), provider, canonical["amount_unit"],
+                    _number(row.get("turnover")), provider, canonical["amount_unit"], canonical['flow_unit'], canonical['turnover_unit'],
                     canonical["flow_definition"], canonical["source_api"],
                     canonical["origin_provider"], canonical["field_mapping_version"], stale,
                     _json(row), d, stock, provider,

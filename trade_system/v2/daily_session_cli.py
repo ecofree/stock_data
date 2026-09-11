@@ -16,6 +16,13 @@ def main():
     run=sub.add_parser('run',help='Bounded current post-close workflow; before close records pending without network')
     run.add_argument('--output',required=True);run.add_argument('--parent');run.add_argument('--archive')
     run.add_argument('--publish-root');run.add_argument('--generation',type=int)
+    run.add_argument('--observation-db',help='Optional read-only legacy prices; never native-source certification')
+    run.add_argument('--theme',action='append',default=[],help='Up to three explicit THS topic codes; current receipt context only')
+    e=sub.add_parser('enrich',help='Retain bounded native bars and current topic receipts for a sealed cohort')
+    e.add_argument('--report',required=True);e.add_argument('--date',required=True);e.add_argument('--output',required=True)
+    e.add_argument('--theme',action='append',default=[])
+    ev=sub.add_parser('enrichment-view',help='Render already sealed enrichment; no network or source mutation')
+    ev.add_argument('--source',required=True);ev.add_argument('--output',required=True)
     v = sub.add_parser('view'); v.add_argument('--report',required=True); v.add_argument('--output',required=True)
     pub=sub.add_parser('publish',help='Verify and publish a sealed observation into a separate V2 namespace')
     pub.add_argument('--report',required=True);pub.add_argument('--root',required=True)
@@ -28,7 +35,21 @@ def main():
     try:
         if a.command=='run':
             from .daily_workflow import run
-            result=run(a.output,parent=a.parent,archive=a.archive,publish_root=a.publish_root,generation=a.generation)
+            result=run(a.output,parent=a.parent,archive=a.archive,publish_root=a.publish_root,generation=a.generation,observation_db=a.observation_db,themes=a.theme)
+        elif a.command=='enrich':
+            from . import native_enrichment
+            result=native_enrichment.capture(verify(a.report),a.date,a.output,themes=a.theme)
+            result={k:result[k] for k in ('enrichment_id','origin','missing_instruments','trade_date')}
+        elif a.command=='enrichment-view':
+            from . import native_enrichment
+            from .daily_session_view import render_enrichment
+            enriched=native_enrichment.verify(a.source)
+            output=Path(a.output).resolve();source=Path(a.source).resolve()
+            if output==source or source in output.parents:
+                raise ValueError('view cannot mutate sealed source')
+            output.mkdir(parents=True,exist_ok=False)
+            (output/'index.html').write_text(render_enrichment(enriched),encoding='utf-8')
+            result={'output':str(output),'enrichment_id':enriched['enrichment_id'],'scope':enriched['scope']}
         elif a.command == 'capture':
             r = capture(a.date,a.output)
             result = {k:r[k] for k in ('report_id','status','trade_date','pool_total','gaps')}

@@ -149,7 +149,7 @@ def submit_confirmed_sell(store, account_id, confirmation_request_id, order_id):
     from .decisions import DecisionService, RiskPolicy
     from .paper_storage import _append
     ensure_exits(store)
-    book = load_paper(store,account_id)
+    book = load_paper(store,account_id,writer_session=True)
     request = store.con.execute('SELECT payload,account_id FROM operator_action WHERE action_id=?',[confirmation_request_id]).fetchone()
     if not request or request[1]!=account_id:
         raise ValueError('paper confirmation belongs to a different or unknown account')

@@ -9,7 +9,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from trade_system.v2.domain import identity, utc
 from trade_system.v2.event_bridge import KINDS
 from trade_system.v2.decisions import RiskPolicy
-from trade_system.v2.paper_storage import load_paper
+from trade_system.v2.paper_storage import load_paper,paper_history
 from trade_system.v2.publisher import publish
 from trade_system.v2.service import Service
 from trade_system.v2.storage import Store
@@ -56,7 +56,7 @@ def market(at, *, capacity=100, price=1000, **overrides):
             'bid_fen':price,'ask_fen':price,'last_fen':price,'bid_quantity':capacity,'ask_quantity':capacity,**overrides}
 
 
-def run_replay(output):
+def run_replay(output, *, bounded=False):
     output = Path(output).resolve()
     output.mkdir(parents=True,exist_ok=False)
     clock = Clock('2026-09-10T09:30:00+08:00')
@@ -70,7 +70,10 @@ def run_replay(output):
             return result
         for kind,(unit,semantics) in KINDS.items():
             call('product',dataset='fixture.'+kind,unit=unit,semantics=semantics,consumer='event:'+kind,origin='synthetic_fixture')
-        call('paper_open',config=paper_config())
+        ledger_config=paper_config()
+        if bounded:
+            ledger_config.update(state_format='bounded_hot_v3',hot_limits={'orders':32,'lots':32,'instruments':4})
+        call('paper_open',config=ledger_config)
         def event(kind, at, payload, key):
             if kind=='funds_cumulative':
                 payload={**payload,'counter_epoch':'synthetic-fixture-continuous-counter'}
@@ -121,11 +124,12 @@ def run_replay(output):
         final = call('paper_status',account_id='fixture-event-paper')
     with Store(output/'paper.duckdb',clock=clock) as store:
         book = load_paper(store,'fixture-event-paper')
+        all_orders,all_fills=paper_history(store,book)
         attribution = project_attribution(store,'fixture-event-paper')
         assert book.summary()==final and final['realized_pnl_fen']==9000
         signals = [json.loads(r[0]) for r in store.con.execute('SELECT payload FROM signal_event ORDER BY asof_time,rowid').fetchall()]
         data = {'scope':'synthetic_fixture_only_not_market_performance','execution_ready':False,'trace':trace,
-                'opportunity_ledger':signals,'paper_portfolio_ledger':book.state,'actual_operator_ledger':[],
+                'opportunity_ledger':signals,'paper_portfolio_ledger':{**book.state,'orders':all_orders,'fills':all_fills},'actual_operator_ledger':[],
                 'actual_account_status':'not_provided','summary':final,'replayed_state_hash':identity(book.state),
                 'limitations':['synthetic_source_finality_and_orderbook','unverified_fixture_rules_and_fees',
                                'displayed_capacity_is_not_exchange_queue_or_fill_proof','exit_is_explicit_reduce_only_not_validated_auto_exit_strategy']}
@@ -133,7 +137,7 @@ def run_replay(output):
             'attribution.json':json.dumps(attribution,ensure_ascii=False,indent=2).encode(),
             'attribution.md':render_attribution_markdown(attribution).encode('utf-8')},generation=1)
     return {'scope':data['scope'],'output':str(output),'signals':[s['state'] for s in signals],
-            'fills':len(book.state['fills']),'summary':final,'replayed_state_hash':data['replayed_state_hash']}
+            'fills':len(all_fills),'summary':final,'replayed_state_hash':data['replayed_state_hash']}
 
 
 if __name__=='__main__':

@@ -130,15 +130,16 @@ def derive_inputs(store, code, policy, *, at=None):
     policy.validate()
     at = utc(store.clock() if at is None else at)
     day = at.astimezone(ZoneInfo('Asia/Shanghai')).date()
+    day_start = at.astimezone(ZoneInfo('Asia/Shanghai')).replace(hour=0,minute=0,second=0,microsecond=0)
     selected, ids, blockers, expires = {}, [], [], []
     for kind,dataset in policy.datasets.items():
         contract = store.con.execute('SELECT unit,semantics,consumer FROM data_product WHERE dataset=?',[dataset]).fetchone()
         if contract != (*KINDS[kind],'event:'+kind):
             raise ValueError('frozen strategy event product mismatch')
         records = store.con.execute('''SELECT event_id,event_at,received_at,payload,mode,raw_hash FROM market_event
-            WHERE dataset=? AND instrument=? AND event_at<=? AND received_at<=?
+            WHERE dataset=? AND instrument=? AND event_at>=? AND event_at<=? AND received_at<=?
             QUALIFY row_number() OVER(PARTITION BY event_at ORDER BY seq DESC)=1
-            ORDER BY event_at,received_at''',[dataset,code,at,at]).fetchall()
+            ORDER BY event_at,received_at''',[dataset,code,day_start,at,at]).fetchall()
         records = [r for r in records if r[1].astimezone(ZoneInfo('Asia/Shanghai')).date()==day]
         if kind == 'funds_cumulative':
             boundary = at-timedelta(seconds=policy.fund_window_seconds)

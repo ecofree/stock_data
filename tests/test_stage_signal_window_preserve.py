@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import duckdb
 
-from trade_system.stage_signals import ensure_stage_signal_schema, generate_stage_signals
+from trade_system.stage_signals import ensure_stage_signal_schema
+from legacy_diagnostics import generate_stage_signals
 
 
 def test_intraday_signal_preserves_morning_snapshot_during_lunch(tmp_path):

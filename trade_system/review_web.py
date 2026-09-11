@@ -2077,7 +2077,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     sector_trail = _render_sector_trail(
         ctx,
         external_lazy=bool(lazy_asset_name),
-        compact_overview=True,
+        compact_overview=False,
     )
     # Keep only the first 50 members in the live JS object.  The complete
     # concept catalogue is embedded as inert JSON below and parsed only when

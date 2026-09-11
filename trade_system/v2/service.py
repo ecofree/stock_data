@@ -133,7 +133,7 @@ class Service:
             return project_attribution(store, **data)
         if command == 'paper_status':
             from .paper_storage import load_paper
-            return load_paper(store, **data).summary()
+            return load_paper(store, **data, writer_session=True).summary()
         if command == 'paper_verify':
             from .paper_storage import load_paper
             return load_paper(store, data['account_id'], full_replay=True).summary()

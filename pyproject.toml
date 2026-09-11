@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-trading-assistant"
-version = "0.1.0"
+version = "0.3.2"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -74,7 +74,7 @@ modules = [
   "trade_system.file_lock", "trade_system.hithink_client", "trade_system.http_transport",
   "trade_system.logging_setup", "trade_system.v2.__init__", "trade_system.v2.__main__",
   "trade_system.v2.accounts", "trade_system.v2.attribution", "trade_system.v2.context_storage",
-  "trade_system.v2.daily_session", "trade_system.v2.daily_session_cli", "trade_system.v2.daily_session_view",
+  "trade_system.v2.daily_session", "trade_system.v2.daily_session_cli", "trade_system.v2.daily_session_view", "trade_system.v2.native_enrichment",
   "trade_system.v2.decisions", "trade_system.v2.domain", "trade_system.v2.event_bridge",
   "trade_system.v2.exit_policy", "trade_system.v2.gap_evidence", "trade_system.v2.market_context",
   "trade_system.v2.operator_workflow", "trade_system.v2.operator_workflow_cli",

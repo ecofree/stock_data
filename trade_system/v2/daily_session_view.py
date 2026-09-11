@@ -2,7 +2,7 @@
 from html import escape
 import json
 
-from .domain import identity, utc
+from .domain import identity, number, utc
 
 STYLE = '''<style>
 :root{--ink:#183e35;--paper:#f5f2e9;--line:#ccd5c9;--muted:#57685f;--accent:#a54027}
@@ -61,13 +61,63 @@ def render_followup(review):
     pending = review['scope']=='pending_next_session_not_completed_review'
     content = '<header><div class="eyebrow">FOLLOW-UP / 原候选完整保留</div><h1>'+('等待下一交易日。' if pending else '判断之后，核对证据。')+'</h1></header>'
     content += '<p class="warning">'+('尚未取得下一交易日数据，不能算完成次日复盘。' if pending else '这里只复盘行情观察和人工判断；没有券商成交证据，不展示真实收益。')+'</p>'
-    content += '<p>固定候选数：'+str(review['cohort_size'])+' · 日期：'+escape(str(review.get('trade_date') or '待来源日历确认'))+'</p><div class="tablewrap"><table><thead><tr><th>证券</th><th>判断与时点</th><th>次日行情</th><th>来源边界</th></tr></thead><tbody>'
+    content += '<p>固定候选数：'+str(review['cohort_size'])+' · 日期：'+escape(str(review.get('trade_date') or '待来源日历确认'))+'</p>'
+    groups={'observe':'继续观察','reject':'不采用','paper_hypothesis':'纸面假设','conflicting_declarations':'事前观点冲突','no_prior_judgement':'无事前判断'}
+    timings={'recorded_before_next_open':'下一开盘前已接收','retrospective_not_prospective':'迟交 / 不算事前判断'}
+    def pct(value):return '—' if value is None else f'{number(value):+.2f}%'
+    learning=review.get('learning')
+    if learning and not pending:
+        observed=sum(r.get('observation') is not None for r in review['rows'])
+        prior=sum(r.get('review_group')!='no_prior_judgement' for r in review['rows'])
+        content+='<section class="stats" aria-label="复盘覆盖">'+''.join('<div class="stat"><span>'+label+'</span><b>'+str(count)+'</b></div>' for label,count in (
+            ('固定候选',review['cohort_size']),('价格已观察',observed),('行情缺失',review['cohort_size']-observed),('有事前判断',prior)))+'</section>'
+        content+='<section id="review-groups"><h2>01 / 判断分组与观察覆盖</h2><p class="muted">每位声明操作者取开盘前最后接收的观点；冲突保留，迟交不改写事前分组。均值只计算有行情的原候选，不是命中率、策略收益或真人绩效。</p><div class="tablewrap"><table><thead><tr><th>事前分组</th><th>原候选</th><th>有行情</th><th>缺行情</th><th>开→收均值</th></tr></thead><tbody>'
+        for key,label in groups.items():
+            g=learning['groups'][key]
+            content+='<tr>'+''.join('<td>'+escape(str(v))+'</td>' for v in (label,g['cohort_count'],g['observed_count'],g['missing_count'],pct(g['mean_open_close_pct'])))+'</tr>'
+        content+='</tbody></table></div></section>'
+    content+='<section id="case-review"><h2>02 / 逐案核对原始判断</h2><p class="muted">开→低、开→高是日内行情范围；未证明实际可成交，不据价格变化自动判定假设成立或失效。</p><div class="tablewrap"><table><thead><tr><th>证券与原始依据</th><th>判断与时点</th><th>次日行情</th><th>来源边界</th></tr></thead><tbody>'
     for row in review['rows']:
         decisions = row.get('judgements',[])
-        label = '；'.join(n['note']['intent']+' / '+n['timing'] for n in decisions) or '未取得人工判断'
+        label = '；'.join(groups.get(n['note']['intent'],n['note']['intent'])+' / '+timings.get(n['timing'],n['timing']) for n in decisions) or '未取得人工判断'
         bar = row.get('observation')
-        observed = '缺失 / 不填零' if not bar else '开 '+bar['open']+' / 收 '+bar['close']+' / 来源涨跌 '+bar['provider_change_pct']+'%'
+        observed = '缺失 / 不填零' if not bar else '开 '+bar['open']+' / 收 '+bar['close']
+        if bar and bar.get('provider_change_pct') is not None:
+            observed+=' / 来源涨跌 '+str(bar['provider_change_pct'])+'%'
         source = '等待数据' if not bar else bar['source_status']
-        content += '<tr>'+''.join('<td>'+escape(v)+'</td>' for v in [row['instrument']+' '+row['name'],label,observed,source])+'</tr>'
-    content += '</tbody></table></div><p>次日未出现在涨停池不等于停牌、失败或负收益；日内价格变化不等于符合 T+1 的可实现收益。</p>'
+        if row.get('topics_at_receipt'):
+            source+='；当前专题 '+','.join(t['theme_id'] for t in row['topics_at_receipt'])+'（采集时成员，不是历史成分或催化证明）'
+        case=escape(row['instrument']+' '+row['name'])
+        original=row.get('original_case')
+        if original:
+            risks='；'.join(RISKS.get(r,r) for r in original['risks'])
+            case+='<details><summary>原依据与风险</summary><p>来源归因：'+escape(original['provider_reason'] or '未提供')+'</p><p class="muted">不是独立催化证明。</p><p>'+escape(risks)+'</p></details>'
+        judgement=escape(label)
+        if decisions:
+            judgement+='<details><summary>查看原判断及失效条件</summary>'
+            for n in decisions:
+                note=n['note']
+                judgement+='<p>声明操作者：'+escape(note.get('operator','未提供'))+'<br>判断依据：'+escape(note.get('hypothesis','未提供'))+'<br>失效条件：'+escape(note.get('invalidation','未提供'))+'</p><p class="mono">实际接收 '+escape(n.get('received_at','未提供'))+'</p>'
+            judgement+='</details>'
+        market_text=escape(observed)
+        if bar:
+            market_text+='<p class="muted">开→收 '+pct(row.get('next_session_open_close_pct'))+'<br>开→低 '+pct(row.get('next_session_open_to_low_pct'))+'<br>开→高 '+pct(row.get('next_session_open_to_high_pct'))+'</p>'
+        content+='<tr><td>'+case+'</td><td>'+judgement+'</td><td>'+market_text+'</td><td>'+escape(source)+'</td></tr>'
+    content+='</tbody></table></div></section><p>次日未出现在涨停池不等于停牌、失败或负收益；日内价格变化不等于符合 T+1 的可实现收益。假设是否失效仍待真人结合证据判断。</p>'
     return shell('下一交易日观察复盘',content)
+
+
+def render_enrichment(result):
+    if result.get('enrichment_id')!=identity({k:v for k,v in result.items() if k!='enrichment_id'}):
+        raise ValueError('enrichment fingerprint changed')
+    content='<header><div class="eyebrow">NATIVE SOURCE RECEIPTS</div><h1>原生价格与专题核验</h1></header>'
+    content+='<p class="warning">交易日期 '+escape(result['trade_date'])+'；来源 '+escape(result['origin'])+'。日线不是可执行报价；当前专题成员不能回填历史。这里没有人工决策或真实收益。</p>'
+    content+='<p class="mono">绑定候选报告 '+escape(result['parent_report_id'])+'</p><div class="tablewrap"><table><thead><tr><th>证券</th><th>开 / 高 / 低 / 收（元）</th><th>采集时间</th><th>采集时专题成员</th></tr></thead><tbody>'
+    for code,bar in result['observations'].items():
+        themes=[k for k,v in result['topics'].items() if code in v['cohort_members']]
+        content+='<tr>'+''.join('<td>'+escape(v)+'</td>' for v in (
+            code,' / '.join(bar[k] for k in ('open','high','low','close')),
+            bar['received_at'],','.join(themes) or '所查专题中未观察到成员关系'))+'</tr>'
+    content+='</tbody></table></div><p>缺失价格：'+escape(','.join(result['missing_instruments']) or '无')+'</p>'
+    content+='<p>专题来源：'+escape(','.join(result['topics']) or '本次未查询')+'。来源响应已归档，不能证明事件首次发布时间或交易所日终最终状态。</p>'
+    return shell('原生来源消费核验',content)

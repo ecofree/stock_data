@@ -52,7 +52,12 @@ def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) 
     concept_match = re.search(
         r"let conceptData = (.*?);\s*const lazyAsset", text, re.S
     )
-    if concept_match:
+    if "review-concept-data" in embedded:
+        concept_groups = embedded["review-concept-data"]
+        failures = [] if isinstance(concept_groups, list) else ["concept_data_json_invalid"]
+        if failures:
+            concept_groups = []
+    elif concept_match:
         try:
             concept_groups = json.loads(concept_match.group(1))
         except json.JSONDecodeError:
@@ -75,7 +80,7 @@ def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) 
         failures.append("unicode_replacement_character_present")
     if len(path.read_bytes()) > 25 * 1024 * 1024:
         failures.append("artifact_larger_than_25MiB")
-    if "id='trail-data'" not in text or "id='trail-details'" not in text:
+    if not {"trail-data", "trail-details"}.issubset(embedded):
         failures.append("required_inline_payload_missing")
 
     # Initial DOM remains bounded. Full data is inline and only rendered after

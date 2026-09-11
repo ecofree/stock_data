@@ -3,7 +3,7 @@ import json
 import duckdb
 
 from trade_system.normalize import build_normalized_views
-from trade_system.signals import generate_signals
+from legacy_diagnostics import generate_signals
 
 
 def _calibration_db(path, *, weak_market: bool = False):
