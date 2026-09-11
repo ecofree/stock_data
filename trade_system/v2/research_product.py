@@ -256,7 +256,7 @@ def publish_desk(output):
 def publish_state(output,name,value):
     """Keep the previous state pointer if building/publishing its page fails."""
     from trade_system.file_lock import FileLock
-    if name not in ('research-current.json','research-candidate.json','prediction-current.json'):raise ValueError('known state pointer required')
+    if name not in ('research-current.json','research-candidate.json','prediction-current.json','price-study-current.json'):raise ValueError('known state pointer required')
     path=Path(output)/name
     with FileLock(Path(output)/'publication.guard'):
         previous=read_json(path)[0] if path.exists() else None
@@ -289,6 +289,8 @@ def _publish_desk(output):
     from . import research_baselines, research_journal
     data['rule_baselines']=research_baselines.read(run) if (run/'rule-baselines.json').exists() else None
     data['previous_model_comparison']=read_json(run/'previous-model-comparison.json')[0] if (run/'previous-model-comparison.json').exists() else None
+    from . import price_study
+    data['price_study']=price_study.read(output)
     data['notes']=research_journal.annotate(data['notes'])
     data['reviews']=research_journal.attach(data['reviews'],data['notes'])
     data['report_id']=identity(data)
