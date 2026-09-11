@@ -24,7 +24,15 @@ def build(config_path, root, output):
     config=read_json(config_path)[0]
     run=output/'builds'/uuid.uuid4().hex; run.mkdir(parents=True)
     write_json(run/'configuration.json',config)
-    meta=dataset.build(config,root,run/'dataset')
+    recent = set(config['sources']) == {'receipts'}
+    previous = read_build(output)[1] if recent else None
+    if recent:
+        write_json(run/'previous-build-pointer.json',read_json(output/'research-current.json')[0])
+    if recent:
+        from . import research_recent
+        meta=research_recent.build_dataset(config,root,run/'dataset')
+    else:
+        meta=dataset.build(config,root,run/'dataset')
     plan=dataset.experiment_plan(config,meta,'delivery-'+run.name[:12])
     research.register_experiment(run,run/'dataset/features.parquet',dict(plan,experiment_id='experiment'))
     result=research.run_experiment(run/'experiment')
@@ -39,29 +47,75 @@ def build(config_path, root, output):
         'train_end':result['folds'][-1]['partition']['train_end'],
         'validation_end':result['folds'][-1]['partition']['valid_end'],
         'frozen_at':now_utc().isoformat(),'execution_ready':False}
+    if recent:
+        research_recent.compare_previous(run,previous,config,result,plan)
+        last,boundaries=research_recent.refit(run,config,result,plan)
+        model.update(model_path=str(last/'model.txt'),model_sha256=file_hash(last/'model.txt'),
+            preprocessing_path=str(last/'preprocessing.json'),preprocessing_sha256=file_hash(last/'preprocessing.json'),
+            selection='predeclared_recent_price_refit_not_test_winner',
+            train_end=boundaries['train_end'],validation_end=boundaries['validation_end'],
+            refit_boundaries=boundaries,final_refit_scored=False,previous_model_id=previous['model_id'],
+            frozen_at=now_utc().isoformat())
+        frame,days,_=research_recent.load_receipts(config,root)
+        current=predict(frame,days,model)
+        if not current.prediction.notna().any():
+            raise ValueError('recent model has no nonempty latest prediction; retain previous build')
+        write_json(run/'inference-check.json',{'date':days[-1],
+            'nonempty':int(current.prediction.notna().sum()),'execution_ready':False})
+        previous_prediction=read_prediction(output)
+        daily=read_json(run/'experiment/run/daily_metrics.json')[0]['price_baseline']
+        readiness=research_recent.publication_readiness(daily,plan['top_k'],
+            int(current.prediction.notna().sum()),previous_prediction['predictions'] if previous_prediction else 0)
+        write_json(run/'publication-readiness.json',readiness)
     model['model_id']=identity(model)
     write_json(run/'frozen-model.json',model)
+    if recent:
+        write_json(run/'candidate-predictions.json',{'date':days[-1],'model_id':model['model_id'],
+            'frozen_at':now_utc().isoformat(),'scope':'recent_model_candidate_not_active_prediction_archive',
+            'rows':[{'instrument':r['instrument'],'prediction':float(r['prediction']) if pd.notna(r['prediction']) else None}
+                for r in current.to_dict('records')], 'execution_ready':False})
     pointer={'build':str(run),'dataset_id':meta['dataset_id'],'model_id':model['model_id'],
         'model_manifest_sha256':file_hash(run/'frozen-model.json'),
         'configuration_sha256':file_hash(run/'configuration.json')}
     pointer['rule_baselines_sha256']=file_hash(run/'rule-baselines.json')
     pointer['rule_baselines_id']=rules['baseline_id']
-    publish_state(output,'research-current.json',pointer)
-    return {'status':'historical_experiment_completed','build':str(run),'rows':result['sampled_rows'],
-        'folds':len(result['folds']),'fits':len(result['folds'])*len(plan['variants']),
+    if recent:
+        pointer['previous_comparison_sha256']=file_hash(run/'previous-model-comparison.json')
+        pointer['readiness_sha256']=file_hash(run/'publication-readiness.json')
+        publish_state(output,'research-candidate.json',pointer)
+    if not recent or readiness['can_replace_current_model']:
+        publish_state(output,'research-current.json',pointer)
+    return {'status':'recent_candidate_not_promoted' if recent and not readiness['can_replace_current_model'] else 'historical_experiment_completed','build':str(run),'rows':result['sampled_rows'],
+        'folds':len(result['folds']),'fits':len(result['folds'])*len(plan['variants'])+int(recent),
         'execution_ready':False,'next':'update current observations and freeze research predictions'}
 
 
-def read_build(output):
-    pointer=read_json(Path(output)/'research-current.json')[0]; run=Path(pointer['build'])
+def read_build(output, *, pointer_name='research-current.json'):
+    if pointer_name not in ('research-current.json','research-candidate.json'):
+        raise ValueError('known build pointer required')
+    pointer=read_json(Path(output)/pointer_name)[0]; run=Path(pointer['build'])
     if Path(output).resolve() not in run.resolve().parents: raise ValueError('build outside workbench')
     if file_hash(run/'configuration.json')!=pointer['configuration_sha256'] or file_hash(run/'frozen-model.json')!=pointer['model_manifest_sha256']:
         raise ValueError('frozen build changed')
     if pointer.get('rule_baselines_sha256') and file_hash(run/'rule-baselines.json')!=pointer['rule_baselines_sha256']:
         raise ValueError('frozen rule baseline changed')
     model=read_json(run/'frozen-model.json')[0]
-    if read_json(run/'dataset/dataset.json')[0]['source_sha256']!=file_hash(dataset.__file__):
+    meta=read_json(run/'dataset/dataset.json')[0]
+    if meta['source_sha256']!=file_hash(dataset.__file__):
         raise ValueError('feature formulas changed; build a new frozen model')
+    if meta.get('recent_source_sha256'):
+        from . import research_recent
+        if meta['recent_source_sha256']!=file_hash(research_recent.__file__):
+            raise ValueError('recent dataset source changed; rebuild required')
+        if file_hash(run/'previous-model-comparison.json')!=pointer.get('previous_comparison_sha256'):
+            raise ValueError('previous model comparison changed')
+        if file_hash(run/'publication-readiness.json')!=pointer.get('readiness_sha256'):
+            raise ValueError('model readiness changed')
+        comparison=read_json(run/'previous-model-comparison.json')[0]
+        for relative,expected in comparison['prediction_files'].items():
+            path=(run/relative).resolve()
+            if run.resolve() not in path.parents or file_hash(path)!=expected:
+                raise ValueError('previous model predictions changed')
     if (model['model_id']!=identity({k:v for k,v in model.items() if k!='model_id'})
         or file_hash(model['model_path'])!=model['model_sha256']
         or file_hash(model['preprocessing_path'])!=model['preprocessing_sha256']):
@@ -102,9 +156,15 @@ def forecast_timing(entry,captured_at):
         'pending_future_calendar' if eligible is None else 'before_entry' if eligible else 'after_entry'}
 
 
-def update(root, output, *, receipts=None, client=None):
+def update(root, output, *, receipts=None, client=None, replay_build=False):
     from tools.v2 import research_campaign as campaign
     run,model,_=read_build(output); config=read_json(run/'configuration.json')[0]
+    if replay_build:
+        from . import research_recent
+        if receipts or client or set(config['sources'])!={'receipts'}:
+            raise ValueError('build replay requires its own frozen receipt source')
+        research_recent.load_receipts(config,root)
+        receipts=Path(root)/config['sources']['receipts']['path']
     moment=now_utc(); today=moment.astimezone(campaign.CST).date()
     folder=Path(output)/'observations'/uuid.uuid4().hex; folder.mkdir(parents=True)
     capture={'codes':[c+('.SH' if c.startswith('6') else '.SZ') for c in config['universe']],
@@ -117,7 +177,7 @@ def update(root, output, *, receipts=None, client=None):
     reg,_,parsed,_=campaign.replay(source)
     if receipts:
         saved=reg.get('config') or {}
-        if (saved.get('codes')!=capture['codes'] or saved.get('selection_scope')!=capture['selection_scope']
+        if (saved.get('codes')!=capture['codes'] or (not replay_build and saved.get('selection_scope')!=capture['selection_scope'])
             or saved.get('end','')>today.isoformat()):raise ValueError('replay requires frozen universe and nonfuture receipt range')
     elif reg.get('config')!=capture: raise ValueError('current update requires exact current range and frozen universe')
     observed=campaign.derive(source)
@@ -126,7 +186,7 @@ def update(root, output, *, receipts=None, client=None):
         raise ValueError('current exchange session not available; retain previous publication')
     native_calendar=parsed.get(0,[])
     market_calendar=native_calendar or calendar
-    if receipts and (not native_calendar or max(native_calendar)<today.isoformat()):
+    if receipts and not replay_build and (not native_calendar or max(native_calendar)<today.isoformat()):
         raise ValueError('replay cannot certify latest market session')
     session=latest_closed_session(market_calendar,moment)
     if session not in calendar:raise ValueError('latest closed session absent from receipts; retain previous date')
@@ -165,6 +225,9 @@ def update(root, output, *, receipts=None, client=None):
         verified_calendar_scope='native_exchange_calendar_with_dual_relay_history',
         data_received_at=max(read_json(path)[0]['received_at'] for path in source.glob('receipt-*.json')),
         baseline_rule='descending 20-session adjusted return; ties by code; no training')
+    if replay_build:
+        result.update(scope='frozen_recent_receipt_replay_not_latest_session_certified',
+            latest_session_certified=False)
     from .research_followup import collect
     result['reviews']=collect(output,frame,calendar,result['captured_at'])
     result['prediction_id']=identity(result)
@@ -193,7 +256,7 @@ def publish_desk(output):
 def publish_state(output,name,value):
     """Keep the previous state pointer if building/publishing its page fails."""
     from trade_system.file_lock import FileLock
-    if name not in ('research-current.json','prediction-current.json'):raise ValueError('known state pointer required')
+    if name not in ('research-current.json','research-candidate.json','prediction-current.json'):raise ValueError('known state pointer required')
     path=Path(output)/name
     with FileLock(Path(output)/'publication.guard'):
         previous=read_json(path)[0] if path.exists() else None
@@ -208,9 +271,15 @@ def publish_state(output,name,value):
 def _publish_desk(output):
     from .research_product_view import render
     run,model,result=read_build(output)
+    candidate_model=None;readiness=None
+    if (Path(output)/'research-candidate.json').exists():
+        run,candidate_model,result=read_build(output,pointer_name='research-candidate.json')
+        readiness=read_json(run/'publication-readiness.json')[0]
     data={'research':result,'model':model,'prediction':read_prediction(output),
         'dataset':read_json(run/'dataset/dataset.json')[0],'notes':[],
         'scope':'local_research_product_no_execution','execution_ready':False}
+    data['candidate_model']=candidate_model
+    data['candidate_readiness']=readiness
     notes=Path(output)/'notes'
     if notes.exists():
         import heapq
@@ -219,6 +288,7 @@ def _publish_desk(output):
     data['reviews']=data['prediction'].get('reviews',[]) if data['prediction'] else []
     from . import research_baselines, research_journal
     data['rule_baselines']=research_baselines.read(run) if (run/'rule-baselines.json').exists() else None
+    data['previous_model_comparison']=read_json(run/'previous-model-comparison.json')[0] if (run/'previous-model-comparison.json').exists() else None
     data['notes']=research_journal.annotate(data['notes'])
     data['reviews']=research_journal.attach(data['reviews'],data['notes'])
     data['report_id']=identity(data)
@@ -248,10 +318,11 @@ def save_note(output, values):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','serve','status'])
     p.add_argument('--config',default='config/research_delivery.json');p.add_argument('--output',default='reports/research-delivery')
-    p.add_argument('--receipts');p.add_argument('--port',type=int,default=8766);p.add_argument('--open-browser',action='store_true')
+    p.add_argument('--receipts');p.add_argument('--replay-build',action='store_true',help='Replay only the frozen training receipts; does not certify the latest market date')
+    p.add_argument('--port',type=int,default=8766);p.add_argument('--open-browser',action='store_true')
     a=p.parse_args();root=Path(__file__).resolve().parents[2];output=(root/a.output).resolve()
     if a.command=='build': result=build(root/a.config,root,output)
-    elif a.command=='update': result=update(root,output,receipts=a.receipts)
+    elif a.command=='update': result=update(root,output,receipts=a.receipts,replay_build=a.replay_build)
     elif a.command=='serve':
         from .research_product_server import serve
         return serve(root,output,a.port,open_browser=a.open_browser)
@@ -259,4 +330,9 @@ def main():
         _,model,result=read_build(output);prediction=read_prediction(output)
         result={'model_id':model['model_id'],'folds':len(result['folds']),'prediction_date':prediction['date'] if prediction else None,
             'predictions':prediction['predictions'] if prediction else 0,'execution_ready':False}
+        result['active_train_end']=model['train_end']
+        if (output/'research-candidate.json').exists():
+            candidate_run,candidate,_=read_build(output,pointer_name='research-candidate.json')
+            result['candidate_train_end']=candidate['train_end']
+            result['candidate_readiness']=read_json(candidate_run/'publication-readiness.json')[0]
     print(canonical(result))
