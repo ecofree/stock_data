@@ -68,6 +68,8 @@ def handler(root, output, port):
                 self.send_response(303);self.send_header('Location','/');self.send_header('Content-Length','0');self.end_headers()
             except (ValueError,KeyError) as exc:
                 self.reply(400,'输入未通过校验：'+str(exc)[:200])
+            except RuntimeError:
+                self.reply(409,'页面版本正在更新。请刷新检查记录是否已保存，再进行操作。')
     return Handler
 
 

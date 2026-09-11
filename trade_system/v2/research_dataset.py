@@ -54,6 +54,11 @@ def features(frame, calendar):
         g['money_ratio']=g.net_mf_amount/g.turnover
         g['money_ratio_5d']=g.net_mf_amount.rolling(5,min_periods=5).sum()/g.turnover.rolling(5,min_periods=5).sum()
         g['feature_eligible']=valid.rolling(61,min_periods=61).sum().eq(61)
+        # The historical paired Alpha158 cohort keeps its 61-session contract.
+        # Current price inference requires only its actual 21-session dependencies.
+        g['price_eligible']=valid.rolling(21,min_periods=21).sum().eq(21)&np.isfinite(g[BASE]).all(axis=1)
+        g['money_eligible']=g.price_eligible&np.isfinite(g[MONEY]).all(axis=1)
+        g['alpha158_window_eligible']=g.feature_eligible
         g['instrument']=str(code);g['datetime']=days
         result.append(g.reset_index(drop=True))
     if not result: raise ValueError('no feature input')
@@ -134,6 +139,8 @@ def build(config, root, output):
         'dataset_config':config,'dataset_id':identity(config),'summary':summary,'rows':len(computed),
         'historical_exploration_allowed':True,'point_in_time_qualified':False,'execution_ready':False,
         'source_sha256':file_hash(__file__),'label_policy':'new_exploration_artifact_only_original_labels_unchanged'}
+    meta['eligibility_contract']={'price_sessions':21,'price_money_sessions':21,'money_sessions':5,
+        'alpha158_sessions':61,'historical_paired_cohort_sessions':61}
     write_json(output/'features.metadata.json',meta)
     write_json(output/'dataset.json',meta)
     return meta

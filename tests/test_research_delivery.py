@@ -99,7 +99,7 @@ def test_followup_rejects_post_outcome_prediction_and_modified_archive():
     frame,days=prices(3);p=prediction();p['rows'][0]['prediction']=7
     with pytest.raises(ValueError,match='changed'):followup.evaluate(p,frame,days,'2025-01-03T16:00:00+08:00')
     p=prediction();p['captured_at']='2025-01-03T16:00:00+08:00';p['prediction_id']=identity({k:v for k,v in p.items() if k!='prediction_id'})
-    with pytest.raises(ValueError,match='order'):followup.evaluate(p,frame,days,'2025-01-03T16:00:00+08:00')
+    assert followup.evaluate(p,frame,days,'2025-01-03T16:00:00+08:00')['status']=='not_prospective'
 
 
 def test_note_requires_explicit_human_inputs_and_retains_versions(tmp_path,monkeypatch):
