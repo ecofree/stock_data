@@ -57,10 +57,11 @@ class Client:
         return envelope.get('data') or {}
 
 
-def rows_for(request,data):
+def rows_for(request,data, *, max_items=64):
     native=request['provider']=='hithink_native'
     items=data.get('item' if native else 'items')
-    if not isinstance(items,list) or len(items)>=64:raise ValueError('bounded response required; possible truncation refused')
+    if not isinstance(max_items,int) or not 1<=max_items<=367: raise ValueError('bounded parser budget required')
+    if not isinstance(items,list) or len(items)>=max_items:raise ValueError('bounded response required; possible truncation refused')
     if not native and data.get('fields')!=API_FIELDS[request['api']]:raise ValueError('exact fields required')
     result={}
     for item in items:
