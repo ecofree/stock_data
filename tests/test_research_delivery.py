@@ -145,7 +145,7 @@ def test_http_refuses_foreign_host_origin_csrf_and_paths(tmp_path,monkeypatch):
 
 
 def test_prediction_and_contributions_use_frozen_feature_order(tmp_path):
-    import lightgbm as lgb
+    lgb=pytest.importorskip('lightgbm',reason='optional QLib model runtime; exercised in local research environment')
     from trade_system.v2.gap_evidence import write_json
     frame,days=prices();calculated=dataset.features(frame,days)
     fit=calculated[calculated.feature_eligible]
