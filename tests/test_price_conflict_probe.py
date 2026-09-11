@@ -106,3 +106,15 @@ def test_parent_seal_and_input_namespace(tmp_path,monkeypatch):
     obj=read_json(parent/'result.json')[0];obj=deepcopy(obj);obj['records'][0]['date']='2025-12-01'
     (parent/'result.json').write_text(canonical(obj),encoding='utf-8');(parent/'completed.json').unlink();seal(parent)
     with pytest.raises(ValueError):p.parent(parent)
+
+
+def test_numeric_differences_ignore_text_precision_but_keep_real_conflict():
+    fields=('open','high','low','close','volume_shares','turnover_cny')
+    a=dict.fromkeys(fields,'100');b=dict.fromkeys(fields,'100.00')
+    first={'observations':{'wide':a,'relay':b}}
+    c={**b,'volume_shares':'1000','turnover_cny':'101'}
+    result=p.numeric_differences([first,{'observations':{'wide':a,'relay':c}},
+                                 {'observations':{'wide':a}}])
+    assert result['complete_pairs']==2 and result['missing_pairs']==1
+    assert result['exact_numeric_differences']==dict(open=0,high=0,low=0,close=0,volume_shares=1,turnover_cny=1)
+    assert result['repair_authorized'] is False

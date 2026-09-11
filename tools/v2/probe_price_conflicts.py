@@ -178,6 +178,20 @@ def compare(cases,values):
     return rows
 
 
+def numeric_differences(rows):
+    """Count Decimal value differences, never formatting such as 100 vs 100.0."""
+    fields=('open','high','low','close','volume_shares','turnover_cny')
+    counts={k:0 for k in fields};complete=0;missing=0
+    for row in rows:
+        observations=row['observations'];native=observations.get('wide');relay=observations.get('relay')
+        if native is None or relay is None:
+            missing+=1;continue
+        complete+=1
+        for key in fields:counts[key]+=number(native[key])!=number(relay[key])
+    return {'complete_pairs':complete,'missing_pairs':missing,'exact_numeric_differences':counts,
+            'comparison':'Decimal_exact_not_string_representation','repair_authorized':False}
+
+
 def analyze(analysis,receipts,output):
     binding=parent(analysis);receipts=Path(receipts);output=Path(output).resolve();reg=read_json(receipts/'registration.json')[0]
     if output.exists() or any(output==p.resolve() or p.resolve() in output.parents or output in p.resolve().parents for p in (Path(analysis),receipts)):raise ValueError('separate new output required')
@@ -195,6 +209,7 @@ def analyze(analysis,receipts,output):
     for code,rows in reports.items():write_json(output/(code+'.json'),{'code':code,'cases':rows,'receipt_manifest_id':manifests[code]})
     result={'scope':SCOPE,'source_sha256':file_hash(Path(__file__)),'analysis_sha256':binding['analysis_sha256'],'capture_binding':completed,
         'codes':len(codes),'cases':sum(counts.values()),'case_statuses':dict(counts),'request_statuses':dict(statuses),
+        'numeric_differences':numeric_differences([r for rows in reports.values() for r in rows]),
         'canonical_replacements':0,'research_ready':False,'execution_ready':False,'production_cutover':False}
     write_json(output/'result.json',result);seal(output);return result
 
