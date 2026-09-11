@@ -443,9 +443,17 @@ def export_features(
     semantics: str | Path | None = None,
     canonical_prices: str | Path | None = None,
     price_receipts: str | Path | None = None,
+    identity_candidate: str | Path | None = None,
+    identity_price_layer: str | Path | None = None,
+    identity_receipts: str | Path | None = None,
 ) -> dict[str, object]:
+    candidate_options = (identity_candidate, identity_price_layer, identity_receipts)
+    if any(x is not None for x in candidate_options) and (
+            any(x is None for x in candidate_options) or semantics is None
+            or calendar_overlay is None or research_overlay is None):
+        raise ValueError('candidate requires paired corpus, price layer, receipts and sealed semantic research protocol')
     if canonical_prices is not None or price_receipts is not None:
-        if canonical_prices is None or price_receipts is None or any(x is not None for x in (calendar_overlay,research_overlay,semantics)) or label_mode!='t1_exec':
+        if canonical_prices is None or price_receipts is None or any(x is not None for x in (calendar_overlay,research_overlay,semantics,*candidate_options)) or label_mode!='t1_exec':
             raise ValueError('canonical v7 requires paired layer/receipts and excludes unqualified mixed protocols')
         from tools.v2.canonical_price_research import export_features as export_canonical
         return export_canonical(db_path, output, layer=canonical_prices, receipts=price_receipts,
@@ -522,6 +530,12 @@ def export_features(
             semantic_meta['output_label_status_counts']=dict(con.execute(
                 'SELECT label_status,count(*) FROM semantic_features WHERE datetime BETWEEN ? AND ? GROUP BY label_status ORDER BY label_status',
                 [start,end]).fetchall())
+        candidate_meta = None
+        if identity_candidate is not None:
+            from tools.v2 import build_identity_candidate, identity_research_columns
+            candidate_payload = build_identity_candidate.verify(identity_candidate,
+                identity_price_layer, identity_receipts, db_path, semantics)
+            candidate_meta = identity_research_columns.apply(con, candidate_payload, start=start, end=end)
         outputs: dict[str, str] = {}
         format_stats: dict[str, dict[str, int | str]] = {}
         for fmt in sorted(formats):
@@ -536,7 +550,7 @@ def export_features(
                 include_flow_features=flow_features_available,
                 include_adjustment=adjustment_available,
                 label_mode=label_mode,
-                materialized_table='semantic_features' if semantic_meta else 'all_features',
+                materialized_table='candidate_features' if candidate_meta else 'semantic_features' if semantic_meta else 'all_features',
             )
             outputs[fmt] = str(target)
         primary_stats = format_stats["parquet" if "parquet" in format_stats else sorted(format_stats)[0]]
@@ -562,6 +576,8 @@ def export_features(
             "label_mode": label_mode,
             "label_version": "market_session_aligned_v6_semantic_exclusions" if semantic_meta else "market_session_aligned_v5_sealed_warmup" if research_repair else "market_session_aligned_v3_calendar_overlay" if repair else "market_session_aligned_v2",
             "research_semantics":semantic_meta,
+            "identity_candidate":candidate_meta,
+            "candidate_feature_columns":candidate_meta['feature_columns'] if candidate_meta else [],
             "research_ready":False,
             "execution_ready":False,
             "warmup_policy": "repair: exact contiguous full price and money windows; legacy derived flow features excluded" if research_repair else "legacy_observation_windows",
@@ -592,6 +608,14 @@ def export_features(
             "generated_at": date.today().isoformat(),
         }
         metadata['artifact_hashes'] = {}
+        if candidate_meta:
+            checked_candidate = build_identity_candidate.verify(identity_candidate,
+                identity_price_layer, identity_receipts, db_path, semantics)
+            if checked_candidate != candidate_payload:
+                raise ValueError('candidate evidence changed during export')
+            from trade_system.v2.domain import file_hash
+            if file_hash(identity_research_columns.__file__) != candidate_meta['consumer_source_sha256']:
+                raise ValueError('candidate consumer changed during export')
         if semantic_meta:
             from trade_system.v2.research_semantics import validate
             checked=validate(semantics)[1]
@@ -638,6 +662,9 @@ def main() -> int:
     parser.add_argument("--semantics", help="Hash-bound retrospective identity and suspension exclusions; not tradability approval")
     parser.add_argument("--canonical-prices", help="Sealed native reconciled price slice; explicit v7 six-field diagnostic protocol")
     parser.add_argument("--price-receipts", help="Raw batch receipts required to replay canonical price resolution")
+    parser.add_argument("--identity-candidate", help="Sealed candidate-only corpus, never default model inputs")
+    parser.add_argument("--identity-price-layer", help="Verified unit layer bound to candidate")
+    parser.add_argument("--identity-receipts", help="Original identity observations required for candidate replay")
     args = parser.parse_args()
     result = export_features(
         args.db,
@@ -651,6 +678,9 @@ def main() -> int:
         semantics=args.semantics,
         canonical_prices=args.canonical_prices,
         price_receipts=args.price_receipts,
+        identity_candidate=args.identity_candidate,
+        identity_price_layer=args.identity_price_layer,
+        identity_receipts=args.identity_receipts,
     )
     print(f"rows={result['rows']} labeled_rows={result['labeled_rows']} instruments={result['instruments']}")
     print(f"date_range={result['start_date']}..{result['end_date']}")
