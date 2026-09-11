@@ -127,7 +127,8 @@ def test_daily_page_full_inert_payload_survives_compact_initial_js():
     assert len(data['review-concept-data'])==2 and len(data['review-concept-data'][0]['limit_up_stocks'])==65
 
 
-def test_workflow_prices_are_wired_but_not_native_or_human_acceptance(tmp_path,monkeypatch):
+@pytest.mark.parametrize('default_encoding',['cp1252','gbk','utf-8'])
+def test_workflow_prices_are_wired_but_not_native_or_human_acceptance(tmp_path,monkeypatch,default_encoding):
     from trade_system.v2 import daily_workflow as w
     from tests.test_v2_daily_session import report,moment
     parent=tmp_path/'parent';parent.mkdir()
@@ -139,7 +140,16 @@ def test_workflow_prices_are_wired_but_not_native_or_human_acceptance(tmp_path,m
     result=w.run(tmp_path/'run',clock=lambda:moment('2026-09-11'),parent=parent,observation_db=tmp_path/'synthetic.duckdb')
     assert result['review_prices_observed']==1 and result['review_prices_missing']==0
     assert not result['human_loop_complete'] and not result['price_source_native_authenticated']
-    review=json.loads((tmp_path/'run/next_session_review.json').read_text())
+    review_path=tmp_path/'run/next_session_review.json'
+    original_open=Path.open
+    def locale_open(path,mode='r',buffering=-1,encoding=None,errors=None,newline=None):
+        if path==review_path and 'b' not in mode and encoding in (None,'locale'):
+            encoding=default_encoding
+        return original_open(path,mode,buffering,encoding,errors,newline)
+    monkeypatch.setattr(Path,'open',locale_open)
+    if default_encoding=='cp1252':
+        with pytest.raises(UnicodeDecodeError):review_path.read_text()
+    review=json.loads(review_path.read_text(encoding='utf-8'))
     assert review['rows'][0]['actual_operator_return'] is None
 
 
