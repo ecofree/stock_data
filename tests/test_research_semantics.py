@@ -79,6 +79,7 @@ def test_old_and_new_code_boundary_never_cross_join_money(tmp_path):
     ('600282','2024-01-12','2024-01-15'),
     ('600759','2024-01-12','2024-01-15'),
     ('603955','2024-01-15','2024-01-18'),
+    ('600729','2024-02-02','2024-02-06'),
 ])
 def test_supplemented_boundaries_exclude_target_path_but_not_resume(tmp_path,code,start,resume):
     # Synthetic calendar/evidence tests the consumer only, not these issuers.
