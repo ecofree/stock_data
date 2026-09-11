@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import date, timedelta
 import json
 
 import duckdb
@@ -69,3 +70,35 @@ def test_old_and_new_code_boundary_never_cross_join_money(tmp_path):
         assert c.execute("SELECT identity_conflict FROM semantic_features WHERE instrument='300114' AND datetime='2025-02-13'").fetchone()[0]
         assert not c.execute("SELECT identity_conflict FROM semantic_features WHERE instrument='302132' AND datetime='2025-02-17'").fetchone()[0]
         assert c.execute("SELECT historical_instrument_hint FROM semantic_features WHERE instrument='300114' AND datetime='2025-02-17'").fetchone()[0]=='300114'
+
+
+@pytest.mark.parametrize('code,start,resume',[
+    ('000657','2023-12-26','2024-01-10'),
+    ('603958','2024-01-02','2024-01-16'),
+    ('002931','2024-01-30','2024-02-06'),
+])
+def test_supplemented_boundaries_exclude_target_path_but_not_resume(tmp_path,code,start,resume):
+    # Synthetic calendar/evidence tests the consumer only, not these issuers.
+    path,value=policy(tmp_path)
+    value['aliases']=[]
+    value['suspensions']=[{'code':code,'start':start,'resume':resume,'source':'test'}]
+    path.write_text(json.dumps(value))
+    first=date.fromisoformat(start)-timedelta(days=6)
+    end=date.fromisoformat(resume)+timedelta(days=6)
+    days=[first+timedelta(days=i) for i in range((end-first).days+1)
+          if (first+timedelta(days=i)).weekday()<5]
+    with duckdb.connect() as c:
+        c.execute('CREATE TABLE verified_calendar_overlay(cal_date DATE,is_open BOOLEAN)')
+        c.executemany('INSERT INTO verified_calendar_overlay VALUES (?,true)',[(d,) for d in days])
+        c.execute('CREATE TABLE tushare_daily(date DATE,stock_code VARCHAR,volume DOUBLE)')
+        c.executemany('INSERT INTO tushare_daily VALUES (?,?,100)',[(d,code) for d in days])
+        c.execute("CREATE TEMP TABLE all_features AS SELECT date AS datetime,stock_code AS instrument,10.0 AS label_next_ret,'old' AS label_status FROM tushare_daily WHERE date<=?", [days[-3]])
+        apply(c,path)
+        rows=c.execute('SELECT datetime,label_next_ret,historical_price_target_ret,label_status,execution_target_ret,execution_qualified FROM semantic_features ORDER BY datetime').fetchall()
+        assert len(rows)==len(days)-2
+        for i,(day,label,raw,status,execution,qualified) in enumerate(rows):
+            suspended=any(start<=d.isoformat()<resume for d in days[i:i+3])
+            assert (label is None)==suspended
+            assert (status=='documented_suspension_in_target_path')==suspended
+            assert raw==10 and execution is None and qualified is False
+        assert c.execute('SELECT label_next_ret,suspended_today FROM semantic_features WHERE datetime=?',[resume]).fetchone()==(10,False)

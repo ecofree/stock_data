@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "scope": "retrospective_analyst_transcription_not_PIT_or_execution",
+  "received_at": "2026-09-11T18:56:49+08:00",
+  "sources": {
+    "code_change": {"path": "../../tmp/moneyflow-case-sources-20260911-r1/302132-code-change.pdf", "sha256": "90427f29e153de4a4ebd236e25f226ac1b2a72911e0577a667a70076ad495f03"},
+    "szse_monthly": {"path": "../../tmp/moneyflow-case-sources-20260911-r1/szse-suspension-202401.html", "sha256": "e3e1d740224bfde76fa43169cf83c08454a3dce84b16df0a039f9ab7622409d3"},
+    "000801_resume": {"path": "../../tmp/moneyflow-case-sources-20260911-r1/000801-resumption.html", "sha256": "8c9b415391c7df77799da87c57967d740c9751e169badb77a40f91325ab35a29"},
+    "688337_resume": {"path": "../../tmp/moneyflow-case-sources-20260911-r1/688337-resumption.pdf", "sha256": "37c25349d78ce87b2d4a42193c18400532326e6ce001de68b3457c65f82ad514"},
+    "000657_resume": {"path": "../../tmp/resumption-sources-20260911-r1/000657-resumption.pdf", "sha256": "0f69f0dc9a7a3faf0bc9896053dcafac1b733c7b0b8848d481d1cf20ce6bbbdd"},
+    "603958_resume": {"path": "../../tmp/resumption-sources-20260911-r1/603958-resumption.html", "sha256": "bab9e25dc8bf0edb1ab8d60fb93576348c9898236b2d32c782c1775a44b03c7a"},
+    "002931_resume": {"path": "../../tmp/resumption-sources-20260911-r1/002931-resumption.pdf", "sha256": "2244f3e97dbc763bb9668b1092cf3e5a043d9fe5d55dc9811ea9314fabe03c36"}
+  },
+  "aliases": [{"old": "300114", "new": "302132", "effective": "2025-02-17", "source": "code_change"}],
+  "suspensions": [
+    {"code": "000801", "start": "2023-12-21", "resume": "2024-01-05", "source": "000801_resume"},
+    {"code": "688337", "start": "2024-01-02", "resume": "2024-01-09", "source": "688337_resume"},
+    {"code": "002052", "start": "2024-01-09", "resume": "2024-01-22", "source": "szse_monthly"},
+    {"code": "300765", "start": "2024-01-11", "resume": "2024-01-25", "source": "szse_monthly"},
+    {"code": "300205", "start": "2024-01-26", "resume": "2024-01-29", "source": "szse_monthly"},
+    {"code": "000657", "start": "2023-12-26", "resume": "2024-01-10", "source": "000657_resume"},
+    {"code": "603958", "start": "2024-01-02", "resume": "2024-01-16", "source": "603958_resume"},
+    {"code": "002931", "start": "2024-01-30", "resume": "2024-02-06", "source": "002931_resume"}
+  ]
+}
