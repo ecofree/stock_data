@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tools.v2 import research_campaign as campaign
+from trade_system.v2 import research_campaign as campaign
 from trade_system.v2 import research_recent as recent, research_dataset as ds
 from trade_system.v2.domain import identity
 from tests.test_research_delivery import prices, configuration
@@ -16,7 +16,8 @@ POLICY = {'train_sessions':60, 'valid_sessions':15, 'variant':'price_baseline'}
 @pytest.mark.parametrize('counts,new,old,ready', [([6,8],40,40,True),([3,4],40,40,False),([6,8],39,40,False),([],40,40,False)])
 def test_sparse_or_regressing_model_does_not_replace_current(counts,new,old,ready):
     result=recent.publication_readiness([{'samples':n} for n in counts],5,new,old)
-    assert result['can_replace_current_model'] is ready
+    assert result['structurally_eligible'] is ready
+    assert not result['can_replace_current_model']
     assert not result['execution_ready']
 
 
@@ -69,7 +70,9 @@ def receipt_fixture(monkeypatch):
     reg = {'origin':'native_and_relay', 'config':capture}
     observed = {'calendar':{'SSE':days, 'SZSE':days.copy()}, 'rows':frame.to_dict('records'), 'coverage':{'security_days':len(frame)}}
     monkeypatch.setattr(campaign, 'replay', lambda _: (reg, {'one':'hash'}, {}, []))
-    monkeypatch.setattr(campaign, 'derive', lambda _: observed)
+    monkeypatch.setattr(campaign, 'derive', lambda _, **kwargs: observed)
+    from trade_system.v2 import research_receipts
+    monkeypatch.setattr(research_receipts, 'sealed', lambda _: {'one':'hash'})
     return config, reg, observed
 
 
@@ -80,6 +83,17 @@ def test_raw_receipt_loader_preserves_adjusted_units_and_money(monkeypatch, tmp_
     assert frame.iloc[10].close == observed['rows'][10]['close']
     assert len(frame) == len(days)*2
     assert summary['receipt_manifest_id'] == config['sources']['receipts']['manifest_id']
+
+
+def test_capacity_preflight_exposes_nonselective_pool_without_any_fit(monkeypatch, tmp_path):
+    config, _, _ = receipt_fixture(monkeypatch)
+    report = recent.capacity_preflight(config, tmp_path)
+    assert report['provider_requests'] == report['fits'] == 0
+    assert not report['execution_ready']
+    for family in report['families'].values():
+        assert family['test_days'] > 0
+        assert family['selection_days'] == 0
+        assert family['minimum_cross_section'] <= 2
 
 
 @pytest.mark.parametrize('change', ['manifest','origin','universe','range','calendar','cohort'])
@@ -114,6 +128,8 @@ def test_recent_dataset_target_uses_exact_two_sessions_and_keeps_tail(tmp_path, 
         return result, {'alpha_test':'synthetic_test_expression'}
     monkeypatch.setattr(alpha158_research, 'compute', alpha)
     meta = recent.build_dataset(config, tmp_path, tmp_path/'dataset')
+    assert (tmp_path/'dataset/features.metadata.json').exists()
+    assert not (tmp_path/'dataset/dataset.json').exists()
     rows = pd.read_parquet(tmp_path/'dataset/features.parquet')
     assert meta['rows'] == 242
     assert not meta['point_in_time_qualified']

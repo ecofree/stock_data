@@ -21,6 +21,21 @@ from trade_system.review_extras import render_first_seal_distribution, render_th
 from trade_system.web_report import _execution_status
 
 
+def test_member_detail_uses_clock_formatter_not_raw_epoch():
+    from trade_system.review_web import _chart_js
+    script = _chart_js({}, {}, [], [])
+    assert "const time = lu && lu.time ? fmtTime(lu.time) : '—';" in script
+    assert "timeZone: 'Asia/Shanghai'" in script
+
+
+def test_server_clock_is_explicit_shanghai_time():
+    from trade_system.review_web import _fmt_clock
+    from datetime import datetime, timezone
+    stamp = int(datetime(2026, 9, 10, 1, 35, tzinfo=timezone.utc).timestamp())
+    assert _fmt_clock(stamp) == '09:35'
+    assert _fmt_clock(stamp * 1000) == '09:35'
+
+
 def test_dashboard_execution_status_is_fail_closed_for_historical_rows(tmp_path):
     db = tmp_path / "dashboard.duckdb"
     con = duckdb.connect(str(db))
@@ -373,7 +388,7 @@ def test_review_narrative_is_blocked_when_close_source_missing():
             "execution_ready": False,
             "effective_position_pct": 0,
         },
-        "concept_limit_up": {"groups": [{"concept_name": "共封装光学(CPO)", "limit_up_count": 8}]},
+        "concept_limit_up": {"groups": [{"concept_name": "共封装光学(CPO)", "limit_up_count": 8, "member_count": 40}]},
         "capital_flow": {
             "stock_inflow": [{"stock_code": "300394", "stock_name": "天孚通信"}],
             "stock_outflow": [{"stock_code": "000636", "stock_name": "风华高科"}],
@@ -596,3 +611,13 @@ def test_period_frames_group_newest_first():
     weeks = _period_frames(dates, "week", 8)
     assert weeks[0]["end"] == "2026-08-13"
     assert weeks[0]["trading_days"] >= 1
+def test_flow_source_column_keeps_provider_cell():
+    from trade_system.review_web import _flow_table
+    text = _flow_table('sources', [{'provider': 'eastmoney_intraday_clist_delay', 'definition': 'provider_main_net',
+                                   'amount_unit': 'yuan', 'rows': 12}],
+                       [('provider', 'source', ''), ('definition', 'metric', ''),
+                        ('amount_unit', 'unit', ''), ('rows', 'rows', 'num')])
+    assert text.count('<td ') == 4
+    assert 'provider_main_net' in text and 'yuan' in text
+    from trade_system.i18n_labels import PROVIDER_CN, cn
+    assert cn(PROVIDER_CN, 'eastmoney_intraday_clist_delay') in text

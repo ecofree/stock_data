@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +124,7 @@ def _fmt_clock(v: Any) -> str:
     text = str(v).strip()
     if text.isdigit() and len(text) >= 10:
         try:
-            return datetime.fromtimestamp(int(text[:10])).strftime("%H:%M")
+            return datetime.fromtimestamp(int(text[:10]), ZoneInfo('Asia/Shanghai')).strftime("%H:%M")
         except (OSError, OverflowError, ValueError):
             return text
     return text
@@ -444,8 +445,8 @@ def _render_flow_compact(ctx: dict[str, Any]) -> str:
     sector_persist_cols = [
         ("sector_name", "名称", ""),
         ("positive_days", "正流入天数", "num"),
-        ("main_net_5d", "5日净流", "num"),
-        ("twenty_day_main_net", "20日净流", "num"),
+        ("flow_streak", "连续正流入", "num"),
+        ("main_net", "匹配3日净流", "num"),
     ]
 
     broad = {"融资融券", "沪股通", "深股通", "国企改革", "富时罗素", "标普道琼斯", "融资融券概念"}
@@ -471,6 +472,18 @@ def _render_flow_compact(ctx: dict[str, Any]) -> str:
         "<button type='button' data-tab='persist'>持续性</button>"
         "</div>"
         f"<p class='dim' style='margin-bottom:10px'>{_e(coverage)}</p>"
+        + ''.join(f"<p class='dim'>{_e(alert)}</p>" for alert in flow.get('coverage_alerts', [])) +
+        "<details id='concept-flow-exclusions'><summary>查看未参与概念资金排名的名单与原因</summary>"
+        + _flow_table('排除名单（不参与本子集排名）',
+            (flow.get('qualified_concept_flow') or {}).get('contract', {}).get('excluded_concepts', []),
+            [('sector_code','代码','mono'),('sector_name','概念',''),
+             ('missing_member_count','缺口成员数','num'),('reason','排除原因','')]) +
+        "</details>" +
+        "<details id='concept-source-evidence'><summary>来源口径与权限边界</summary>"
+        "<p class='dim'>本地留存记录不等于当前在线授权。目录优先同花顺官方，其次已授权中继；不同资金定义不直接替换。</p>"
+        + _flow_table('已有资金来源（不混加）', (flow.get('concept_source_evidence') or {}).get('sources',[]),
+            [('provider','来源',''),('definition','资金定义',''),('amount_unit','单位',''),('rows','留存行数','num')]) +
+        "</details>" +
         "<div class='tab-panel active' data-panel='in'><div class='grid g-2'>"
         f"{_flow_table('个股净流入 Top 8', ranked('stock_inflow', 8), stock_cols)}"
         f"{_flow_table('概念净流入 Top 6', ranked('sector_inflow', 6, skip_names=True), sector_cols)}"
@@ -590,6 +603,17 @@ def _render_loop(ctx: dict[str, Any]) -> str:
             "<th class='num'>分数</th><th class='num'>主力净额</th><th>状态</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
+        cards=[]
+        for row in picks[:10]:
+            evidence=row.get('concept_evidence') or []
+            details=''.join(f"<li>{_e(e['name'])}：成员 {e['members']} 只，主力净额 {_fmt(e['main_net'])}；"
+                + (f"匹配窗口正流入 {e['positive_days']} 日" if e['history_status']=='matched' else '历史成员或来源不匹配，持续性未知')
+                + f"。输入指纹 {_e(e['input_sha256'][:12])}</li>" for e in evidence)
+            cards.append(f"<details><summary>{_e(row.get('stock_name') or row.get('stock_code'))} · 概念资金解释</summary>"
+                f"<ul>{details or '<li>没有合格概念资金关联；不等于看空或无概念。</li>'}</ul>"
+                f"<p>{_e(row.get('invalidation','待补充失效条件'))}</p></details>")
+        parts.append("<div id='candidate-concept-evidence'><p class='dim'>仅补充已有候选的背景，不改模型分数或排序。"
+            "多个概念可能共享成员，不是相互独立的利好证据。</p>"+''.join(cards)+"</div>")
     return "\n".join(parts)
 
 
@@ -905,6 +929,7 @@ def _flow_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str,
             val = row.get(key)
             if key == "provider":
                 val = cn(PROVIDER_CN, val)
+                tds.append(f"<td class='{cls}'>{_e(val) if val is not None else '—'}</td>")
             elif key in money_keys:
                 tds.append(f"<td class='num {_sign_class(val)}'>{_fmt(val)}</td>")
             elif key in {"change_pct", "seal_rate"}:
@@ -1464,7 +1489,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     const n = Number(v);
     if (Number.isFinite(n) && n > 1e9) {{
       const d = new Date(n > 1e12 ? n : n * 1000);
-      return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      return new Intl.DateTimeFormat('en-GB', {{timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}}).format(d);
     }}
     return String(v);
   }};
@@ -1733,7 +1758,7 @@ window.addEventListener('DOMContentLoaded', () => {{
       const renderDetailRows = (day, stocks) => stocks.map((stock, index) => {{
         const lu = luByDateCode[`${{day}}|${{stock.code}}`] || null;
         const board = lu && lu.board != null ? lu.board + '板' : '—';
-        const time = lu && lu.time ? lu.time : '—';
+        const time = lu && lu.time ? fmtTime(lu.time) : '—';
         return `<div class="day-row cols5 stock-detail-row" style="cursor:default"><span class="dim">${{index + 1}}</span>`
           + `<span class="n">${{stock.name || stock.code || '—'}} <span class="dim">${{stock.code || ''}}</span></span>`
           + `<span class="num ${{signCls(stock.pct)}}">${{fmtPctJs(stock.pct)}}</span>`
@@ -2340,9 +2365,10 @@ def _render_review_bundle(
 
 
 def render_review_web(db_path: str | Path, trade_date: str | None = None,
-                      echarts_path: str | Path | None = None) -> tuple[str, str]:
+                      echarts_path: str | Path | None = None, *,
+                      as_of: datetime | str | None = None) -> tuple[str, str]:
     """Build the inline-compatible review page and return (html, trade_date)."""
-    html_out, selected, _ = _render_review_bundle(db_path, trade_date, echarts_path)
+    html_out, selected, _ = _render_review_bundle(db_path, trade_date, echarts_path, as_of=as_of)
     return html_out, selected
 
 

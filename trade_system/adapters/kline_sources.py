@@ -15,6 +15,7 @@ import atexit
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
+from trade_system.units import requested_adjustment
 
 try:
     from trade_system.config import SETTINGS as _PROJECT_SETTINGS
@@ -148,12 +149,14 @@ def _auto_decode(raw):
 # ---------------------------------------------------------------- 1) baostock（独立服务器）
 def _from_baostock(code, start, end, fq="qfq"):
     global _BAOSTOCK_MODULE, _BAOSTOCK_LOGGED_IN
+    # This adapter certifies raw prices only. Other qualified sources may
+    # satisfy adjusted requests; never relabel raw data to obtain coverage.
+    if requested_adjustment(fq) != 'none':
+        return None
     import baostock as bs
     _BAOSTOCK_MODULE = bs
     mkt, pure = _norm_code(code)
-    # 注意：baostock 的 adjustflag="1"(前复权) 对部分标的返回异常放大值（实测 600519 返回 9066 而非 1182）；
-    # 用 "3"不复权 原始价最稳，qfq 由 腾讯/新浪/Tushare 源补齐。
-    adj = {"qfq": "3", "hfq": "2", "": "3"}[fq]
+    adj = '3'
     with _BAOSTOCK_LOCK:
         if not _BAOSTOCK_LOGGED_IN:
             login = bs.login()
@@ -451,9 +454,12 @@ _KLINE_SOURCES = [
 def get_kline(code, start="20260101", end="20500101", fq="qfq", timeout_per=10):
     """自动多源降级取日 K 线，返回统一结构 list[dict]。"""
     tried = []
+    expected = requested_adjustment(fq)
+    if expected == 'unknown':
+        raise ValueError('unsupported requested adjustment')
     for name, fn in _KLINE_SOURCES:
         res = _run(lambda: fn(code, start, end, fq), timeout=timeout_per, label=name)
-        if res:
+        if res and all(isinstance(row, dict) and row.get('adjustment') == expected for row in res):
             res.sort(key=lambda x: x["date"])
             return res
         tried.append(name)

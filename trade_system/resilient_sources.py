@@ -377,7 +377,7 @@ def adaptive_ttl(datatype):
 #    顺序只是初始顺序，运行时会被 health 动态重排。
 # =====================================================================
 def _relay_daily_basic(code, trade_date=None):
-    """估值冗余源：Tushare 中继 daily_basic（PE/PB/市值）。total_mv 单位为千元，换算成亿。"""
+    """估值冗余源：TuShare daily_basic 市值原值为万元，此兼容输出为亿元。"""
     if not TUSHARE_TOKEN:
         return None
     mkt, pure = _norm_code(code)
@@ -400,17 +400,21 @@ def _relay_daily_basic(code, trade_date=None):
             return float(v) if v not in (None, "") else None
         except Exception:
             return None
-    return {
+    result = {
         "code": pure, "name": None,
         "pe_ttm": g("pe_ttm"), "pe": g("pe"), "pb": g("pb"),
         # TuShare daily_basic 的 total_mv/circ_mv 单位=万元；本统一行情
         # 结构以亿元表达，因此除以 1e4，而不是旧实现的 1e5。
-        "total_mv": (g("total_mv") / 1e4) if g("total_mv") else None,
-        "circ_mv": (g("circ_mv") / 1e4) if g("circ_mv") else None,
-        "total_mv_unit": "billion_yuan",
-        "circ_mv_unit": "billion_yuan",
+        "total_mv": (g("total_mv") / 1e4) if g("total_mv") is not None else None,
+        "circ_mv": (g("circ_mv") / 1e4) if g("circ_mv") is not None else None,
+        "total_mv_unit": "100m_yuan",
+        "circ_mv_unit": "100m_yuan",
         "turnover": g("turnover_rate"), "trade_date": td, "_src": "tushare_relay",
+        "raw": row,
     }
+    from trade_system.units import market_caps
+    result.update(market_caps(result))
+    return result
 
 
 def _plan_kline(code, start="20260101", end="20500101", fq="qfq", **kw):

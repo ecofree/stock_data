@@ -10,27 +10,7 @@ from trade_system.v2.daily_session import verify,CALENDAR,CST,seal
 from trade_system.v2.domain import canonical,file_hash,identity,now_utc,number,utc
 from trade_system.v2.gap_evidence import write_json
 from trade_system.v2.native_enrichment import PRICES
-
-MISSING_2024=['2024-01-03','2024-02-26','2024-04-08','2024-07-02','2024-07-12',
-              '2024-07-30','2024-08-16','2024-10-14','2024-11-01','2024-12-03']
-
-
-def calendar_overlay(rows):
-    expected={(datetime(2024,1,1).date()).isoformat()}
-    from datetime import timedelta
-    expected={(datetime(2024,1,1)+timedelta(days=i)).date().isoformat() for i in range(366)}
-    result={}
-    for row in rows:
-        day=datetime.strptime(row['cal_date'],'%Y%m%d').date().isoformat()
-        if row['exchange']!='SSE' or type(row['is_open']) is not int or row['is_open'] not in (0,1) or day in result:
-            raise ValueError('unique explicit SSE calendar dates/status required')
-        result[day]=bool(row['is_open'])
-    if set(result)!=expected:
-        raise ValueError('full 2024 calendar coverage required, not observed-bar inference')
-    return {'exchange':'SSE','calendar_days':366,'open_days':sorted(d for d,v in result.items() if v),
-            'target_dates':{d:result[d] for d in MISSING_2024},
-            'scope':'new_relay_calendar_receipt_not_original_PIT_or_SZSE_certification'}
-
+from trade_system.v2.research_receipts import calendar_overlay, MISSING_2024  # noqa: F401
 
 def run(report_path,output):
     report=verify(report_path);day=report['trade_date'];now=now_utc()

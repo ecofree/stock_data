@@ -1,6 +1,57 @@
 # stock_data
 
-## Current remediation boundary (2026-09-11)
+## Current local workspace (2026-09-12)
+
+Open http://127.0.0.1:8769/ or double-click `Start Research.cmd` in this checkout.
+The launcher verifies the workspace and running source identity before reuse.
+Viewing does not fetch or train. Judgements and human condition reviews return
+independent, retry-safe receipts; static exports cannot save records.
+The current local patch is **not** the approved fixed scheduler release and has
+not changed production tasks. See the single delivery ledger for exact boundaries.
+
+Approved maintenance installer: see [Administrator operation sheet](docs/v2/DEPLOYMENT_OPERATOR_20260913.md).
+`scripts/deploy_research_cutover.ps1 -Mode Check` is read-only; Apply requires the
+approved 2026-09-13 16:00–17:00 China-time window and an elevated operator shell.
+The installer is prepared and tested, not deployed. Never substitute the old task installer.
+
+## Previous delivery: 0.3.10 permission and utility verification (2026-09-12)
+
+Installed runtimes now refuse legacy disk writers even without Git metadata;
+hardlink aliases of the live database are also refused. A direct-writer inventory
+gate prevents new unclassified entry points. This is not OS-level isolation.
+`python -m trade_system.v2.research_product utility --destination <new-folder>`
+independently recomputes sealed OOS selection comparisons without fitting.
+The present candidate has not demonstrated a promotion-worthy advantage.
+`scripts/run_research_daily.ps1` is the checked research-only daily entry point;
+no Windows task has been registered or changed. See the ledger for remaining
+human, prospective-data, legacy-consumer and cutover acceptance boundaries.
+
+## Previous 0.3.9 delivery
+
+Daily updates now include a same-date read-only market projection, complete
+declared theme membership and matched previous-session breadth. Real incremental
+refresh and explicit holiday-calendar reuse have been exercised. The full source
+database was copied/restored in isolation; source-release rollback was rehearsed.
+Start manually with `scripts/start_research_workbench.ps1 -Port 8769`.
+The tested 8769 service was gracefully stopped; restarting it was blocked by the
+execution environment. No scheduled tasks or production database were replaced.
+
+The current implementation and remaining boundaries are in the single
+[delivery ledger](docs/v2/CONSOLIDATED_REMEDIATION_20260912.md).
+The local research workspace now joins same-date market review, frozen model
+comparison, candidate explanations, manual notes and pending follow-up queues.
+Start with `scripts/start_research_workbench.ps1`; viewing never trains implicitly.
+The research source distribution uses `requirements-research-replay.lock` in a
+separate Windows CPython 3.12 environment. The operational wheel is a different,
+minimal product, not a package of the entire legacy collector/UI.
+
+The legacy trading-terminal generator now refuses execution explicitly; its
+historical HTML remains untouched. Current production tasks and database have
+not been replaced. Four-batch convergence is **partially implemented**, not fully
+accepted; real human decisions, model superiority and production cutover are not
+established by local tests. The sections below are historical context.
+
+## Historical remediation boundary (2026-09-11)
 
 The current implementation record is [the four-stage continuation](docs/v2/FOUR_STAGES_20260911.md), extending [the retirement remediation ledger](docs/v2/RETIREMENT_REMEDIATION_20260910.md).
 This checkout is an isolated remediation branch, **not a deployed replacement**.

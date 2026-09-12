@@ -18,22 +18,14 @@ from typing import Any, Callable
 import duckdb
 
 from trade_system import resilient_sources
-from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
+from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row, normalize_sector_flow_row
 from trade_system.source_authority import provider_rank_sql
+from trade_system.units import _number
 
 
 def _date(value: Any, fallback: str | None = None) -> str | None:
     raw = "".join(ch for ch in str(value or fallback or "") if ch.isdigit())
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}" if len(raw) >= 8 else None
-
-
-def _number(value: Any) -> float | None:
-    try:
-        if value in (None, "", "-"):
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _json(value: Any) -> str:
@@ -114,6 +106,8 @@ class MultiSourceStore:
               fetched_at TIMESTAMP DEFAULT current_timestamp,
               is_stale BOOLEAN DEFAULT FALSE, raw_json VARCHAR)
         """)
+        self.con.execute("ALTER TABLE multi_source_quote ADD COLUMN IF NOT EXISTS source_event_time TIMESTAMP")
+        self.con.execute("ALTER TABLE multi_source_quote ADD COLUMN IF NOT EXISTS collected_at TIMESTAMP")
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS multi_source_sync_status(
               run_id VARCHAR, run_started_at TIMESTAMP, run_finished_at TIMESTAMP,
@@ -175,7 +169,7 @@ class MultiSourceStore:
 
         # Do not overwrite a live row with an expired cache result.  The stale
         # observation above is enough to make the degradation auditable.
-            if data is not None and not stale:
+            if data is not None and status in {'live', 'refreshed', 'fresh', 'delayed'}:
                 if data_type in {"kline", "index_kline", "etf_kline", "cb_kline"}:
                     rows_written = self._store_klines(data_type, code, data, provider, asset_type, stale)
                 elif data_type in {"stock_flow", "fund_flow_120d", "fund_flow"}:
@@ -287,14 +281,22 @@ class MultiSourceStore:
         for row in rows:
             if not isinstance(row, dict) or not row.get("sector_code"):
                 continue
+            canonical = normalize_sector_flow_row(row, provider)
             # A pre-open Eastmoney snapshot can contain sector names/prices
             # while all flow fields are ``-``.  Such rows are not a partial
             # flow measurement and must not make readiness look available.
             flow_fields = ("main_net", "super_net", "large_net", "mid_net", "small_net")
-            if not any(row.get(field) not in (None, "", "-") for field in flow_fields):
+            if not any(canonical.get(field) is not None for field in flow_fields):
                 continue
             d = _date(row.get("date") or row.get("trade_date")) or d_default
             code = str(row.get("sector_code"))
+            conflicting = self.con.execute(
+                "SELECT 1 FROM multi_source_sector_flow WHERE source_date=? AND sector_code=? AND provider=? "
+                "AND sector_type IS NOT NULL AND sector_type<>'unknown' AND sector_type<>? LIMIT 1",
+                [d, code, provider, canonical['sector_type']],
+            ).fetchone()
+            if conflicting:
+                raise ValueError('sector source/date/code changed taxonomy; explicit migration required')
             self.con.execute(
                 "DELETE FROM multi_source_sector_flow WHERE source_date=? AND sector_code=? AND provider=?",
                 [d, code, provider],
@@ -302,15 +304,10 @@ class MultiSourceStore:
             self.con.execute(
                 "INSERT INTO multi_source_sector_flow(source_date,sector_code,sector_name,main_net,super_net,large_net,mid_net,small_net,change_pct,main_ratio,provider,sector_type,amount_unit,is_stale,raw_json) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [d, code, row.get("sector_name"), _number(row.get("main_net")), _number(row.get("super_net")),
-                 _number(row.get("large_net")), _number(row.get("mid_net")), _number(row.get("small_net")),
+                [d, code, row.get("sector_name"), canonical['main_net'], canonical['super_net'],
+                 canonical['large_net'], canonical['mid_net'], canonical['small_net'],
                  _number(row.get("change_pct")), _number(row.get("main_ratio")), provider,
-                 row.get("sector_type") or {
-                     "derived_ths_stock_aggregate": "ths_concept",
-                     "eastmoney_sector_full": "em_industry",
-                     "tushare_sector_full": "tushare_dc_sector",
-                 }.get(provider),
-                 row.get("amount_unit") or "yuan", stale, _json(row)],
+                 canonical['sector_type'], 'yuan', stale, _json(dict(row, canonical_contract=canonical))],
             )
             count += 1
         return count
@@ -318,20 +315,40 @@ class MultiSourceStore:
     def _store_quote(self, data_type, code, data, provider, asset_type, stale, trade_date):
         if not isinstance(data, dict):
             return 0
+        from trade_system.units import market_caps, quote_source_event_time
+        from zoneinfo import ZoneInfo
+        # Preserve existing provider-valued columns and raw receipt; canonical
+        # names and unknown reasons travel in the persisted JSON without DDL.
+        data = dict(data, **market_caps(data))
         d = _date(data.get("date") or data.get("trade_date") or trade_date) or date.today().isoformat()
         ac = str(code or data.get("code") or "")
+        if data.get('code') and str(data['code']).split('.')[0]!=ac.split('.')[0]:
+            raise ValueError('quote security identity mismatch')
+        event=quote_source_event_time(data,provider)
+        received=datetime.now(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+        if event:
+            declared=_date(data.get('date') or data.get('trade_date'))
+            if event>received or (declared and declared!=event.date().isoformat()):
+                raise ValueError('quote event time/date inconsistent')
+            d=event.date().isoformat()
+            data['source_event_time']=event.replace(tzinfo=ZoneInfo('Asia/Shanghai')).isoformat()
+        columns={row[1] for row in self.con.execute("PRAGMA table_info('multi_source_quote')").fetchall()}
+        clocks={'source_event_time':event,'collected_at':received,'fetched_at':received}
+        clock_fields=[name for name in clocks if name in columns]
+        extra_columns=','+','.join(clock_fields) if clock_fields else ''
+        extra_values=',?'*len(clock_fields)
         self.con.execute(
             "DELETE FROM multi_source_quote WHERE source_date=? AND asset_type=? AND asset_code=? AND provider=?",
             [d, asset_type or data_type, ac, provider],
         )
         self.con.execute(
-            "INSERT INTO multi_source_quote(source_date,asset_type,asset_code,name,price,change_pct,pe_ttm,pb,total_mv,circ_mv,provider,total_mv_unit,circ_mv_unit,is_stale,raw_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO multi_source_quote(source_date,asset_type,asset_code,name,price,change_pct,pe_ttm,pb,total_mv,circ_mv,provider,total_mv_unit,circ_mv_unit,is_stale,raw_json"+extra_columns+") "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"+extra_values+")",
             [d, asset_type or data_type, ac, data.get("name"), _number(data.get("price")),
-             _number(data.get("change_pct") or data.get("pct")), _number(data.get("pe_ttm")), _number(data.get("pb")),
+             _number(data.get("change_pct") if data.get("change_pct") is not None else data.get("pct")), _number(data.get("pe_ttm")), _number(data.get("pb")),
              _number(data.get("total_mv")), _number(data.get("circ_mv")), provider,
              data.get("total_mv_unit") or "unknown", data.get("circ_mv_unit") or "unknown",
-             stale, _json(data)],
+             stale, _json(data), *[clocks[name] for name in clock_fields]],
         )
         return 1
 
@@ -340,23 +357,34 @@ class MultiSourceStore:
         try:
             date_clause = " AND source_date=CAST(? AS DATE)" if trade_date else ""
             params = [trade_date] if trade_date else []
+            self.con.execute("BEGIN TRANSACTION")
+            # This legacy destination has no namespace/measure column. Refuse
+            # an ambiguous projection, rather than silently rank unlike types
+            # into the same date/code key or discard the prior good snapshot.
+            collisions = self.con.execute(
+                "SELECT source_date,sector_code FROM multi_source_sector_flow "
+                "WHERE is_stale=FALSE AND sector_type IN "
+                "('em_industry','ths_concept','ths_concept_derived') AND amount_unit='yuan'"
+                + date_clause + " GROUP BY source_date,sector_code "
+                "HAVING count(DISTINCT sector_type)>1 LIMIT 20", params).fetchall()
+            if collisions:
+                raise ValueError(f"sector_capital namespace/measure collision; snapshot preserved: {collisions}")
             sector_order = provider_rank_sql("sector_flow", "provider")
             rows = self.con.execute(
                 f"SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net FROM ("
                 "SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net,provider,fetched_at,"
                 f"row_number() OVER (PARTITION BY source_date,sector_code ORDER BY {sector_order} ASC, fetched_at DESC) AS _rn "
                 "FROM multi_source_sector_flow WHERE is_stale=FALSE"
+                " AND sector_type IN ('em_industry','ths_concept','ths_concept_derived') AND amount_unit='yuan'"
                 " AND (main_net IS NOT NULL OR super_net IS NOT NULL OR large_net IS NOT NULL OR mid_net IS NOT NULL OR small_net IS NOT NULL)"
                 + date_clause + ") WHERE _rn=1",
                 params,
             ).fetchall()
             if not rows:
+                self.con.rollback()
                 return 0
-            self.con.execute("BEGIN TRANSACTION")
-            if trade_date:
-                # Remove quote-only compatibility rows and duplicate providers
-                # for this session before copying the authoritative selection.
-                self.con.execute("DELETE FROM sector_capital WHERE date=CAST(? AS DATE)", [trade_date])
+            for selected_date in sorted({row[0] for row in rows}):
+                self.con.execute("DELETE FROM sector_capital WHERE date=CAST(? AS DATE)", [selected_date])
             for row in rows:
                 self.con.execute(
                     "INSERT INTO sector_capital(date,sector_code,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow) VALUES (?,?,?,?,?,?,?)",
@@ -364,6 +392,9 @@ class MultiSourceStore:
                 )
             self.con.commit()
             return len(rows)
+        except ValueError:
+            self.con.rollback()
+            raise
         except Exception:
             # A partially initialized legacy DB may not have sector_capital;
             # migration data remains available in its source-aware table.

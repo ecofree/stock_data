@@ -28,6 +28,13 @@ class SourcePolicy:
 
 
 SOURCE_POLICIES: dict[str, SourcePolicy] = {
+    "observation_quote": SourcePolicy(
+        "observation_quote", "multi_source_quote", ("hithink", "hithink_quote", "hithink_official"),
+        ("xiaodefa", "tushare_relay", "tencent_spot_quote", "tencent", "sina"),
+        "existing_quote_collectors_read_only_observation_consumer",
+        (),
+        "Observation only. Source event time, receipt order and TTL must qualify before priority is applied; never an executable/account quote.",
+    ),
     "market_state": SourcePolicy(
         "market_state", "daily_summary", ("kpl_market",),
         ("secondary_verified", "derived_current", "fallback"),

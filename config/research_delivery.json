@@ -4,14 +4,14 @@
   "universe": ["000001","000066","000078","000417","000524","000639","000759","000838","000892","000938","000948","000977","001207","001208","001229","001287","002025","002152","002208","002245","002346","002350","002396","002414","002457","002467","002512","002542","002552","002632","002745","002829","002845","600353","600793","600909","600992","603115","603137","603329","603726","603928","603989"],
   "selection_reason": "43 of 54 previously frozen duplicate-key securities with complete 2025 prefix price/factor/money data; retrospective availability selection, not a historical PIT universe or representative market sample. No selection by future returns.",
   "excluded_factor_incomplete": ["002767","002841","301251","600288"],
-  "selection_ledger": "tmp/research-delivery-inputs-20260911-r1/selected43.json",
+  "selection_ledger": "data/research-inputs/frozen-20260912/selection.json",
   "start": "2025-01-02",
   "end": "2025-11-26",
   "warmup_sessions": 61,
   "split": {"train":40,"valid":15,"test":20,"holdout":20},
   "max_rows": 20000,
   "sources": {
-    "prices": {"path":"tmp/seven-duplicate-year-analysis-20260911-r2/result.json","sha256":"c8ef40abb7e89bc08ff77c9ba18d570a49762db76998cbf53bb69ab53d12a625"},
-    "database": {"path":"tmp/ed47-followup-measure-20260911-r2/source-copy/kpl_data.duckdb","sha256":"26d7bae1461e65bb1315413c7c1f56a04048fa3e0dbbe7c56de36558e75cecfd"}
+    "prices": {"path":"data/research-inputs/frozen-20260912/prices.json","sha256":"c8ef40abb7e89bc08ff77c9ba18d570a49762db76998cbf53bb69ab53d12a625"},
+    "database": {"path":"data/research-inputs/frozen-20260912/source.duckdb","sha256":"26d7bae1461e65bb1315413c7c1f56a04048fa3e0dbbe7c56de36558e75cecfd"}
   }
 }

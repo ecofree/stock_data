@@ -6,6 +6,51 @@ from typing import Any
 import duckdb
 
 
+def primary_checkout():
+    """Resolve the shared Git checkout from this source tree, without config secrets."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    marker = root/'.git'
+    if marker.is_dir():
+        return root
+    if marker.is_file():
+        value = marker.read_text(encoding='utf-8').strip()
+        if value.startswith('gitdir: '):
+            gitdir = (root/value[8:]).resolve()
+            common = gitdir/'commondir'
+            if common.is_file():
+                shared = (gitdir/common.read_text(encoding='utf-8').strip()).resolve()
+                if shared.name == '.git':
+                    return shared.parent
+    return None
+
+
+def refuse_primary_legacy_write(database):
+    """Accidental-routing barrier for legacy source code, not OS access control."""
+    from pathlib import Path
+    if str(database)==':memory:':
+        return
+    path = Path(database).resolve()
+    primary = primary_checkout()
+    if primary is None:
+        raise ValueError('installed runtime refuses legacy disk writes; use the V2 owned store')
+    if primary and (path==primary or primary in path.parents):
+        raise ValueError('legacy writer refuses primary checkout; use an isolated migration copy')
+    live=primary/'kpl_data.duckdb'
+    if path.exists() and live.exists() and path.samefile(live):
+        raise ValueError('legacy writer refuses primary checkout hardlink alias')
+
+
+def guard_legacy_schema(con):
+    """Check direct schema calls too, including already-open V2 connections."""
+    for _, _, path in con.execute('PRAGMA database_list').fetchall():
+        if path:
+            refuse_primary_legacy_write(path)
+    if con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name IN "
+                   "('v2_schema','account_snapshot','reservation','paper_ledger_event')").fetchone()[0]:
+        raise ValueError('legacy schema refuses V2/account database identity')
+
+
 def latest_open_session(db_path, as_of=None):
     """Pure read-only calendar lookup, independent of collectors/configuration."""
     from datetime import date
@@ -32,6 +77,7 @@ def refuse_v2_writes(db_path):
     Direct DuckDB callers still require retirement inventory and migration.
     """
     from pathlib import Path
+    refuse_primary_legacy_write(db_path)
     path=Path(db_path)
     if path.is_file():
         with duckdb.connect(str(path),read_only=True) as con:

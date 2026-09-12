@@ -35,7 +35,8 @@ def test_stage_run_saves_each_task_and_resumes_from_checkpoint(tmp_path):
         if data_type == "stock_flow":
             return ([{"date": "2026-07-13", "main_net": 4}], {"source": "fake", "status": "live"})
         if data_type == "sector_flow":
-            return ([{"sector_code": "BK0001", "main_net": 7}], {"source": "fake", "status": "live"})
+            return ([{"sector_code": "BK0001", "main_net": 7, "amount_unit": "yuan",
+                      "sector_type": "em_industry"}], {"source": "fake", "status": "live"})
         return ([{"date": "2026-07-13"}], {"source": "fake", "status": "live"})
 
     with StageScheduler(db, date.today().isoformat(), ["000001"], fetcher=fake_fetcher) as scheduler:

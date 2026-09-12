@@ -9,6 +9,105 @@ from .domain import identity
 from .gap_evidence import read_json
 
 
+def retry_note(output, request_id, command):
+    """Recover an acknowledged or interrupted request without making a second event.
+
+    The event itself is the authority; no separately committed receipt index.
+    Called under judgement.guard, including on retries after a process restart.
+    """
+    if not request_id:
+        return None
+    if not isinstance(request_id, str) or not re.fullmatch('[a-f0-9]{32}', request_id):
+        raise ValueError('invalid judgement request id')
+    for path in (Path(output)/'notes').glob('*.json'):
+        note = verify_note(read_json(path)[0])
+        if note.get('request_id') == request_id:
+            if note.get('command_id') != identity(command):
+                raise ValueError('request id already used for different judgement; start a new draft')
+            return note['note_id']
+    return None
+
+
+def append_note(output, note):
+    """Flush a complete event before atomically exposing its final filename."""
+    import os
+    import uuid
+    from .domain import canonical
+    folder = Path(output)/'notes'
+    folder.mkdir(exist_ok=True)
+    target = folder/(note['note_id']+'.json')
+    if target.exists():
+        if verify_note(read_json(target)[0]) != note:
+            raise ValueError('existing judgement differs')
+        return
+    staging = folder/('.pending-'+uuid.uuid4().hex)
+    # Incomplete staging files remain invisible and retained for diagnosis.
+    with staging.open('x', encoding='utf-8') as stream:
+        stream.write(canonical(note))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(staging, target)
+
+
+def read_note(output, note_id):
+    if not isinstance(note_id, str) or not re.fullmatch('[a-f0-9]{64}', note_id):
+        raise ValueError('invalid judgement receipt id')
+    note=verify_note(read_json(Path(output)/'notes'/(note_id+'.json'))[0])
+    if note['note_id']!=note_id:raise ValueError('judgement receipt identity mismatch')
+    return note
+
+
+def save_review(output, values):
+    """An explicit human observation, separate from computed future-price labels."""
+    from trade_system.file_lock import FileLock
+    from .domain import now_utc
+    output=Path(output)
+    with FileLock(output/'judgement.guard'):
+        note=read_note(output,values.get('note_id'))
+        request_id=values.get('request_id')
+        if not isinstance(request_id,str) or not re.fullmatch('[a-f0-9]{32}',request_id):
+            raise ValueError('invalid review request id')
+        if values.get('conclusion') not in ('pending','triggered','not_triggered','unclear'):
+            raise ValueError('explicit condition review required')
+        for key in ('reviewer','evidence'):
+            if not isinstance(values.get(key),str) or not 1<=len(values[key].strip())<=4000:
+                raise ValueError('explicit bounded human review required')
+        command={key:values[key] for key in ('note_id','conclusion','reviewer','evidence')}
+        folder=output/'notes'/'reviews'
+        folder.mkdir(exist_ok=True)
+        for path in folder.glob('*.json'):
+            old=read_review(output,path.stem)
+            if old['request_id']==request_id:
+                if old['command_id']!=identity(command):raise ValueError('review request reused with different content')
+                return old['review_id']
+        review=dict(command,request_id=request_id,command_id=identity(command),
+            prediction_id=note['prediction_id'],instrument=note['instrument'],
+            received_at=now_utc().isoformat(),identity_scope='caller_declared_not_authenticated',
+            scope='human_condition_observation_not_price_label_or_account_acceptance',execution_ready=False)
+        review['review_id']=identity(review)
+        # Reuse the single-event durable writer without exposing review JSON as notes.
+        import os
+        import uuid
+        from .domain import canonical
+        staging=folder/('.pending-'+uuid.uuid4().hex)
+        with staging.open('x',encoding='utf-8') as stream:
+            stream.write(canonical(review));stream.flush();os.fsync(stream.fileno())
+        os.replace(staging,folder/(review['review_id']+'.json'))
+        return review['review_id']
+
+
+def read_review(output,review_id):
+    if not isinstance(review_id,str) or not re.fullmatch('[a-f0-9]{64}',review_id):
+        raise ValueError('invalid review receipt id')
+    review=read_json(Path(output)/'notes'/'reviews'/(review_id+'.json'))[0]
+    if review.get('review_id')!=review_id or review_id!=identity({k:v for k,v in review.items() if k!='review_id'}):
+        raise ValueError('human review changed')
+    note=read_note(output,review['note_id'])
+    if any(note[k]!=review[k] for k in ('prediction_id','instrument')):
+        raise ValueError('human review parent differs')
+    return review
+
+
 def verify_note(note):
     if note['note_id']!=identity({k:v for k,v in note.items() if k!='note_id'}):raise ValueError('judgement record changed')
     return note

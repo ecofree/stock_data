@@ -57,38 +57,8 @@ class Client:
         return envelope.get('data') or {}
 
 
-def rows_for(request,data, *, max_items=64):
-    native=request['provider']=='hithink_native'
-    items=data.get('item' if native else 'items')
-    if not isinstance(max_items,int) or not 1<=max_items<=367: raise ValueError('bounded parser budget required')
-    if not isinstance(items,list) or len(items)>=max_items:raise ValueError('bounded response required; possible truncation refused')
-    if not native and data.get('fields')!=API_FIELDS[request['api']]:raise ValueError('exact fields required')
-    result={}
-    for item in items:
-        if native:
-            day=datetime.fromtimestamp(float(number(item['date_ms']))/1000,tz=CST).date().isoformat()
-            row={k:str(number(item[k+'_price'])) for k in ('open','high','low','close')}
-            row.update(volume_shares=str(number(item['volume'])),turnover_cny=str(number(item['turnover'])))
-        else:
-            if len(item)!=len(API_FIELDS[request['api']]):raise ValueError('row width differs')
-            source=dict(zip(API_FIELDS[request['api']],item))
-            if source['ts_code']!=request['code']:raise ValueError('provider returned another code; no implicit alias')
-            day=datetime.strptime(source['trade_date'],'%Y%m%d').date().isoformat()
-            row={k:(None if v is None else str(number(v))) for k,v in source.items() if k not in ('ts_code','trade_date')}
-            if request['api']=='daily':
-                row['volume_shares']=str(number(row.pop('vol'))*100)
-                row['turnover_cny']=str(number(row.pop('amount'))*1000)
-            elif request['api']=='adj_factor' and (row['adj_factor'] is None or number(row['adj_factor'])<=0):
-                raise ValueError('positive factor required')
-            elif request['api']=='moneyflow' and any(v is not None and number(v)<0 for k,v in row.items() if k.startswith(('buy_','sell_'))):
-                raise ValueError('nonnegative gross flow required')
-        if not request['start']<=day<=request['end'] or day in result:raise ValueError('duplicate or out-of-window date')
-        if native or request['api']=='daily':
-            o,h,l,c=[number(row[k]) for k in ('open','high','low','close')]
-            if min(o,h,l,c)<=0 or l>min(o,c) or h<max(o,c) or number(row['volume_shares'])<0 or number(row['turnover_cny'])<0:
-                raise ValueError('invalid price/volume bounds')
-        result[day]=row
-    return result
+# Compatibility name: one parser implementation in the application.
+from trade_system.v2.research_receipts import rows_for  # noqa: F401
 
 
 def capture(output,client=None):

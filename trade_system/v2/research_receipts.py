@@ -6,12 +6,32 @@ import time
 import urllib.request
 from urllib.parse import urlsplit
 
-from .daily_session import seal
+from .daily_session import seal, CST
 from .domain import canonical,file_hash,identity,now_utc,number,utc,instrument
 from .gap_evidence import read_json,write_json
 
 FIELDS={'adj_factor':['ts_code','trade_date','adj_factor'],
         'moneyflow':['ts_code','trade_date','net_mf_amount','buy_lg_amount','sell_lg_amount','buy_elg_amount','sell_elg_amount']}
+
+MISSING_2024=['2024-01-03','2024-02-26','2024-04-08','2024-07-02','2024-07-12',
+              '2024-07-30','2024-08-16','2024-10-14','2024-11-01','2024-12-03']
+
+
+def calendar_overlay(rows):
+    """Pure parser for the existing frozen 2024 protocol; no collector dependency."""
+    from datetime import timedelta
+    expected={(datetime(2024,1,1)+timedelta(days=i)).date().isoformat() for i in range(366)}
+    result={}
+    for row in rows:
+        day=datetime.strptime(row['cal_date'],'%Y%m%d').date().isoformat()
+        if row['exchange']!='SSE' or type(row['is_open']) is not int or row['is_open'] not in (0,1) or day in result:
+            raise ValueError('unique explicit SSE calendar dates/status required')
+        result[day]=bool(row['is_open'])
+    if set(result)!=expected:
+        raise ValueError('full 2024 calendar coverage required, not observed-bar inference')
+    return {'exchange':'SSE','calendar_days':366,'open_days':sorted(d for d,v in result.items() if v),
+            'target_dates':{d:result[d] for d in MISSING_2024},
+            'scope':'new_relay_calendar_receipt_not_original_PIT_or_SZSE_certification'}
 
 
 def sealed(folder):
@@ -77,7 +97,6 @@ def capture(calendar,start,end,output,*,client=None,clock=now_utc):
     members=sealed(calendar)
     cal=read_json(Path(calendar)/'calendar-overlay.json')[0]
     # Revalidate the calendar's native receipt derivation, not just its seal.
-    from tools.v2.probe_native_gaps import calendar_overlay
     receipt=read_json(Path(calendar)/'calendar-relay-receipt.json')[0]
     if cal!={**calendar_overlay(receipt['rows']),'receipt_sha256':identity(receipt)}:
         raise ValueError('calendar derivation changed')
@@ -156,3 +175,40 @@ def main():
 
 
 if __name__=='__main__':main()
+
+
+API_FIELDS={'daily':['ts_code','trade_date','open','high','low','close','vol','amount'],**FIELDS}
+
+
+def rows_for(request,data, *, max_items=64):
+    native=request['provider']=='hithink_native'
+    items=data.get('item' if native else 'items')
+    if not isinstance(max_items,int) or not 1<=max_items<=367: raise ValueError('bounded parser budget required')
+    if not isinstance(items,list) or len(items)>=max_items:raise ValueError('bounded response required; possible truncation refused')
+    if not native and data.get('fields')!=API_FIELDS[request['api']]:raise ValueError('exact fields required')
+    result={}
+    for item in items:
+        if native:
+            day=datetime.fromtimestamp(float(number(item['date_ms']))/1000,tz=CST).date().isoformat()
+            row={k:str(number(item[k+'_price'])) for k in ('open','high','low','close')}
+            row.update(volume_shares=str(number(item['volume'])),turnover_cny=str(number(item['turnover'])))
+        else:
+            if len(item)!=len(API_FIELDS[request['api']]):raise ValueError('row width differs')
+            source=dict(zip(API_FIELDS[request['api']],item))
+            if source['ts_code']!=request['code']:raise ValueError('provider returned another code; no implicit alias')
+            day=datetime.strptime(source['trade_date'],'%Y%m%d').date().isoformat()
+            row={k:(None if v is None else str(number(v))) for k,v in source.items() if k not in ('ts_code','trade_date')}
+            if request['api']=='daily':
+                row['volume_shares']=str(number(row.pop('vol'))*100)
+                row['turnover_cny']=str(number(row.pop('amount'))*1000)
+            elif request['api']=='adj_factor' and (row['adj_factor'] is None or number(row['adj_factor'])<=0):
+                raise ValueError('positive factor required')
+            elif request['api']=='moneyflow' and any(v is not None and number(v)<0 for k,v in row.items() if k.startswith(('buy_','sell_'))):
+                raise ValueError('nonnegative gross flow required')
+        if not request['start']<=day<=request['end'] or day in result:raise ValueError('duplicate or out-of-window date')
+        if native or request['api']=='daily':
+            o,h,l,c=[number(row[k]) for k in ('open','high','low','close')]
+            if min(o,h,l,c)<=0 or l>min(o,c) or h<max(o,c) or number(row['volume_shares'])<0 or number(row['turnover_cny'])<0:
+                raise ValueError('invalid price/volume bounds')
+        result[day]=row
+    return result

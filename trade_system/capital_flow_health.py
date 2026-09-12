@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -39,6 +39,7 @@ def _relation_health(
     collected_after: datetime | None = None,
     max_age_seconds: int | None = None,
     now: datetime | None = None,
+    provider: str | None = None,
 ) -> dict:
     collected_after = as_local_naive(collected_after)
     now = as_local_naive(now) or datetime.now()
@@ -85,14 +86,22 @@ def _relation_health(
         else ()
     )
     valid_flow = (
-        "(" + " OR ".join(f'"{name}" IS NOT NULL' for name in flow_columns if name in columns) + ")"
+        "(" + " OR ".join(f'isfinite(TRY_CAST("{name}" AS DOUBLE))' for name in flow_columns if name in columns) + ")"
         if any(name in columns for name in flow_columns)
         else "TRUE"
     )
     if relation == "multi_source_stock_flow" and "main_net" in columns:
-        valid_flow = '"main_net" IS NOT NULL'
+        valid_flow = 'isfinite(TRY_CAST("main_net" AS DOUBLE))'
     date_filter = f'"{date_column}" = CAST(? AS DATE) AND {valid_flow}'
+    if 'is_stale' in columns:
+        date_filter += ' AND coalesce(is_stale, FALSE)=FALSE'
     date_params: list[object] = [trade_date]
+    if provider is not None:
+        if 'provider' in columns:
+            date_filter += ' AND provider=?'
+            date_params.append(provider)
+        else:
+            date_filter += ' AND FALSE'
     if now is not None and timestamp_column:
         date_filter += f' AND "{timestamp_column}" <= ?'
         date_params.append(now)
@@ -182,12 +191,10 @@ def assess_capital_flow_health(
     else:
         collected_after = as_local_naive(collected_after)
     now = as_local_naive(now) or datetime.now()
-    # A historical close replay is evaluated against exact trade-date rows.
-    # Applying the current wall-clock TTL to yesterday's 14:50 flow snapshot
-    # turns a complete source into a false stale blocker.  Same-day intraday
-    # and close runs retain the TTL safety gate.
-    historical_close = date.fromisoformat(str(trade_date)[:10]) < now.date()
-    effective_max_age_seconds = None if historical_close else max_age_seconds
+    # Never silently turn off an explicitly requested TTL for an older date.
+    # Historical as-of replay supplies its historical clock; retrospective
+    # date-only inspection may explicitly omit TTL, without certifying freshness.
+    effective_max_age_seconds = max_age_seconds
     con = connect_duckdb(str(db_path), read_only=True)
     primary_stock_provider = None
     primary_stock_codes = None
@@ -215,12 +222,10 @@ def assess_capital_flow_health(
                 ).fetchone()
                 primary_stock_provider = str(batch_row[0] or "") if batch_row else None
         if primary_stock_provider and table_exists(con, "multi_source_stock_flow"):
-            primary_stock_codes = int(con.execute(
-                "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow "
-                "WHERE source_date=CAST(? AS DATE) AND provider=? "
-                "AND coalesce(is_stale,FALSE)=FALSE AND main_net IS NOT NULL",
-                [trade_date, primary_stock_provider],
-            ).fetchone()[0] or 0)
+            primary_health = _relation_health(con, 'multi_source_stock_flow', trade_date,
+                'stock_code', collected_after=collected_after,
+                max_age_seconds=effective_max_age_seconds, now=now, provider=primary_stock_provider)
+            primary_stock_codes = primary_health['recent_codes']
         if not expected_sector_codes and table_exists(con, "intraday_sector_flow_batch"):
             batch_row = con.execute(
                 "SELECT coalesce(expected_rows,0) FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
@@ -285,17 +290,13 @@ def assess_capital_flow_health(
         con.close()
     except Exception:
         sector_batch = None
-    # A full-sector run may be marked ``partial`` when an optional taxonomy
-    # provider (for example TuShare DC) is unavailable even though the
-    # authoritative Eastmoney/THS universe is complete.  Coverage is the
-    # readiness gate; preserve the provider status in the report without
-    # turning a complete 870/870 snapshot into a hard failure.
+    # A matching count does not repair a partial membership/page batch.
+    # The producer already has a distinct success_with_optional_gap status.
     if sector_batch:
         batch_status = str(sector_batch[0] or "").lower()
         batch_coverage = float(sector_batch[1] or 0)
         batch_usable = batch_status in {
             "success",
-            "partial",
             "success_with_unavailable",
             "success_with_optional_gap",
         }
@@ -474,7 +475,8 @@ def assess_capital_flow_health(
         "effective_max_age_seconds": (
             int(effective_max_age_seconds) if effective_max_age_seconds is not None else None
         ),
-        "freshness_contract": "same_trade_date" if historical_close else "timestamp_ttl",
+        "freshness_contract": "timestamp_ttl" if max_age_seconds is not None else "same_trade_date_no_ttl_certification",
+        "evaluated_at": now.isoformat(timespec='seconds'),
         "stock_flow": {
             "ready": stock_ready,
             "observed_codes": stock_codes,

@@ -11,6 +11,7 @@ from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
 from trade_system.limit_rules import limit_threshold_sql
 from trade_system.source_authority import provider_rank
+from trade_system.units import normalization_sql
 
 logger = get_logger(__name__)
 
@@ -781,23 +782,15 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 high,
                 low,
                 close,
-                CASE lower(coalesce(nullif({tushare_volume_unit}, ''), 'unknown'))
-                    WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
-                    WHEN 'shares' THEN CAST(volume AS BIGINT)
-                    ELSE CAST(NULL AS BIGINT)
-                END AS volume,
-                CASE lower(coalesce(nullif({tushare_amount_unit}, ''), 'unknown'))
-                    WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
-                    WHEN 'yuan' THEN CAST(turnover AS BIGINT)
-                    ELSE CAST(NULL AS BIGINT)
-                END AS turnover,
+                {canonical_volume} AS volume,
+                {canonical_amount} AS turnover,
                 change_pct,
                 'D' AS ktype,
                 'tushare_daily' AS source_table,
                 false AS is_fallback,
                 fetched_at,
-                lower(coalesce(nullif({tushare_volume_unit}, ''), 'unknown')) AS volume_unit,
-                lower(coalesce(nullif({tushare_amount_unit}, ''), 'unknown')) AS amount_unit,
+                'shares' AS volume_unit,
+                'yuan' AS amount_unit,
                 coalesce(nullif({tushare_adjustment}, ''), 'none') AS adjustment,
                 coalesce(nullif({tushare_provider}, ''), 'unknown') AS provider
             FROM ({tushare_latest})
@@ -808,6 +801,8 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
             tushare_amount_unit=tushare_amount_unit,
             tushare_adjustment=tushare_adjustment,
             tushare_provider=tushare_provider,
+            canonical_volume=normalization_sql('volume', tushare_volume_unit, 'volume'),
+            canonical_amount=normalization_sql('turnover', tushare_amount_unit, 'amount'),
         )
         fallback_sql = None
         if _relation_has_rows(con, "kline"):
@@ -820,16 +815,8 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
             fallback_sql = f"""
                 SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, open, high,
                        low, close,
-                       CASE lower(coalesce(nullif({volume_unit}, ''), 'unknown'))
-                           WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
-                           WHEN 'shares' THEN CAST(volume AS BIGINT)
-                           ELSE CAST(NULL AS BIGINT)
-                       END AS volume,
-                       CASE lower(coalesce(nullif({amount_unit}, ''), 'unknown'))
-                           WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
-                           WHEN 'yuan' THEN CAST(turnover AS BIGINT)
-                           ELSE CAST(NULL AS BIGINT)
-                       END AS turnover,
+                       {normalization_sql('volume', volume_unit, 'volume')} AS volume,
+                       {normalization_sql('turnover', amount_unit, 'amount')} AS turnover,
                        change_pct,
                        upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
                        'kline' AS source_table, false AS is_fallback, fetched_at,
@@ -886,16 +873,8 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
                 high,
                 low,
                 close,
-                CASE lower(coalesce(nullif({volume_unit}, ''), 'unknown'))
-                    WHEN 'hands' THEN CAST(volume * 100 AS BIGINT)
-                    WHEN 'shares' THEN CAST(volume AS BIGINT)
-                    ELSE CAST(NULL AS BIGINT)
-                END AS volume,
-                CASE lower(coalesce(nullif({amount_unit}, ''), 'unknown'))
-                    WHEN 'thousand_yuan' THEN CAST(turnover * 1000 AS BIGINT)
-                    WHEN 'yuan' THEN CAST(turnover AS BIGINT)
-                    ELSE CAST(NULL AS BIGINT)
-                END AS turnover,
+                {normalization_sql('volume', volume_unit, 'volume')} AS volume,
+                {normalization_sql('turnover', amount_unit, 'amount')} AS turnover,
                 change_pct,
                 upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
                 'kline' AS source_table,

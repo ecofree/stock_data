@@ -14,6 +14,8 @@ def _ensure_business_indexes(db: duckdb.DuckDBPyConnection) -> None:
     non-unique performance index and the repair command can promote it later.
     New and repaired databases get unique indexes and reject duplicate writes.
     """
+    from trade_system.db_utils import guard_legacy_schema
+    guard_legacy_schema(db)
     indexes = (
         ("uq_multi_source_stock_flow", "multi_source_stock_flow", "source_date, stock_code, provider"),
         ("uq_multi_source_sector_flow", "multi_source_sector_flow", "source_date, sector_code, provider"),
@@ -42,6 +44,8 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
     successful provider checkpoint is not sufficient on its own: the source
     snapshot date must also be verified before it can enter the default view.
     """
+    from trade_system.db_utils import guard_legacy_schema
+    guard_legacy_schema(db)
     required = (
         "ths_concept_daily",
         "ths_concept_stock_history",
@@ -202,6 +206,8 @@ def _refresh_default_concept_views(db: duckdb.DuckDBPyConnection) -> None:
 
 def init_schema(db: duckdb.DuckDBPyConnection):
     """Initialize all tables for KPL data storage."""
+    from trade_system.db_utils import guard_legacy_schema
+    guard_legacy_schema(db)
     # The canonical runner applies numbered migrations before launching
     # collectors and marks child processes with this flag.  In that mode a
     # collector may use the already-open connection for business writes, but

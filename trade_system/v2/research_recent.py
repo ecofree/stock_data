@@ -10,10 +10,11 @@ from .gap_evidence import read_json, write_json
 
 
 def load_receipts(config, root):
-    from tools.v2 import research_campaign as campaign
+    from . import research_campaign as campaign
     source = config['sources']['receipts']
     folder = (Path(root) / source['path']).resolve()
-    reg, members, _, _ = campaign.replay(folder)
+    replayed = campaign.replay(folder)
+    reg, members, _, _ = replayed
     if identity(members) != source['manifest_id']:
         raise ValueError('frozen receipt manifest changed')
     capture = reg.get('config') or {}
@@ -21,7 +22,7 @@ def load_receipts(config, root):
     if (reg['origin'] != 'native_and_relay' or capture.get('codes') != expected_codes
             or capture.get('start') != config['start'] or capture.get('end') != config['end']):
         raise ValueError('receipt origin, range or frozen universe differs')
-    observed = campaign.derive(folder)
+    observed = campaign.derive(folder, replayed=replayed)
     days = observed['calendar']['SSE']
     if days != observed['calendar']['SZSE']:
         raise ValueError('exchange calendars differ')
@@ -59,7 +60,7 @@ def build_dataset(config, root, output):
     calculated['label_status'] = np.where(calculated.label_next_ret.notna(), 'retrospective_price_target_not_execution', 'missing_exact_target')
     # The independently fitted price model must not inherit Alpha158's 61-day
     # dependency. This does not change any identity/label of the paired study.
-    price_refit = calculated.copy()
+    price_refit = calculated.drop(columns=list(expressions)).copy()
     price_target_valid = calculated.price_eligible & (grouped.open.shift(-1) > 0) & (grouped.close.shift(-2) > 0) & np.isfinite(target)
     price_refit['label_next_ret'] = target.where(price_target_valid)
     price_refit['label_status'] = np.where(price_refit.label_next_ret.notna(), 'retrospective_price_target_not_execution', 'missing_exact_target')
@@ -67,8 +68,8 @@ def build_dataset(config, root, output):
     price_refit.to_parquet(output/'price-refit.parquet', index=False)
     calculated = calculated[calculated.datetime >= pd.Timestamp(days[60])].sort_values(['datetime', 'instrument'])
     calculated.to_parquet(output/'features.parquet', index=False)
-    _, _, after = load_receipts(config, root)
-    if summary['receipt_manifest_id'] != after['receipt_manifest_id']:
+    from .research_receipts import sealed
+    if summary['receipt_manifest_id'] != identity(sealed((Path(root)/config['sources']['receipts']['path']).resolve())):
         raise ValueError('receipts changed during build')
     meta = {'label_version':'exploratory_price_target_v1_not_formal_execution_labels',
         'label_definition':dataset.LABEL, 'availability_assumption':dataset.AVAILABILITY,
@@ -82,7 +83,6 @@ def build_dataset(config, root, output):
         'eligibility_contract':{'price_sessions':21, 'price_money_sessions':21, 'money_sessions':5,
             'alpha158_sessions':61, 'historical_paired_cohort_sessions':61}}
     write_json(output/'features.metadata.json', meta)
-    write_json(output/'dataset.json', meta)
     return meta
 
 
@@ -133,13 +133,45 @@ def publication_readiness(daily, top_k, nonempty, previous_nonempty):
         reasons.append('test_cross_section_not_larger_than_top_k')
     if nonempty < max(1, previous_nonempty):
         reasons.append('current_coverage_regresses')
-    return {'can_replace_current_model':not reasons, 'reasons':reasons,
+    structural = not reasons
+    if structural:
+        reasons.append('model_promotion_requires_separate_review')
+    return {'can_replace_current_model':False, 'structurally_eligible':structural, 'reasons':reasons,
         'test_days':len(counts), 'minimum_test_cross_section':min(counts) if counts else 0,
         'maximum_test_cross_section':max(counts) if counts else 0,
         'required_minimum_cross_section':top_k+1,
         'current_nonempty':nonempty, 'previous_nonempty':previous_nonempty,
         'scope':'structural_gate_added_after_initial_recent_run_not_proof_of_alpha',
         'execution_ready':False}
+
+
+def capacity_preflight(config, root):
+    """Read-only cohort/label capacity, before Alpha computation or model fitting."""
+    from .ml_protocol import rolling_partitions
+    from .price_study import price_features
+    if set(config['sources']) == {'receipts'}:
+        frame, days, summary = load_receipts(config, root)
+    else:
+        frame, days, summary = dataset.load_history(config, root)
+    computed = price_features({'rows':frame.to_dict('records'), 'calendar':{'SSE':days,'SZSE':days}}, days[60])
+    splits = config['split']
+    partition = rolling_partitions(days[60:-2], train_observations=splits['train'],
+        valid_observations=splits['valid'], test_observations=splits['test'],
+        final_holdout_observations=splits['holdout'])
+    test_days = sorted({day for fold in partition['folds'] for day in days
+        if fold['test_start'] <= day <= fold['test_end']})
+    families = {}
+    for name, column in [('price','price_eligible'), ('price_money','money_eligible'),
+                         ('alpha158_window','alpha158_window_eligible')]:
+        valid = computed[column] & computed.label_next_ret.notna()
+        counts = computed[valid].groupby('datetime').size()
+        daily = [{'date':day,'samples':int(counts.get(pd.Timestamp(day), 0))} for day in test_days]
+        families[name] = {'days':daily,'selection_days':sum(r['samples'] > 5 for r in daily),
+            'test_days':len(daily),'minimum_cross_section':min((r['samples'] for r in daily),default=0)}
+    return {'configuration_id':identity(config), 'summary':summary, 'families':families,
+        'partition':partition, 'source_sha256':file_hash(__file__),
+        'scope':'capacity_only_not_factor_validity_or_model_effectiveness',
+        'provider_requests':0, 'fits':0, 'execution_ready':False}
 
 
 def compare_previous(run, previous, config, result, plan):

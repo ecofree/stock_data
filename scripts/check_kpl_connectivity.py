@@ -12,6 +12,8 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from datetime import datetime, timezone
+import time
 from typing import Any
 
 import duckdb
@@ -71,6 +73,7 @@ def _infer_stock_code(db_path: str | Path) -> str:
 
 
 def run_probe(db_path: str | Path, trade_date: str, stock_code: str) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc).isoformat()
     client = KPLClient(request_timeout=12, max_attempts=1, total_budget_seconds=30)
     checks: list[dict[str, Any]] = []
     for name, endpoint, params in (
@@ -79,13 +82,21 @@ def run_probe(db_path: str | Path, trade_date: str, stock_code: str) -> dict[str
         ("market_rise_fall", "/market/rise-fall", {"date": trade_date}),
         ("index_zhishu_kline", "/index/zhishu-kline", {"code": "SH000001", "ktype": "d", "index": "0"}),
     ):
+        before = dict(client.stats)
+        started = time.monotonic()
         payload = client.get(endpoint, params, critical=True)
+        delta = {key: value - before.get(key, 0) for key, value in client.stats.items()}
+        count = _payload_count(payload)
+        reason = _check_reason(count, delta, getattr(client, "_circuit_open_reason", None))
         checks.append(
             {
                 "name": name,
                 "endpoint": endpoint,
-                "status": "data" if payload is not None and _payload_count(payload) > 0 else "unavailable",
-                "item_count": _payload_count(payload),
+                "status": "data" if count > 0 else "unavailable",
+                "item_count": count,
+                "reason": reason,
+                "stats_delta": delta,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
             }
         )
 
@@ -107,6 +118,10 @@ def run_probe(db_path: str | Path, trade_date: str, stock_code: str) -> dict[str
     else:
         status = "reachable_empty_or_unavailable"
     return {
+        "schema_version": 2,
+        "observed_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "four_legacy_routes_not_primary_provider_or_full_pipeline_acceptance",
         "status": status,
         "trade_date": trade_date,
         "stock_code": stock_code,
@@ -119,11 +134,33 @@ def run_probe(db_path: str | Path, trade_date: str, stock_code: str) -> dict[str
     }
 
 
+def _check_reason(count: int, delta: dict[str, int], circuit: str | None) -> str:
+    if count > 0:
+        return "verified_payload"
+    if delta.get("skipped"):
+        return "not_probed_budget_exhausted" if circuit == "total_budget_exceeded" else "not_probed_circuit_or_cooldown"
+    if delta.get("auth_error"):
+        return "authentication_or_route_permission_rejected"
+    if delta.get("route_error"):
+        return "route_not_found"
+    if delta.get("semantic_error"):
+        return "semantic_payload_rejected"
+    if delta.get("empty"):
+        return "empty_payload"
+    if delta.get("rate_limited"):
+        return "rate_limited"
+    if delta.get("error"):
+        return "transport_or_http_error"
+    return "unavailable_unclassified"
+
+
 def render_report(result: dict[str, Any]) -> str:
     lines = [
         "# KPL 连通性与数据 Canary",
         "",
         f"- status: `{result['status']}`",
+        f"- observed_at: `{result['observed_at']}`",
+        f"- completed_at: `{result['completed_at']}`",
         f"- api_host: `{result['api_host']}`",
         f"- trade_date: `{result['trade_date']}`",
         f"- stock_code: `{result['stock_code']}`",
@@ -133,12 +170,12 @@ def render_report(result: dict[str, Any]) -> str:
         "",
         "## 核心接口",
         "",
-        "| check | endpoint | status | item_count |",
-        "|---|---|---|---:|",
+        "| check | endpoint | status | item_count | reason | seconds |",
+        "|---|---|---|---:|---|---:|",
     ]
     for item in result["checks"]:
         lines.append(
-            f"| {item['name']} | `{item['endpoint']}` | {item['status']} | {item['item_count']} |"
+            f"| {item['name']} | `{item['endpoint']}` | {item['status']} | {item['item_count']} | {item['reason']} | {item['elapsed_seconds']} |"
         )
     lines.extend(
         [
@@ -161,7 +198,7 @@ def main() -> int:
     parser.add_argument("--date", default="", help="Trading date; defaults to newest local snapshot.")
     parser.add_argument("--stock-code", default="", help="Stock code for K-line canary; defaults to a local core code.")
     parser.add_argument("--out", default=str(ROOT / "reports" / "kpl_connectivity_latest.md"))
-    parser.add_argument("--json-out", default=str(ROOT / "reports" / "kpl_connectivity_latest.json"))
+    parser.add_argument("--json-out", default="", help="Defaults beside --out, never a shared global path.")
     args = parser.parse_args()
 
     selected_date = args.date or latest_local_trade_date(args.db, TODAY)
@@ -170,7 +207,7 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
-    json_out = Path(args.json_out)
+    json_out = Path(args.json_out) if args.json_out else out.with_suffix(".json")
     json_out.parent.mkdir(parents=True, exist_ok=True)
     json_out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"kpl_connectivity_status={result['status']}")

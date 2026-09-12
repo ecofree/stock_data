@@ -22,7 +22,9 @@ class _EmbeddedJsonParser(HTMLParser):
         values = dict(attrs)
         if tag == "script" and values.get("type") == "application/json" and values.get("id"):
             self.current = str(values["id"])
-            self.buffers.setdefault(self.current, [])
+            if self.current in self.buffers:
+                raise ValueError("duplicate inline payload id")
+            self.buffers[self.current] = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script":
@@ -45,7 +47,15 @@ def _embedded_json(html_text: str) -> dict[str, Any]:
 def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) -> dict[str, Any]:
     path = Path(html_path)
     text = path.read_text(encoding="utf-8")
-    embedded = _embedded_json(text)
+    try:
+        embedded = _embedded_json(text)
+    except (ValueError, json.JSONDecodeError):
+        return {"status": "fail", "trade_date": trade_date,
+                "artifact": str(path.resolve()), "size_bytes": path.stat().st_size,
+                "latest_day": "", "concepts": 0, "limit_up_concepts": 0,
+                "limit_up_pairs": 0, "initial_concept_rows": 0,
+                "membership_snapshot": "", "concept_coverage_pct": 0,
+                "failures": ["inline_payload_invalid_or_duplicate"], "warnings": []}
     trail = embedded.get("trail-data") or {}
     details = embedded.get("trail-details") or {}
     concept_groups: list[dict[str, Any]] = []

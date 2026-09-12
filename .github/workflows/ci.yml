@@ -22,10 +22,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Lint (ruff)
-        run: python -m ruff check --select E9,F63,F7,F82,F401,F841 .
-      - name: Lint (migrations)
-        run: python scripts/lint_migrations.py
       - name: Installed package entry points (offline build)
         run: |
           python -m pip install --require-hashes -r requirements-build.lock
@@ -40,10 +36,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & tmp/core-runtime/Scripts/python.exe -m pip install --no-index --no-deps $taskWheel.FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & tmp/core-runtime/Scripts/python.exe -m pip check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & tmp/core-runtime/Scripts/python.exe -I tools/v2/probe_installed.py --minimal-runtime
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The delivery verifier owns lint, migrations, installed dependency checks,
+          # the installed entrypoint probe and the single full test run.
           python tools/v2/verify_delivery.py --output tmp/delivery --installed-python tmp/core-runtime/Scripts/python.exe --wheel $taskWheel.FullName --minimal-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve test evidence

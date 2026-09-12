@@ -10,22 +10,44 @@ into explicit fields.
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
+from trade_system.units import _number as number, normalize_amount
 
 
 FLOW_MAPPING_VERSION = "stock_flow_v3_explicit_units"
 DEFAULT_AMOUNT_UNIT = "yuan"
 
+SECTOR_TAXONOMIES = {
+    'em_industry': ('eastmoney.industry', 'provider_reported', 'main_orders_net'),
+    'ths_industry': ('ths.industry', 'provider_reported', 'sector_total_net'),
+    'ths_concept': ('ths.concept', 'provider_reported', 'declared_sector_flow'),
+    'ths_concept_derived': ('ths.concept', 'member_aggregate', 'sum_member_main_orders_net'),
+}
 
-def number(value: Any) -> float | None:
-    try:
-        if value in (None, "", "-"):
-            return None
-        parsed = float(value)
-        return parsed if math.isfinite(parsed) else None
-    except (TypeError, ValueError):
-        return None
+
+def normalize_sector_flow_row(row: dict, provider: str) -> dict:
+    """Explicit taxonomy/measure identity; unknown types never become EM by prefix."""
+    defaults = {'eastmoney':'em_industry', 'eastmoney_sector_full':'em_industry',
+                'derived_ths_stock_aggregate':'ths_concept_derived'}
+    raw_type = row.get('sector_type')
+    kind = str(raw_type or defaults.get(provider) or 'unknown')
+    contract = SECTOR_TAXONOMIES.get(kind)
+    source_unit = row.get('amount_unit') or ('yuan' if provider in defaults else 'unknown')
+    result = {field:normalize_amount(row.get(field), source_unit)
+              for field in ('main_net','super_net','large_net','mid_net','small_net')}
+    raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
+    reason = 'unsupported_taxonomy' if not contract else None
+    if reason is None and not any(value is not None for value in result.values()):
+        reason = 'no_finite_declared_flow'
+    result.update(sector_type=kind if contract else 'unknown', raw_sector_type=raw_type,
+        taxonomy_namespace=contract[0] if contract else None,
+        aggregation_kind=contract[1] if contract else None,
+        flow_definition=contract[2] if contract else None,
+        amount_unit='yuan', source_amount_unit=source_unit,
+        mapping_version='sector-flow-contract-v1',
+        quality_reason=reason,
+        catalogue_version=row.get('catalogue_version') or raw.get('membership_snapshot_date'))
+    return result
 
 
 def _raw_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -131,12 +153,12 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
 
     origin_provider = str(row.get("origin_provider") or raw.get("_src") or provider or "unknown")
     return {
-        "main_net": main_net,
-        "net_total": reported_total,
-        "super_net": super_net,
-        "large_net": large,
-        "mid_net": mid,
-        "small_net": small,
+        "main_net": number(main_net),
+        "net_total": number(reported_total),
+        "super_net": number(super_net),
+        "large_net": number(large),
+        "mid_net": number(mid),
+        "small_net": number(small),
         "amount_unit": "yuan" if known_unit else str(declared or 'unknown'),
         "flow_unit": "CNY" if known_unit else None,
         "turnover_unit": "CNY" if row.get('turnover_unit') in yuan_units else None,

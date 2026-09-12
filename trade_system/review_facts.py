@@ -16,6 +16,30 @@ from trade_system.quality import table_exists
 from trade_system.review_metrics import metric_contract
 
 
+def workspace_snapshot(context: dict) -> dict:
+    """Project an already built review context; never query or decide in the view."""
+    from trade_system.daily_review import build_review_narrative
+    from trade_system.review_queries import _BROAD_TRAIL_CONCEPTS
+    from trade_system.v2.domain import identity
+    story=build_review_narrative(context)
+    groups=(context.get('concept_limit_up') or {}).get('groups',[])
+    themes=[]
+    for row in groups:
+        count=row.get('member_count')
+        if row.get('concept_name') in _BROAD_TRAIL_CONCEPTS or not isinstance(count,(int,float)) or not 0<count<=800:
+            continue
+        themes.append({k:row.get(k) for k in ('concept_code','concept_name','member_count','limit_up_count','max_board','limit_up_stocks')})
+    value={'schema':1,'scope':'read_only_market_review_not_execution',
+        'trade_date':str(context['trade_date']),'as_of':str(context.get('review_as_of') or context.get('generated_at') or 'unknown'),
+        'breadth':story['breadth'],'regime':story['regime'],
+        'themes':themes,'theme_scope':'qualified_focused_concepts_with_limit_up_members_not_all_stock_universe',
+        'source_groups':len(groups),'excluded_broad_or_unknown_members':len(groups)-len(themes),
+        'missing':story['missing'],'account_state':'unknown','execution_ready':False}
+    # Convert date/Decimal query values without turning missing fields into zero.
+    value=json.loads(json.dumps(value,ensure_ascii=False,default=str,allow_nan=False))
+    return dict(value,snapshot_id=identity(value))
+
+
 def _trend_series(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
     trend: dict[str, Any] = {
         "dates": [], "limit_up": [], "limit_down": [], "broken_rate": [],

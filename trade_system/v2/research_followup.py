@@ -23,7 +23,11 @@ def evaluate(prediction, frame, calendar, received_at):
     if not model_frozen<=frozen<=received or frozen<signal:
         raise ValueError('model and prediction receipt order invalid')
     result={'prediction_id':prediction['prediction_id'],'prediction_date':prediction['date'],
-        'received_at':received_at,'rows':[],'paired':0,'status':'pending_exact_future_sessions',
+        'received_at':received_at,'rows':[{'instrument':r['instrument'],
+            'prediction':r['prediction'],'baseline_momentum_20d':r.get('baseline_momentum_20d'),
+            'target_pct':None,'error_pct':None,'entry_date':None,'exit_date':None,
+            'status':'pending_exact_future_sessions'} for r in prediction['rows']],
+        'paired':0,'status':'pending_exact_future_sessions',
         'execution_ready':False,'target_scope':'adjusted_price_target_not_executable_return'}
     if prediction.get('prospective_eligible') is False:
         result['status']='not_prospective';return result
@@ -37,6 +41,7 @@ def evaluate(prediction, frame, calendar, received_at):
     if received<pd.Timestamp(t2+'T16:00:00',tz='Asia/Shanghai'): return result
     grid=frame.copy(); grid['datetime']=pd.to_datetime(grid.datetime).dt.strftime('%Y-%m-%d')
     grid=grid.set_index(['instrument','datetime'])
+    result['rows']=[]
     for row in prediction['rows']:
         code=row['instrument']; target=None; state='missing_exact_future_price'
         try:
@@ -53,7 +58,8 @@ def evaluate(prediction, frame, calendar, received_at):
     result['status']='mature' if all(r['target_pct'] is not None for r in result['rows']) else 'partial_missing_prices'
     paired=[r for r in result['rows'] if r['target_pct'] is not None and r['prediction'] is not None and r['baseline_momentum_20d'] is not None]
     result['common_rule_model_samples']=len(paired)
-    if paired:
+    result['selection_eligible']=len(paired)>=6
+    if len(paired)>=6:
         model_top=sorted(paired,key=lambda r:(-r['prediction'],r['instrument']))[:5]
         rule_top=sorted(paired,key=lambda r:(-r['baseline_momentum_20d'],r['instrument']))[:5]
         result['comparison']={'model_top5_target_pct':float(np.mean([r['target_pct'] for r in model_top])),

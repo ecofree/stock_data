@@ -16,6 +16,7 @@ from trade_system.db_utils import fetch_dicts as _fetch_dicts
 from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
 from trade_system.source_authority import provider_rank_sql
+from trade_system.units import normalization_sql
 
 logger = get_logger(__name__)
 
@@ -39,7 +40,43 @@ def _latest_date(con: duckdb.DuckDBPyConnection) -> str:
     return ""
 
 
-def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
+def _apply_qualified_concept_flow(result, con, trade_date, *, now=None):
+    from zoneinfo import ZoneInfo
+    from trade_system.concept_flow import (qualified_concept_review, matched_concept_history,
+        explain_concept_candidates, concept_source_evidence)
+    if now is not None and now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+    qualified = qualified_concept_review(con, trade_date, now=now)
+    rows, contract = qualified['rows'], qualified['contract']
+    result['qualified_concept_flow'] = qualified
+    result['sector_inflow'] = sorted((r for r in rows if r['main_net']>0),
+        key=lambda r:(-r['main_net'],r['sector_code']))[:10]
+    result['sector_outflow'] = sorted((r for r in rows if r['main_net']<0),
+        key=lambda r:(r['main_net'],r['sector_code']))[:10]
+    history = matched_concept_history(con, trade_date, qualified, now=now)
+    result['concept_history'] = history
+    matched = [r for r in history['rows'] if r['history_status']=='matched']
+    result['sector_flow_persistence'] = sorted((r for r in matched if r['flow_streak']>=2),
+        key=lambda r:(-r['flow_streak'],-r['main_net'],r['sector_code']))[:10]
+    result['sector_flow_persistence_outflow'] = sorted((r for r in matched if r['main_net']<0),
+        key=lambda r:(r['main_net'],r['sector_code']))[:10]
+    result['candidate_picks'] = explain_concept_candidates(result.get('candidate_picks',[]),qualified,history)
+    result['concept_source_evidence'] = concept_source_evidence(con,trade_date)
+    mode = '显式历史重放' if now is not None else '当前时间校验'
+    eligible = len(rows)
+    excluded = len(contract.get('excluded_concepts', []))
+    result.setdefault('coverage_alerts', []).append(
+        f"概念资金排名仅含成员资金完整的 {eligible}/{contract.get('expected_rows',0)} 个概念；"
+        f"排除 {excluded} 个。{mode}：{contract.get('evaluated_at','不可用')}（上海时间）；"
+        "仅为该子集内资金排序，不代表全市场或选股优势。")
+    result['coverage_alerts'].append(f"同口径持续性：{len(matched)} 个概念匹配 {len(history['sessions'])} 个交易日，"
+        "固定成员及逐股来源口径，仅作历史描述，不是当时可见性或收益证明。来源在线权限未重新验证。")
+    if contract.get('error'):
+        result['coverage_alerts'].append(f"概念资金校验：{contract.get('missing_stock_count',0)} 只成员缺少合格资金；其他异常见排除名单。")
+    return result
+
+
+def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str, *, now=None) -> dict[str, Any]:
     """Build the explicit daily fund-flow review contract.
 
     Rows are deduplicated by asset code before ranking.  Sector rankings are
@@ -57,7 +94,6 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
         "lhb": [], "coverage_alerts": [],
     }
     stock_provider_order = provider_rank_sql("stock_flow", "f.provider")
-    sector_provider_order = provider_rank_sql("sector_flow", "provider")
     if table_exists(con, "multi_source_stock_flow"):
         result["stock_flow_meta"] = _fetch_dicts(
             con,
@@ -135,6 +171,11 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
             pass
 
     if table_exists(con, "multi_source_sector_flow"):
+        unsupported = con.execute("""SELECT count(*) FROM multi_source_sector_flow
+            WHERE source_date=CAST(? AS DATE)
+              AND coalesce(sector_type,'unknown') NOT IN ('em_industry','ths_concept','ths_concept_derived')""", [trade_date]).fetchone()[0]
+        if unsupported:
+            result['coverage_alerts'].append(f'{unsupported} 条板块来源记录未进入主力排名：分类或指标口径未认证；保留原始资料，不按代码前缀改成行业。')
         result["sector_flow_meta"] = _fetch_dicts(
             con,
             """
@@ -148,41 +189,7 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
             """,
             [trade_date, trade_date, trade_date],
         )[0]
-        sector_sql = f"""
-            WITH ranked AS (
-                SELECT sector_code, sector_name, sector_type, main_net, change_pct,
-                       provider, fetched_at,
-                       row_number() OVER (
-                           PARTITION BY sector_code
-                           ORDER BY {sector_provider_order} ASC,
-                                    fetched_at DESC NULLS LAST
-                       ) AS provider_rank
-                FROM multi_source_sector_flow
-                WHERE source_date=CAST(? AS DATE)
-                  AND coalesce(is_stale,FALSE)=FALSE
-                  AND sector_type IN ('ths_concept','ths_concept_derived')
-                  AND (
-                        provider <> 'derived_ths_stock_aggregate'
-                        OR json_extract_string(raw_json, '$.raw.membership_snapshot_date') = (
-                            SELECT CAST(max(trade_date) AS VARCHAR)
-                            FROM v_default_concept_stock_history
-                            WHERE trade_date <= CAST(? AS DATE)
-                        )
-                      )
-            )
-            SELECT sector_code, sector_name, sector_type, main_net, change_pct,
-                   provider, fetched_at
-            FROM ranked
-            WHERE provider_rank=1
-            ORDER BY main_net {{direction}} NULLS LAST LIMIT 10
-        """
         try:
-            result["sector_inflow"] = _fetch_dicts(
-                con, sector_sql.format(direction="DESC"), [trade_date, trade_date]
-            )
-            result["sector_outflow"] = _fetch_dicts(
-                con, sector_sql.format(direction="ASC"), [trade_date, trade_date]
-            )
             industry_sql = """
                 SELECT sector_code, sector_name, sector_type, main_net, change_pct,
                        provider, fetched_at
@@ -404,7 +411,7 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dic
         result["coverage_alerts"].append(
             f"板块资金流覆盖 {sector_meta.get('batch_coverage_pct', 0)}%，低于 99.5%"
         )
-    return result
+    return _apply_qualified_concept_flow(result, con, trade_date, now=now)
 
 
 _BROAD_TRAIL_CONCEPTS = (
@@ -1194,14 +1201,16 @@ def _sector_trail_review(
             # Going through v_kline_daily here forces DuckDB to evaluate the
             # fallback union and its all-history window even for a 20-day
             # review, which was the main source of post-QLib memory spikes.
-            kline_sql = """
+            amount_unit = 'k.amount_unit' if 'amount_unit' in table_columns(con, 'tushare_daily') else "'unknown'"
+            amount_sql = normalization_sql('k.turnover', amount_unit, 'amount')
+            kline_sql = f"""
                 kline AS (
                     SELECT d, stock_code, close, change_pct, turnover
                     FROM (
                         SELECT CAST(k.date AS DATE) AS d,
                                regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '') AS stock_code,
                                k.close, k.change_pct,
-                               CAST(k.turnover * 1000 AS DOUBLE) AS turnover,
+                               {amount_sql} AS turnover,
                                row_number() OVER (
                                    PARTITION BY CAST(k.date AS DATE),
                                        regexp_replace(CAST(k.stock_code AS VARCHAR), '[.].*$', '')
@@ -1430,7 +1439,7 @@ def _sector_trail_review(
                                row_number() OVER (
                                    PARTITION BY source_date,
                                        regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '')
-                                   ORDER BY fetched_at DESC NULLS LAST
+                                   ORDER BY {provider_rank_sql('stock_flow')}, fetched_at DESC NULLS LAST, provider
                                ) AS rn
                         FROM multi_source_stock_flow
                         WHERE source_date IN ({date_ph})
@@ -1482,8 +1491,10 @@ def _sector_trail_review(
                 "board_level": item.get("board_level"),
                 "limit_up_time": item.get("limit_up_time"),
                 "pct_chg": item.get("change_pct"),
-                "turnover": item.get("turnover_rate")
-                if item.get("turnover_rate") is not None else item.get("turnover"),
+                "turnover_rate_pct": item.get("turnover_rate"),
+                "trade_amount_cny": item.get("turnover"),
+                # Compatibility aliases retain one dimension, never fall back.
+                "turnover": item.get("turnover_rate"),
                 "amount": item.get("turnover"),
                 "main_net": item.get("main_net"),
             }

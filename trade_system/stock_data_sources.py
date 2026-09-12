@@ -134,29 +134,8 @@ def _from_tencent_quote(codes):
     字段索引见 _TENCENT_Q / _from_tencent_valuation。"""
     if isinstance(codes, str):
         codes = [codes]
-    q = ",".join(_qt_code(c) for c in codes)
-    out = subprocess.run(
-        ["curl", "-s", "-4", "--compressed", "-m", "12", "-H", f"User-Agent: {UA}",
-         f"https://qt.gtimg.cn/q={q}"], capture_output=True, timeout=20)
-    # 注意：腾讯行情返回 GBK 编码（含中文股票名），必须按字节读再 gbk 解码，
-    # 不能 text=True（utf-8 会 UnicodeDecodeError 导致整条取值失败）。
-    text = out.stdout.decode("gbk", "ignore")
-    result = {}
-    for line in text.split(";"):
-        if "=" not in line:
-            continue
-        _, _, payload = line.partition("=")
-        payload = payload.strip().strip('"')
-        if not payload:
-            continue
-        parts = payload.split("~")
-        if len(parts) < 49:
-            continue
-        code = parts[2] if len(parts) > 2 else ""
-        if not code:
-            continue
-        result[code] = parts
-    return result or None
+    from trade_system.quote_transport import fetch_parts
+    return fetch_parts(codes) or None
 
 
 # 腾讯 qt.gtimg.cn 字段索引（2026-07-12 实测 sh600519 / sz000001 校准：茅台总市值 15063 亿、平安 2027 亿吻合）
@@ -186,7 +165,7 @@ def _from_tencent_valuation(code):
         except (ValueError, IndexError):
             return None
 
-    return {
+    result = {
         "code": parts[2],
         "name": parts[1],
         "price": g("price"), "pre_close": g("pre_close"), "open": g("open"),
@@ -194,10 +173,13 @@ def _from_tencent_valuation(code):
         "amount": g("amount_wan"), "change": g("change"), "change_pct": g("change_pct"),
         "turnover": g("turnover"), "pe_ttm": g("pe_ttm"), "pb": g("pb"),
         "total_mv": g("total_mv_yi"), "circ_mv": g("circ_mv_yi"),
-        "total_mv_unit": "billion_yuan", "circ_mv_unit": "billion_yuan",
+        "total_mv_unit": "100m_yuan", "circ_mv_unit": "100m_yuan",
         "limit_up": g("limit_up"), "limit_down": g("limit_down"),
-        "time": parts[_TENCENT_Q["time"]], "_src": "tencent",
+        "time": parts[_TENCENT_Q["time"]], "_src": "tencent", "raw": parts,
     }
+    from trade_system.units import market_caps
+    result.update(market_caps(result))
+    return result
 
 
 # ---------------------------------------------------------------- 8) 股票列表参考镜像（Tushare 中继）

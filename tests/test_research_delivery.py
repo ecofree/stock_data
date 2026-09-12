@@ -137,7 +137,7 @@ def test_http_refuses_foreign_host_origin_csrf_and_paths(tmp_path,monkeypatch):
         conn=http.client.HTTPConnection('127.0.0.1',port,timeout=3);conn.request('GET','/')
         response=conn.getresponse();html=response.read().decode();conn.close()
         token=re.search(r'value="([^"]+)"',html).group(1)
-        form={'csrf':token,'prediction_id':prediction()['prediction_id'],'instrument':'000001','intent':'observe',
+        form={'csrf':token,'request_id':'1'*32,'prediction_id':prediction()['prediction_id'],'instrument':'000001','intent':'observe',
             'operator':'SYNTHETIC TEST ONLY','hypothesis':'test','invalidation':'test'}
         assert request('/note','POST',headers,urlencode(form))==303
         assert len(list((tmp_path/'notes').glob('*.json')))==1

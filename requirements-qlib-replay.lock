@@ -1,0 +1,15 @@
+# Windows CPython 3.12 only: runtime registered by the current frozen model.
+# First install requirements-core.lock and requirements-qlib.lock with hashes.
+# Then remove sparsediffpy (only required by the newer CVXPY in the base lock),
+# apply this overlay with --no-deps --require-hashes and run pip check.
+# Never change a frozen experiment registration to bypass runtime validation.
+numpy==1.26.4 \
+    --hash=sha256:08beddf13648eb95f8d867350f6a018a4be2e5ad54c8d8caed89ebca558b2818
+pandas==2.2.2 \
+    --hash=sha256:d187d355ecec3629624fccb01d104da7d7f391db0311145817525281e2804d23
+lightgbm==4.6.0 \
+    --hash=sha256:37089ee95664b6550a7189d887dbf098e3eadab03537e411f52c63c121e3ba4b
+cvxpy==1.6.7 \
+    --hash=sha256:b5dce884e4dcaf12499d69ef39738f1b1051ebafb7d122512eca282d07107c2e
+pytz==2024.1 \
+    --hash=sha256:328171f4e3623139da4983451950b28e95ac706e13f3f2630a879749e7a8b319

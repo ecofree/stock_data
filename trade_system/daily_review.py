@@ -100,8 +100,11 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     breadth = _breadth_snapshot(context)
 
     regime_name = str(regime.get("regime_name") or regime.get("regime") or "未知")
-    top_concept = (concepts[0].get("concept_name") if concepts else None) or None
-    top_limit_up = concepts[0].get("limit_up_count") if concepts else None
+    from .review_queries import _BROAD_TRAIL_CONCEPTS as BROAD_CONCEPTS
+    focused = [c for c in concepts if c.get("concept_name") not in BROAD_CONCEPTS
+               and 0 < int(c.get("member_count") or 0) <= 800]
+    top_concept = (focused[0].get("concept_name") if focused else None) or None
+    top_limit_up = focused[0].get("limit_up_count") if focused else None
     missing = [str(item) for item in (readiness.get("missing_groups") or []) if item]
     blocked = not readiness.get(
         "analysis_ready", readiness.get("certified_ready", False)
@@ -382,7 +385,7 @@ def build_daily_review_context(
             """,
             [selected_date],
         )
-        capital_flow = _capital_flow_review(con, selected_date)
+        capital_flow = _capital_flow_review(con, selected_date, now=review_now)
         concept_limit_up = _concept_limit_up_review(con, selected_date)
         market_context = _market_context_review(con, selected_date)
         data_sources = _data_source_review(con, selected_date)

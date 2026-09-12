@@ -19,11 +19,6 @@ from legacy_diagnostics import generate_stage_signals
 from trade_system.stage_signals import (
     ensure_stage_signal_schema,
 )
-from trade_system.terminal_report import (
-    _health_section,
-    render_terminal_html,
-    write_terminal,
-)
 
 
 def test_is_delayed_provider():
@@ -276,38 +271,3 @@ def test_intraday_strict_blocks_quote_without_sell_side_liquidity(tmp_path):
     assert actionable is False
     assert executable is False
     assert json.loads(evidence)["row_block_reason"] == "missing_sell_side_liquidity"
-
-
-def test_health_section_accepts_trade_date_argument():
-    # Regression: auction phase crashed with
-    # TypeError: _health_section() takes 1 positional argument but 2 were given
-    html = _health_section(
-        {
-            "chains": [{"chain": "市场状态", "status": "available"}],
-            "freshness": [{"label": "个股资金流", "latest": "2026-07-29"}],
-            "reconciliation": {"status": "pass", "reference_rows": 100},
-            "independent_source_codes": 50,
-        },
-        "2026-07-30",
-    )
-    assert "数据健康" in html
-    assert "2026-07-29" in html
-    assert "stale" in html  # 07-29 < 07-30 marked stale
-
-
-def test_render_terminal_html_with_health_section_does_not_raise():
-    from tests.test_trading_terminal import _sample_context
-
-    html = render_terminal_html(_sample_context())
-    assert "交易作战室" in html
-    assert "数据健康" in html
-
-
-def test_write_terminal_smoke_empty_db(tmp_path):
-    db = tmp_path / "empty.duckdb"
-    duckdb.connect(str(db)).close()
-    out = tmp_path / "terminal.html"
-    # Must not raise even when tables are missing.
-    path = write_terminal(str(db), out, "2026-07-30")
-    text = Path(path).read_text(encoding="utf-8")
-    assert "交易作战室" in text

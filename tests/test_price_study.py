@@ -38,6 +38,15 @@ def test_price_conflict_not_cleared_by_factor_supplement():
     assert result['rows'][0]['close'] is None
 
 
+def test_supplement_second_security_uses_same_contract_not_case_code():
+    source,raw,factors,request=inputs()
+    request['code']='600276.SH'
+    for row in source['rows']: row['instrument']='600276'
+    raw={('600276.SH',day):values for (_,day),values in raw.items()}
+    result,dates=study.supplement_rows(source,raw,factors,request,{'declared':'second frozen scope'})
+    assert len(dates)==2 and result['rows'][0]['close']==22
+
+
 @pytest.mark.parametrize('kind',['overwrite','missing_date','extra_date','wrong_code','wrong_api','zero','infinity'])
 def test_factor_supplement_refuses_unapproved_or_incomplete_input(kind):
     source,raw,factors,request=inputs()

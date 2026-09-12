@@ -2,6 +2,7 @@
 from copy import deepcopy
 from pathlib import Path
 import uuid
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,9 +15,12 @@ from .gap_evidence import read_json, write_json
 def supplement_rows(observed, raw_native, factors, request, lineage):
     """Only a missing factor may be supplied; existing conflicts remain exclusions."""
     result = deepcopy(observed)
-    code = request['code'].split('.')[0]
-    expected = [d for d in observed['calendar']['SZSE'] if request['start'] <= d <= request['end']]
-    if request['code'] != '002414.SZ' or request['api'] != 'adj_factor' or sorted(factors) != expected:
+    if not re.fullmatch(r'\d{6}\.(SZ|SH)', request['code']):
+        raise ValueError('explicit supported security required')
+    code, exchange = request['code'].split('.')
+    expected = [d for d in observed['calendar']['SZSE' if exchange == 'SZ' else 'SSE']
+                if request['start'] <= d <= request['end']]
+    if not expected or request['api'] != 'adj_factor' or sorted(factors) != expected:
         raise ValueError('exact approved security and complete factor dates required')
     if any(not np.isfinite(float(r['adj_factor'])) or number(r['adj_factor']) <= 0 for r in factors.values()):
         raise ValueError('positive finite factors required')
@@ -44,16 +48,21 @@ def supplement_rows(observed, raw_native, factors, request, lineage):
     return result, supplied
 
 
-def recover(base, donor):
-    from tools.v2 import research_campaign as campaign
+def recover(base, donor, *, request=None):
+    from . import research_campaign as campaign
     base, donor = Path(base), Path(donor)
     reg, members, parsed, statuses = campaign.replay(base)
     donor_reg, donor_members, donor_parsed, donor_statuses = campaign.replay(donor)
     if reg['origin'] != 'native_and_relay' or donor_reg['origin'] != 'native_and_relay':
         raise ValueError('real sealed receipts required')
-    wanted = lambda r: r.get('code') == '002414.SZ' and r.get('api') == 'adj_factor' and r.get('start') == '2026-06-14' and r.get('end') == '2026-09-11'
-    matches = [i for i,r in enumerate(reg['requests']) if wanted(r)]
-    donor_matches = [i for i,r in enumerate(donor_reg['requests']) if wanted(r)]
+    matches = [i for i,r in enumerate(reg['requests']) if r.get('api') == 'adj_factor'
+        and statuses[i]['status'] == 'failed' and (request is None or r == request)
+        and any(r == other and donor_statuses[j]['status'] == 'observed'
+                for j, other in enumerate(donor_reg['requests']))]
+    if len(matches) != 1:
+        raise ValueError('one unambiguous failed factor request required; select an exact request otherwise')
+    selected = reg['requests'][matches[0]]
+    donor_matches = [i for i,r in enumerate(donor_reg['requests']) if r == selected]
     if len(matches) != 1 or len(donor_matches) != 1:
         raise ValueError('exact single approved request required')
     i, j = matches[0], donor_matches[0]
@@ -62,6 +71,7 @@ def recover(base, donor):
     filename = f'receipt-{j:02d}.json'
     receipt = read_json(donor/filename)[0]
     lineage = {'base_folder':str(base.resolve()), 'base_manifest_id':identity(members), 'failed_index':i,
+        'security':selected['code'], 'request':selected,
         'donor_folder':str(donor.resolve()), 'donor_manifest_id':identity(donor_members),
         'donor_file':filename, 'donor_sha256':donor_members[filename], 'received_at':receipt['received_at'],
         'supplemented_at':now_utc().isoformat(), 'not_a_new_provider_response':True}
@@ -166,7 +176,7 @@ def run(root, output, donor):
         'candidate_inference':{'model_id':candidate['model_id'],'date':observed['calendar']['SSE'][-1],
             'nonempty':nonempty,'rows':[{'instrument':r['instrument'],'prediction':float(r['prediction']) if pd.notna(r['prediction']) else None} for r in current.to_dict('records')]},
         'active_model_changed':False,'execution_ready':False}
-    from tools.v2 import research_campaign as campaign
+    from . import research_campaign as campaign
     if identity(campaign.sealed(base))!=recovery['base_manifest_id'] or identity(campaign.sealed(donor))!=recovery['donor_manifest_id']:
         raise ValueError('receipt batches changed during study')
     write_json(folder/'result.json',value)

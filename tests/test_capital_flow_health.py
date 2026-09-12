@@ -4,6 +4,27 @@ from datetime import datetime
 from trade_system.capital_flow_health import assess_capital_flow_health
 
 
+def test_explicit_ttl_is_not_disabled_by_selecting_old_trade_date(tmp_path):
+    db = tmp_path/'ttl.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE multi_source_stock_flow(source_date DATE, stock_code VARCHAR, main_net DOUBLE, fetched_at TIMESTAMP)')
+        con.execute("INSERT INTO multi_source_stock_flow VALUES ('2026-09-11','000001',100,'2026-09-11 15:00:00')")
+    expired = assess_capital_flow_health(db,'2026-09-11',max_age_seconds=7200,now=datetime(2026,9,12,10))
+    assert expired['effective_max_age_seconds'] == 7200
+    assert expired['stock_flow']['observed_codes'] == 0
+    historical = assess_capital_flow_health(db,'2026-09-11',max_age_seconds=7200,now=datetime(2026,9,11,16))
+    assert historical['stock_flow']['observed_codes'] == 1
+
+
+def test_stale_and_nonfinite_rows_do_not_count_as_usable_flow():
+    from trade_system.capital_flow_health import _relation_health
+    with duckdb.connect(':memory:') as con:
+        con.execute('CREATE TABLE multi_source_stock_flow(source_date DATE, stock_code VARCHAR, main_net DOUBLE, fetched_at TIMESTAMP, is_stale BOOLEAN)')
+        con.execute("INSERT INTO multi_source_stock_flow VALUES ('2026-09-11','A',100,'2026-09-11 15:00:00',true), ('2026-09-11','B','NaN','2026-09-11 15:00:00',false)")
+        result = _relation_health(con,'multi_source_stock_flow','2026-09-11','stock_code',now=datetime(2026,9,11,16))
+        assert result['codes'] == 0
+
+
 def test_capital_flow_historical_as_of_rejects_future_writes(tmp_path):
     db_path = tmp_path / "future-flow.duckdb"
     con = duckdb.connect(str(db_path))
@@ -164,7 +185,7 @@ def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path):
     assert result["ready"] is True
 
 
-def test_capital_flow_health_accepts_complete_partial_sector_batch(tmp_path):
+def test_capital_flow_health_rejects_count_complete_partial_sector_batch(tmp_path):
     db_path = tmp_path / "complete-partial-sector.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -193,5 +214,5 @@ def test_capital_flow_health_accepts_complete_partial_sector_batch(tmp_path):
 
     result = assess_capital_flow_health(db_path, "2026-07-16")
 
-    assert result["sector_flow"]["ready"] is True
-    assert result["ready"] is True
+    assert result["sector_flow"]["ready"] is False
+    assert result["ready"] is False
