@@ -3,69 +3,55 @@
   "architecture_m0_m3": {
     "approved": true,
     "baseline_commit": "f414108f235df590734d2acb5061b6adec60f7ea",
-    "baseline_remote_ci": {"run_id":34736515443,"passed":1579,"failed":7,"skipped":1,"source":"provided_and_hash_verified_audit_artifact"},
-    "status":"implementation_in_progress_not_delivery_acceptance",
-    "m0":"local_targeted_parquet_and_mandatory_research_checks_passed_remote_pending",
-    "m1":"pending","m2":"pending","m3":"pending",
-    "plan":"docs/v2/ARCHITECTURE_EXECUTION_PLAN_20260913.md",
-    "handover":"docs/v2/ARCHITECTURE_HANDOVER_20260913.md"
+    "baseline_remote_ci": {
+      "run_id": 34736515443,
+      "passed": 1579,
+      "failed": 7,
+      "skipped": 1,
+      "source": "provided_and_hash_verified_audit_artifact"
+    },
+    "status": "implementation_in_progress_not_delivery_acceptance",
+    "m0": "passed_remote_ci_34746149786_c81be59",
+    "m1": "model_independent_market_and_judgement_workflow_implemented_local_browser_verified",
+    "m2": "observation_plan_core_paper_link_implemented_synthetic_verified_real_account_pending",
+    "m3": "shared_calculation_and_relocatable_release_implemented_remaining_handover_and_scale_acceptance",
+    "plan": "docs/v2/ARCHITECTURE_EXECUTION_PLAN_20260913.md",
+    "handover": "docs/v2/ARCHITECTURE_HANDOVER_20260913.md"
   },
   "current_delivery": {
-    "deployment_authorization": {"approved":true,"approved_date":"2026-09-12","window_start":"2026-09-13T16:00:00+08:00","window_end":"2026-09-13T17:00:00+08:00","scope":"three_file_hotfix_dedicated_non_admin_identity_and_read_only_daily_task","window_followup_automation_id":"stockdata","current_session_elevated_administrator":false,"operator_separate_elevated_window_confirmed_by_user":true,"deployment_started":false},
-    "installer": {"path":"scripts/deploy_research_cutover.ps1","sha256":"8924c867edadf56f86da7c192560bd5340cda2ccc253d81e03b79fff1b91a16e","modes":["Check","Apply","Rollback"],"read_only_check_actually_passed":true,"kernel_guard_interoperability_test_passed":true,"apply_performed":false,"real_account_acl_and_scheduled_identity_probe":"deferred_to_user_administrator_execution_in_approved_window","operator_guide":"docs/v2/DEPLOYMENT_OPERATOR_20260913.md"},
-    "date": "2026-09-12",
-    "version": "0.3.10",
-    "patch": "shared-quote-ingestion-real-receipts-and-retained-consumption-20260912",
-    "status": "PARTIAL_local_workspace_running_not_production_cutover",
-    "local_code_checks_passed": true,
-    "local_tests": {"passed":1587,"failed":0,"errors":0,"skipped":0,"warnings":1},
-    "source_sha256": "ea3b173afe755479c042628c27ce6fdeb737da776e8c3a401cde6a95dc794b9b",
-    "source_unchanged_during_checks": true,
-    "verification_receipt": "reports/quote-ingestion-20260912/verification/verification.json",
-    "observation_workspace": {"retained_quote_consumption_implemented":true,"retained_tables":["multi_source_quote","executable_quote_snapshot"],"shared_update_guard":true,"provider_event_time_required":true,"source_store_time_and_zero_change_fixed":true,"qualified_current_quotes":0,"research_pool":43,"real_intraday_data_acceptance":false,"new_market_requests":1,"new_fits":0,"source_database_mutations":0,"shared_tencent_transport":true,"old_duplicate_transport_retired":true,"received_rows":43,"received_source_date":"2026-09-11","repeated_capture_requests":0,"readonly_replay_requests":0,"native_relay_live_adapter":"not_verified","receipt_manifest_id":"b28a3c61e3958f2c33989fa1afb7569b74c868d9d696c5ccf436a2a24d233228","evidence":"reports/quote-ingestion-20260912/acceptance.json"},
-    "clean_research_environment": {"packages":196,"shared_site_packages":false,"hash_locked_install_passed":true,"predictions":40,"max_abs_delta":0.0,"pointers_unchanged":true,"receipt":"reports/observation-delivery-20260912/clean-replay-restart.json","rollback_receipt":"reports/quote-ingestion-20260912/release-rehearsal/rehearsal.json","current_packaged_quote_replay_rows":43,"new_git_commit_created":true,"git_scope":"local_cumulative_remediation_commit_not_pushed"},
-    "daily_workspace": {
-      "url": "http://127.0.0.1:8769/",
-      "source_mode": "current_remediation_checkout_not_approved_fixed_scheduler_release",
-      "running_verified": true,
-      "launcher_checks_workspace_and_surface_identity": true,
-      "idempotent_judgement_receipts": true,
-      "human_condition_review_records": true,
-      "review_is_not_computed_price_or_account_acceptance": true,
-      "browser_acceptance": "reports/workpackages-20260912/browser-acceptance.json",
-      "synthetic_fixture_notes": 1,
-      "synthetic_fixture_reviews": 1,
-      "real_notes": 0,
-      "real_reviews": 0,
-      "screenshots": "unavailable_CDP_capture_timeout",
-      "candidate_archive": "reports/quote-ingestion-20260912/stock-data-quote-workspace.zip",
-      "candidate_archive_sha256": "8a6060074829a4805e03fc0c39f38fd0b3215f952076e33ca46ec4bd204b887c",
-      "stale_control_recovery_fixed": true,
-      "actual_graceful_stop_and_restart_passed": true,
-      "isolated_release_rollback_passed": true,
-      "approved_installer_and_fixed_release_unchanged": true,
-      "all_four_workpackages_complete": false
-    },
-    "ledger": "docs/v2/CONSOLIDATED_REMEDIATION_20260912.md",
-    "legacy_hotfix": {"files":3,"manifest_sha256":"9f40772a5285896a68941ad1d32ca42df9f363aeb27cd3712bba2c0387f7443f","original_legacy_dependencies_rehearsed":true,"real_database_read_only":true,"artifact_audit_passed":true,"concepts":390,"limit_up_concepts":265,"limit_up_pairs":1189,"initial_rows":50,"live_source_unchanged":true,"evidence":"reports/ops-repair-20260912/hotfix-rehearsal/rehearsal.json"},
-    "connectivity": {"real_probes":2,"requests":8,"each_probe_all_four_routes_with_data":true,"scope":"two_observation_times_not_SYSTEM_scheduled_or_continuous_acceptance","phase_json_output_collision_fixed":true,"per_endpoint_reasons_added":true},
-    "acl_evidence": {"current":"reports/ops-repair-20260912/windows/source-database-acl.json","previous_closure_windows_final_acl_invalid":true,"previous_reason":"silent_GetAcl_module_import_error_empty_owner_and_rules","actual_rule_count":4,"legacy_collectors_identity":"SYSTEM","isolated_research_identity_deployed":false},
-    "research_release": {"version":"0.3.10","manifest_sha256":"553892d78e698bb205fb10952b42c857660b5b65ab043a2947f9511b494f9111","hash_bound_launcher_actual_update_passed":true,"result":"sealed_session_reused","predictions":40,"provider_requests":0,"fits":0},
-    "proposed_maintenance_window": "2026-09-13T16:00:00+08:00/2026-09-13T17:00:00+08:00",
-    "proposed_research_task": {"name":"StockData-ResearchDaily","identity":"StockDataResearch_non_administrator_not_created","first_run":"2026-09-14T18:30:00+08:00","weekdays_only":true,"separate_scope_approval_required":false,"created":false},
-    "scheduled_task_mutations": 0,
-    "acl_mutations": 0,
-    "production_file_mutations": 0,
-    "monthly_compact_state": "Disabled",
-    "real_account_acceptance": "pending_user_will_provide_later",
-    "human_judgements": 0,
-    "pending_future_review_groups": 2,
-    "prospective_window_status": "not_started",
-    "new_fits": 0,
-    "model_pointer_changed": false,
-    "remaining": ["approved_three_file_live_hotfix_and_dedicated_identity_deployment", "actual_scheduled_read_only_daily_publication", "actual_trading_session_quote_coverage", "native_relay_live_quote_adapter_verification", "all_legacy_consumer_semantics_and_dynamic_authority_retirement", "real_human_and_account_acceptance", "exact_future_session_reviews_and_prospective_qlib_validation", "whole_system_production_cutover"],
+    "date": "2026-09-13",
+    "version": "0.3.11",
+    "status": "PARTIAL_daily_workspace_delivered_M0_to_M3_not_all_acceptance_closed",
+    "local_workspace_url": "http://127.0.0.1:8769/",
+    "local_workspace_running_verified": true,
     "production_cutover": false,
-    "execution_ready": false
+    "execution_ready": false,
+    "real_human_records": 0,
+    "real_account_acceptance": false,
+    "reference_full_verification": {
+      "path": "reports/architecture-release-20260913/r2/verification/verification.json",
+      "tests": 1599,
+      "failures": 0,
+      "skipped": 0,
+      "source_sha256": "da1aad951d445efe6f62edea8d37b259d15e8f8508cd482867f369bdc48e3148",
+      "scope": "before_final_presentation_only_adjustments_final_commit_CI_still_required"
+    },
+    "candidate": {
+      "path": "reports/architecture-release-20260913/r3/stock-data-workspace-0.3.11.zip",
+      "sha256": "59304ba3fa444b28f3a06e1a3101067a61a40ac7733bc76cf794209f53faa0c9",
+      "files": 57
+    },
+    "implementation": "docs/v2/ARCHITECTURE_IMPLEMENTATION_20260913.md",
+    "open_engineering": [
+      "complete_legacy_responsibility_inventory_and_live_entrypoint_handover",
+      "complete_long_history_attention_index_and_stress_acceptance"
+    ],
+    "external_acceptance": [
+      "administrator_deployment_receipt",
+      "real_human_account_review",
+      "future_sessions_and_independent_model_utility"
+    ],
+    "prior_0310_authorization_unchanged": true
   },
   "historical_delivery_0_3_10_first": {
     "date": "2026-09-12",
@@ -73,29 +59,71 @@
     "status": "PARTIAL",
     "scope": "writer_boundary_independent_utility_and_cutover_preparation_not_production_acceptance",
     "local_code_checks_passed": true,
-    "local_tests": {"passed":1536,"failed":0,"errors":0,"skipped":0,"warnings":1},
+    "local_tests": {
+      "passed": 1536,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "warnings": 1
+    },
     "source_sha256": "1e88313408755625e0c4a7a95c85919cc3e29b8fda1ed0f9a29d15e4f7ec89a1",
     "source_unchanged_during_checks": true,
     "verification_receipt": "reports/closure-20260912/verification-r2/verification.json",
     "ledger": "docs/v2/CONSOLIDATED_REMEDIATION_20260912.md",
-    "writer_boundary": {"installed_no_git_disk_write_refused":true,"primary_hardlink_alias_refused":true,"non_test_potential_direct_write_calls":4,"regression_gate_passed":true,"os_authority_separation_deployed":false,"all_legacy_semantics_retired":false},
-    "utility": {"evidence":"reports/closure-20260912/qlib-utility-final/result.json","status":"independent_arithmetic_verified_no_promotion_support","paired_samples":677,"test_days":40,"eligible_top5_days":23,"unseen_holdout":false,"portfolio_return_backtest":false,"promotion_allowed":false},
+    "writer_boundary": {
+      "installed_no_git_disk_write_refused": true,
+      "primary_hardlink_alias_refused": true,
+      "non_test_potential_direct_write_calls": 4,
+      "regression_gate_passed": true,
+      "os_authority_separation_deployed": false,
+      "all_legacy_semantics_retired": false
+    },
+    "utility": {
+      "evidence": "reports/closure-20260912/qlib-utility-final/result.json",
+      "status": "independent_arithmetic_verified_no_promotion_support",
+      "paired_samples": 677,
+      "test_days": 40,
+      "eligible_top5_days": 23,
+      "unseen_holdout": false,
+      "portfolio_return_backtest": false,
+      "promotion_allowed": false
+    },
     "new_fits": 0,
     "new_provider_requests": 0,
     "model_pointer_changed": false,
-    "daily_entrypoint": {"path":"scripts/run_research_daily.ps1","actual_run":"sealed_session_reused","predictions":40,"installed_as_scheduled_task":false},
+    "daily_entrypoint": {
+      "path": "scripts/run_research_daily.ps1",
+      "actual_run": "sealed_session_reused",
+      "predictions": 40,
+      "installed_as_scheduled_task": false
+    },
     "real_account_acceptance": "pending_user_will_provide_later",
     "human_judgements": 0,
     "pending_future_review_groups": 2,
-    "prospective_registration": {"directory":"data/research-inputs/prospective-registration-20260911","original_identity_preserved":true,"window_start":"2026-09-14","status":"not_started"},
+    "prospective_registration": {
+      "directory": "data/research-inputs/prospective-registration-20260911",
+      "original_identity_preserved": true,
+      "window_start": "2026-09-14",
+      "status": "not_started"
+    },
     "windows_evidence": "reports/closure-20260912/windows-final",
     "scheduled_task_mutations": 0,
     "monthly_compact_state": "Disabled",
     "core_upgrade": "existing_dedicated_environment_0.3.9_to_0.3.10_not_clean_install",
     "release_rollback": "isolated_0.3.9_to_0.3.10_to_0.3.9_verified_not_live_cutover",
-    "service": {"port":8769,"currently_running":false,"restart":"previously_blocked_not_retried"},
+    "service": {
+      "port": 8769,
+      "currently_running": false,
+      "restart": "previously_blocked_not_retried"
+    },
     "account_required_for_read_only_reporting_cutover": false,
-    "remaining": ["legacy_consumer_semantics_and_os_identity_separation", "real_human_and_account_acceptance", "future_session_reviews_and_prospective_qlib_validation", "legacy_task_health_repair", "specific_approved_live_deployment_and_cutover"],
+    "remaining": [
+      "legacy_consumer_semantics_and_os_identity_separation",
+      "real_human_and_account_acceptance",
+      "future_session_reviews_and_prospective_qlib_validation",
+      "legacy_task_health_repair",
+      "specific_approved_live_deployment_and_cutover"
+    ],
     "production_cutover": false,
     "execution_ready": false
   },
@@ -103,7 +131,12 @@
     "date": "2026-09-12",
     "version": "0.3.9",
     "local_code_checks_passed": true,
-    "local_tests": {"passed":1530,"failed":0,"errors":0,"skipped":0},
+    "local_tests": {
+      "passed": 1530,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
     "source_sha256": "ce71290b283b2f3f265a74e5448a7f1205876a9899fd79a6d252f6e86cd0b86e",
     "status": "combined_daily_engineering_delivery_not_full_legacy_or_production_acceptance",
     "ledger": "docs/v2/CONSOLIDATED_REMEDIATION_20260912.md",
@@ -125,9 +158,19 @@
     "stable_build_inputs": "data/research-inputs/frozen-20260912",
     "full_database_restore": "isolated_read_only_copy_hash_and_323_table_controls_verified_not_production_restore",
     "release_rollback": "isolated_previous_candidate_previous_artifact_switch_verified_not_task_cutover",
-    "service": {"port":8769,"start_get_and_graceful_stop_verified":true,"restart":"blocked_by_execution_environment","currently_running":false},
+    "service": {
+      "port": 8769,
+      "start_get_and_graceful_stop_verified": true,
+      "restart": "blocked_by_execution_environment",
+      "currently_running": false
+    },
     "static_delivery": "reports/completion-20260912/delivery/publication/runs/4dea7720807743449f353137a62ca9e3/index.html",
-    "remaining": ["real_next_session_and_human_account_acceptance", "independent_and_prospective_qlib_evidence", "remaining_legacy_consumer_time_semantics_and_dynamic_writer_authority", "approved_live_task_repair_and_production_cutover"],
+    "remaining": [
+      "real_next_session_and_human_account_acceptance",
+      "independent_and_prospective_qlib_evidence",
+      "remaining_legacy_consumer_time_semantics_and_dynamic_writer_authority",
+      "approved_live_task_repair_and_production_cutover"
+    ],
     "production_cutover": false,
     "execution_ready": false
   },
@@ -139,7 +182,12 @@
     "verification_receipt": "reports/convergence-20260912/verification-r2/verification.json",
     "acceptance_requires_passing_current_receipt": true,
     "local_code_checks_passed": true,
-    "local_tests": {"passed": 1521, "failed": 0, "errors": 0, "skipped": 0},
+    "local_tests": {
+      "passed": 1521,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
     "source_sha256": "afa2339577b4e95be57a8d512a2229468e0e8a96df2da8a2b9837b00bc4b36df",
     "local_workspace_url": "http://127.0.0.1:8766/",
     "real_data_evidence": "reports/convergence-20260912/market/acceptance.json",
@@ -153,7 +201,13 @@
     "model_pointer_changed": false,
     "core_upgrade": "existing_dedicated_environment_0.3.3_to_0.3.8_not_clean_install",
     "research_dependencies": "single_196_package_profile_existing_environment_verified",
-    "remaining": ["automatic_daily_market_projection_and_cross_day_acceptance", "matched_scope_previous_day_and_full_theme_members", "remaining_consumer_and_writer_convergence", "full_database_restore_and_deployment_rollback", "real_human_loop_and_independent_qlib_validation"],
+    "remaining": [
+      "automatic_daily_market_projection_and_cross_day_acceptance",
+      "matched_scope_previous_day_and_full_theme_members",
+      "remaining_consumer_and_writer_convergence",
+      "full_database_restore_and_deployment_rollback",
+      "real_human_loop_and_independent_qlib_validation"
+    ],
     "production_cutover": false,
     "execution_ready": false
   },
@@ -165,25 +219,129 @@
     "round": "combined_followup_batch",
     "evidence": "reports/consolidated-batch-20260912-final/verification-r4/verification.json",
     "source_sha256": "cfbe45ed6a7e6d376cf64fc2d33ff52555c089123606d449908b1207ef6b0b38",
-    "local_tests": {"passed": 1511, "failed": 0, "errors": 0, "skipped": 0},
-    "real_data": {"selected_sessions": 20, "rows": 110939, "consumer_mismatches": 0, "full_database_repaired": false},
-    "sector_replay": {"evidence": "reports/consolidated-batch-20260912-final/real-data-r4/acceptance.json", "real_retained_rows": 496, "fault_cases_preserving_snapshot": 3, "fresh_rows_after_3h": 0, "independent_online_catalogue_qualified": false, "new_provider_requests": 0, "scope": "real_rows_simulated_transport_replay_not_live_source_qualification"},
-    "ths_aggregation": {"entrypoints_share_atomic_guard": true, "retained_concepts": 390, "retained_member_pairs": 70521, "required_stocks": 5571, "missing_same_definition_eligible_flow": 58, "qualified_concepts_consumed": 236, "affected_concepts": 154, "retained_replay_status": "partial_stock_flow", "full_snapshot_promoted": false, "old_snapshot_unchanged": true, "old_snapshot_quality_recertified": false, "new_subset_consumer_delivered": true, "consumer_scope": "isolated_review_capital_panel_explicit_asof_not_other_scores_or_qlib", "new_provider_requests": 0},
-    "subset_preview": {"page": "reports/consolidated-batch-20260912-final/real-data-r4/daily_review.html", "evidence": "reports/consolidated-batch-20260912-final/real-data-r4/acceptance.json", "as_of": "2026-09-11T17:40:17.945778", "excluded_disclosure_rows": 154, "external_resource_requests": 0, "expired_rankings_empty": true},
-    "candidate_context": {"existing_candidates": 20, "with_qualified_concept_evidence": 18, "displayed_candidates": 10, "ranking_changed": false, "scope": "legacy_review_candidates_context_not_qlib_model_contribution"},
-    "concept_history": {"sessions": ["2026-09-09", "2026-09-10", "2026-09-11"], "matched_concepts": 223, "current_qualified_without_match": 13, "fixed_member_set": true, "fixed_per_stock_provider_definition": true, "point_in_time_certified": false, "scope": "retrospective_concept_history_not_individual_stock_panel_or_alpha"},
-    "writer_boundary": {"primary_source_path_refused_before_open": true, "direct_schema_v2_refused": true, "potential_direct_connect_sites": 4, "classified_memory_sites": 2, "classified_guarded_connector_sites": 1, "classified_v2_owned_store_sites": 1, "literal_ddl_sites": 344, "all_writer_authority_closed": false, "limitations": ["tools_and_tests_excluded", "dynamic_sql_and_complex_aliases_not_covered", "not_os_access_control", "installed_path_guard_without_git_topology_unavailable"]},
-    "research": {"new_fits": 0, "previous_round_fits": 9, "new_provider_requests": 0, "current_predictions": 40, "active_model_changed": false, "superiority_proven": false},
+    "local_tests": {
+      "passed": 1511,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "real_data": {
+      "selected_sessions": 20,
+      "rows": 110939,
+      "consumer_mismatches": 0,
+      "full_database_repaired": false
+    },
+    "sector_replay": {
+      "evidence": "reports/consolidated-batch-20260912-final/real-data-r4/acceptance.json",
+      "real_retained_rows": 496,
+      "fault_cases_preserving_snapshot": 3,
+      "fresh_rows_after_3h": 0,
+      "independent_online_catalogue_qualified": false,
+      "new_provider_requests": 0,
+      "scope": "real_rows_simulated_transport_replay_not_live_source_qualification"
+    },
+    "ths_aggregation": {
+      "entrypoints_share_atomic_guard": true,
+      "retained_concepts": 390,
+      "retained_member_pairs": 70521,
+      "required_stocks": 5571,
+      "missing_same_definition_eligible_flow": 58,
+      "qualified_concepts_consumed": 236,
+      "affected_concepts": 154,
+      "retained_replay_status": "partial_stock_flow",
+      "full_snapshot_promoted": false,
+      "old_snapshot_unchanged": true,
+      "old_snapshot_quality_recertified": false,
+      "new_subset_consumer_delivered": true,
+      "consumer_scope": "isolated_review_capital_panel_explicit_asof_not_other_scores_or_qlib",
+      "new_provider_requests": 0
+    },
+    "subset_preview": {
+      "page": "reports/consolidated-batch-20260912-final/real-data-r4/daily_review.html",
+      "evidence": "reports/consolidated-batch-20260912-final/real-data-r4/acceptance.json",
+      "as_of": "2026-09-11T17:40:17.945778",
+      "excluded_disclosure_rows": 154,
+      "external_resource_requests": 0,
+      "expired_rankings_empty": true
+    },
+    "candidate_context": {
+      "existing_candidates": 20,
+      "with_qualified_concept_evidence": 18,
+      "displayed_candidates": 10,
+      "ranking_changed": false,
+      "scope": "legacy_review_candidates_context_not_qlib_model_contribution"
+    },
+    "concept_history": {
+      "sessions": [
+        "2026-09-09",
+        "2026-09-10",
+        "2026-09-11"
+      ],
+      "matched_concepts": 223,
+      "current_qualified_without_match": 13,
+      "fixed_member_set": true,
+      "fixed_per_stock_provider_definition": true,
+      "point_in_time_certified": false,
+      "scope": "retrospective_concept_history_not_individual_stock_panel_or_alpha"
+    },
+    "writer_boundary": {
+      "primary_source_path_refused_before_open": true,
+      "direct_schema_v2_refused": true,
+      "potential_direct_connect_sites": 4,
+      "classified_memory_sites": 2,
+      "classified_guarded_connector_sites": 1,
+      "classified_v2_owned_store_sites": 1,
+      "literal_ddl_sites": 344,
+      "all_writer_authority_closed": false,
+      "limitations": [
+        "tools_and_tests_excluded",
+        "dynamic_sql_and_complex_aliases_not_covered",
+        "not_os_access_control",
+        "installed_path_guard_without_git_topology_unavailable"
+      ]
+    },
+    "research": {
+      "new_fits": 0,
+      "previous_round_fits": 9,
+      "new_provider_requests": 0,
+      "current_predictions": 40,
+      "active_model_changed": false,
+      "superiority_proven": false
+    },
     "human_judgements": 0,
-    "approved_operational_change": {"task": "StockData-MonthlyCompact", "state": "Disabled", "other_tasks_unchanged": true},
+    "approved_operational_change": {
+      "task": "StockData-MonthlyCompact",
+      "state": "Disabled",
+      "other_tasks_unchanged": true
+    },
     "core_install": "0.3.7_fresh_minimal_environment_verified_operational_core_excludes_legacy_collectors_and_review",
     "collector_delivery": "isolated_source_and_candidate_source_overlay_not_deployed",
     "core_upgrade": "0.3.6_to_0.3.7_synthetic_account_state_preserved_not_full_production_restore",
-    "research_clean_install": {"status": "verified_windows_cpython312_base_plus_frozen_replay_profile", "expected_dependencies_matched": 196, "shared_site_packages": false, "frozen_prediction_count": 40, "maximum_prediction_difference": 0.0, "qlib_components_imported": ["LGBModel", "Alpha158"], "new_fits": 0, "pointers_unchanged": true, "evidence": "reports/consolidated-batch-20260912-final/research-clean-runtime.json", "package": "reports/consolidated-batch-20260912-final/stock-data-research-0.3.7-r3.zip", "other_platforms_and_optional_backends_verified": false},
+    "research_clean_install": {
+      "status": "verified_windows_cpython312_base_plus_frozen_replay_profile",
+      "expected_dependencies_matched": 196,
+      "shared_site_packages": false,
+      "frozen_prediction_count": 40,
+      "maximum_prediction_difference": 0,
+      "qlib_components_imported": [
+        "LGBModel",
+        "Alpha158"
+      ],
+      "new_fits": 0,
+      "pointers_unchanged": true,
+      "evidence": "reports/consolidated-batch-20260912-final/research-clean-runtime.json",
+      "package": "reports/consolidated-batch-20260912-final/stock-data-research-0.3.7-r3.zip",
+      "other_platforms_and_optional_backends_verified": false
+    },
     "production_cutover": false,
     "execution_ready": false,
     "actual_deletions": [],
-    "remaining_engineering": ["independent_online_catalogue_metric_and_permission_qualification", "remaining_consumer_ttl_calendar_price_rules_and_metadata_asof", "dynamic_writer_ddl_and_os_authority", "full_product_and_database_restore_acceptance"],
+    "remaining_engineering": [
+      "independent_online_catalogue_metric_and_permission_qualification",
+      "remaining_consumer_ttl_calendar_price_rules_and_metadata_asof",
+      "dynamic_writer_ddl_and_os_authority",
+      "full_product_and_database_restore_acceptance"
+    ],
     "historical_sections_below_are_not_current_acceptance": true
   },
   "four_stage_continuation": {
@@ -197,7 +355,12 @@
     "capacity": "256_cash_events_only_not_long_history_acceptance",
     "evidence": "tmp/delivery-20260911-r3/verification.json",
     "local_checks_passed": true,
-    "local_tests": {"passed": 1081, "failed": 0, "errors": 0, "skipped": 0},
+    "local_tests": {
+      "passed": 1081,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
     "source_sha256": "3882247ef06ec0df53bf988b0f563c473a06ce30bbfeaf47815f8ddd37cd0d79",
     "production_cutover": false,
     "execution_ready": false
@@ -209,7 +372,12 @@
     "ledger": "docs/v2/RETIREMENT_REMEDIATION_20260910.md",
     "local_evidence": "tmp/remediation-final-r4/verification.json",
     "local_checks_passed": true,
-    "local_tests": {"passed": 1064, "failed": 0, "errors": 0, "skipped": 0},
+    "local_tests": {
+      "passed": 1064,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0
+    },
     "source_sha256": "32395792eda61639d845c60c65078f03dc1ddbc893f56f2806280693966d5d02",
     "native_evidence_scope": "retained_native_observations_not_new_fetch_or_completed_paper_workflow",
     "remote_ci_verified": false,
@@ -511,7 +679,10 @@
           "id": "SD2-04-01",
           "description": "逐个核对实际已购KPL网关与TuShare权益：授权用途、历史范围、字段、限制、实测时效。只做GET/只读受控探测；不批量调用可能具有写入效果的目录项。",
           "status": "partial",
-          "evidence": ["docs/v2/STAGE_NATIVE_20260910.md", "reports/v2-native-gap-continuation-20260910/completed.json"],
+          "evidence": [
+            "docs/v2/STAGE_NATIVE_20260910.md",
+            "reports/v2-native-gap-continuation-20260910/completed.json"
+          ],
           "note": "已有凭据、官方字段和精确日期只读请求已核对；两轮16次传输尝试，同花顺得7现金候选/1送股观察，中继HTTP429后停止。未认证完整授权用途、历史覆盖或上游独立来源；未购买升级或写行情。"
         },
         {
@@ -950,7 +1121,10 @@
           "id": "SD2-14-02",
           "description": "同时做固定候选池比较与允许候选变化的完整系统比较；每个实验独立paper账户和预算，输入到达、成本、规则及候选限制一致。",
           "status": "partial",
-          "evidence": ["trade_system/v2/portfolio_experiment.py", "docs/v2/STAGE_PORTFOLIO_20260910.md"],
+          "evidence": [
+            "trade_system/v2/portfolio_experiment.py",
+            "docs/v2/STAGE_PORTFOLIO_20260910.md"
+          ],
           "note": "价格/价格加资金/身份哈希三组固定 OOS 样本，以同预算、持有期、假设费用和日历运行独立诊断账；实际三组均因缺持仓日线中止，不作不等区间优劣比较。仍非 C/F/K/T 完整系统消融或经 DecisionService 的可执行纸面回测。"
         },
         {
@@ -964,7 +1138,10 @@
           "id": "SD2-14-04",
           "description": "预登记主要指标、经济最小改善、实验数量和保留区间；按交易日/题材相关性评估不确定性与多次试验偏差，测量成本、人工耗时和容灾价值；产生继续/降频/仅容灾/停用建议。",
           "status": "partial",
-          "evidence": ["trade_system/v2/rolling_research.py", "docs/v2/STAGE_ROLLING_20260910.md"],
+          "evidence": [
+            "trade_system/v2/rolling_research.py",
+            "docs/v2/STAGE_ROLLING_20260910.md"
+          ],
           "note": "已冻结本次两组特征/预算/基线/成本场景与历史暴露声明，执行日级移动块描述区间。不是 C/F/K/T 完整付费消融；经济最小改善、多重检验、题材相关性/人工耗时/容灾价值及续费建议仍未完成。"
         }
       ]
@@ -1172,5 +1349,177 @@
     "disabled_optional": "未授权的可选扩展"
   },
   "latest_stage_document": "docs/v2/CONSOLIDATED_REMEDIATION_20260912.md",
-  "latest_verified_scope": "source_bound_candidate_core_install_synthetic_restore_real_partition_static_review_and_frozen_research_not_production"
+  "latest_verified_scope": "source_bound_candidate_core_install_synthetic_restore_real_partition_static_review_and_frozen_research_not_production",
+  "previous_delivery": {
+    "deployment_authorization": {
+      "approved": true,
+      "approved_date": "2026-09-12",
+      "window_start": "2026-09-13T16:00:00+08:00",
+      "window_end": "2026-09-13T17:00:00+08:00",
+      "scope": "three_file_hotfix_dedicated_non_admin_identity_and_read_only_daily_task",
+      "window_followup_automation_id": "stockdata",
+      "current_session_elevated_administrator": false,
+      "operator_separate_elevated_window_confirmed_by_user": true,
+      "deployment_started": false
+    },
+    "installer": {
+      "path": "scripts/deploy_research_cutover.ps1",
+      "sha256": "8924c867edadf56f86da7c192560bd5340cda2ccc253d81e03b79fff1b91a16e",
+      "modes": [
+        "Check",
+        "Apply",
+        "Rollback"
+      ],
+      "read_only_check_actually_passed": true,
+      "kernel_guard_interoperability_test_passed": true,
+      "apply_performed": false,
+      "real_account_acl_and_scheduled_identity_probe": "deferred_to_user_administrator_execution_in_approved_window",
+      "operator_guide": "docs/v2/DEPLOYMENT_OPERATOR_20260913.md"
+    },
+    "date": "2026-09-12",
+    "version": "0.3.10",
+    "patch": "shared-quote-ingestion-real-receipts-and-retained-consumption-20260912",
+    "status": "PARTIAL_local_workspace_running_not_production_cutover",
+    "local_code_checks_passed": true,
+    "local_tests": {
+      "passed": 1587,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "warnings": 1
+    },
+    "source_sha256": "ea3b173afe755479c042628c27ce6fdeb737da776e8c3a401cde6a95dc794b9b",
+    "source_unchanged_during_checks": true,
+    "verification_receipt": "reports/quote-ingestion-20260912/verification/verification.json",
+    "observation_workspace": {
+      "retained_quote_consumption_implemented": true,
+      "retained_tables": [
+        "multi_source_quote",
+        "executable_quote_snapshot"
+      ],
+      "shared_update_guard": true,
+      "provider_event_time_required": true,
+      "source_store_time_and_zero_change_fixed": true,
+      "qualified_current_quotes": 0,
+      "research_pool": 43,
+      "real_intraday_data_acceptance": false,
+      "new_market_requests": 1,
+      "new_fits": 0,
+      "source_database_mutations": 0,
+      "shared_tencent_transport": true,
+      "old_duplicate_transport_retired": true,
+      "received_rows": 43,
+      "received_source_date": "2026-09-11",
+      "repeated_capture_requests": 0,
+      "readonly_replay_requests": 0,
+      "native_relay_live_adapter": "not_verified",
+      "receipt_manifest_id": "b28a3c61e3958f2c33989fa1afb7569b74c868d9d696c5ccf436a2a24d233228",
+      "evidence": "reports/quote-ingestion-20260912/acceptance.json"
+    },
+    "clean_research_environment": {
+      "packages": 196,
+      "shared_site_packages": false,
+      "hash_locked_install_passed": true,
+      "predictions": 40,
+      "max_abs_delta": 0,
+      "pointers_unchanged": true,
+      "receipt": "reports/observation-delivery-20260912/clean-replay-restart.json",
+      "rollback_receipt": "reports/quote-ingestion-20260912/release-rehearsal/rehearsal.json",
+      "current_packaged_quote_replay_rows": 43,
+      "new_git_commit_created": true,
+      "git_scope": "f414108_pushed_to_origin_on_20260913"
+    },
+    "daily_workspace": {
+      "url": "http://127.0.0.1:8769/",
+      "source_mode": "current_remediation_checkout_not_approved_fixed_scheduler_release",
+      "running_verified": true,
+      "launcher_checks_workspace_and_surface_identity": true,
+      "idempotent_judgement_receipts": true,
+      "human_condition_review_records": true,
+      "review_is_not_computed_price_or_account_acceptance": true,
+      "browser_acceptance": "reports/workpackages-20260912/browser-acceptance.json",
+      "synthetic_fixture_notes": 1,
+      "synthetic_fixture_reviews": 1,
+      "real_notes": 0,
+      "real_reviews": 0,
+      "screenshots": "unavailable_CDP_capture_timeout",
+      "candidate_archive": "reports/quote-ingestion-20260912/stock-data-quote-workspace.zip",
+      "candidate_archive_sha256": "8a6060074829a4805e03fc0c39f38fd0b3215f952076e33ca46ec4bd204b887c",
+      "stale_control_recovery_fixed": true,
+      "actual_graceful_stop_and_restart_passed": true,
+      "isolated_release_rollback_passed": true,
+      "approved_installer_and_fixed_release_unchanged": true,
+      "all_four_workpackages_complete": false
+    },
+    "ledger": "docs/v2/CONSOLIDATED_REMEDIATION_20260912.md",
+    "legacy_hotfix": {
+      "files": 3,
+      "manifest_sha256": "9f40772a5285896a68941ad1d32ca42df9f363aeb27cd3712bba2c0387f7443f",
+      "original_legacy_dependencies_rehearsed": true,
+      "real_database_read_only": true,
+      "artifact_audit_passed": true,
+      "concepts": 390,
+      "limit_up_concepts": 265,
+      "limit_up_pairs": 1189,
+      "initial_rows": 50,
+      "live_source_unchanged": true,
+      "evidence": "reports/ops-repair-20260912/hotfix-rehearsal/rehearsal.json"
+    },
+    "connectivity": {
+      "real_probes": 2,
+      "requests": 8,
+      "each_probe_all_four_routes_with_data": true,
+      "scope": "two_observation_times_not_SYSTEM_scheduled_or_continuous_acceptance",
+      "phase_json_output_collision_fixed": true,
+      "per_endpoint_reasons_added": true
+    },
+    "acl_evidence": {
+      "current": "reports/ops-repair-20260912/windows/source-database-acl.json",
+      "previous_closure_windows_final_acl_invalid": true,
+      "previous_reason": "silent_GetAcl_module_import_error_empty_owner_and_rules",
+      "actual_rule_count": 4,
+      "legacy_collectors_identity": "SYSTEM",
+      "isolated_research_identity_deployed": false
+    },
+    "research_release": {
+      "version": "0.3.10",
+      "manifest_sha256": "553892d78e698bb205fb10952b42c857660b5b65ab043a2947f9511b494f9111",
+      "hash_bound_launcher_actual_update_passed": true,
+      "result": "sealed_session_reused",
+      "predictions": 40,
+      "provider_requests": 0,
+      "fits": 0
+    },
+    "proposed_maintenance_window": "2026-09-13T16:00:00+08:00/2026-09-13T17:00:00+08:00",
+    "proposed_research_task": {
+      "name": "StockData-ResearchDaily",
+      "identity": "StockDataResearch_non_administrator_not_created",
+      "first_run": "2026-09-14T18:30:00+08:00",
+      "weekdays_only": true,
+      "separate_scope_approval_required": false,
+      "created": false
+    },
+    "scheduled_task_mutations": 0,
+    "acl_mutations": 0,
+    "production_file_mutations": 0,
+    "monthly_compact_state": "Disabled",
+    "real_account_acceptance": "pending_user_will_provide_later",
+    "human_judgements": 0,
+    "pending_future_review_groups": 2,
+    "prospective_window_status": "not_started",
+    "new_fits": 0,
+    "model_pointer_changed": false,
+    "remaining": [
+      "approved_three_file_live_hotfix_and_dedicated_identity_deployment",
+      "actual_scheduled_read_only_daily_publication",
+      "actual_trading_session_quote_coverage",
+      "native_relay_live_quote_adapter_verification",
+      "all_legacy_consumer_semantics_and_dynamic_authority_retirement",
+      "real_human_and_account_acceptance",
+      "exact_future_session_reviews_and_prospective_qlib_validation",
+      "whole_system_production_cutover"
+    ],
+    "production_cutover": false,
+    "execution_ready": false
+  }
 }

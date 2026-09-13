@@ -41,6 +41,13 @@ def test_changed_provider_not_compared_and_partial_members_not_published(con):
     assert r['themes']==[] and r['membership_status']=='partial'
 
 
+def test_normalized_turnover_is_not_converted_twice_for_old_view_labels(con):
+    con.execute('ALTER TABLE v_kline_daily ADD COLUMN turnover BIGINT')
+    con.execute("UPDATE v_kline_daily SET turnover=12345000,amount_unit='thousand_yuan'")
+    result=project(con)['turnover']
+    assert result['cny']==12345000 and result['legacy_unit_label_mismatch']
+
+
 def test_missing_price_date_and_duplicate_identity_refused(con):
     with pytest.raises(ValueError,match='exact market session'):
         market.project(con,'2026-09-12','2026-09-12T17:00:00',set())
@@ -58,12 +65,12 @@ def test_market_failure_prevents_half_publication(tmp_path,monkeypatch):
     assert (tmp_path/'prediction-current.json').read_bytes()==old
 
 
-def test_configured_market_is_same_prediction_date_and_read_only(tmp_path,monkeypatch):
+def test_configured_market_uses_its_own_calendar_not_prediction_date(tmp_path,monkeypatch):
     write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic.duckdb','read_only':True})
     calls=[]
-    monkeypatch.setattr(market,'snapshot',lambda *args:calls.append(args) or {'trade_date':args[1]})
-    assert product.configured_market(tmp_path,{'date':'2026-09-11','rows':[{'instrument':'000001'}]})['trade_date']=='2026-09-11'
-    assert calls[0][0]=='synthetic.duckdb' and calls[0][3]==['000001']
+    monkeypatch.setattr(market,'latest_snapshot',lambda *args:calls.append(args) or {'trade_date':'2026-09-14'})
+    assert product.configured_market(tmp_path,{'date':'2026-09-11','rows':[{'instrument':'000001'}]})['trade_date']=='2026-09-14'
+    assert calls[0][0]=='synthetic.duckdb' and calls[0][2]==['000001']
     assert read_json(tmp_path/'workspace-config.json')[0]['read_only']
 
 

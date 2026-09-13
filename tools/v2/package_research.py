@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import zipfile
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -72,7 +73,7 @@ def build(output, root=ROOT):
     if output.exists():
         raise ValueError('new research distribution path required')
     files = source_closure(root)
-    for name in ('requirements-research-replay.lock','config/research_delivery.json'):
+    for name in ('requirements-research-replay.lock','config/research_delivery.json','config/research_inference_compatibility.json'):
         files[name] = (root/name).read_bytes()
     files['run_research.py'] = LAUNCHER.encode('utf-8')
     files['README.txt'] = (
@@ -90,6 +91,7 @@ def build(output, root=ROOT):
         'Hashes detect accidental changes, not an attacker able to replace this release and its manifest.\n'
     ).encode('utf-8')
     manifest = {'schema':1, 'entry':ENTRY,
+        'version':tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8'))['project']['version'],
         'base_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
         'files':{n:hashlib.sha256(v).hexdigest() for n,v in sorted(files.items())},
         'scope':'isolated_research_source_distribution_not_operational_core',

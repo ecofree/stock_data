@@ -67,7 +67,12 @@ def import_snapshot(store, raw: bytes):
 
 def latest_account(store, account_id):
     store.check_owner()
-    row = store.con.execute('''SELECT snapshot_id,mode,asof_time,valid_until,cash_fen,frozen_fen,
+    return read_account(store.con,account_id)
+
+
+def read_account(con, account_id):
+    """Same account authority for an owning writer or a read-only projection."""
+    row = con.execute('''SELECT snapshot_id,mode,asof_time,valid_until,cash_fen,frozen_fen,
          equity_fen,reconciled,payload,imported_at FROM account_snapshot WHERE account_id=?
          ORDER BY seq DESC LIMIT 1''', [account_id]).fetchone()
     if row is None:
@@ -76,6 +81,33 @@ def latest_account(store, account_id):
                        'equity_fen', 'reconciled', 'payload', 'imported_at'), row))
     result['payload'] = json.loads(result['payload'])
     return result
+
+
+def risk_snapshot(source, account_id, as_of):
+    """Never imports, reserves or reconciles while presenting an account."""
+    from pathlib import Path
+    import duckdb
+    at=utc(as_of)
+    with duckdb.connect(str(Path(source).resolve(strict=True)),read_only=True) as con:
+        con.execute('BEGIN TRANSACTION')
+        account=read_account(con,account_id)
+        if account is None:return {'status':'account_unknown','account_id':account_id,'execution_ready':False}
+        blockers=[]
+        if not utc(account['asof'])<=at<utc(account['valid_until']):blockers.append('account_stale_or_future')
+        if not account['reconciled']:blockers.append('account_unreconciled')
+        pending=con.execute("SELECT instrument,amount_fen,status FROM reservation WHERE account_id=? AND status IN ('held','unknown')",[account_id]).fetchall()
+        if any(r[2]=='unknown' for r in pending):blockers.append('unresolved_internal_action')
+        orders=account['payload']['open_orders']
+        if orders:blockers.append('open_external_orders_require_reconciliation')
+        result={'status':'risk_blocked' if blockers else 'account_snapshot_available_not_execution',
+            'account_id':account_id,'snapshot_id':account['snapshot_id'],'mode':account['mode'],
+            'as_of':account['asof'].isoformat(),'valid_until':account['valid_until'].isoformat(),
+            'cash_fen':account['cash_fen'],'frozen_fen':account['frozen_fen'],
+            'positions':account['payload']['positions'],'open_orders':orders,
+            'internal_reservations':[{'instrument':c,'amount_fen':v,'status':s} for c,v,s in pending],
+            'declared_complete':account['payload']['declared_complete'],'reconciled':account['reconciled'],
+            'blockers':blockers,'execution_ready':False,'source_mode':'read_only_core_account'}
+        return result
 
 
 def append_account_event(store, event_id, account_id, kind, payload):

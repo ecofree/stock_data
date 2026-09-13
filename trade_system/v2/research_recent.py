@@ -44,26 +44,11 @@ def build_dataset(config, root, output):
     if output.exists():
         raise ValueError('new recent dataset version required')
     frame, days, summary = load_receipts(config, root)
-    calculated = dataset.features(frame, days)
     output.mkdir(parents=True)
-    alpha, expressions = compute(frame, days, output/'alpha158-provider', input_units='adjusted_shares_CNY')
-    calculated['datetime'] = pd.to_datetime(calculated.datetime)
-    calculated = calculated.merge(alpha, on=['datetime', 'instrument'], how='left', validate='one_to_one')
-    calculated = calculated.sort_values(['instrument', 'datetime'])
-    grouped = calculated.groupby('instrument', sort=False)
-    target = (grouped.close.shift(-2) / grouped.open.shift(-1) - 1) * 100
-    eligible = calculated.feature_eligible & grouped.feature_eligible.shift(-1).eq(True) & grouped.feature_eligible.shift(-2).eq(True)
-    calculated['label_next_ret'] = target.where(eligible)
-    calculated['label_date'] = grouped.datetime.shift(-2)
-    calculated['label_end_time'] = calculated.label_date + pd.Timedelta(hours=16)
-    calculated['label_available_time'] = calculated.label_end_time
-    calculated['label_status'] = np.where(calculated.label_next_ret.notna(), 'retrospective_price_target_not_execution', 'missing_exact_target')
+    calculated,expressions=dataset.assemble(frame,days,output,alpha_compute=compute)
     # The independently fitted price model must not inherit Alpha158's 61-day
     # dependency. This does not change any identity/label of the paired study.
-    price_refit = calculated.drop(columns=list(expressions)).copy()
-    price_target_valid = calculated.price_eligible & (grouped.open.shift(-1) > 0) & (grouped.close.shift(-2) > 0) & np.isfinite(target)
-    price_refit['label_next_ret'] = target.where(price_target_valid)
-    price_refit['label_status'] = np.where(price_refit.label_next_ret.notna(), 'retrospective_price_target_not_execution', 'missing_exact_target')
+    price_refit=dataset.target_labels(calculated.drop(columns=list(expressions)),days,family='price21')
     price_refit = price_refit[price_refit.datetime >= pd.Timestamp(days[20])].sort_values(['datetime', 'instrument'])
     price_refit.to_parquet(output/'price-refit.parquet', index=False)
     calculated = calculated[calculated.datetime >= pd.Timestamp(days[60])].sort_values(['datetime', 'instrument'])
@@ -71,19 +56,8 @@ def build_dataset(config, root, output):
     from .research_receipts import sealed
     if summary['receipt_manifest_id'] != identity(sealed((Path(root)/config['sources']['receipts']['path']).resolve())):
         raise ValueError('receipts changed during build')
-    meta = {'label_version':'exploratory_price_target_v1_not_formal_execution_labels',
-        'label_definition':dataset.LABEL, 'availability_assumption':dataset.AVAILABILITY,
-        'feature_columns':dataset.BASE + dataset.MONEY + list(expressions),
-        'artifact_hashes':{'features.parquet':file_hash(output/'features.parquet'),
-            'price-refit.parquet':file_hash(output/'price-refit.parquet')},
-        'dataset_config':config, 'dataset_id':identity(config), 'summary':summary, 'rows':len(calculated),
-        'historical_exploration_allowed':True, 'point_in_time_qualified':False, 'execution_ready':False,
-        'source_sha256':file_hash(dataset.__file__), 'recent_source_sha256':file_hash(__file__),
-        'label_policy':'new_exploration_artifact_only_original_labels_unchanged',
-        'eligibility_contract':{'price_sessions':21, 'price_money_sessions':21, 'money_sessions':5,
-            'alpha158_sessions':61, 'historical_paired_cohort_sessions':61}}
-    write_json(output/'features.metadata.json', meta)
-    return meta
+    return dataset.write_metadata(config,summary,len(calculated),expressions,output,
+        artifacts=('features.parquet','price-refit.parquet'),recent_source=__file__)
 
 
 def final_frames(frame, tail_start, policy):

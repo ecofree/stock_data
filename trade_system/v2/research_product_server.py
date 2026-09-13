@@ -16,7 +16,7 @@ def service_identity(root, output):
     from .domain import identity, file_hash
     folder=Path(__file__).parent
     files=('research_product_server.py','research_product.py','research_product_view.py',
-           'research_journal.py','research_followup.py','observation_workspace.py','observation_capture.py','publisher.py')
+           'research_journal.py','daily_workspace.py','market_workspace.py','operator_workflow.py','accounts.py','research_followup.py','observation_workspace.py','observation_capture.py','publisher.py')
     return {'protocol':'stock-data-workspace-v1',
             'workspace_id':identity({'root':str(Path(root).resolve()).casefold(),
                                      'output':str(Path(output).resolve()).casefold()}),
@@ -34,7 +34,11 @@ def handler(root, output, port, *, shutdown=None):
 
     def refresh(mode='daily'):
         try:
-            if mode in ('observation','capture_quotes'):
+            if mode=='market':
+                from .daily_workspace import update_market
+                result=update_market(output)
+                state['message']=f"市场快照已发布：{result['date']}；未训练模型，未发起网络请求。"
+            elif mode in ('observation','capture_quotes'):
                 result=product.observe(output,capture_quotes=mode=='capture_quotes')
                 state['message']=f"报价核对完成：{result['qualified']} / {result['securities']} 只通过当前时点校验；本次请求 {result['provider_requests']} 次，失败 {result['capture_failures']} 次，未训练。缺失不使用昨日价格回填。"
             else:
@@ -80,12 +84,23 @@ def handler(root, output, port, *, shutdown=None):
                     return self.reply(200,receipt_page(note),'text/html; charset=utf-8')
                 except (ValueError,FileNotFoundError,KeyError):
                     return self.reply(404,'判断回执不存在或完整性校验失败；未创建新记录。')
+            if self.path.startswith('/plan-receipt/'):
+                try:
+                    from .operator_workflow import read_observation_plan
+                    from .research_product_view import plan_receipt_page
+                    plan=read_observation_plan(output,self.path.removeprefix('/plan-receipt/'))
+                    return self.reply(200,plan_receipt_page(plan),'text/html; charset=utf-8')
+                except (ValueError,FileNotFoundError,KeyError):return self.reply(404,'计划回执不可用。')
             if self.path!='/': return self.reply(404,'Not found')
             try:
+                if not (output/'publication/current.json').exists():
+                    from .daily_workspace import empty_projection
+                    html=render(product.journal_projection(output,empty_projection()))
+                    return self.reply(200,server_page(html,token,state['message'],state['running']),'text/html; charset=utf-8')
                 _,files=read_current(output/'publication')
                 # Read the sealed published projection and the small journal only.
                 # GET never loads a model, fetches data or changes the publication.
-                html=(render(product.journal_projection(output,json.loads(files['desk.json'])))
+                html=(render(product.journal_projection(output,json.loads(files['desk.json'])),include_account=True)
                       if 'desk.json' in files else files['index.html'].decode('utf-8'))
                 html=server_page(html,token,state['message'],state['running'])
                 self.reply(200,html,'text/html; charset=utf-8')
@@ -94,14 +109,14 @@ def handler(root, output, port, *, shutdown=None):
 
         def do_POST(self):
             if not self.valid_host() or self.headers.get('Origin')!=origin: return self.reply(403,'Origin refused')
-            if self.path not in ('/note','/review','/update','/observe','/capture-quotes','/shutdown'): return self.reply(404,'Not found')
+            if self.path not in ('/note','/plan','/review','/update','/market-update','/observe','/capture-quotes','/shutdown'): return self.reply(404,'Not found')
             if self.path!='/shutdown' and service_identity(root,output)!=startup_identity:
                 return self.reply(409,'服务代码已变化，请正常停止旧服务并重新启动；本次未执行。')
             try:
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=32000: return self.reply(413,'Form size refused')
                 if self.headers.get_content_type()!='application/x-www-form-urlencoded': return self.reply(415,'Form required')
-                fields=parse_qs(self.rfile.read(size).decode('utf-8'),strict_parsing=True,keep_blank_values=True,max_num_fields=11)
+                fields=parse_qs(self.rfile.read(size).decode('utf-8'),strict_parsing=True,keep_blank_values=True,max_num_fields=14)
                 if any(len(v)!=1 for v in fields.values()) or fields.get('csrf')!=[token]: return self.reply(403,'Token refused')
                 values={k:v[0] for k,v in fields.items() if k!='csrf'}
                 if self.path=='/shutdown':
@@ -115,6 +130,12 @@ def handler(root, output, port, *, shutdown=None):
                     self.send_response(303);self.send_header('Location','/review-receipt/'+review_id)
                     self.send_header('Content-Length','0');self.end_headers()
                     return
+                if self.path=='/plan':
+                    from .operator_workflow import save_observation_plan
+                    with mutex:plan_id=save_observation_plan(output,values)
+                    self.send_response(303);self.send_header('Location','/plan-receipt/'+plan_id)
+                    self.send_header('Content-Length','0');self.end_headers()
+                    return
                 if self.path=='/note':
                     if not values.get('request_id'):return self.reply(400,'请刷新工作台后提交带请求编号的判断。')
                     with mutex: note_id=product.save_note(output,values)
@@ -125,7 +146,7 @@ def handler(root, output, port, *, shutdown=None):
                     with mutex:
                         if state['running']: return self.reply(409,'已有更新正在运行')
                         state['running']=True;state['message']='正在更新真实数据；完成前继续展示上一成功版本。'
-                        mode={'/observe':'observation','/capture-quotes':'capture_quotes'}.get(self.path,'daily')
+                        mode={'/market-update':'market','/observe':'observation','/capture-quotes':'capture_quotes'}.get(self.path,'daily')
                         threading.Thread(target=refresh,args=(mode,),daemon=True).start()
                 self.send_response(303);self.send_header('Location','/');self.send_header('Content-Length','0');self.end_headers()
             except (ValueError,KeyError) as exc:
@@ -151,6 +172,7 @@ def serve(root, output, port=8766, *, open_browser=False):
             super().server_bind()
 
     output=Path(output)
+    output.mkdir(parents=True,exist_ok=True)
     control=output/('service-'+str(port)+'.json')
     # A crashed process can leave metadata, not ownership. Replace it only after
     # holding our permanent guard AND successfully binding the exclusive port.

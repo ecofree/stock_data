@@ -5,10 +5,6 @@ from pathlib import Path
 from collections import Counter
 import uuid
 
-import numpy as np
-import pandas as pd
-
-from . import research_dataset as dataset, rolling_research as research
 from .domain import canonical, file_hash, identity, now_utc
 from .gap_evidence import read_json, write_json
 from .publisher import publish, read_current
@@ -20,6 +16,8 @@ def write_pointer(root, name, value):
 
 
 def build(config_path, root, output):
+    import pandas as pd
+    from . import research_dataset as dataset, rolling_research as research
     output=Path(output).resolve(); output.mkdir(parents=True,exist_ok=True)
     config=read_json(config_path)[0]
     run=output/'builds'/uuid.uuid4().hex; run.mkdir(parents=True)
@@ -92,6 +90,7 @@ def build(config_path, root, output):
 
 
 def read_build(output, *, pointer_name='research-current.json', historical=False):
+    from . import research_dataset as dataset, rolling_research as research
     if pointer_name not in ('research-current.json','research-candidate.json'):
         raise ValueError('known build pointer required')
     pointer=read_json(Path(output)/pointer_name)[0]; run=Path(pointer['build'])
@@ -102,11 +101,11 @@ def read_build(output, *, pointer_name='research-current.json', historical=False
         raise ValueError('frozen rule baseline changed')
     model=read_json(run/'frozen-model.json')[0]
     meta=dataset_metadata(run)
-    if not historical and meta['source_sha256']!=file_hash(dataset.__file__):
+    if not historical and meta['source_sha256']!=file_hash(dataset.__file__) and not dataset.inference_compatible(meta):
         raise ValueError('feature formulas changed; build a new frozen model')
     if meta.get('recent_source_sha256'):
         from . import research_recent
-        if not historical and meta['recent_source_sha256']!=file_hash(research_recent.__file__):
+        if not historical and meta['recent_source_sha256']!=file_hash(research_recent.__file__) and not dataset.inference_compatible(meta):
             raise ValueError('recent dataset source changed; rebuild required')
         if file_hash(run/'previous-model-comparison.json')!=pointer.get('previous_comparison_sha256'):
             raise ValueError('previous model comparison changed')
@@ -137,6 +136,9 @@ def dataset_metadata(run):
 
 
 def predict(frame, calendar, model):
+    import numpy as np
+    import pandas as pd
+    from . import research_dataset as dataset
     import lightgbm as lgb
     calculated=dataset.features(frame,calendar)
     current=calculated[calculated.datetime==pd.Timestamp(calendar[-1])].copy()
@@ -156,6 +158,7 @@ def predict(frame, calendar, model):
 
 
 def latest_closed_session(calendar, moment):
+    import pandas as pd
     local=pd.Timestamp(moment).tz_convert('Asia/Shanghai')
     if list(calendar)!=sorted(set(calendar)):raise ValueError('ordered unique exchange calendar required')
     eligible=[d for d in calendar if pd.Timestamp(d+'T16:00:00',tz='Asia/Shanghai')<=local]
@@ -164,6 +167,7 @@ def latest_closed_session(calendar, moment):
 
 
 def forecast_timing(entry,captured_at):
+    import pandas as pd
     eligible=bool(pd.Timestamp(captured_at)<pd.Timestamp(entry)) if entry else None
     return {'prospective_eligible':eligible,'forecast_status':
         'pending_future_calendar' if eligible is None else 'before_entry' if eligible else 'after_entry'}
@@ -180,9 +184,9 @@ def update(root, output, *, receipts=None, client=None, replay_build=False, forc
 def configured_market(output, prediction):
     path=Path(output)/'workspace-config.json'
     if not path.exists():return None
-    from .market_workspace import snapshot
+    from .market_workspace import latest_snapshot
     config=read_json(path)[0]
-    return snapshot(config['market_database'],prediction['date'],now_utc().isoformat(),
+    return latest_snapshot(config['market_database'],now_utc().isoformat(),
                     [r['instrument'] for r in prediction['rows']])
 
 
@@ -202,6 +206,8 @@ def calendar_covers_clock(reg, parsed, today):
 
 
 def _update(root, output, *, receipts=None, client=None, replay_build=False, force_refresh=False):
+    import pandas as pd
+    from . import research_dataset as dataset
     from . import research_campaign as campaign
     run,model,_=read_build(output); config=read_json(run/'configuration.json')[0]
     if replay_build:
@@ -342,8 +348,17 @@ def publish_state(output,name,value,*,market=None):
 
 
 def _publish_desk(output,*,market=None):
+    from .daily_workspace import projection
     from .research_product_view import render
-    run,model,result=read_build(output)
+    data=projection(output,market=market,research_loader=_research_projection)
+    publication=Path(output)/'publication'
+    generation=read_current(publication)[0]['generation']+1 if (publication/'current.json').exists() else 1
+    return publish(publication,uuid.uuid4().hex,{'index.html':render(data).encode('utf-8'),'desk.json':canonical(data).encode()},generation=generation)
+
+
+def _research_projection(output):
+    """Optional frozen research evidence; never the owner of a market session."""
+    run,model,result=read_build(output,historical=True)
     candidate_model=None;readiness=None
     if (Path(output)/'research-candidate.json').exists():
         # Historical display is not permission to use changed formulas for inference.
@@ -354,26 +369,13 @@ def _publish_desk(output,*,market=None):
         'scope':'local_research_product_no_execution','execution_ready':False}
     data['candidate_model']=candidate_model
     data['candidate_readiness']=readiness
-    if market is not None:
-        if not data['prediction'] or market['trade_date']!=data['prediction']['date']:
-            raise ValueError('market and prediction date differ')
-        data['market']=market
-    if (Path(output)/'publication/current.json').exists():
-        import json
-        _,previous_files=read_current(Path(output)/'publication')
-        previous_market=json.loads(previous_files['desk.json']).get('market')
-        if market is None and previous_market and data['prediction'] and previous_market['trade_date']==data['prediction']['date']:
-            data['market']=previous_market
     data['reviews']=data['prediction'].get('reviews',[]) if data['prediction'] else []
     from . import research_baselines
     data['rule_baselines']=research_baselines.read(run) if (run/'rule-baselines.json').exists() else None
     data['previous_model_comparison']=read_json(run/'previous-model-comparison.json')[0] if (run/'previous-model-comparison.json').exists() else None
     from . import price_study
     data['price_study']=price_study.read(output)
-    data=journal_projection(output,data)
-    publication=Path(output)/'publication'
-    generation=read_current(publication)[0]['generation']+1 if (publication/'current.json').exists() else 1
-    return publish(publication,uuid.uuid4().hex,{'index.html':render(data).encode('utf-8'),'desk.json':canonical(data).encode()},generation=generation)
+    return data
 
 
 def journal_projection(output,data):
@@ -382,16 +384,18 @@ def journal_projection(output,data):
     from copy import deepcopy
     import heapq
     data=deepcopy(data);data.pop('report_id',None)
-    paths=(Path(output)/'notes').glob('*.json')
+    paths=research_journal.note_paths(output)
     recent=heapq.nlargest(100,paths,key=lambda p:p.stat().st_mtime_ns)
     notes=sorted([read_json(p)[0] for p in recent],key=lambda n:n['received_at'])
     data['notes']=research_journal.annotate(notes)
-    review_paths=heapq.nlargest(100,(Path(output)/'notes'/'reviews').glob('*.json'),key=lambda p:p.stat().st_mtime_ns)
+    data['attention_followups']=research_journal.attention_followups(output,data['notes'],data.get('market'))
+    review_paths=heapq.nlargest(100,research_journal.review_paths(output),key=lambda p:p.stat().st_mtime_ns)
     data['human_reviews']=[research_journal.read_review(output,p.stem) for p in reversed(review_paths)]
-    data['note_scope']={'shown':len(notes),'total':sum(1 for _ in (Path(output)/'notes').glob('*.json')),'limit':100}
+    data['note_scope']={'shown':len(notes),'total':sum(1 for _ in research_journal.note_paths(output)),'limit':100}
     reviews=data.setdefault('reviews',[])
     represented={r['prediction_id'] for r in reviews}
     for note in data['notes']:
+        if not note.get('prediction_id'):continue
         if note['prediction_id'] in represented:continue
         frozen=data.get('prediction')
         if not frozen or frozen['prediction_id']!=note['prediction_id']:
@@ -426,6 +430,11 @@ def journal_projection(output,data):
             # judgements or the independently sealed daily product.
             data['observation']={'error':'observation_snapshot_unavailable','qualified':0,
                                  'rows':[],'as_of':None,'execution_ready':False}
+    from .operator_workflow import observation_plans
+    try:
+        data['plans']=observation_plans(output,now_utc().isoformat(),(data.get('observation') or {}).get('rows',[]))
+    except (OSError,ValueError,KeyError) as exc:
+        data['plans']={'rows':[],'account':{'status':'risk_unavailable','execution_ready':False},'error':str(exc)[:200]}
     data['report_id']=identity(data)
     return data
 
@@ -525,8 +534,8 @@ def present(output,*,market_review=None):
 
 def render_saved(output,destination,*,market_review=None):
     """Export to a new directory without changing current publication."""
-    from .research_product_view import render
-    data=saved_projection(output,market_review=market_review)
+    from .research_product_view import render,export_projection
+    data=export_projection(saved_projection(output,market_review=market_review))
     destination=Path(destination).resolve()
     if destination.exists():raise ValueError('new isolated render destination required')
     destination.mkdir(parents=True)
@@ -546,6 +555,9 @@ def save_note(output, values):
 
 
 def _save_note(output, values):
+    if not values.get('prediction_id'):
+        from .research_journal import save_attention
+        return save_attention(output,values)
     from . import research_journal
     command={k:values.get(k) for k in ('prediction_id','instrument','intent','operator','hypothesis','invalidation')}
     command['supersedes']=values.get('supersedes') or None
@@ -570,7 +582,7 @@ def _save_note(output, values):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market'])
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market'])
     p.add_argument('--config',default='config/research_delivery.json');p.add_argument('--output',default='reports/research-delivery')
     p.add_argument('--receipts');p.add_argument('--replay-build',action='store_true',help='Replay only the frozen training receipts; does not certify the latest market date')
     p.add_argument('--destination',help='New isolated destination for a read-only render')
@@ -584,16 +596,18 @@ def main():
     a=p.parse_args();root=Path(__file__).resolve().parents[2];output=(root/a.output).resolve()
     if a.command=='configure-market':
         if not a.market_db:p.error('--market-db is required')
+        output.mkdir(parents=True,exist_ok=True)
         source=(root/a.market_db).resolve(strict=True)
-        from .market_workspace import snapshot
-        prediction=read_prediction(output)
-        if not prediction:raise ValueError('existing frozen prediction required')
-        market=snapshot(source,prediction['date'],now_utc().isoformat(),[r['instrument'] for r in prediction['rows']])
+        from .market_workspace import latest_snapshot
+        market=latest_snapshot(source,now_utc().isoformat())
         from trade_system.file_lock import FileLock
         with FileLock(output/'update.guard'):
             write_pointer(output,'workspace-config.json',{'market_database':str(source),'read_only':True})
             publish_desk(output,market=market)
         result={'configured':True,'snapshot_id':market['snapshot_id'],'production_cutover':False}
+    elif a.command=='market-update':
+        from .daily_workspace import update_market
+        result=update_market(output)
     elif a.command=='observe':result=observe(output,capture_quotes=a.capture_quotes,quote_receipts=a.quote_receipts)
     elif a.command=='present':
         result=present(output,market_review=root/a.market_review if a.market_review else None)

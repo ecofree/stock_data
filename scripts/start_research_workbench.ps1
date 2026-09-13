@@ -10,9 +10,6 @@ if ($Build) {
     & $Python -m trade_system.v2.research_product build
     if ($LASTEXITCODE -ne 0) { throw 'Research build failed; prior successful version is retained.' }
 }
-if (-not (Test-Path -LiteralPath 'reports/research-delivery/research-current.json')) {
-    throw 'No frozen research build. Viewing never starts training automatically; use -Build explicitly after preparing inputs.'
-}
 if ($Update) {
     & $Python -m trade_system.v2.research_product update
     if ($LASTEXITCODE -ne 0) { Write-Warning 'Current update failed. The prior version remains available with its original date.' }

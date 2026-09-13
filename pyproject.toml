@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-trading-assistant"
-version = "0.3.10"
+version = "0.3.11"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
 requires-python = ">=3.11,<3.13"
 dependencies = [

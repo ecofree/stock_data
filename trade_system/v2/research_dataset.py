@@ -16,6 +16,25 @@ LABEL = 'adjusted T+1 open to exact T+2 close percent; retrospective price targe
 AVAILABILITY = 'assumed Shanghai 16:00 on exact T+2; original historical receipt time unavailable'
 
 
+def inference_compatible(meta):
+    """A reviewed formula-preserving refactor is not permission to change old labels."""
+    import ast
+    import hashlib
+    from .gap_evidence import read_json
+    contract=read_json(Path(__file__).resolve().parents[2]/'config/research_inference_compatibility.json')[0]
+    if contract['base_features']!=BASE or contract['money_features']!=MONEY:return False
+    for name,key in [('research_dataset.py','source_sha256'),('research_recent.py','recent_source_sha256')]:
+        if not meta.get(key):continue
+        path=Path(__file__).with_name(name)
+        if meta[key]==file_hash(path):continue
+        approved=contract['modules'][name]
+        if meta[key]!=approved['legacy_source_sha256']:return False
+        module=ast.parse(path.read_bytes())
+        function=next(n for n in module.body if isinstance(n,ast.FunctionDef) and n.name==approved['function'])
+        if hashlib.sha256(ast.dump(function,include_attributes=False).encode()).hexdigest()!=approved['ast_sha256']:return False
+    return True
+
+
 def preflight(config, calendar):
     if config['schema'] != 1 or config['scope'] != 'retrospective_availability_selected_exploration':
         raise ValueError('explicit retrospective exploration scope required')
@@ -109,41 +128,68 @@ def load_history(config, root):
     return frame,days,summary
 
 
+def target_labels(computed, calendar, *, family='paired_alpha61'):
+    """One exact-session target algorithm; family eligibility remains independent."""
+    if family not in ('paired_alpha61','price21'):raise ValueError('explicit target family required')
+    computed=computed.copy();computed['datetime']=pd.to_datetime(computed.datetime)
+    computed=computed.sort_values(['instrument','datetime'])
+    days=pd.DatetimeIndex(calendar)
+    if not days.is_unique or not days.is_monotonic_increasing:raise ValueError('ordered unique target calendar required')
+    for _, group in computed.groupby('instrument',sort=False):
+        if not pd.DatetimeIndex(group.datetime).equals(days):raise ValueError('exact full session grid required; missing bars must remain rows')
+    grouped=computed.groupby('instrument',sort=False)
+    target=(grouped.close.shift(-2)/grouped.open.shift(-1)-1)*100
+    if family=='paired_alpha61':
+        valid=computed.feature_eligible&grouped.feature_eligible.shift(-1).eq(True)&grouped.feature_eligible.shift(-2).eq(True)
+    else:
+        valid=computed.price_eligible&(grouped.open.shift(-1)>0)&(grouped.close.shift(-2)>0)&np.isfinite(target)
+    computed['label_next_ret']=target.where(valid)
+    computed['label_date']=grouped.datetime.shift(-2)
+    computed['label_end_time']=computed.label_date+pd.Timedelta(hours=16)
+    computed['label_available_time']=computed.label_end_time
+    computed['label_status']=np.where(computed.label_next_ret.notna(),'retrospective_price_target_not_execution','missing_exact_target')
+    return computed
+
+
+def assemble(frame, days, output, *, alpha_compute=None):
+    if alpha_compute is None:
+        from .alpha158_research import compute as alpha_compute
+    calculated=features(frame,days)
+    alpha,expressions=alpha_compute(frame,days,Path(output)/'alpha158-provider',input_units='adjusted_shares_CNY')
+    calculated['datetime']=pd.to_datetime(calculated.datetime)
+    calculated=calculated.merge(alpha,on=['datetime','instrument'],how='left',validate='one_to_one')
+    return target_labels(calculated,days),expressions
+
+
+def write_metadata(config, summary, rows, expressions, output, *, artifacts=('features.parquet',), recent_source=None):
+    """One metadata producer; legacy dataset.json remains a read-only compatibility input."""
+    output=Path(output)
+    meta={'label_version':'exploratory_price_target_v1_not_formal_execution_labels','label_definition':LABEL,
+        'availability_assumption':AVAILABILITY,'feature_columns':BASE+MONEY+list(expressions),
+        'artifact_hashes':{name:file_hash(output/name) for name in artifacts},
+        'dataset_config':config,'dataset_id':identity(config),'summary':summary,'rows':rows,
+        'historical_exploration_allowed':True,'point_in_time_qualified':False,'execution_ready':False,
+        'source_sha256':file_hash(__file__),'label_policy':'new_exploration_artifact_only_original_labels_unchanged',
+        'eligibility_contract':{'price_sessions':21,'price_money_sessions':21,'money_sessions':5,
+            'alpha158_sessions':61,'historical_paired_cohort_sessions':61}}
+    if recent_source:meta['recent_source_sha256']=file_hash(recent_source)
+    write_json(output/'features.metadata.json',meta)
+    return meta
+
+
 def build(config, root, output):
     output=Path(output).resolve()
     if output.exists(): raise ValueError('new dataset version required')
     frame,days,summary=load_history(config,root)
-    computed=features(frame,days); output.mkdir(parents=True)
-    from .alpha158_research import compute
-    alpha,expressions=compute(frame,days,output/'alpha158-provider',input_units='adjusted_shares_CNY')
-    computed['datetime']=pd.to_datetime(computed.datetime)
-    computed=computed.merge(alpha,on=['datetime','instrument'],how='left',validate='one_to_one')
-    computed=computed.sort_values(['instrument','datetime'])
-    by=computed.groupby('instrument',sort=False)
-    target=(by.close.shift(-2)/by.open.shift(-1)-1)*100
-    future_valid=by.feature_eligible.shift(-1).eq(True)&by.feature_eligible.shift(-2).eq(True)
-    computed['label_next_ret']=target.where(computed.feature_eligible&future_valid)
-    computed['label_date']=by.datetime.shift(-2)
-    computed['label_end_time']=computed.label_date+pd.Timedelta(hours=16)
-    computed['label_available_time']=computed.label_end_time
-    computed['label_status']=np.where(computed.label_next_ret.notna(),'retrospective_price_target_not_execution','missing_exact_target')
+    output.mkdir(parents=True)
+    computed,expressions=assemble(frame,days,output)
     # Keep all cohort identities after the declared common warmup, including failed rows.
     computed=computed[computed.datetime>=pd.Timestamp(days[60])].sort_values(['datetime','instrument'])
     computed.to_parquet(output/'features.parquet',index=False)
     for item in config['sources'].values():
         if file_hash(Path(root)/item['path']) != item['sha256']:
             raise ValueError('source changed during dataset build')
-    meta={'label_version':'exploratory_price_target_v1_not_formal_execution_labels','label_definition':LABEL,
-        'availability_assumption':AVAILABILITY,'feature_columns':BASE+MONEY+list(expressions),
-        'artifact_hashes':{'features.parquet':file_hash(output/'features.parquet')},
-        'dataset_config':config,'dataset_id':identity(config),'summary':summary,'rows':len(computed),
-        'historical_exploration_allowed':True,'point_in_time_qualified':False,'execution_ready':False,
-        'source_sha256':file_hash(__file__),'label_policy':'new_exploration_artifact_only_original_labels_unchanged'}
-    meta['eligibility_contract']={'price_sessions':21,'price_money_sessions':21,'money_sessions':5,
-        'alpha158_sessions':61,'historical_paired_cohort_sessions':61}
-    write_json(output/'features.metadata.json',meta)
-    write_json(output/'dataset.json',meta)
-    return meta
+    return write_metadata(config,summary,len(computed),expressions,output)
 
 
 def experiment_plan(config, meta, name):

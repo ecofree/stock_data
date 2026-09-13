@@ -92,14 +92,7 @@ def price_features(observed, first_date):
     if days != observed['calendar']['SZSE']:
         raise ValueError('exchange calendars differ')
     frame = ds.features(pd.DataFrame(observed['rows']), days).sort_values(['instrument','datetime'])
-    grouped = frame.groupby('instrument', sort=False)
-    target = (grouped.close.shift(-2) / grouped.open.shift(-1) - 1) * 100
-    valid = frame.price_eligible & (grouped.open.shift(-1)>0) & (grouped.close.shift(-2)>0) & np.isfinite(target)
-    frame['label_next_ret'] = target.where(valid)
-    frame['label_date'] = grouped.datetime.shift(-2)
-    frame['label_end_time'] = frame.label_date + pd.Timedelta(hours=16)
-    frame['label_available_time'] = frame.label_end_time
-    frame['label_status'] = np.where(valid,'retrospective_price_target_not_execution','missing_exact_target')
+    frame=ds.target_labels(frame,days,family='price21')
     # Keep the already frozen evaluation calendar, not extra backtested dates.
     return frame[frame.datetime>=pd.Timestamp(first_date)].sort_values(['datetime','instrument'])
 

@@ -12,6 +12,173 @@ SCOPE = 'offline_paper_confirmation_only'
 ACK = 'I_UNDERSTAND_PAPER_ONLY_NO_REAL_ORDER'
 
 
+def read_observation_plan(output, plan_id):
+    import re
+    from pathlib import Path
+    from .gap_evidence import read_json
+    from .research_journal import read_note
+    if not isinstance(plan_id,str) or not re.fullmatch('[a-f0-9]{64}',plan_id):raise ValueError('valid plan identity required')
+    plan=read_json(Path(output)/'notes/plans'/(plan_id+'.json'))[0]
+    if plan_id!=identity({k:v for k,v in plan.items() if k!='plan_id'}):raise ValueError('plan changed')
+    note=read_note(output,plan['note_id'])
+    if note['instrument']!=plan['instrument']:raise ValueError('plan parent differs')
+    return plan
+
+
+def save_observation_plan(output, values):
+    """Append an explicit non-executable plan; the existing account core owns risk."""
+    from pathlib import Path
+    from datetime import timedelta
+    import re
+    from trade_system.file_lock import FileLock
+    from .domain import now_utc, number
+    from .gap_evidence import read_json
+    from .research_journal import read_note, durable_event
+    output=Path(output)
+    command={k:values.get(k,'') for k in ('note_id','operator','condition','threshold','valid_until','supersedes')}
+    request_id=values.get('request_id')
+    if not isinstance(request_id,str) or not re.fullmatch('[a-f0-9]{32}',request_id):raise ValueError('valid plan request id required')
+    with FileLock(output/'judgement.guard'):
+        for path in (output/'notes/plans').glob('*.json'):
+            old=read_observation_plan(output,path.stem)
+            if old['request_id']==request_id:
+                if old['command_id']!=identity(command):raise ValueError('plan request reused with different content')
+                return old['plan_id']
+        note=read_note(output,command['note_id'])
+        if command['operator']!=note['operator']:raise ValueError('plan must preserve declared judgement author')
+        if command['condition'] not in ('manual','price_above','price_below'):raise ValueError('explicit supported condition required')
+        if command['condition']!='manual' and number(command['threshold'])<=0:raise ValueError('positive unadjusted CNY threshold required')
+        at=now_utc();until=utc(command['valid_until'])
+        if not at<until<=at+timedelta(days=30):raise ValueError('plan expiry must be in the next 30 days')
+        if command['supersedes']:
+            parent=read_observation_plan(output,command['supersedes'])
+            if any(parent[k]!=command[k] for k in ('note_id','operator')):raise ValueError('plan revision parent differs')
+            if any(read_json(p)[0].get('supersedes')==command['supersedes'] for p in (output/'notes/plans').glob('*.json')):
+                raise ValueError('plan already revised')
+        risk=configured_account_risk(output,at.isoformat())
+        plan=dict(command,request_id=request_id,command_id=identity(command),instrument=note['instrument'],
+            evidence_id=note.get('evidence_id') or note.get('prediction_id'),received_at=at.isoformat(),
+            account_id=risk.get('account_id'),account_snapshot_id=risk.get('snapshot_id'),
+            invalidation=note['invalidation'],scope='observation_plan_not_order',price_unit='unadjusted_CNY',
+            quantity=None,execution_ready=False,account_status=risk['status'])
+        plan['plan_id']=identity(plan);durable_event(output/'notes/plans',plan['plan_id'],plan)
+        return plan['plan_id']
+
+
+def configured_account_risk(output, as_of):
+    from pathlib import Path
+    from .gap_evidence import read_json
+    from .accounts import risk_snapshot
+    path=Path(output)/'workspace-config.json'
+    config=read_json(path)[0] if path.exists() else {}
+    if not config.get('account_database') or not config.get('account_id'):
+        return {'status':'account_unknown','execution_ready':False,'positions':[],'open_orders':[]}
+    import duckdb
+    try:return risk_snapshot(config['account_database'],config['account_id'],as_of)
+    except (duckdb.Error,OSError,ValueError) as exc:
+        return {'status':'account_source_unavailable','error':str(exc)[:160],'execution_ready':False,'positions':[],'open_orders':[]}
+
+
+def evaluate_observation_plan(plan, as_of, *, quote=None, account=None):
+    from .domain import number
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    at=utc(as_of)
+    deadline=None
+    if quote and quote.get('valid_until'):
+        deadline=datetime.fromisoformat(quote['valid_until'])
+        if deadline.tzinfo is None:deadline=deadline.replace(tzinfo=ZoneInfo('Asia/Shanghai'))
+    blockers=[]
+    if not account or account.get('status')!='account_snapshot_available_not_execution':blockers.append('account_not_verified')
+    if plan.get('account_snapshot_id') and (account or {}).get('snapshot_id')!=plan['account_snapshot_id']:blockers.append('account_version_changed')
+    if at<utc(plan['received_at']):state='data_insufficient'
+    elif at>=utc(plan['valid_until']):state='expired'
+    elif plan['condition']=='manual':state='pending_human_condition'
+    elif (not quote or quote.get('instrument')!=plan['instrument'] or quote.get('price') is None
+          or quote.get('state')!='current_observation_not_executable'
+          or deadline is None or at>=utc(deadline)):
+        state='data_insufficient'
+    else:
+        price=number(quote['price']);threshold=number(plan['threshold'])
+        triggered=price>=threshold if plan['condition']=='price_above' else price<=threshold
+        state='triggered' if triggered else 'pending'
+    return {'state':state,'account_blockers':blockers,'execution_ready':False,
+            'condition_scope':'observation_only_not_fill_or_order_permission'}
+
+
+def observation_plans(output, as_of, quotes=()):
+    from pathlib import Path
+    import heapq
+    paths=heapq.nlargest(100,(Path(output)/'notes/plans').glob('*.json'),key=lambda p:p.stat().st_mtime_ns)
+    plans=[read_observation_plan(output,p.stem) for p in paths]
+    superseded={p.get('supersedes') for p in plans};by_code={q['instrument']:q for q in quotes}
+    account=configured_account_risk(output,as_of)
+    invalidations=plan_invalidation_context(output)
+    rows=[]
+    for plan in plans:
+        evaluation=evaluate_observation_plan(plan,as_of,quote=by_code.get(plan['instrument']),account=account)
+        invalidation=plan_invalidation(output,plan,context=invalidations)
+        if invalidation:evaluation.update(state='invalid',invalidation=invalidation)
+        rows.append(dict(plan,is_latest=plan['plan_id'] not in superseded,evaluation=evaluation))
+    return {'account':account,'rows':rows}
+
+
+def plan_invalidation_context(output):
+    from pathlib import Path
+    from .gap_evidence import read_json
+    from .research_journal import read_review,note_paths,review_paths
+    plans={read_json(p)[0].get('supersedes') for p in (Path(output)/'notes/plans').glob('*.json')}
+    notes={read_json(p)[0].get('supersedes') for p in note_paths(output)}
+    reviews=[read_review(output,p.stem) for p in review_paths(output)]
+    return {'plans':plans,'notes':notes,'invalid_notes':{r['note_id'] for r in reviews if r['conclusion']=='triggered'}}
+
+
+def plan_invalidation(output, plan, *, context=None):
+    state=context if context is not None else plan_invalidation_context(output)
+    if plan['plan_id'] in state['plans']:return 'plan_superseded'
+    if plan['note_id'] in state['notes']:return 'judgement_revised_requires_new_plan'
+    # Once invalidated, a new plan version is required; a later note cannot revive it.
+    if plan['note_id'] in state['invalid_notes']:return 'human_reported_invalidation'
+    return None
+
+
+def link_observation_paper_plan(store, output, plan_id, decision_id):
+    """A plan can link only to a real existing core certificate, never manufacture one."""
+    plan=read_observation_plan(output,plan_id);packet=export_plan(store,decision_id)
+    cert=packet['certificate'];code=cert['instrument'].split('.')[-1]
+    if code!=plan['instrument'] or utc(store.clock())>=utc(plan['valid_until']):raise ValueError('paper certificate does not match a current observation plan')
+    if plan.get('account_id') and cert['account_id']!=plan['account_id']:raise ValueError('paper account differs')
+    if plan.get('account_snapshot_id') and cert['snapshot_id']!=plan['account_snapshot_id']:raise ValueError('account snapshot changed')
+    return {'plan_id':plan_id,'note_id':plan['note_id'],'paper_packet':packet,'execution_ready':False}
+
+
+def confirm_linked_observation(store, output, linked, *, condition_confirmed=False, **confirmation):
+    plan=read_observation_plan(output,linked['plan_id'])
+    cert=validate_packet(store,linked['paper_packet'])
+    if linked['note_id']!=plan['note_id'] or cert['instrument'].split('.')[-1]!=plan['instrument']:
+        raise ValueError('linked observation parent differs')
+    confirmation=dict(confirmation)
+    confirmation['request_id']=identity([plan['plan_id'],confirmation['request_id']])
+    action_id='desk:'+identity([linked['paper_packet']['packet_id'],confirmation['request_id']])
+    existing=store.con.execute('SELECT 1 FROM operator_action WHERE action_id=?',[action_id]).fetchone()
+    if not existing:
+        if plan_invalidation(output,plan):raise ValueError('observation plan invalidated or superseded')
+        if utc(store.clock())>=utc(plan['valid_until']):raise ValueError('observation plan expired')
+        if plan['condition']=='manual' and condition_confirmed is not True:raise ValueError('explicit manual condition confirmation required')
+        current=DecisionService(store,RiskPolicy(**cert['policy'])).evaluate(
+            cert['account_id'],cert['signal_id'],confirmation['quote_manifest'],cert['quote_dataset'])
+        if plan.get('account_snapshot_id') and current['snapshot_id']!=plan['account_snapshot_id']:
+            raise ValueError('observation account version changed')
+        if plan['condition']!='manual':
+            state=evaluate_observation_plan(plan,store.clock().isoformat(),quote={
+                'instrument':plan['instrument'],'price':current['price_fen']/100,
+                'state':'current_observation_not_executable' if not current['blockers'] else 'unavailable',
+                'valid_until':current['expires_at']})
+            if state['state']!='triggered':raise ValueError('observation condition is not currently triggered')
+    # Retries delegate to the durable core even after expiry; new requests recheck everything.
+    return dict(confirm_plan(store,linked['paper_packet'],**confirmation),plan_id=linked['plan_id'],note_id=linked['note_id'])
+
+
 def certificate(store, decision_id):
     store.check_owner()
     row = store.con.execute('SELECT payload FROM decision_certificate WHERE decision_id=?',[decision_id]).fetchone()

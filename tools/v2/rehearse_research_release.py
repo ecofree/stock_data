@@ -38,6 +38,7 @@ def rehearse(previous,candidate,output,runtime,workspace):
     workspace=Path(workspace).resolve(strict=True)
     pointers=['research-current.json','research-candidate.json','prediction-current.json']
     before={p:file_hash(workspace/p) for p in pointers if (workspace/p).exists()}
+    events_before={p.relative_to(workspace).as_posix():file_hash(p) for p in (workspace/'notes').rglob('*.json')}
     releases={}
     for name,archive in [('previous',previous),('candidate',candidate)]:
         info=stage(archive,output/name)
@@ -60,8 +61,12 @@ def rehearse(previous,candidate,output,runtime,workspace):
         events.append({'generation':manifest['generation'],'release':name,'manifest_sha256':receipt['manifest_sha256']})
     after={p:file_hash(workspace/p) for p in before}
     if after!=before:raise ValueError('frozen workspace pointers changed')
+    events_after={p.relative_to(workspace).as_posix():file_hash(p) for p in (workspace/'notes').rglob('*.json')}
+    if events_after!=events_before:raise ValueError('human records changed during release rehearsal')
     report={'scope':'isolated_release_artifact_switch_and_rollback_not_windows_task_cutover',
         'events':events,'frozen_pointers_unchanged':True,'releases':releases,
+        'human_event_files_checked':len(events_before),'human_event_bytes_unchanged':True,
+        'new_schema_display_requires_reader':'0.3.11; older readers retain but do not display attention subdirectories',
         'rollback_verified':True,'production_cutover':False,'execution_ready':False}
     (output/'rehearsal.json').write_text(canonical(report),encoding='utf-8')
     return report
