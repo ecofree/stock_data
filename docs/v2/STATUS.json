@@ -1,5 +1,15 @@
 {
   "schema_version": 1,
+  "architecture_m0_m3": {
+    "approved": true,
+    "baseline_commit": "f414108f235df590734d2acb5061b6adec60f7ea",
+    "baseline_remote_ci": {"run_id":34736515443,"passed":1579,"failed":7,"skipped":1,"source":"provided_and_hash_verified_audit_artifact"},
+    "status":"implementation_in_progress_not_delivery_acceptance",
+    "m0":"local_targeted_parquet_and_mandatory_research_checks_passed_remote_pending",
+    "m1":"pending","m2":"pending","m3":"pending",
+    "plan":"docs/v2/ARCHITECTURE_EXECUTION_PLAN_20260913.md",
+    "handover":"docs/v2/ARCHITECTURE_HANDOVER_20260913.md"
+  },
   "current_delivery": {
     "deployment_authorization": {"approved":true,"approved_date":"2026-09-12","window_start":"2026-09-13T16:00:00+08:00","window_end":"2026-09-13T17:00:00+08:00","scope":"three_file_hotfix_dedicated_non_admin_identity_and_read_only_daily_task","window_followup_automation_id":"stockdata","current_session_elevated_administrator":false,"operator_separate_elevated_window_confirmed_by_user":true,"deployment_started":false},
     "installer": {"path":"scripts/deploy_research_cutover.ps1","sha256":"8924c867edadf56f86da7c192560bd5340cda2ccc253d81e03b79fff1b91a16e","modes":["Check","Apply","Rollback"],"read_only_check_actually_passed":true,"kernel_guard_interoperability_test_passed":true,"apply_performed":false,"real_account_acl_and_scheduled_identity_probe":"deferred_to_user_administrator_execution_in_approved_window","operator_guide":"docs/v2/DEPLOYMENT_OPERATOR_20260913.md"},

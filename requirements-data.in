@@ -1,0 +1,2 @@
+# Data test lane, separate from the minimal installed core and frozen research.
+pyarrow==25.0.1

@@ -18,7 +18,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --require-hashes -r requirements-data.lock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -38,7 +38,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The delivery verifier owns lint, migrations, installed dependency checks,
           # the installed entrypoint probe and the single full test run.
-          python tools/v2/verify_delivery.py --output tmp/delivery --installed-python tmp/core-runtime/Scripts/python.exe --wheel $taskWheel.FullName --minimal-runtime
+          python tools/v2/verify_delivery.py --output tmp/delivery --installed-python tmp/core-runtime/Scripts/python.exe --wheel $taskWheel.FullName --minimal-runtime --data-lane
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve test evidence
         if: always()
@@ -46,3 +46,35 @@ jobs:
         with:
           name: core-evidence-${{ github.sha }}
           path: tmp/delivery/
+  research:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-research-test.lock
+      - name: Install frozen research and test runtime
+        run: |
+          python -m pip install --require-hashes -r requirements-research-test.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Mandatory QLib Alpha158 fit and frozen inference
+        run: python -m pytest -o addopts= -q tests/test_research_runtime_contract.py tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order --junitxml=tmp/research/tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: research-evidence-${{ github.sha }}
+          path: tmp/research/
+  acceptance:
+    if: always()
+    needs: [test, research]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both profiles must pass on this commit
+        env:
+          DATA_RESULT: ${{ needs.test.result }}
+          RESEARCH_RESULT: ${{ needs.research.result }}
+        run: test "$DATA_RESULT" = success && test "$RESEARCH_RESULT" = success

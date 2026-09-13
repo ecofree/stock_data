@@ -1,0 +1,2 @@
+# Overlay for the frozen Windows CPython 3.12 research runtime.
+pytest==9.1.1

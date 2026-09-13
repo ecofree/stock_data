@@ -26,11 +26,11 @@ def digest(path):
 def source_files():
     files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=ROOT).decode().split('\0')
     return {p:digest(ROOT/p) for p in sorted(set(files)) if p and (ROOT/p).is_file()
-            and Path(p).suffix in ('.py','.ps1','.bat','.cmd','.toml','.sql','.lock','.in','.yml','.yaml')
+            and Path(p).suffix in ('.py','.ps1','.bat','.cmd','.toml','.sql','.lock','.in','.yml','.yaml','.json')
             and not p.startswith(('docs/','reports/','tmp/','backups/','.workbuddy/'))}
 
 
-def capture(output,installed_python,wheel,*,minimal_runtime=False):
+def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=False):
     output.mkdir(parents=True,exist_ok=False)
     start=datetime.now(timezone.utc).isoformat()
     before=source_files()
@@ -54,6 +54,10 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False):
         'tests':[sys.executable,'-m','pytest','-o','addopts=','-q','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml')],
         'installed_dependencies':[str(installed_python),'-m','pip','check'],
         'installed_core':[str(installed_python),'-I',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
+    if data_lane:
+        commands['tests'] += ['--ignore=tests/test_research_runtime_contract.py',
+            '--deselect=tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order']
+    report['test_lane']='data' if data_lane else 'complete_local'
     success=True
     for name,command in commands.items():
         try:
@@ -94,5 +98,6 @@ if __name__=='__main__':
     parser.add_argument('--installed-python',type=Path,required=True)
     parser.add_argument('--wheel',type=Path,required=True)
     parser.add_argument('--minimal-runtime',action='store_true')
+    parser.add_argument('--data-lane',action='store_true')
     args=parser.parse_args()
-    raise SystemExit(0 if capture(args.output.resolve(),args.installed_python.resolve(),args.wheel.resolve(),minimal_runtime=args.minimal_runtime) else 1)
+    raise SystemExit(0 if capture(args.output.resolve(),args.installed_python.resolve(),args.wheel.resolve(),minimal_runtime=args.minimal_runtime,data_lane=args.data_lane) else 1)
