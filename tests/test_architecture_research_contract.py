@@ -6,7 +6,8 @@ from tests.test_research_delivery import prices
 
 
 def test_frozen_inference_compatibility_is_exact_not_general_bypass(monkeypatch):
-    meta={'source_sha256':'ef6711d61e95691bb0cbb684e6528f5f5b3807fa4b06b6d57f2eea90bc90790f'}
+    meta={'source_sha256':'ef6711d61e95691bb0cbb684e6528f5f5b3807fa4b06b6d57f2eea90bc90790f',
+          'recent_source_sha256':'611165eceec9d90850e3b2dfc3846039a9788452f09b47b32fdd6e24dd4f5902'}
     assert dataset.inference_compatible(meta)
     assert not dataset.inference_compatible({'source_sha256':'0'*64})
     monkeypatch.setattr(dataset,'BASE',[*dataset.BASE,'unreviewed_feature'])

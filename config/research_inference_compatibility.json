@@ -16,12 +16,18 @@
     "research_dataset.py": {
       "legacy_source_sha256": "ef6711d61e95691bb0cbb684e6528f5f5b3807fa4b06b6d57f2eea90bc90790f",
       "function": "features",
-      "ast_sha256": "11b39b4498cf0083c3dc26cd1f7cbf495df9aad9e598daa83687db7856927cfb"
+      "ast_sha256_by_python_minor": {
+        "3.11": "b7a01b51c91d9f97dbc04e389602cc4a82d7638bc04cc2f0a740cea6f6903a76",
+        "3.12": "11b39b4498cf0083c3dc26cd1f7cbf495df9aad9e598daa83687db7856927cfb"
+      }
     },
     "research_recent.py": {
       "legacy_source_sha256": "611165eceec9d90850e3b2dfc3846039a9788452f09b47b32fdd6e24dd4f5902",
       "function": "load_receipts",
-      "ast_sha256": "c0872e99f46ac00ff2a4595ff13236741ad3421260257617356a1a327f154aa2"
+      "ast_sha256_by_python_minor": {
+        "3.11": "8378245cce0f26e9e28abcb8ff4405bddfaaa8fb19d98b1e9fd3d93022f8814f",
+        "3.12": "c0872e99f46ac00ff2a4595ff13236741ad3421260257617356a1a327f154aa2"
+      }
     }
   }
 }

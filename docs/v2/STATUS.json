@@ -29,16 +29,16 @@
     "real_human_records": 0,
     "real_account_acceptance": false,
     "reference_full_verification": {
-      "path": "reports/architecture-release-20260913/r2/verification/verification.json",
-      "tests": 1599,
+      "path": "reports/architecture-release-20260913/r4/verification/verification.json",
+      "tests": 1600,
       "failures": 0,
       "skipped": 0,
-      "source_sha256": "da1aad951d445efe6f62edea8d37b259d15e8f8508cd482867f369bdc48e3148",
-      "scope": "before_final_presentation_only_adjustments_final_commit_CI_still_required"
+      "source_sha256": "4ea0b43073d7fcf4b2d71d7975adcb067384535f062eb095df7bf32f9827d5d4",
+      "scope": "before_parser_version_compatibility_fix_final_commit_CI_still_required"
     },
     "candidate": {
-      "path": "reports/architecture-release-20260913/r3/stock-data-workspace-0.3.11.zip",
-      "sha256": "59304ba3fa444b28f3a06e1a3101067a61a40ac7733bc76cf794209f53faa0c9",
+      "path": "reports/architecture-release-20260913/r5/stock-data-workspace-0.3.11.zip",
+      "sha256": "409d9ee85eb89dd49851cc70eb1d76035b3681749f2916408b829b660cb97f08",
       "files": 57
     },
     "implementation": "docs/v2/ARCHITECTURE_IMPLEMENTATION_20260913.md",

@@ -69,3 +69,12 @@ assert '每日观察与复盘' in render(empty_projection())
 '''
     result=subprocess.run([sys.executable,'-c',script],capture_output=True,text=True)
     assert result.returncode==0,result.stderr
+
+
+def test_independent_receipt_links_to_its_own_followup(tmp_path):
+    from trade_system.v2.research_product_view import receipt_page
+    product.publish_desk(tmp_path,market=market())
+    note_id=product.save_note(tmp_path,command())
+    page=receipt_page(journal.read_note(tmp_path,note_id))
+    assert '市场证据' in page and '原预测批次' not in page
+    assert '/#review-'+note_id in page

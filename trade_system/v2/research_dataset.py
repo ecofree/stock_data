@@ -20,6 +20,7 @@ def inference_compatible(meta):
     """A reviewed formula-preserving refactor is not permission to change old labels."""
     import ast
     import hashlib
+    import sys
     from .gap_evidence import read_json
     contract=read_json(Path(__file__).resolve().parents[2]/'config/research_inference_compatibility.json')[0]
     if contract['base_features']!=BASE or contract['money_features']!=MONEY:return False
@@ -31,7 +32,11 @@ def inference_compatible(meta):
         if meta[key]!=approved['legacy_source_sha256']:return False
         module=ast.parse(path.read_bytes())
         function=next(n for n in module.body if isinstance(n,ast.FunctionDef) and n.name==approved['function'])
-        if hashlib.sha256(ast.dump(function,include_attributes=False).encode()).hexdigest()!=approved['ast_sha256']:return False
+        # Python 3.12 added FunctionDef.type_params. Bind each supported parser's
+        # exact legacy AST instead of weakening the function-change check.
+        parser_version=f'{sys.version_info.major}.{sys.version_info.minor}'
+        expected=approved['ast_sha256_by_python_minor'].get(parser_version)
+        if not expected or hashlib.sha256(ast.dump(function,include_attributes=False).encode()).hexdigest()!=expected:return False
     return True
 
 
