@@ -10,7 +10,7 @@ import time
 import duckdb
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
-from tools.v2 import probe_identity_sources as probe
+from tools.incidents import probe_identity_sources as probe
 from tools.incidents.normalize_price_units import qualify,FIELDS
 from tools.incidents.canonical_price_research import resolve
 from trade_system.v2.daily_session import CST,seal

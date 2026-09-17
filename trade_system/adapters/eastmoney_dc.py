@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import math
 import urllib.request as _u
 import urllib.parse as _up
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
-from trade_system.http_transport import read_verified_once
+from trade_system.http_transport import read_verified_once, request_deadline
 
 try:
     from trade_system.config import SETTINGS as _PROJECT_SETTINGS
@@ -52,8 +54,11 @@ def _em_get_json(url, params=None, headers=None, timeout=15, post=False, data=No
 
 def _em_get_clist_json(params=None, timeout=15):
     """Low-frequency clist request with an independently guarded delay route."""
-    import requests
-
+    if not math.isfinite(timeout) or not 0 < timeout <= 60:
+        raise ValueError('clist requires a positive budget of at most 60 seconds')
+    deadline = time.monotonic() + timeout
+    if request_deadline.get() is not None:
+        deadline = min(deadline, request_deadline.get())
     request_params = dict(params or {})
     request_params.setdefault("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
     routes = (
@@ -62,20 +67,15 @@ def _em_get_clist_json(params=None, timeout=15):
     )
     errors = []
     for endpoint, guard, source in routes:
+        if time.monotonic() >= deadline:
+            break
         try:
             guard.assert_available()
         except EastmoneyClistUnavailable as exc:
             errors.append(f"{source}: {exc}")
             continue
         try:
-            session = requests.Session()
-            session.trust_env = False
-            response = session.get(
-                endpoint, params=request_params, headers=EM_SESSION_HDR,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
+            payload = _em_get_json(endpoint, request_params, timeout=deadline-time.monotonic())
             data = payload.get("data") if isinstance(payload, dict) else None
             diff = data.get("diff") if isinstance(data, dict) else None
             if not isinstance(diff, (list, dict)):
@@ -570,7 +570,7 @@ def _from_em_stock_news(code, page_size=20):
     try:
         req = _u.Request("https://search-api-web.eastmoney.com/search/jsonp?" + _up.urlencode(params),
                          headers={"User-Agent": UA, "Referer": "https://so.eastmoney.com/"})
-        text = _u.urlopen(req, timeout=12).read().decode("utf-8", "ignore")
+        text = read_verified_once(req, timeout=12, max_bytes=8_000_000).decode("utf-8", "ignore")
         json_str = text[text.index("(") + 1: text.rindex(")")]
         d = json.loads(json_str)
     except Exception:
@@ -605,7 +605,7 @@ def _from_cls_telegraph(page_size=50):
     url = f"https://www.cls.cn/v1/roll/get_roll_list?{qs}&sign={sign}"
     try:
         req = _u.Request(url, headers={"User-Agent": UA, "Referer": "https://www.cls.cn/"})
-        d = json.loads(_u.urlopen(req, timeout=10).read())
+        d = json.loads(read_verified_once(req, timeout=10, max_bytes=8_000_000))
     except Exception:
         return None
     out = []

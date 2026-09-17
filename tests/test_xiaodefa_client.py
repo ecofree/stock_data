@@ -115,7 +115,7 @@ def acquisition(tmp_path, monkeypatch):
     monkeypatch.setattr(source, 'cache', Cache())
     monkeypatch.setattr(source.health, 'is_cooldown', lambda *a: False)
     monkeypatch.setattr(source.health, 'record', lambda *a: None)
-    monkeypatch.setattr(source.rate, 'acquire', lambda *a: None)
+    monkeypatch.setattr(source.rate, 'acquire', lambda *a, **kw: None)
     monkeypatch.setattr(source.rate, 'release', lambda *a: None)
     return source
 
@@ -219,6 +219,73 @@ def test_shared_cooldown_refuses_out_of_budget_wait(tmp_path, monkeypatch):
     limiter.cooldown('fixture-account', 60)
     with pytest.raises(TimeoutError, match='cooldown'):
         limiter.acquire('fixture-account', 1, deadline=time.monotonic()+0.05)
+
+
+@pytest.mark.parametrize('operation', ['acquire', 'cooldown'])
+def test_limiter_is_lazy_and_database_lock_obeys_deadline(tmp_path, monkeypatch, operation):
+    from trade_system.host_limiter import SharedHostLimiter
+    import sqlite3
+    import time
+    monkeypatch.setenv('KPL_SHARED_RATE_LIMIT', '1')
+    path = tmp_path/'rate.db'
+    limiter = SharedHostLimiter(path)
+    assert not path.exists()
+    with sqlite3.connect(path) as lock:
+        lock.execute('BEGIN IMMEDIATE')
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            getattr(limiter, operation)('fixture', 1, deadline=start+0.05)
+        assert time.monotonic()-start < 0.5
+        lock.rollback()
+    limiter.acquire('fixture', 0.01, deadline=time.monotonic()+1)
+    with sqlite3.connect(path) as con:
+        assert con.execute('SELECT count(*) FROM host_rate_limit').fetchone()[0] == 1
+
+
+def test_unfinished_provider_holds_concurrency_slot(acquisition, monkeypatch):
+    limiter = acquisition.RateLimiter()
+    limiter.sem = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(acquisition, 'rate', limiter)
+    monkeypatch.setattr(acquisition.shared_host_limiter, 'acquire', lambda *a, **kw: None)
+    release = threading.Event(); done = threading.Event(); calls = []; failures = []
+    def fetch():
+        calls.append(1)
+        release.wait(2)
+        done.set()
+        return [{'value':7}]
+    monkeypatch.setattr(acquisition.health, 'record', lambda *a: failures.append(a))
+    monkeypatch.setitem(acquisition.SOURCE_PLAN, 'fixture', [('fixture', fetch)])
+    try:
+        assert acquisition.get('fixture', code='first', timeout_per=0.03)[1]['status'] == 'in_progress'
+        assert acquisition.get('fixture', code='second', timeout_per=0.03)[1]['status'] == 'failed'
+        assert calls == [1] and not failures
+    finally:
+        release.set()
+        assert done.wait(1)
+    assert limiter.sem.acquire(timeout=1)
+    limiter.sem.release()
+
+
+def test_orchestrator_budget_reaches_nested_transport(monkeypatch):
+    import json
+    import subprocess
+    import time
+    from types import SimpleNamespace
+    from trade_system.resilient_sources import _call
+    from trade_system.http_transport import read_verified_once, request_deadline
+    calls = []
+    def run(command, *, input, timeout, **kwargs):
+        calls.append(timeout)
+        assert json.loads(input)['timeout'] == timeout
+        return SimpleNamespace(returncode=0, stdout=b'{"ok":true}\n{}')
+    monkeypatch.setattr(subprocess, 'run', run)
+    def source():
+        assert request_deadline.get() is not None
+        time.sleep(0.03)
+        return read_verified_once(urllib.request.Request('https://example.invalid'), timeout=15, max_bytes=100)
+    assert _call(source, 0.5) == b'{}'
+    assert len(calls) == 1 and 0 < calls[0] < 0.5
+    assert request_deadline.get() is None
 
 
 def test_blocked_transport_worker_is_reaped_at_deadline(monkeypatch):

@@ -5,7 +5,7 @@ import pytest
 
 from tools.incidents import duplicate_year_campaign as campaign
 from tools.incidents.normalize_price_units import FIELDS
-from tools.v2.probe_identity_sources import API_FIELDS,PRICES
+from tools.incidents.probe_identity_sources import API_FIELDS,PRICES
 from trade_system.v2.daily_session import CST,seal
 from trade_system.v2.domain import canonical,file_hash
 from trade_system.v2.gap_evidence import read_json

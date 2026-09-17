@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from tools.v2 import resolve_exchange_price_conflicts as p
+from tools.incidents import resolve_exchange_price_conflicts as p
 
 
 def fixture():

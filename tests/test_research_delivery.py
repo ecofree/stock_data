@@ -67,7 +67,7 @@ def test_generic_capture_same_entry_ranges(start,end,windows):
 
 
 def test_64_valid_calendar_rows_do_not_trip_legacy_probe_limit():
-    from tools.v2.probe_identity_sources import rows_for
+    from trade_system.v2.research_receipts import rows_for
     dates=pd.bdate_range('2026-06-15',periods=64)
     r={'provider':'xiaodefa_relay','api':'adj_factor','code':'000001.SZ','start':'2026-06-14','end':'2026-09-11','kind':'security_history'}
     d={'fields':campaign.FIELDS['adj_factor'],'items':[['000001.SZ',day.strftime('%Y%m%d'),2] for day in dates]}

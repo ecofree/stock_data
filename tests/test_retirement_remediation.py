@@ -107,6 +107,30 @@ def test_no_unguarded_legacy_duckdb_writer_calls():
     assert not offenders,offenders
 
 
+def test_current_application_and_tools_do_not_import_fixed_incidents():
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    files = subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard','--','*.py'],cwd=root).decode().split('\0')
+    offenders = []
+    for name in set(files):
+        if not name.startswith(('scripts/', 'trade_system/', 'tools/v2/')) or not (root/name).is_file():
+            continue
+        for node in ast.walk(ast.parse((root/name).read_text(encoding='utf-8-sig'))):
+            modules = []
+            if isinstance(node, ast.Import):modules = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or '']
+                if node.module == 'tools':modules += ['tools.'+a.name for a in node.names]
+            elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
+                fn = node.func
+                if (isinstance(fn, ast.Name) and fn.id == '__import__') or (isinstance(fn, ast.Attribute) and fn.attr == 'import_module'):
+                    modules = [str(node.args[0].value)]
+            if any(m == 'tools.incidents' or m.startswith('tools.incidents.') for m in modules):
+                offenders.append((name, node.lineno))
+    assert not offenders, offenders
+
+
 @pytest.mark.parametrize('clock', [Clock(), AdvancingClock(), None])
 def test_event_signal_captures_one_cutoff(tmp_path, clock):
     with Store(tmp_path/'v2.duckdb', **({'clock': clock} if clock else {})) as store:

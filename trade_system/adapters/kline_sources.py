@@ -14,6 +14,7 @@ import atexit
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
+from trade_system.http_transport import read_verified_once
 from trade_system.units import requested_adjustment
 
 try:
@@ -311,7 +312,7 @@ def _from_baidu(code, start, end, fq="qfq"):
                  "Accept": "application/vnd.finance-web.v1+json",
                  "Origin": "https://gushitong.baidu.com",
                  "Referer": "https://gushitong.baidu.com"})
-    d = json.loads(_u.urlopen(req, timeout=8).read())
+    d = json.loads(read_verified_once(req, timeout=8, max_bytes=8_000_000))
     md = (d.get("Result") or {}).get("newMarketData") or {}
     raw = (md.get("marketData") or "").split(";")
     # keys 顺序: [timestamp, time, open, close, volume, high, low, amount, range, ratio, ...]

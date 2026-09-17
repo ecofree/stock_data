@@ -302,22 +302,20 @@ class RateLimiter:
                     "eastmoney": 0.18, "xiaodefa": 0.0, "baidu": 0.30,
                     "ths": 0.20, "cninfo": 0.20, "cls": 0.20,
                     "sina_option": 0.15, "local": 0.0}
-        self.last = {}
-        self.lock = threading.Lock()
-        self.sem = threading.Semaphore(4)   # 全局并发上限
+        self.sem = threading.BoundedSemaphore(4)
 
-    def acquire(self, source):
+    def acquire(self, source, *, deadline):
         mi = self.min.get(source, 0.15)
-        # Coordinate with collectors started by another process.  The local
-        # lock below still protects threads inside this process.
-        shared_host_limiter.acquire(source, mi)
-        with self.lock:
-            now = time.time()
-            wait = mi - (now - self.last.get(source, 0.0))
-            if wait > 0:
-                time.sleep(wait)
-            self.last[source] = time.time()
-        self.sem.acquire()
+        remaining = deadline-time.monotonic()
+        if remaining <= 0 or not self.sem.acquire(timeout=remaining):
+            raise TimeoutError('source concurrency deadline exhausted')
+        try:
+            shared_host_limiter.acquire(source, mi, deadline=deadline)
+            if time.monotonic() >= deadline:
+                raise TimeoutError('source rate limit deadline exhausted')
+        except BaseException:
+            self.sem.release()
+            raise
         return self
 
     def release(self, source):
@@ -327,30 +325,29 @@ class RateLimiter:
 rate = RateLimiter()
 
 
-def _call(fn, timeout, retries=1, backoff=0.2, pending=None):
-    """在线程里跑源，超时/异常都返回 None，绝不阻塞主流程。
-    源级退避重试：瞬时失败（超时/抖动）自动重试，降低误判为封禁的概率。"""
-    last = None
-    for attempt in range(retries + 1):
-        executor = ThreadPoolExecutor(max_workers=1)
-        fut = None
+def _call(fn, timeout, pending=None):
+    """One attempt; an unfinished worker remains owned by the caller."""
+    if timeout <= 0:
+        return None
+    from trade_system.http_transport import request_deadline
+    deadline = time.monotonic()+timeout
+    def run():
+        token = request_deadline.set(deadline)
         try:
-            fut = executor.submit(fn)
-            last = fut.result(timeout=timeout)
-            if last:
-                return last
-        except Exception:
-            last = None
-            if pending is not None and fut is not None and not fut.done():
-                pending.append(fut)
+            return fn()
         finally:
-            # Exiting a ThreadPoolExecutor context uses shutdown(wait=True),
-            # which defeats the timeout when a provider socket is stuck.  Do
-            # not wait for an untrusted network worker here.
-            executor.shutdown(wait=False, cancel_futures=True)
-        if attempt < retries:
-            time.sleep(backoff * (2 ** attempt))
-    return last
+            request_deadline.reset(token)
+    executor = ThreadPoolExecutor(max_workers=1)
+    fut = None
+    try:
+        fut = executor.submit(run)
+        return fut.result(timeout=max(0, deadline-time.monotonic()))
+    except Exception:
+        if pending is not None and fut is not None and not fut.done():
+            pending.append(fut)
+        return None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def adaptive_ttl(datatype):
@@ -964,12 +961,19 @@ def _get_owned(datatype, code=None, ttl=None, timeout_per=None, *, _pending=None
         # burst against all providers.
         eligible = ordered[:1]
     for name, fn in eligible:
-        rate.acquire(name)
+        deadline = time.monotonic()+timeout_per
         t0 = time.time()
         try:
-            out = _call(fn, timeout_per, retries=0, pending=_pending)
+            rate.acquire(name, deadline=deadline)
+        except TimeoutError:
+            continue  # Local queue/cooldown exhaustion is not a provider failure.
+        try:
+            out = _call(fn, deadline-time.monotonic(), pending=_pending)
         finally:
-            rate.release(name)
+            if _pending:
+                _pending[-1].add_done_callback(lambda future, source=name: rate.release(source))
+            else:
+                rate.release(name)
         dt = time.time() - t0
         if _pending:
             return None, {"source": name, "status": "in_progress", "error": "provider timeout; acquisition ownership retained until worker exits"}

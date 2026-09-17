@@ -6,7 +6,7 @@ import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.v2 import probe_identity_sources as old
+from tools.incidents import probe_identity_sources as old
 from tools.incidents.probe_price_conflicts import normalize
 from trade_system.v2.daily_session import CST, seal
 from trade_system.v2.domain import file_hash, identity, now_utc, number, utc

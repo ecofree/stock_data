@@ -5,7 +5,7 @@ import duckdb
 import pytest
 
 from tools.incidents import normalize_price_units as units
-from tools.v2 import probe_identity_sources as probe
+from tools.incidents import probe_identity_sources as probe
 from trade_system.v2.daily_session import CST, seal
 from trade_system.v2.domain import file_hash
 from trade_system.v2.gap_evidence import read_json, write_json

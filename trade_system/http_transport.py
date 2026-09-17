@@ -14,6 +14,9 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
+from contextvars import ContextVar
+
+request_deadline = ContextVar('request_deadline', default=None)
 
 from trade_system.config import SETTINGS
 
@@ -171,8 +174,11 @@ def read_verified_once(request, *, timeout, max_bytes):
     import subprocess
     import sys
     import math
+    import time
     if not math.isfinite(timeout) or timeout > 60:
         raise ValueError("transport timeout must be finite and at most 60 seconds")
+    if request_deadline.get() is not None:
+        timeout = min(timeout, request_deadline.get()-time.monotonic())
     if timeout <= 0:
         raise TimeoutError('transport deadline exhausted')
     if not 1 <= max_bytes <= 8_000_000:

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from tools.v2 import probe_third_price_source as p
+from tools.incidents import probe_third_price_source as p
 from tests.test_price_conflict_probe import source
 from trade_system.v2.daily_session import seal
 from trade_system.v2.domain import canonical

@@ -3,7 +3,7 @@ from copy import deepcopy
 import duckdb
 import pytest
 
-from tools.v2.probe_identity_sources import plan,rows_for,capture,analyze,API_FIELDS
+from tools.incidents.probe_identity_sources import plan,rows_for,capture,analyze,API_FIELDS
 from trade_system.v2.domain import file_hash
 
 

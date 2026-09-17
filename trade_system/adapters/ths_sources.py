@@ -10,6 +10,7 @@ import re
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
+from trade_system.http_transport import read_verified_once
 
 try:
     from trade_system.config import SETTINGS as _PROJECT_SETTINGS
@@ -33,7 +34,7 @@ def _from_ths_northbound():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36",
         "Host": "data.hexin.cn", "Referer": "https://data.hexin.cn/"})
     try:
-        raw = _u.urlopen(req, timeout=12).read()
+        raw = read_verified_once(req, timeout=12, max_bytes=8_000_000)
         d = json.loads(_auto_decode(raw))
     except Exception:
         return None
@@ -83,7 +84,7 @@ def _from_ths_hot_reason(date=None):
     req = _u.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36"})
     try:
-        raw = _u.urlopen(req, timeout=12).read()
+        raw = read_verified_once(req, timeout=12, max_bytes=8_000_000)
         d = json.loads(_auto_decode(raw))
     except Exception:
         return None
@@ -116,7 +117,7 @@ def _from_ths_eps_forecast(code):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Referer": "https://basic.10jqka.com.cn/"})
     try:
-        raw = _u.urlopen(req, timeout=15).read()
+        raw = read_verified_once(req, timeout=15, max_bytes=8_000_000)
         html = _auto_decode(raw)
     except Exception:
         return None

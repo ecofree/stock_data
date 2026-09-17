@@ -53,3 +53,33 @@ def test_datacenter_failure_does_not_retry_other_hosts_or_http(monkeypatch, fail
     with pytest.raises(type(failure), match=str(failure)):
         em._em_get_json('https://push2.eastmoney.com/api/test')
     assert calls == ['https://push2.eastmoney.com/api/test']
+
+
+@pytest.mark.parametrize('spent,expected_calls', [(0.6, 2), (1.1, 1)])
+def test_clist_routes_share_budget_and_keep_source_identity(monkeypatch, spent, expected_calls):
+    from types import SimpleNamespace
+    from trade_system.adapters import eastmoney_dc as em
+    clock = [100.0]; calls = []; failures = []; successes = []
+    monkeypatch.setattr(em.time, 'monotonic', lambda: clock[0])
+    for name in ('DEFAULT_CLIST_GUARD', 'DELAY_CLIST_GUARD'):
+        monkeypatch.setattr(em, name, SimpleNamespace(assert_available=lambda: None,
+            record_failure=lambda error, endpoint: failures.append(endpoint),
+            record_success=lambda endpoint: successes.append(endpoint)))
+    def request(url, params, *, timeout):
+        calls.append((url, timeout))
+        if len(calls) == 1:
+            clock[0] += spent
+            raise TimeoutError('primary failed')
+        return {'data':{'diff':[{'f12':'000001','f2':None}]}}
+    monkeypatch.setattr(em, '_em_get_json', request)
+    if expected_calls == 1:
+        with pytest.raises(RuntimeError):em._em_get_clist_json(timeout=1)
+        assert not successes
+    else:
+        result = em._em_get_clist_json(timeout=1)
+        assert result['_clist_source'] == 'eastmoney_delay'
+        assert result['data']['diff'][0]['f2'] is None
+        assert calls[1][1] == pytest.approx(0.4)
+        assert successes == [calls[1][0]]
+    assert len(calls) == expected_calls
+    assert failures == [calls[0][0]]

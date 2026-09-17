@@ -45,7 +45,7 @@ def test_realtime_index_list_payload_is_valid():
 
 def test_provider_timeout_does_not_wait_for_blocked_worker():
     started = time.monotonic()
-    result = _call(lambda: (time.sleep(0.3), {"ok": True})[1], timeout=0.03, retries=0)
+    result = _call(lambda: (time.sleep(0.3), {"ok": True})[1], timeout=0.03)
     elapsed = time.monotonic() - started
     assert result is None
     assert elapsed < 0.2
