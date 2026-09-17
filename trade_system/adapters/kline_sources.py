@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 import re
 import subprocess
 import threading
@@ -51,18 +50,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 EM_UT = "7eea3edcaed734bea9cbfc24409ed989"
 # Tushare is an optional last-resort source.  Keep credentials out of source
 # control; the non-Tushare providers remain fully usable when these are empty.
-TUSHARE_RELAY = (
-    os.environ.get("TUSHARE_FAST_RELAY_URL")
-    or _PROJECT_SETTINGS.get("TUSHARE_FAST_RELAY_URL")
-    or "https://fastapic.stockai888.top"
-)
-TUSHARE_TOKEN = (
-    os.environ.get("TUSHARE_FAST_RELAY_TOKEN")
-    or os.environ.get("TUSHARE_TOKEN")
-    or _PROJECT_SETTINGS.get("TUSHARE_FAST_RELAY_TOKEN")
-    or _PROJECT_SETTINGS.get("TUSHARE_TOKEN")
-    or ""
-)
+XIAODEFA_URL = _PROJECT_SETTINGS.get("XIAODEFA_URL") or "https://t.xiaodefa.top/"
+XIAODEFA_TOKEN = _PROJECT_SETTINGS.get("XIAODEFA_TOKEN") or _PROJECT_SETTINGS.get("TUSHARE_XIAODEFA_TOKEN") or ""
 
 # pytdx / mootdx 可达的交易所行情服务器（沙箱实测 TCP 7709 通，2026-07），合并两份清单自动轮询
 TDX_HOSTS = [
@@ -344,15 +333,15 @@ def _from_baidu(code, start, end, fq="qfq"):
 
 
 # ---------------------------------------------------------------- 6) Tushare 中继（HTTP）
-def _from_tushare_relay(code, start, end, fq="qfq"):  # noqa: E302
-    if not TUSHARE_TOKEN:
+def _from_xiaodefa(code, start, end, fq="qfq"):  # noqa: E302
+    if not XIAODEFA_TOKEN:
         return None
     mkt, pure = _norm_code(code)
     exchange = {"sh": "SH", "sz": "SZ", "bj": "BJ"}[mkt]
     ts_code = f"{pure}.{exchange}"
     # 注意：该中继的 daily 接口【不支持 adj 参数】，加上会返回 count=0，故始终不带 adj（返回非复权）。
     params = {"ts_code": ts_code, "start_date": _norm_date(start), "end_date": _norm_date(end)}
-    rows = _tushare_query(
+    rows = _xiaodefa_query(
         "daily", params,
         fields="ts_code,trade_date,open,high,low,close,vol,amount",
         timeout=20,
@@ -373,34 +362,22 @@ def _from_tushare_relay(code, start, end, fq="qfq"):  # noqa: E302
             "amount": float(row.get("amount") or 0) * 1000,
             "volume_unit": "shares", "amount_unit": "yuan",
             "adjustment": "none",
-            "_src": "tushare_relay"})
+            "_src": "xiaodefa"})
     return res or None
 
 
-def _tushare_query(api_name, params=None, fields="", timeout=20):
-    """Call the optional fast relay using the standard Tushare Pro envelope."""
-    if not TUSHARE_TOKEN:
-        return None
-    try:
-        from trade_system.tushare_relay import TushareRelayClient
-
-        client = TushareRelayClient(
-            token=TUSHARE_TOKEN, url=TUSHARE_RELAY, timeout=int(timeout),
-            retries=1, min_interval_seconds=0.65,
-        )
-        rows = client.query_rows(api_name, params or {}, fields or "")
-        return rows or None
-    except Exception as exc:
-        logger.warning("tushare relay query %s failed: %s", api_name, exc)
-        return None
+def _xiaodefa_query(api_name, params=None, fields="", timeout=20):
+    from trade_system.xiaodefa_source import XiaodefaClient
+    client = XiaodefaClient(token=XIAODEFA_TOKEN, url=XIAODEFA_URL, timeout=timeout, max_retries=1)
+    return client.query_rows(api_name, params or {}, fields)
 
 
 
-def _from_tushare_moneyflow(code, days=120):
+def _from_xiaodefa_moneyflow(code, days=120):
     """Tushare moneyflow fallback, normalized to yuan and net-flow columns."""
     mkt, pure = _norm_code(code)
     ts_code = f"{pure}.{'SH' if mkt == 'sh' else 'SZ' if mkt == 'sz' else 'BJ'}"
-    rows = _tushare_query(
+    rows = _xiaodefa_query(
         "moneyflow", {"ts_code": ts_code, "limit": int(days)},
         fields=("ts_code,trade_date,buy_sm_amount,sell_sm_amount,buy_md_amount,sell_md_amount,"
                 "buy_lg_amount,sell_lg_amount,buy_elg_amount,sell_elg_amount,net_mf_amount"),
@@ -432,7 +409,7 @@ def _from_tushare_moneyflow(code, days=120):
         out.append({"date": str(row.get("trade_date") or "")[:10],
                     "main_net": main, "small_net": small, "mid_net": mid,
                     "large_net": large, "super_net": super_net,
-                    "net_total": total, "_src": "tushare_relay",
+                    "net_total": total, "_src": "xiaodefa",
                     "source_api": "moneyflow", "flow_definition": "main_orders_net",
                     "amount_unit": "yuan"})
     return out or None
@@ -440,70 +417,30 @@ def _from_tushare_moneyflow(code, days=120):
 
 
 
-_KLINE_SOURCES = [
-    ("baostock", _from_baostock),
-    ("pytdx", _from_pytdx),
-    ("tencent", _from_tencent),
-    ("sina", _from_sina),
-    ("tushare_relay", _from_tushare_relay),
-    ("baidu", _from_baidu),          # 独立域名、自带 MA，但实测偶发限流返回空，仅作末尾兜底
-    ("eastmoney", _from_eastmoney),   # 沙箱内会被秒跳过（整族被封），本机自动生效
-]
 
 
-def get_kline(code, start="20260101", end="20500101", fq="qfq", timeout_per=10):
-    """自动多源降级取日 K 线，返回统一结构 list[dict]。"""
-    tried = []
-    expected = requested_adjustment(fq)
-    if expected == 'unknown':
+
+def get_kline(code, start=None, end=None, fq="qfq", timeout_per=10):
+    """Thin compatibility call into the sole acquisition owner."""
+    from trade_system.resilient_sources import get
+    if requested_adjustment(fq) == 'unknown':
         raise ValueError('unsupported requested adjustment')
-    for name, fn in _KLINE_SOURCES:
-        res = _run(lambda: fn(code, start, end, fq), timeout=timeout_per, label=name)
-        if res and all(isinstance(row, dict) and row.get('adjustment') == expected for row in res):
-            res.sort(key=lambda x: x["date"])
-            return res
-        tried.append(name)
-    logger.warning("get_kline(%s): no source returned data (tried: %s)",
-                   code, ", ".join(tried))
-    return []
+    params = {"fq": fq}
+    if start is not None: params["start"] = start
+    if end is not None: params["end"] = end
+    rows, meta = get('kline', code, timeout_per=timeout_per, **params)
+    return sorted(rows, key=lambda row: row['date']) if rows and meta['status'] in {'live','fresh','refreshed'} else []
 
 
-def _from_tushare_sector_flow(trade_date=None, limit=300):
-    """Optional Tushare sector-flow mirror used after Eastmoney fails.
-
-    The two Tushare endpoints do *not* share a unit or field contract:
-
-    * ``moneyflow_ind_dc`` reports yuan and ``buy_*_amount`` fields are
-      already net amounts (there is no corresponding ``sell_*`` field).
-    * ``moneyflow_ind_ths`` reports the headline amounts in 亿元 and only
-      exposes aggregate buy/sell values.
-
-    Keep the conversion endpoint-specific so a provider fallback cannot make
-    an otherwise plausible ranking 10,000x too large.
-    """
+def _from_xiaodefa_sector_flow(trade_date=None, limit=300):
+    """Read DC sector flow in yuan; an empty DC result cannot become THS flow."""
     params = {"trade_date": _norm_date(trade_date)} if trade_date else {"limit": int(limit)}
-    dc_fields = (
+    fields = (
         "trade_date,content_type,ts_code,name,pct_change,close,net_amount,"
         "net_amount_rate,buy_elg_amount,buy_lg_amount,buy_md_amount,buy_sm_amount"
     )
-    ths_fields = (
-        "trade_date,ts_code,industry,name,pct_change,close,company_num,"
-        "net_buy_amount,net_sell_amount,net_amount"
-    )
-    rows = None
-    api_used = ""
-    for api, fields in (("moneyflow_ind_dc", dc_fields), ("moneyflow_ind_ths", ths_fields)):
-        rows = _tushare_query(api, params, fields=fields)
-        if rows:
-            api_used = api
-            break
+    rows = _xiaodefa_query("moneyflow_ind_dc", params, fields=fields)
     if not rows:
-        return None
-
-    def pick(row, *keys):
-        for key in keys:
-            if row.get(key) not in (None, ""):
-                return row.get(key)
         return None
 
     def number(value):
@@ -512,45 +449,15 @@ def _from_tushare_sector_flow(trade_date=None, limit=300):
         except (TypeError, ValueError):
             return None
 
-    def amount(row, *keys):
-        value = number(pick(row, *keys))
-        return value * 10000 if value is not None else None
-
-    def yuan(value):
-        value = number(value)
-        return value if value is not None else None
-
-    def ths_yuan(value):
-        # THS sector endpoints document net buy/sell/net as 亿元.
-        value = number(value)
-        return value * 100000000 if value is not None else None
-
-    out = []
-    for row in rows:
-        code = pick(row, "ts_code", "code", "industry_code", "index_code")
-        if not code:
-            continue
-        if api_used == "moneyflow_ind_dc":
-            record = {
-                "sector_code": str(code), "sector_name": pick(row, "name", "industry_name"),
-                "sector_type": pick(row, "content_type") or "unknown",
-                "change_pct": number(pick(row, "pct_change", "change_pct")),
-                "main_net": yuan(pick(row, "net_amount", "main_net")),
-                "super_net": yuan(pick(row, "buy_elg_amount")),
-                "large_net": yuan(pick(row, "buy_lg_amount")),
-                "mid_net": yuan(pick(row, "buy_md_amount")),
-                "small_net": yuan(pick(row, "buy_sm_amount")),
-                "amount_unit": "yuan",
-            }
-        else:
-            record = {
-                "sector_code": str(code), "sector_name": pick(row, "name", "industry_name"),
-                "sector_type": "ths_industry",
-                "change_pct": number(pick(row, "pct_change", "change_pct")),
-                "main_net": ths_yuan(pick(row, "net_amount", "main_net")),
-                "super_net": None, "large_net": None, "mid_net": None, "small_net": None,
-                "amount_unit": "yuan_from_100m_yuan",
-            }
-        record.update({"_src": "tushare_relay", "source_api": api_used, "raw": row})
-        out.append(record)
-    return out or None
+    return [{
+        "sector_code": str(row["ts_code"]), "sector_name": row.get("name"),
+        "sector_type": row.get("content_type") or "unknown",
+        "change_pct": number(row.get("pct_change")),
+        "main_net": number(row.get("net_amount")),
+        "super_net": number(row.get("buy_elg_amount")),
+        "large_net": number(row.get("buy_lg_amount")),
+        "mid_net": number(row.get("buy_md_amount")),
+        "small_net": number(row.get("buy_sm_amount")),
+        "amount_unit": "yuan", "_src": "xiaodefa",
+        "source_api": "moneyflow_ind_dc", "raw": row,
+    } for row in rows if row.get("ts_code")] or None

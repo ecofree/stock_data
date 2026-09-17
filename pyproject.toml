@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-trading-assistant"
-version = "0.3.15"
+version = "0.3.16"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -64,8 +64,8 @@ module = [
 ]
 disallow_untyped_defs = true
 
-[tool.setuptools.packages.find]
-include = ["trade_system", "trade_system.v2"]
+[tool.setuptools]
+packages = ["trade_system", "trade_system.v2"]
 
 [tool.stock_data.release]
 scope = "operational_core_only_research_from_isolated_source"

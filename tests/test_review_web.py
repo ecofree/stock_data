@@ -34,7 +34,6 @@ from trade_system.review_web import (
     _render_tomorrow,
 )
 from trade_system.review_extras import render_first_seal_distribution, render_theme_timeline
-from trade_system.web_report import _execution_status
 
 
 def test_member_detail_uses_clock_formatter_not_raw_epoch():
@@ -52,37 +51,6 @@ def test_server_clock_is_explicit_shanghai_time():
     assert _fmt_clock(stamp * 1000) == '09:35'
 
 
-def test_dashboard_execution_status_is_fail_closed_for_historical_rows(tmp_path):
-    db = tmp_path / "dashboard.duckdb"
-    con = duckdb.connect(str(db))
-    con.execute(
-        """
-        CREATE TABLE stock_candidate_stage_signal(
-            trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR,
-            is_actionable BOOLEAN, is_executable BOOLEAN,
-            evidence_json VARCHAR, decision VARCHAR,
-            execution_valid_until TIMESTAMP
-        )
-        """
-    )
-    con.execute(
-        """
-        INSERT INTO stock_candidate_stage_signal VALUES
-        ('2026-07-31','intraday_strength','000001',true,true,'{}','follow',
-         '2026-07-31 14:00:00')
-        """
-    )
-    con.close()
-
-    con = duckdb.connect(str(db), read_only=True)
-    try:
-        status = _execution_status(con, "2026-07-31")
-    finally:
-        con.close()
-
-    assert status["candidate_total"] == 0
-    assert status["executable_candidates"] == 0
-    assert status["execution_ready"] is False
 
 
 def test_blocked_page_labels_plans_as_research_drafts():

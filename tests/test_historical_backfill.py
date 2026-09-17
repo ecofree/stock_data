@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from trade_system.kpl_history import KPLHistoryCollector
 from trade_system.tushare_history import TushareHistoryCollector
-from trade_system.tushare_relay import TushareRelayError
+from trade_system.xiaodefa_source import XiaodefaError
 
 
 class FakeTushare:
@@ -94,7 +94,7 @@ def test_tushare_calendar_failure_is_fail_closed(tmp_path):
     with TushareHistoryCollector(db, client=BrokenCalendarTushare()) as collector:
         try:
             collector.ensure_calendar("20260727", "20260727")
-        except TushareRelayError as exc:
+        except XiaodefaError as exc:
             assert "trade_cal fetch failed" in str(exc)
         else:
             raise AssertionError("calendar relay failure must not synthesize a weekday")

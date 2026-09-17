@@ -3,7 +3,11 @@ import duckdb
 from trade_system.review_statistics import build_daily_review_statistics, render_daily_review_statistics
 
 
-def test_daily_review_statistics_marks_small_stage_samples_as_insufficient(tmp_path):
+def test_daily_review_reads_counts_without_backtest_or_database_writes(tmp_path, monkeypatch):
+    from trade_system import backtest
+    def forbidden(*args, **kwargs):
+        raise AssertionError("render must not backtest")
+    monkeypatch.setattr(backtest, "run_stage_candidate_backtest", forbidden)
     db_path = tmp_path / "review_stats.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -32,12 +36,15 @@ def test_daily_review_statistics_marks_small_stage_samples_as_insufficient(tmp_p
     )
     con.close()
 
+    before = db_path.read_bytes()
     stats = build_daily_review_statistics(db_path, min_return_samples=5)
+    assert db_path.read_bytes() == before
     report = render_daily_review_statistics(stats)
 
     stage = stats["stage_statistics"]["premarket_pool"]
-    assert stage["return_sample_count"] == 1
-    assert stage["verdict"] == "insufficient_sample"
+    assert stage["return_sample_count"] == 0
+    assert stage["hit_rate"] is None
+    assert stage["verdict"] == "not_computed"
     assert stats["regime_stage_counts"]["weak"]["premarket_pool"] == 1
-    assert "insufficient_sample" in report
+    assert "not_computed" in report
     assert "Daily Review Statistics" in report

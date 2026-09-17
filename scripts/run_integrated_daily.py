@@ -195,7 +195,7 @@ def command_plan(
                 # xiaodefa relay: official chips / margin / unlock calendar /
                 # HK-connect holdings. Range kinds (hsgt/ggt/float) tolerate a
                 # forward window because future rows simply return empty.
-                ("collect_xiaodefa", [py, "-m", "trade_system.xiaodefa_source", "--db", db_path,
+                ("collect_xiaodefa", [py, "scripts/collect_xiaodefa.py", "--db", db_path,
                  "--trade-date", selected_date,
                  "--start-date", selected_date,
                  "--end-date", (date.fromisoformat(selected_date) + timedelta(days=14)).strftime("%Y-%m-%d"),
@@ -217,7 +217,7 @@ def command_plan(
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
                 ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_market_collection_latest.json")], False),
                 ("collect_index_kline_daily", [py, "scripts/collect_index_kline_daily.py", "--db", db_path, "--date", selected_date, "--out", report("index_kline_collection_latest.md")], False),
-                ("collect_xiaodefa_critical", [py, "-m", "trade_system.xiaodefa_source", "--db", db_path, "--trade-date", selected_date,
+                ("collect_xiaodefa_critical", [py, "scripts/collect_xiaodefa.py", "--db", db_path, "--trade-date", selected_date,
                  "--start-date", selected_date, "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail"], False),
             ]
         elif phase == "history":
@@ -295,7 +295,7 @@ def main() -> int:
     selected_phase = resolve_phase(args.phase)
     backend, python = ROOT, sys.executable
     if args.collector_contract:
-        from trade_system.source_authority import verify_collection_contract
+        from trade_system.migration_boundary import verify_collection_contract
         contract = verify_collection_contract(args.collector_contract, args.collector_contract_sha256,
                                                args.db, args.reports_dir)
         backend, python = Path(contract["source_root"]), contract["python"]

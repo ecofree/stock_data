@@ -1,7 +1,7 @@
-from scripts.collect_tushare_basic_data import SKIPPED, _format_collection_line
+import pytest
+from scripts import collect_tushare_basic_data, run_daily_screen, generate_web_dashboard
 
-
-def test_format_collection_line_marks_skipped_tables():
-    line = _format_collection_line("tushare_daily", SKIPPED, 123)
-
-    assert line == "tushare_daily: skipped total_rows=123"
+@pytest.mark.parametrize("module", [collect_tushare_basic_data,run_daily_screen,generate_web_dashboard])
+def test_retired_entry_points_refuse_before_work(module):
+    with pytest.raises(SystemExit,match="retired entry point"):
+        module.main()

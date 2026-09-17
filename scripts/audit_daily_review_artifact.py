@@ -44,11 +44,26 @@ def _embedded_json(html_text: str) -> dict[str, Any]:
     return result
 
 
+def _trail_payload(path: Path, text: str, embedded: dict, trade_date: str) -> tuple[dict, Path]:
+    """Read a full inline page or the compact page's exact static trail sibling."""
+    if "trail-data" in embedded or "trail-details" in embedded:
+        return embedded, path
+    sibling = path.parent / "sector_trail_latest.html"
+    if not re.search(r'href=["\']sector_trail_latest\.html["\']', text) or not sibling.is_file():
+        return {}, path
+    sibling_text = sibling.read_text(encoding="utf-8")
+    if (f"<title>板块轨迹 · {trade_date}</title>" not in sibling_text
+            or sibling.stat().st_size > 25 * 1024 * 1024 or "\ufffd" in sibling_text):
+        return {}, sibling
+    return _embedded_json(sibling_text), sibling
+
+
 def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) -> dict[str, Any]:
     path = Path(html_path)
     text = path.read_text(encoding="utf-8")
     try:
         embedded = _embedded_json(text)
+        trail_payload, trail_artifact = _trail_payload(path, text, embedded, trade_date)
     except (ValueError, json.JSONDecodeError):
         return {"status": "fail", "trade_date": trade_date,
                 "artifact": str(path.resolve()), "size_bytes": path.stat().st_size,
@@ -56,8 +71,8 @@ def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) 
                 "limit_up_pairs": 0, "initial_concept_rows": 0,
                 "membership_snapshot": "", "concept_coverage_pct": 0,
                 "failures": ["inline_payload_invalid_or_duplicate"], "warnings": []}
-    trail = embedded.get("trail-data") or {}
-    details = embedded.get("trail-details") or {}
+    trail = trail_payload.get("trail-data") or {}
+    details = trail_payload.get("trail-details") or {}
     concept_groups: list[dict[str, Any]] = []
     concept_match = re.search(
         r"let conceptData = (.*?);\s*const lazyAsset", text, re.S
@@ -90,7 +105,7 @@ def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) 
         failures.append("unicode_replacement_character_present")
     if len(path.read_bytes()) > 25 * 1024 * 1024:
         failures.append("artifact_larger_than_25MiB")
-    if not {"trail-data", "trail-details"}.issubset(embedded):
+    if not {"trail-data", "trail-details"}.issubset(trail_payload):
         failures.append("required_inline_payload_missing")
 
     # Initial DOM remains bounded. Full data is inline and only rendered after
@@ -318,6 +333,7 @@ def audit_artifact(db_path: str | Path, html_path: str | Path, trade_date: str) 
         "status": "pass" if not failures else "fail",
         "trade_date": trade_date,
         "artifact": str(path.resolve()),
+        "trail_artifact": str(trail_artifact.resolve()),
         "size_bytes": path.stat().st_size,
         "latest_day": latest_day,
         "concepts": len(sectors),

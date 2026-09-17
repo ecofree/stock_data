@@ -4,8 +4,6 @@ from datetime import datetime
 import json
 from pathlib import Path
 import sys
-import time
-import urllib.request
 
 import duckdb
 
@@ -13,7 +11,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from trade_system.v2.daily_session import CST,seal
 from trade_system.v2.domain import canonical,file_hash,identity,now_utc,number,utc
 from trade_system.v2.gap_evidence import read_json,write_json
-from trade_system.v2.research_receipts import FIELDS,Relay,sealed
+from trade_system.v2.research_receipts import FIELDS,sealed
 from trade_system.v2.native_enrichment import PRICES
 
 API_FIELDS={'daily':['ts_code','trade_date','open','high','low','close','vol','amount'],**FIELDS}
@@ -44,17 +42,12 @@ class Client:
 
     def query(self,request):
         if request['provider']=='hithink_native':return self.native._get(request['api'],request['params'])
-        from trade_system.http_transport import open_verified_once
-        if self.relay is None:self.relay=Relay()
-        r=self.relay
-        time.sleep(max(0,.65-(time.monotonic()-r.last)));r.last=time.monotonic()
-        body={'api_name':request['api'],'token':r.token,'params':request['params'],'fields':','.join(API_FIELDS[request['api']])}
-        req=urllib.request.Request(r.url,data=canonical(body).encode(),headers={'Content-Type':'application/json'})
-        with open_verified_once(req,timeout=15) as response:raw=response.read(4_000_001)
-        if len(raw)>4_000_000:raise ValueError('response budget exceeded')
-        envelope=json.loads(raw)
-        if envelope.get('code')!=0:raise ValueError('provider rejected request')
-        return envelope.get('data') or {}
+        if request['provider'] != 'xiaodefa_relay':
+            raise ValueError('unapproved research provider')
+        from trade_system.xiaodefa_source import XiaodefaClient
+        self.relay=self.relay or XiaodefaClient(max_retries=1,timeout=15,max_response_bytes=4_000_000)
+        return self.relay.query_data(request['api'],request['params'],','.join(API_FIELDS[request['api']]))
+
 
 
 # Compatibility name: one parser implementation in the application.

@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from trade_system.tushare_relay import sync_tushare_ohlc_to_core_tables  # noqa: E402
+from trade_system.tushare_store import (sync_tushare_ohlc_to_core_tables)
 from trade_system.tushare_history import TushareHistoryCollector  # noqa: E402
 
 

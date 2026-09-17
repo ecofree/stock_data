@@ -53,14 +53,19 @@ def test_actual_view_has_canonical_labels_and_is_idempotent():
     assert math.isfinite(amount)
 
 
-def test_kline_rejects_wrong_adjustment_before_selecting_next_source(monkeypatch):
-    wrong = [{'date': '2026-09-11', 'adjustment': 'none'}]
-    correct = [{'date': '2026-09-11', 'adjustment': 'qfq'}]
-    monkeypatch.setattr(kline_sources, '_KLINE_SOURCES', [
-        ('wrong', lambda *a: wrong), ('right', lambda *a: correct)])
-    assert kline_sources.get_kline('000001', fq='qfq') == correct
-    monkeypatch.setattr(kline_sources, '_KLINE_SOURCES', [('wrong', lambda *a: wrong)])
-    assert kline_sources.get_kline('000001', fq='qfq') == []
+def test_kline_rejects_wrong_adjustment_before_selecting_next_source(monkeypatch, tmp_path):
+    from trade_system import resilient_sources as sources
+    wrong = [{'date': '2026-09-11', 'adjustment': 'none', 'volume_unit':'hands', 'amount_unit':'yuan'}]
+    correct = [{**wrong[0], 'adjustment':'qfq'}]
+    monkeypatch.setattr(sources, 'CACHE_DIR', str(tmp_path))
+    monkeypatch.setattr(sources.cache, 'get', lambda key: (None, 0))
+    monkeypatch.setattr(sources.cache, 'put', lambda *args: None)
+    monkeypatch.setattr(sources.health, 'is_cooldown', lambda *args: False)
+    monkeypatch.setattr(sources.health, 'record', lambda *args: None)
+    monkeypatch.setitem(sources.SOURCE_PLAN, 'kline', [('wrong', lambda: wrong), ('right', lambda: correct)])
+    assert kline_sources.get_kline('000001', start='20260911', end='20260911', fq='qfq') == correct
+    monkeypatch.setitem(sources.SOURCE_PLAN, 'kline', [('wrong', lambda: wrong)])
+    assert kline_sources.get_kline('000001', start='20260911', end='20260911', fq='qfq') == []
 
 
 def test_market_caps_preserve_total_float_and_unknown_semantics():
@@ -79,9 +84,9 @@ def test_market_caps_preserve_total_float_and_unknown_semantics():
 
 def test_relay_valuation_exports_canonical_caps_and_raw(monkeypatch):
     from trade_system import resilient_sources as sources
-    monkeypatch.setattr(sources, 'TUSHARE_TOKEN', 'fixture')
+    monkeypatch.setattr(sources, 'XIAODEFA_TOKEN', 'fixture')
     raw = {'total_mv': 20000, 'circ_mv': 10000, 'turnover_rate': None}
-    monkeypatch.setattr(sources, '_tushare_query', lambda *a, **k: [raw])
+    monkeypatch.setattr(sources, '_xiaodefa_query', lambda *a, **k: [raw])
     result = sources._relay_daily_basic('000001', '20260911')
     assert result['total_market_cap_cny'] == 200000000
     assert result['float_market_cap_cny'] == 100000000

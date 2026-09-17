@@ -1,5 +1,4 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -184,19 +183,10 @@ def test_endpoint_circuit_breaker_prevents_repeated_permission_calls(audit_folde
     assert r['transport_attempts'] == 4 and r['status_counts']['endpoint_circuit_open'] == 4
 
 
-def test_transport_secrets_only_stdin_no_redirects(monkeypatch):
-    observed = {}
-    def subprocess_run(args, **kwargs):
-        observed.update(args=args, **kwargs)
-        return SimpleNamespace(returncode=0, stdout=b'{"code":0}\n200', stderr=b'')
-    monkeypatch.setattr(run.subprocess, 'run', subprocess_run)
-    monkeypatch.setattr(run, 'reserve_rate_slot', lambda _: None)
+def test_fixed_incident_transport_is_retired():
     for api in ('daily', 'hithink_daily'):
-        r = run.http_fetch(source.request_spec(CASE, api), 'secret-value')
-        assert r['http_status'] == 200 and b'secret-value' in observed['input']
-        assert 'secret-value' not in repr(observed['args'])
-        assert '--location' not in observed['args'] and '-k' not in observed['args']
-        assert observed['timeout'] == 18
+        with pytest.raises(ValueError, match='retired'):
+            run.http_fetch(source.request_spec(CASE, api), 'secret-value')
 
 
 def test_manifest_and_derived_mapping_tampering(audit_folder, tmp_path):

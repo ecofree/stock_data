@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import uuid
 
 from trade_system.file_lock import FileLock
@@ -28,41 +29,55 @@ def publish(root, run_id, artifacts, *, generation):
         raise ValueError('invalid run identity or generation')
     if not artifacts or 'manifest.json' in artifacts:
         raise ValueError('nonempty explicit artifact list required; manifest name is reserved')
-    run = root / 'runs' / run_id
-    run.mkdir(parents=True, exist_ok=False)
+    run = safe_child(root, 'runs/' + run_id)
     hashes = {}
     for name, content in artifacts.items():
+        safe_child(run, name)
         if not isinstance(content, bytes):
             raise ValueError('artifact content must be bytes')
-        file = safe_child(run, name)
-        file.parent.mkdir(parents=True, exist_ok=True)
-        with file.open('xb') as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
         hashes[name] = hashlib.sha256(content).hexdigest()
-    manifest = {'run_id': run_id, 'generation': generation, 'artifacts': hashes}
-    manifest_bytes = canonical(manifest).encode()
-    with (run / 'manifest.json').open('xb') as handle:
-        handle.write(manifest_bytes)
-        handle.flush()
-        os.fsync(handle.fileno())
-    pointer = {'run_id': run_id, 'generation': generation,
-               'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()}
+    root.mkdir(parents=True, exist_ok=True)
     with FileLock(root / 'publish.guard'):
-        owner=root/'v2-publication-owner.json'
-        if not owner.exists():
-            with owner.open('x',encoding='utf-8') as stream:
-                stream.write(canonical({'scope':'v2_versioned_publication_only','legacy_writes':'forbidden'}))
         current = root / 'current.json'
-        if current.exists() and json.loads(current.read_text(encoding='utf-8'))['generation'] >= generation:
-            raise ValueError('older or equal generation cannot replace current bundle')
+        if current.exists():
+            previous, _ = read_current(root)
+            if previous['generation'] >= generation:
+                raise ValueError('older or equal generation cannot replace current bundle')
+            if previous['artifacts'] == hashes:
+                return json.loads(current.read_text(encoding='utf-8'))
+        # Only a changed, valid bundle creates a new run directory.
+        run.mkdir(parents=True, exist_ok=False)
         temp = root / ('.current-' + uuid.uuid4().hex)
-        with temp.open('xb') as handle:
-            handle.write(canonical(pointer).encode())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp.replace(current)
+        try:
+            for name, content in artifacts.items():
+                file = safe_child(run, name)
+                file.parent.mkdir(parents=True, exist_ok=True)
+                with file.open('xb') as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            manifest = {'run_id': run_id, 'generation': generation, 'artifacts': hashes}
+            manifest_bytes = canonical(manifest).encode()
+            with (run / 'manifest.json').open('xb') as handle:
+                handle.write(manifest_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            pointer = {'run_id': run_id, 'generation': generation,
+                       'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()}
+            owner = root / 'v2-publication-owner.json'
+            if not owner.exists():
+                with owner.open('x', encoding='utf-8') as stream:
+                    stream.write(canonical({'scope': 'v2_versioned_publication_only', 'legacy_writes': 'forbidden'}))
+            with temp.open('xb') as handle:
+                handle.write(canonical(pointer).encode())
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp.replace(current)
+        except BaseException:
+            # Remove only this attempt, never any previously published run.
+            temp.unlink(missing_ok=True)
+            shutil.rmtree(run)
+            raise
     return pointer
 
 

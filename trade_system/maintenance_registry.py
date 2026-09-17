@@ -121,7 +121,7 @@ def empty_table_collection_plan(
 
 def script_lifecycle(name: str, *, mentioned_by_runner: bool = False) -> str:
     lower = name.lower()
-    if lower in {"paper_order.py", "run_daily_operator_loop.py"}:
+    if lower in {"paper_order.py", "run_daily_operator_loop.py", "run_daily_screen.py", "generate_web_dashboard.py", "collect_tushare_basic_data.py", "generate_review_report.py", "generate_professional_reports.py"}:
         return "retired_reject_only"
     if lower == "run_integrated_daily.py":
         return "migration_only"

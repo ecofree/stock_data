@@ -2,12 +2,9 @@
 from datetime import datetime
 import json
 from pathlib import Path
-import time
-import urllib.request
-from urllib.parse import urlsplit
 
 from .daily_session import seal, CST
-from .domain import canonical,file_hash,identity,now_utc,number,utc,instrument
+from .domain import file_hash,identity,now_utc,number,utc,instrument
 from .gap_evidence import read_json,write_json
 
 FIELDS={'adj_factor':['ts_code','trade_date','adj_factor'],
@@ -70,27 +67,7 @@ def normalize(api,day,data):
     return sorted(rows,key=lambda r:r['stock_code'])
 
 
-class Relay:
-    def __init__(self):
-        from trade_system.config import SETTINGS
-        self.token=SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')
-        self.url=SETTINGS.get('XIAODEFA_URL') or 'https://t.xiaodefa.top/'
-        url=urlsplit(self.url)
-        if not self.token or url.scheme!='https' or not url.netloc or url.username or url.password or url.query or url.fragment:
-            raise ValueError('configured HTTPS xiaodefa endpoint and credential required')
-        self.last=0
 
-    def query(self,api,day):
-        from trade_system.http_transport import open_verified_once
-        time.sleep(max(0,.65-(time.monotonic()-self.last)))
-        self.last=time.monotonic()
-        body={'api_name':api,'token':self.token,'params':{'trade_date':day.replace('-','')},'fields':','.join(FIELDS[api])}
-        req=urllib.request.Request(self.url,data=canonical(body).encode(),headers={'Content-Type':'application/json'})
-        with open_verified_once(req,timeout=15) as response:raw=response.read(8_000_001)
-        if len(raw)>8_000_000:raise ValueError('response byte budget exceeded')
-        response=json.loads(raw)
-        if response.get('code')!=0:raise ValueError('provider rejected request')
-        return response.get('data') or {}
 
 
 def capture(calendar,start,end,output,*,client=None,clock=now_utc):
@@ -117,10 +94,15 @@ def capture(calendar,start,end,output,*,client=None,clock=now_utc):
          'money_amount_unit':'CNY','source_money_amount_unit':'ten_thousand_CNY','execution_ready':False}
     write_json(output/'registration.json',reg);summaries=[]
     try:
-        client=client or Relay()
+        if client is None:
+            from trade_system.xiaodefa_source import XiaodefaClient
+            transport = XiaodefaClient(max_retries=1, timeout=15)
+        else:
+            transport = None
         for day in requested:
             for api in FIELDS:
-                data=client.query(api,day)
+                data=(transport.query_data(api, {'trade_date':day.replace('-','')}, ','.join(FIELDS[api]))
+                      if transport is not None else client.query(api,day))
                 normalized=normalize(api,day,data)
                 rec={'api':api,'params':{'trade_date':day.replace('-','')},'data':data,'received_at':utc(clock()).isoformat()}
                 write_json(output/f'{api}-{day}.json',rec)

@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from base import DuckDBStore
 from config import DB_PATH, TODAY
 from schema import init_schema
-from scripts.collect_tushare_basic_data import infer_stock_codes
+from trade_system.tushare_backfill import infer_stock_codes
 from trade_system.normalize import build_normalized_views
 from trade_system.tushare_backfill import (
     build_tushare_gap_list,

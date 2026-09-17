@@ -1102,22 +1102,20 @@ def write_daily_review(
     out_path: str | Path,
     trade_date: str | None = None,
     *,
-    allow_direct_publish: bool = False,
     context: dict | None = None,
     as_of: datetime | str | None = None,
 ) -> Path:
-    context = context or build_daily_review_context(db_path, trade_date, as_of=as_of)
     path = Path(out_path)
     project_reports = Path(__file__).resolve().parents[1] / "reports"
     if (
-        not allow_direct_publish
-        and path.resolve().parent == project_reports.resolve()
+        path.resolve().parent == project_reports.resolve()
         and path.name == "daily_review_latest.md"
     ):
         raise ValueError(
-            "latest review files must be written through the integrated pipeline; "
-            "use a staging/preview path or explicitly allow direct publish"
+            "legacy latest publication is retired; use an explicit preview path; "
+            "daily_workspace owns current publication"
         )
+    context = context or build_daily_review_context(db_path, trade_date, as_of=as_of)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_daily_review_markdown(context), encoding="utf-8")
     return path

@@ -1,7 +1,6 @@
 import duckdb
 
 from trade_system.backtest import run_market_regime_backtest
-from trade_system.review import render_daily_report
 
 
 def test_backtest_returns_sample_count(tmp_path):
@@ -24,19 +23,3 @@ def test_backtest_returns_sample_count(tmp_path):
 
     assert result["sample_count"] == 2
     assert "regime_counts" in result
-
-
-def test_render_daily_report_contains_core_sections():
-    report = render_daily_report(
-        trade_date="2026-07-06",
-        quality={"summary": {"table_count": 2, "total_rows": 10}},
-        regime={"regime": "主升", "suggested_position_pct": 70},
-        sectors=[{"sector_name": "test sector", "score": 88}],
-        candidates=[{"stock_name": "test stock", "score": 77}],
-        alerts=[{"severity": "P1", "message": "test alert"}],
-        backtest={"sample_count": 2, "regime_counts": {"主升": 1}},
-    )
-
-    assert "盘前/盘后交易辅助报告" in report
-    assert "市场状态" in report
-    assert "风险告警" in report

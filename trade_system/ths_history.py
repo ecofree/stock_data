@@ -1,4 +1,4 @@
-﻿"""同花顺概念/所属个股快照采集。
+"""同花顺概念/所属个股快照采集。
 
 同花顺公开的热榜接口返回 ``stock_list[].tag.concept_tag``，可以稳定形成
 “概念 -> 热榜个股”关系；当前接口只接受 ``period``，不提供历史日期参数。
@@ -458,13 +458,13 @@ def _tushare_ths_provider(catalog: list[tuple[str, str]]):
     fallback handle that run.
     """
     try:
-        from trade_system.tushare_relay import TushareRelayClient
+        from trade_system.xiaodefa_source import XiaodefaClient
         # Construct through the shared relay adapter so the project-level
         # .env/config settings are honored as well as process environment
         # variables.  The previous os.environ-only check silently disabled
         # this provider for CLI runs even when the configured relay token was
         # available in the project settings.
-        client = TushareRelayClient(timeout=40, retries=2)
+        client = XiaodefaClient(timeout=40, max_retries=2)
         if len(client.token) < 40:
             return None, {}, "missing valid Tushare token"
         rows = client.query_rows("ths_index", {"exchange": "A"},

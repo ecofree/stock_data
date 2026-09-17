@@ -15,12 +15,7 @@ def main() -> int:
     parser.add_argument("--db", default=str(project_root / "kpl_data.duckdb"))
     parser.add_argument("--trade-date", default="")
     parser.add_argument("--as-of", default="", help="ISO timestamp for freshness gates.")
-    parser.add_argument("--out", default=str(project_root / "reports" / "daily_review_latest.md"))
-    parser.add_argument(
-        "--allow-direct-publish",
-        action="store_true",
-        help="Allow an explicit manual write to reports/daily_review_latest.md; use only for controlled recovery.",
-    )
+    parser.add_argument("--out", required=True, help="Explicit historical preview destination; current publication belongs to daily_workspace")
     args = parser.parse_args()
 
     context = build_daily_review_context(
@@ -30,7 +25,6 @@ def main() -> int:
         args.db,
         args.out,
         context["trade_date"],
-        allow_direct_publish=args.allow_direct_publish,
         context=context,
     )
     print(f"daily_review_report={path}")

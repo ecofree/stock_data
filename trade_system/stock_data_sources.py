@@ -10,7 +10,7 @@
   │   ├─ 腾讯财经 qt.gtimg.cn
   │   ├─ 新浪财经 money.finance.sina.com.cn
   │   ├─ 东方财富 push2his（仅在本机/非沙箱可达；沙箱内自动跳过）
-  │   └─ Tushare 中继 fastapic.stockai888.top
+  │   └─ xiaodefa TuShare 通道
   └─ 财务/资金流
       ├─ 东方财富 datacenter-web / datacenter（沙箱 200 可用，免 token）业绩报表+资金流
       ├─ 新浪财报三表 quotes.sina.cn（资产负债表/利润表/现金流量表，免 token，补 datacenter 无此表的缺口）
@@ -30,7 +30,7 @@ K 线源另含：百度股市通 finance.pae.baidu.com（独立域名，自带 M
   bs   = get_financial_statements("600519", "fzb")                 # 资产负债表(新浪)
 """
 from __future__ import annotations
-import subprocess, json, socket, os
+import subprocess, json, os
 import datetime
 import urllib.request as _u, urllib.parse as _up  # noqa: E402
 
@@ -49,8 +49,8 @@ from trade_system.adapters.kline_sources import (  # noqa: F401
     _close_baostock,
     UA,
     EM_UT,
-    TUSHARE_RELAY,
-    TUSHARE_TOKEN,
+    XIAODEFA_URL,
+    XIAODEFA_TOKEN,
     TDX_HOSTS,
     _run,
     _norm_code,
@@ -64,11 +64,10 @@ from trade_system.adapters.kline_sources import (  # noqa: F401
     _from_sina,
     _from_eastmoney,
     _from_baidu,
-    _from_tushare_relay,
-    _tushare_query,
-    _from_tushare_moneyflow,
-    _from_tushare_sector_flow,
-    _KLINE_SOURCES,
+    _from_xiaodefa,
+    _xiaodefa_query,
+    _from_xiaodefa_moneyflow,
+    _from_xiaodefa_sector_flow,
     get_kline,
 )
 from trade_system.adapters.eastmoney_dc import (  # noqa: F401
@@ -118,7 +117,6 @@ except Exception:
     _PROJECT_SETTINGS = {}
 
 # 防止任何源在沙箱内卡死：全局 socket 超时
-socket.setdefaulttimeout(10)
 
 
 # ---------------------------------------------------------------- 7) 腾讯实时行情 qt.gtimg.cn（批量，含 PE/PB/市值/涨跌停）
@@ -183,9 +181,9 @@ def _from_tencent_valuation(code):
 
 
 # ---------------------------------------------------------------- 8) 股票列表参考镜像（Tushare 中继）
-def _from_tushare_basic(list_status="L"):
+def _from_xiaodefa_basic(list_status="L"):
     """全量股票列表（ts_code/name/industry/market/list_date），Tushare 中继，用于本地参考镜像（总量容灾）。"""
-    return _tushare_query(
+    return _xiaodefa_query(
         "stock_basic", {"list_status": list_status},
         fields="ts_code,symbol,name,industry,market,list_date",
     )

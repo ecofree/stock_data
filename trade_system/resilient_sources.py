@@ -101,12 +101,12 @@ LOCAL_MODE = os.environ.get("STOCK_DATA_LOCAL") == "1"
 # ---- 低层源（来自 stock_data.py，已含多源与超时） ----
 from .stock_data_sources import (  # noqa: E402
     _from_baostock, _from_pytdx, _from_tencent, _from_sina,
-    _from_eastmoney, _from_baidu, _from_tushare_relay,
-    _from_tushare_moneyflow, _from_tushare_sector_flow,
-    _from_sina_fund_flow, _from_tencent_valuation, _from_tushare_basic,
+    _from_eastmoney, _from_baidu, _from_xiaodefa,
+    _from_xiaodefa_moneyflow, _from_xiaodefa_sector_flow,
+    _from_sina_fund_flow, _from_tencent_valuation, _from_xiaodefa_basic,
     _from_ths_northbound, _from_ths_hot_reason, _from_ths_eps_forecast,
     get_financials, get_fund_flow, get_financial_statements,
-    _norm_code, _norm_date, TUSHARE_TOKEN, _tushare_query,
+    _norm_code, _norm_date, XIAODEFA_TOKEN, _xiaodefa_query,
     # —— 新增：东财数据中心 / 新闻 / 公告 / 涨停池 / 同花顺 / 期权 ——
     _from_em_dragon_tiger, _from_em_dragon_tiger_daily, _from_em_margin,
     _from_em_holder, _from_em_lockup, _from_em_dividend, _from_em_block_trade,
@@ -299,7 +299,7 @@ class RateLimiter:
     def __init__(self):
         # 每源最小请求间隔（秒）——刻意压低 burst
         self.min = {"baostock": 0.30, "pytdx": 0.08, "tencent": 0.12, "sina": 0.18,
-                    "eastmoney": 0.18, "tushare_relay": 0.65, "baidu": 0.30,
+                    "eastmoney": 0.18, "xiaodefa": 0.0, "baidu": 0.30,
                     "ths": 0.20, "cninfo": 0.20, "cls": 0.20,
                     "sina_option": 0.15, "local": 0.0}
         self.last = {}
@@ -327,12 +327,13 @@ class RateLimiter:
 rate = RateLimiter()
 
 
-def _call(fn, timeout, retries=1, backoff=0.2):
+def _call(fn, timeout, retries=1, backoff=0.2, pending=None):
     """在线程里跑源，超时/异常都返回 None，绝不阻塞主流程。
     源级退避重试：瞬时失败（超时/抖动）自动重试，降低误判为封禁的概率。"""
     last = None
     for attempt in range(retries + 1):
         executor = ThreadPoolExecutor(max_workers=1)
+        fut = None
         try:
             fut = executor.submit(fn)
             last = fut.result(timeout=timeout)
@@ -340,6 +341,8 @@ def _call(fn, timeout, retries=1, backoff=0.2):
                 return last
         except Exception:
             last = None
+            if pending is not None and fut is not None and not fut.done():
+                pending.append(fut)
         finally:
             # Exiting a ThreadPoolExecutor context uses shutdown(wait=True),
             # which defeats the timeout when a provider socket is stuck.  Do
@@ -351,41 +354,24 @@ def _call(fn, timeout, retries=1, backoff=0.2):
 
 
 def adaptive_ttl(datatype):
-    """自适应 TTL：某类数据源普遍失败时，延长缓存有效期，更依赖'过期缓存兜底'，
-    避免对已挂源反复打扰（配合 HealthRegistry 冷却形成双保险）。"""
-    base = TTL.get(datatype, 3600)
-    rel = [r for r in health.all_rows() if r[1] == datatype]
-    if not rel:
-        return base
-    ok = sum(r[2] for r in rel)      # success 列
-    fail = sum(r[3] for r in rel)    # fail 列
-    total = ok + fail
-    if total == 0:
-        return base
-    fail_ratio = fail / total
-    if fail_ratio > 0.8:
-        return int(base * 10)
-    if fail_ratio > 0.5:
-        return int(base * 4)
-    if fail_ratio > 0.2:
-        return int(base * 2)
-    return base
+    """Source outages never extend the freshness of previously received facts."""
+    return TTL.get(datatype, 3600)
 
 
 # =====================================================================
 # 3) 数据源计划（SOURCE_PLAN）：每个数据类型 → 有序源列表
-#    顺序只是初始顺序，运行时会被 health 动态重排。
+#    优先级固定；健康状态只能暂停失败源，不能提升低优先级来源。
 # =====================================================================
 def _relay_daily_basic(code, trade_date=None):
     """估值冗余源：TuShare daily_basic 市值原值为万元，此兼容输出为亿元。"""
-    if not TUSHARE_TOKEN:
+    if not XIAODEFA_TOKEN:
         return None
     mkt, pure = _norm_code(code)
     exchange = {"sh": "SH", "sz": "SZ", "bj": "BJ"}[mkt]
     ts_code = f"{pure}.{exchange}"
     td = trade_date or datetime.date.today().strftime("%Y%m%d")
     params = {"ts_code": ts_code, "trade_date": td}
-    rows = _tushare_query(
+    rows = _xiaodefa_query(
         "daily_basic", params,
         fields="ts_code,trade_date,pe_ttm,pe,pb,total_mv,circ_mv,turnover_rate",
         timeout=20,
@@ -409,7 +395,7 @@ def _relay_daily_basic(code, trade_date=None):
         "circ_mv": (g("circ_mv") / 1e4) if g("circ_mv") is not None else None,
         "total_mv_unit": "100m_yuan",
         "circ_mv_unit": "100m_yuan",
-        "turnover": g("turnover_rate"), "trade_date": td, "_src": "tushare_relay",
+        "turnover": g("turnover_rate"), "trade_date": td, "_src": "xiaodefa",
         "raw": row,
     }
     from trade_system.units import market_caps
@@ -419,11 +405,11 @@ def _relay_daily_basic(code, trade_date=None):
 
 def _plan_kline(code, start="20260101", end="20500101", fq="qfq", **kw):
     srcs = [
+        ("xiaodefa", lambda: _from_xiaodefa(code, start, end, fq)),
         ("baostock", lambda: _from_baostock(code, start, end, fq)),
         ("pytdx", lambda: _from_pytdx(code, start, end, fq)),
         ("tencent", lambda: _from_tencent(code, start, end, fq)),
         ("sina", lambda: _from_sina(code, start, end, fq)),
-        ("tushare_relay", lambda: _from_tushare_relay(code, start, end, fq)),
         ("baidu", lambda: _from_baidu(code, start, end, fq)),
     ]
     if LOCAL_MODE:   # 本机运行东方财富 K 线自动复活
@@ -432,8 +418,8 @@ def _plan_kline(code, start="20260101", end="20500101", fq="qfq", **kw):
 
 
 def _plan_valuation(code, **kw):
-    return [("tencent", lambda: _from_tencent_valuation(code)),
-            ("tushare_relay", lambda: _relay_daily_basic(code))]
+    return [("xiaodefa", lambda: _relay_daily_basic(code)),
+            ("tencent", lambda: _from_tencent_valuation(code))]
 
 
 def _plan_financials(code, periods=8, **kw):
@@ -451,7 +437,7 @@ def _plan_statements(code, report_type="lrb", periods=8, **kw):
 
 def _plan_stock_basic(code=None, list_status="L", **kw):
     # 异后端双源：tushare_relay + 东财 push2 clist（不同供应商，抗封）
-    return [("tushare_relay", lambda: _from_tushare_basic(list_status)),
+    return [("xiaodefa", lambda: _from_xiaodefa_basic(list_status)),
             ("eastmoney", lambda: _from_em_all_stocks())]
 
 
@@ -673,7 +659,7 @@ def _plan_ths_hot_list_v2(code=None, period=None, **kw):
 def _plan_fund_flow_120d_v2(code, **kw):
     return [("eastmoney", lambda: _from_em_fund_flow_120d(code)),
             ("sina", lambda: _from_sina_fund_flow(code, days=120)),
-            ("tushare_relay", lambda: _from_tushare_moneyflow(code, days=120))]
+            ("xiaodefa", lambda: _from_xiaodefa_moneyflow(code, days=120))]
 
 def _plan_stock_flow(code, **kw):
     """Stable project-facing alias for per-stock capital flow."""
@@ -682,7 +668,7 @@ def _plan_stock_flow(code, **kw):
 def _plan_sector_flow(code=None, **kw):
     """Market-wide sector capital flow, independent of the Tushare relay."""
     return [("eastmoney", lambda: _from_em_sector_flow(kw.get("top_n", 200))),
-            ("tushare_relay", lambda: _from_tushare_sector_flow(kw.get("date"), kw.get("top_n", 300)))]
+            ("xiaodefa", lambda: _from_xiaodefa_sector_flow(kw.get("date"), kw.get("top_n", 300)))]
 
 def _plan_ths_hot_list(code=None, period=None, **kw):
     return [("ths", lambda: _from_ths_hot_list(period or "hour"))]
@@ -830,60 +816,27 @@ TIMEOUT = {
 # 4) 统一入口：缓存优先 + 自适应降级 + 过期兜底
 # =====================================================================
 def _cache_key(datatype, code, kwargs):
-    """数据类型相关的缓存键：纳入影响结果的参数（区间/复权/日期/周期/排名等），
-    避免 key 不一致导致缓存命中失败。"""
-    parts = [datatype]
-    if code is not None:
-        parts.append(str(code))
-    # 各类型真正影响结果的参数（其余参数变化不改变结果，不进 key）
-    RELEVANT = {
-        "kline": ("fq",),
-        "financials": ("periods", "report_type"),
-        "fund_flow": ("periods",),
-        "statements": ("periods", "report_type"),
-        "stock_basic": ("list_status",),
-        "hot_topics": ("date",),
-        "dragon_tiger": ("date",),
-        "dragon_tiger_daily": ("date",),
-        "zt_pool": ("date",), "zb_pool": ("date",), "dt_pool": ("date",),
-        "yzt_pool": ("date",), "ths_limit_up": ("date",),
-        "limit_up_sentiment": ("date",),
-    "ths_hot_list": ("period",), "em_hot_rank": ("top",),
-    "valuation_metrics": (), "valuation": (), "intraday": ("date",),
-    # —— P1 覆盖面缺口类型（RELEVANT）——
-    "index_kline": ("fq",), "etf_kline": ("fq",), "cb_kline": ("fq",),
-    "index_spot": (), "etf_info": (), "cb_quote": (),
-    "forecast": (), "express": (), "top10_holders": (),
-    "northbound_hist": (), "bid_ask": (),
-    "ipo_calendar": ("start", "end"), "macro": ("indicators",),
-}
-    relevant = RELEVANT.get(datatype, ())
-    for k in sorted(kwargs.keys()):
-        if k in relevant:
-            parts.append(f"{k}={kwargs[k]}")
-    return ":".join(parts)
+    """Bind all request semantics and the retained authorization scope."""
+    import hashlib
+    scope = hashlib.sha256(str(XIAODEFA_TOKEN or "").encode()).hexdigest()
+    return json.dumps([datatype, code, kwargs, scope], sort_keys=True, default=str)
 
 
 def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
-    """统一取数。返回 (data, meta)。
-    meta["status"]:
-      fresh     —— 缓存命中且未过期（0 网络）
-      live      —— 实时取回（此前无缓存）
-      refreshed —— 缓存过期，本次实时刷新成功
-      stale     —— ⚠ 所有实时源失败，已降级返回【过期缓存】（仍拿到数据！）
-      failed    —— 彻底失败（从未取过且无任何源可用）
-    """
-    if datatype not in SOURCE_PLAN:
-        raise ValueError(f"未知数据类型: {datatype}，可选: {list(SOURCE_PLAN)}")
-    timeout_per = timeout_per if timeout_per is not None else TIMEOUT.get(datatype, 10)
-    # The default keeps a reusable full-history K-line cache.  Stage runners can
-    # set full_history=False for a bounded daily slice; that key includes the
-    # requested window so a short slice can never masquerade as full history.
-    full_history = bool(kwargs.pop("full_history", True))
-    # Full-history K-line payloads are canonicalized in DuckDB/Parquet.  Do
-    # not duplicate hundreds of megabytes of JSON in the small SQLite
-    # resilience cache; bounded daily slices may still use the cache.
-    cache_allowed = not (datatype in {"kline", "index_kline", "etf_kline", "cb_kline"} and full_history)
+    """One acquisition owner per demand, including timed-out workers still running."""
+    import hashlib
+    from pathlib import Path
+    from trade_system.file_lock import FileLock, FileLockBusy
+
+    # Run ids belong to receipts, never to the identity of economic data.
+    kwargs.pop("run_id", None)
+    if datatype in {"kline", "index_kline", "etf_kline", "cb_kline"}:
+        today = datetime.date.today()
+        kwargs.setdefault("fq", "qfq")
+        kwargs.setdefault("start", (today-datetime.timedelta(days=10)).strftime("%Y%m%d"))
+        kwargs.setdefault("end", today.strftime("%Y%m%d"))
+        kwargs["start"], kwargs["end"] = _norm_date(kwargs["start"]), _norm_date(kwargs["end"])
+        kwargs.setdefault("full_history", False)
     # 日期型 / 周期型类型：默认取今天/本周期，并把参数固化进 kwargs，
     # 保证缓存 key 与取数一致（否则 warm 与 get 的 key 不一致会命中失败）。
     _DATE_TYPES = ("hot_topics", "dragon_tiger", "dragon_tiger_daily",
@@ -898,14 +851,61 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
         kwargs["date"] = datetime.date.today().strftime(fmt)
     if datatype in _PERIOD_TYPES and "period" not in kwargs:
         kwargs["period"] = "hour"
+    identity = _cache_key(datatype, code, kwargs)
+    # A bounded set of lock carriers avoids a new file for every stock/session.
+    bucket = int(hashlib.sha256(identity.encode()).hexdigest()[:4], 16) % 64
+    lock = FileLock(Path(CACHE_DIR) / f"acquisition-{bucket:02d}.guard")
+    try:
+        lock.__enter__()
+    except FileLockBusy:
+        return None, {"source": None, "status": "in_progress", "error": "acquisition already owned; retry from cache after completion"}
+    pending = []
+    try:
+        return _get_owned(datatype, code, ttl, timeout_per, _pending=pending, **kwargs)
+    finally:
+        remaining = set(pending)
+        if not remaining:
+            lock.__exit__()
+        else:
+            mutex = threading.Lock()
+            def completed(future):
+                with mutex:
+                    remaining.discard(future)
+                    if not remaining:
+                        lock.__exit__()
+            for future in pending:
+                future.add_done_callback(completed)
+
+
+def _get_owned(datatype, code=None, ttl=None, timeout_per=None, *, _pending=None, **kwargs):
+    """统一取数。返回 (data, meta)。
+    meta["status"]:
+      fresh     —— 缓存命中且未过期（0 网络）
+      live      —— 实时取回（此前无缓存）
+      refreshed —— 缓存过期，本次实时刷新成功
+      stale     —— ⚠ 所有实时源失败，已降级返回【过期缓存】（仍拿到数据！）
+      failed    —— 彻底失败（从未取过且无任何源可用）
+    """
+    if datatype not in SOURCE_PLAN:
+        raise ValueError(f"未知数据类型: {datatype}，可选: {list(SOURCE_PLAN)}")
+    timeout_per = timeout_per if timeout_per is not None else TIMEOUT.get(datatype, 10)
+    # Daily requests default to a bounded slice; full history must be explicit.
+    full_history = bool(kwargs.pop("full_history", False))
+    # Full-history K-line payloads are canonicalized in DuckDB/Parquet.  Do
+    # not duplicate hundreds of megabytes of JSON in the small SQLite
+    # resilience cache; bounded daily slices may still use the cache.
+    cache_allowed = not (datatype in {"kline", "index_kline", "etf_kline", "cb_kline"} and full_history)
     ttl = ttl if ttl is not None else adaptive_ttl(datatype)
 
-    # kline 按"全量历史"缓存（key 不含起止），任意区间复用同一份 → stale 兜底才稳健
+    # Bounded K-line receipts bind every request parameter and date window.
     if datatype in {"kline", "index_kline", "etf_kline", "cb_kline"}:
+        today = datetime.date.today()
+        kwargs.setdefault("start", (today-datetime.timedelta(days=10)).strftime("%Y%m%d"))
+        kwargs.setdefault("end", today.strftime("%Y%m%d"))
         fq = kwargs.get("fq", "qfq")
         sd = _norm_date(kwargs.get("start", "19900101"))
         ed = _norm_date(kwargs.get("end", "20500101"))
-        key = f"{datatype}:{code}:{fq}" if full_history else f"{datatype}:{code}:{fq}:{sd}:{ed}"
+        key = _cache_key(datatype, code, kwargs)
         post_filter = (lambda rows: [b for b in rows
                                      if isinstance(b, dict) and sd <= _norm_date(b.get("date", "")) <= ed]
                        if isinstance(rows, list) else rows)
@@ -939,17 +939,24 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
         fetch_kwargs = kwargs
 
     # ① 缓存优先
-    val, ts = cache.get(key) if cache_allowed else (None, 0)
+    # Older unbound cache entries may belong to a retired channel. Keep them on
+    # disk as history, but never reinterpret them as a newly qualified receipt.
+    key = "receipt-v1:" + _cache_key(datatype, code, {"request_key": key})
+    receipt, ts = cache.get(key) if cache_allowed else (None, 0)
+    val = receipt.get("data") if isinstance(receipt, dict) and receipt.get("schema") == 1 else None
+    origin = receipt.get("source") if val is not None else None
+    received_at = receipt.get("received_at", ts) if val is not None else ts
     if val is not None and (time.time() - ts) < ttl and (
         datatype not in {"kline", "index_kline", "etf_kline", "cb_kline"}
         or _contract_matches(val)
     ):
-        return post_filter(val), {"source": "cache", "status": "fresh", "cached_at": ts}
+        return post_filter(val), {"source": origin, "status": "fresh", "cache_hit": True,
+                                  "cached_at": received_at, "received_at": received_at}
 
     # ② 实时降级（按健康度动态排序）
     spec = SOURCE_PLAN[datatype]
     sources = spec(code, **fetch_kwargs) if callable(spec) else list(spec)
-    ordered = health.order(sources, datatype)
+    ordered = list(sources)
     eligible = [(name, fn) for name, fn in ordered if not health.is_cooldown(name, datatype)]
     if not eligible and ordered:
         # Half-open recovery: allow one probe only.  Probing every cooled
@@ -960,29 +967,33 @@ def get(datatype, code=None, ttl=None, timeout_per=None, **kwargs):
         rate.acquire(name)
         t0 = time.time()
         try:
-            out = _call(fn, timeout_per)
+            out = _call(fn, timeout_per, retries=0, pending=_pending)
         finally:
             rate.release(name)
         dt = time.time() - t0
+        if _pending:
+            return None, {"source": name, "status": "in_progress", "error": "provider timeout; acquisition ownership retained until worker exits"}
         if out:
             if datatype in {"kline", "index_kline", "etf_kline", "cb_kline"} and not _contract_matches(out):
                 health.record(name, datatype, False, dt)
                 logger.warning("%s returned rows without a verified K-line unit/adjustment contract", name)
                 continue
+            received_at = time.time()
             if cache_allowed:
-                cache.put(key, out)
+                cache.put(key, {"schema": 1, "source": name, "received_at": received_at, "data": out})
             health.record(name, datatype, True, dt)
             if val is not None:
                 return post_filter(out), {"source": name, "status": "refreshed",
-                                          "cached_at": ts, "latency": round(dt, 3)}
+                                          "cached_at": received_at, "received_at": received_at, "latency": round(dt, 3)}
             return post_filter(out), {"source": name, "status": "live",
-                                     "cached_at": time.time(), "latency": round(dt, 3)}
+                                     "cached_at": received_at, "received_at": received_at, "latency": round(dt, 3)}
         else:
             health.record(name, datatype, False, dt)
 
     # ③ 全源失败 → 过期缓存兜底（关键：永不空手而归）
     if val is not None:
-        return post_filter(val), {"source": "cache", "status": "stale", "cached_at": ts,
+        return post_filter(val), {"source": origin, "status": "stale", "cache_hit": True,
+                                 "cached_at": received_at, "received_at": received_at,
                                  "warning": "所有实时源失败，已降级返回过期缓存"}
     return None, {"source": None, "status": "failed"}
 

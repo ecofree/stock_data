@@ -3,17 +3,8 @@ import duckdb
 from base import DuckDBStore
 from schema import init_schema
 from trade_system.integration.data_catalog import build_default_data_sources
-from trade_system.tushare_relay import (
-    TushareRelayClient,
-    collect_tushare_adj_factor,
-    collect_tushare_daily,
-    collect_tushare_daily_basic,
-    collect_tushare_index_daily,
-    collect_tushare_stock_basic,
-    collect_tushare_trade_cal,
-    stock_code_to_ts_code,
-    sync_tushare_ohlc_to_core_tables,
-)
+from trade_system.xiaodefa_source import XiaodefaClient
+from trade_system.tushare_store import (collect_tushare_adj_factor, collect_tushare_daily, collect_tushare_daily_basic, collect_tushare_index_daily, collect_tushare_stock_basic, collect_tushare_trade_cal, stock_code_to_ts_code, sync_tushare_ohlc_to_core_tables)
 
 
 class FakeRunner:
@@ -45,7 +36,7 @@ def _count(db_path, table):
 
 
 def test_tushare_relay_client_maps_fields_items_to_dicts():
-    client = TushareRelayClient(token="secret", runner=FakeRunner({
+    client = XiaodefaClient(token="secret", runner=FakeRunner({
         "daily": {
             "code": 0,
             "msg": "ok",
@@ -65,23 +56,13 @@ def test_tushare_relay_client_maps_fields_items_to_dicts():
     assert rows == [{"ts_code": "000001.SZ", "trade_date": "20260709", "close": 12.34}]
 
 
-def test_tushare_relay_normalizes_whitespace_in_connection_settings():
-    client = TushareRelayClient(
-        token="  secret-token \n",
-        url=" https://relay.example.test/ ",
-        resolve=" 1.2.3.4:443 ",
-        runner=FakeRunner({}),
-    )
-
+def test_xiaodefa_normalizes_connection_settings():
+    client = XiaodefaClient(token="  secret-token ", url=" https://t.xiaodefa.top/ ", runner=FakeRunner({}))
     assert client.token == "secret-token"
-    assert client.url == "https://relay.example.test/"
-    assert client.resolve == "1.2.3.4:443"
+    assert client.url == "https://t.xiaodefa.top/"
 
 
-def test_tushare_relay_test_runner_defaults_to_no_sleep():
-    client = TushareRelayClient(token="secret", runner=FakeRunner({}))
 
-    assert client.min_interval_seconds == 0
 
 
 def test_stock_code_to_ts_code_preserves_leading_zero_stock_codes():
@@ -92,7 +73,7 @@ def test_stock_code_to_ts_code_preserves_leading_zero_stock_codes():
 
 def test_tushare_collectors_write_staging_tables_idempotently(tmp_path):
     store, db_path = _store(tmp_path)
-    client = TushareRelayClient(
+    client = XiaodefaClient(
         token="secret",
         runner=FakeRunner(
             {
@@ -178,7 +159,7 @@ def test_tushare_daily_collector_splits_long_date_ranges(tmp_path):
             },
         }
 
-    client = TushareRelayClient(token="secret", runner=FakeRunner({"daily": daily_payload}))
+    client = XiaodefaClient(token="secret", runner=FakeRunner({"daily": daily_payload}))
     try:
         inserted = collect_tushare_daily(client, store, ["000001"], "20250101", "20260709")
     finally:

@@ -6,24 +6,9 @@ from pathlib import Path
 
 import duckdb
 
-from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.quality import table_exists
 from trade_system.db_utils import fetch_dicts as _fetch_dicts
 
-
-
-def _verdict(stats: dict, min_return_samples: int) -> str:
-    samples = int(stats.get("return_sample_count") or 0)
-    if samples < min_return_samples:
-        return "insufficient_sample"
-    hit_rate = stats.get("hit_rate")
-    avg_return = stats.get("avg_forward_return_pct")
-    # 仅描述样本内统计，不证明策略能力；判读规则见页面 Interpretation Rules。
-    if hit_rate is not None and avg_return is not None and hit_rate >= 50 and avg_return > 0:
-        return "positive_review_sample"
-    if avg_return is not None and avg_return < 0:
-        return "negative_review_sample"
-    return "mixed_sample"
 
 
 def _regime_stage_counts(db_path: str | Path) -> dict[str, dict[str, int]]:
@@ -59,18 +44,22 @@ def _regime_stage_counts(db_path: str | Path) -> dict[str, dict[str, int]]:
 
 
 def build_daily_review_statistics(db_path: str | Path, min_return_samples: int = 50) -> dict:
-    # Align with the formal stage/operator/web backtests, which all use enforce_t1=True.
-    # The default (False) would score same-day buy/sell returns that are not executable
-    # under A-share T+1, making the daily review caliber inconsistent with them.
-    backtest = run_stage_candidate_backtest(db_path, enforce_t1=True)
-    stage_statistics = {}
-    for stage, stats in backtest.get("stage_stats", {}).items():
-        item = dict(stats)
-        item["verdict"] = _verdict(item, min_return_samples)
-        item["min_return_samples"] = min_return_samples
-        stage_statistics[stage] = item
+    """Read persisted signal counts; evaluating returns belongs to explicit research."""
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        if not table_exists(con, "stock_candidate_stage_signal"):
+            counts = []
+        else:
+            columns = {r[1] for r in con.execute("PRAGMA table_info('stock_candidate_stage_signal')").fetchall()}
+            qualified = "WHERE coalesce(is_actionable, false) = true" if "is_actionable" in columns else ""
+            counts = con.execute(f"SELECT stage, count(*) FROM stock_candidate_stage_signal {qualified} GROUP BY stage").fetchall()
+    stage_statistics = {stage: {
+        "sample_count": count, "return_sample_count": 0,
+        "hit_rate": None, "avg_forward_return_pct": None,
+        "verdict": "not_computed", "min_return_samples": min_return_samples,
+    } for stage, count in counts}
     return {
-        "sample_count": backtest.get("sample_count", 0),
+        "sample_count": sum(count for _, count in counts),
+        "scope": "stored_signal_counts_only",
         "stage_statistics": stage_statistics,
         "regime_stage_counts": _regime_stage_counts(db_path),
     }
@@ -111,8 +100,7 @@ def render_daily_review_statistics(stats: dict) -> str:
             "",
             "## Interpretation Rules",
             "",
-            "- `insufficient_sample` means the stage does not yet have enough forward-return samples to support a trading conclusion.",
-            "- `positive_review_sample` / `negative_review_sample` describe in-sample statistics only; they do not prove strategy capability.",
+            "- `not_computed`: this view reads stored counts only; it never runs a backtest. Returns and hit rates are unavailable here.",
             "- Regime group counts cover actionable signals only (`is_actionable=true` when the column exists), aligned with the backtest caliber.",
             "",
         ]

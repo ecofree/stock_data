@@ -56,10 +56,10 @@ def run(report_path,output):
     overlay=None
     try:
         from trade_system.config import SETTINGS
-        from trade_system.tushare_relay import TushareRelayClient
+        from trade_system.xiaodefa_source import XiaodefaClient
         token=SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')
         if not token:raise ValueError('xiaodefa credential unavailable')
-        relay=TushareRelayClient(token=token,url=SETTINGS.get('XIAODEFA_URL') or 'https://t.xiaodefa.top/',resolve='',timeout=15,retries=1)
+        relay=XiaodefaClient(token=token,url=SETTINGS.get('XIAODEFA_URL') or 'https://t.xiaodefa.top/',timeout=15,max_retries=1)
         params={'exchange':'SSE','start_date':'20240101','end_date':'20241231'}
         rows=relay.query_rows('trade_cal',params,'exchange,cal_date,is_open,pretrade_date')
         receipt={'provider':'xiaodefa_relay','api':'trade_cal','params':params,'rows':rows,'received_at':now_utc().isoformat(),

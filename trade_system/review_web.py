@@ -2212,7 +2212,7 @@ def render_review_web(db_path: str | Path, trade_date: str | None = None,
 
 def write_review_web(db_path: str | Path, out_path: str | Path,
                      trade_date: str | None = None,
-                     *, allow_direct_publish: bool = False,
+                     *,
                      context: dict[str, Any] | None = None,
                      as_of: datetime | str | None = None) -> Path:
     """Render the review page and write it to ``out_path``. Returns the path.
@@ -2226,13 +2226,12 @@ def write_review_web(db_path: str | Path, out_path: str | Path,
     out = Path(out_path)
     project_reports = Path(__file__).resolve().parents[1] / "reports"
     if (
-        not allow_direct_publish
-        and out.resolve().parent == project_reports.resolve()
+        out.resolve().parent == project_reports.resolve()
         and out.name in {"daily_review_latest.html", "sector_trail_latest.html"}
     ):
         raise ValueError(
-            "latest review files must be written through the integrated pipeline; "
-            "use a staging/preview path or explicitly allow direct publish"
+            "legacy latest publication is retired; use an explicit preview path; "
+            "daily_workspace owns current publication"
         )
     out.parent.mkdir(parents=True, exist_ok=True)
     html_out, _selected = _render_review_bundle(

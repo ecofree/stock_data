@@ -272,7 +272,7 @@ def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, m
     import hashlib
     import json
     import subprocess
-    from trade_system.source_authority import collection_contract, verify_collection_contract
+    from trade_system.migration_boundary import collection_contract, verify_collection_contract
     source=tmp_path/'source';source.mkdir()
     (source/'fetch_all.py').write_text('# synthetic collector')
     cache=source/'trade_system/.stock_cache/limiter.json';cache.parent.mkdir(parents=True)

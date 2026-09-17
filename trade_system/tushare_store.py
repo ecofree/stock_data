@@ -1,49 +1,11 @@
-﻿"""TuShare relay adapter for basic historical data.
-
-The relay is used as a bounded base-data supplement. It must not be used as an
-automatic trading trigger; collectors write staging tables first, then an
-explicit sync can copy OHLC rows into the existing core K-line tables.
-"""
-
+"""TuShare dataset conversions and storage; transport belongs to XiaodefaClient."""
 from __future__ import annotations
-
-import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
-import subprocess
-import threading
-import time
-from typing import Any, Callable
-from trade_system.host_limiter import shared_host_limiter
-
+from typing import Any
 from base import DuckDBStore
-from trade_system.config import SETTINGS
 from trade_system.backfill import TABLE_SPECS
-
-
-# The historical collector must use the same migrated relay as the live
-# multi-source entry points.  The previous default was the retired
-# Cloudflare-fronted endpoint and made every YTD backfill look like a data
-# outage even though the replacement relay is available.
-DEFAULT_RELAY_URL = "https://fastapic.stockai888.top"
-DEFAULT_RESOLVE = ""
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
-)
-
-
-class TushareRelayError(RuntimeError):
-    """Raised when the relay cannot return structured data."""
-
-
-Runner = Callable[[dict[str, Any], int], dict[str, Any]]
-
-
-def _settings_value(name: str, default: str = "") -> str:
-    return os.environ.get(name) or SETTINGS.get(name, default)
+from trade_system.xiaodefa_source import XiaodefaClient
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -152,158 +114,12 @@ def _append_scope_filters(
         params.append(_iso_date(end_date))
 
 
-class TushareRelayClient:
-    def __init__(
-        self,
-        token: str | None = None,
-        *,
-        url: str | None = None,
-        resolve: str | None = None,
-        timeout: int = 40,
-        retries: int = 3,
-        runner: Runner | None = None,
-        min_interval_seconds: float | None = None,
-    ) -> None:
-        configured_token = token if token is not None else (
-            _settings_value("TUSHARE_FAST_RELAY_TOKEN")
-            or _settings_value("TUSHARE_RELAY_TOKEN")
-            or _settings_value("TUSHARE_TOKEN")
-        )
-        self.token = str(configured_token or "").strip()
-        configured_url = url or (
-            _settings_value("TUSHARE_FAST_RELAY_URL")
-            or _settings_value("TUSHARE_RELAY_URL", DEFAULT_RELAY_URL)
-        )
-        self.url = str(configured_url or DEFAULT_RELAY_URL).strip()
-        configured_resolve = resolve if resolve is not None else _settings_value("TUSHARE_RELAY_RESOLVE", DEFAULT_RESOLVE)
-        self.resolve = str(configured_resolve or "").strip()
-        self.timeout = int(timeout)
-        self.retries = int(retries)
-        self._shared_limit_enabled = runner is None
-        self.runner = runner or self._run_curl
-        if min_interval_seconds is None:
-            # The relay allows 100 requests/minute.  Keep a 0.65s
-            # start-to-start interval in production to leave transport jitter
-            # below the advertised ceiling,
-            # while test runners remain fast unless they opt into the limiter.
-            min_interval_seconds = (
-                "0"
-                if runner is not None
-                else _settings_value("TUSHARE_RELAY_MIN_INTERVAL_SECONDS", "0.65")
-            )
-        try:
-            self.min_interval_seconds = max(0.0, float(min_interval_seconds))
-        except (TypeError, ValueError):
-            self.min_interval_seconds = 0.65 if runner is None else 0.0
-        self._rate_lock = threading.Lock()
-        self._last_request_at: float | None = None
-
-    def _wait_for_rate_limit(self) -> None:
-        """Throttle request starts to stay below the relay's 100/minute limit."""
-        if self.min_interval_seconds <= 0:
-            return
-        with self._rate_lock:
-            now = time.monotonic()
-            if self._last_request_at is not None:
-                remaining = self.min_interval_seconds - (now - self._last_request_at)
-                if remaining > 0:
-                    time.sleep(remaining)
-            self._last_request_at = time.monotonic()
-        # The relay limit is account-wide, not process-wide.  Keep the
-        # advertised 100/minute ceiling across all collectors on this machine.
-        if self._shared_limit_enabled and self.min_interval_seconds > 0:
-            shared_host_limiter.acquire("tushare_relay", self.min_interval_seconds)
-
-    def query(self, api_name: str, params: dict[str, Any] | None = None, fields: str = "") -> tuple[list[str], list[list[Any]]]:
-        if not self.token:
-            raise TushareRelayError("missing TUSHARE_FAST_RELAY_TOKEN/TUSHARE_RELAY_TOKEN")
-        body = {
-            "api_name": api_name,
-            "token": self.token,
-            "params": params or {},
-            "fields": fields or "",
-        }
-        last_error = "unknown"
-        for attempt in range(1, self.retries + 1):
-            try:
-                self._wait_for_rate_limit()
-                payload = self.runner(body, self.timeout)
-                if payload.get("code") != 0:
-                    raise TushareRelayError(f"relay api error: code={payload.get('code')} msg={payload.get('msg', '')}")
-                data = payload.get("data") or {}
-                return list(data.get("fields") or []), list(data.get("items") or [])
-            except Exception as exc:
-                last_error = type(exc).__name__
-                if attempt >= self.retries:
-                    break
-                # Rate-limit responses (relay app code=-1 "次数超限" or HTTP
-                # 429) only clear once the one-minute window rolls over, so a
-                # one-second retry just burns another attempt.  Scale the
-                # backoff with the attempt count, capped near the window size.
-                text = str(exc)
-                if "超限" in text or "429" in text:
-                    time.sleep(min(65.0, 15.0 * attempt))
-                else:
-                    time.sleep(1)
-        raise TushareRelayError(f"relay request failed after {self.retries} attempts: {last_error}")
-
-    def query_rows(self, api_name: str, params: dict[str, Any] | None = None, fields: str = "") -> list[dict[str, Any]]:
-        field_names, items = self.query(api_name, params, fields)
-        rows = []
-        for item in items:
-            values = list(item)
-            if len(values) < len(field_names):
-                values.extend([None] * (len(field_names) - len(values)))
-            rows.append(dict(zip(field_names, values)))
-        return rows
-
-    def _run_curl(self, body: dict[str, Any], timeout: int) -> dict[str, Any]:
-        curl = "curl.exe" if os.name == "nt" else "curl"
-        cmd = [
-            curl,
-            "-s",
-            "-m",
-            str(max(timeout, 5)),
-            "-X",
-            "POST",
-            self.url,
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            f"User-Agent: {DEFAULT_UA}",
-            "-H",
-            "Origin: https://fastapic.stockai888.top",
-            "-H",
-            "Referer: https://fastapic.stockai888.top/",
-            # Read the JSON body from stdin so the relay token never appears
-            # in the Windows process command line.
-            "-d",
-            "@-",
-        ]
-        if self.resolve:
-            cmd[7:7] = ["--resolve", self.resolve]
-        proc = subprocess.run(
-            cmd,
-            input=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=timeout + 5,
-        )
-        if proc.returncode != 0:
-            raise TushareRelayError(f"curl failed: rc={proc.returncode}")
-        try:
-            return json.loads(proc.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            raise TushareRelayError("relay returned non-json response") from exc
-
-
 def _row_value(row: dict[str, Any], name: str, default=None):
     value = row.get(name)
     return default if value is None else value
 
 
-def collect_tushare_trade_cal(client: TushareRelayClient, store: DuckDBStore, start_date: str, end_date: str) -> int:
+def collect_tushare_trade_cal(client: XiaodefaClient, store: DuckDBStore, start_date: str, end_date: str) -> int:
     rows = client.query_rows(
         "trade_cal",
         {"exchange": "SSE", "start_date": start_date, "end_date": end_date},
@@ -327,7 +143,7 @@ def collect_tushare_trade_cal(client: TushareRelayClient, store: DuckDBStore, st
     )
 
 
-def collect_tushare_stock_basic(client: TushareRelayClient, store: DuckDBStore) -> int:
+def collect_tushare_stock_basic(client: XiaodefaClient, store: DuckDBStore) -> int:
     rows = client.query_rows(
         "stock_basic",
         {"exchange": "", "list_status": "L"},
@@ -355,7 +171,7 @@ def collect_tushare_stock_basic(client: TushareRelayClient, store: DuckDBStore) 
 
 
 def collect_tushare_daily(
-    client: TushareRelayClient,
+    client: XiaodefaClient,
     store: DuckDBStore,
     stock_codes: list[str],
     start_date: str,
@@ -398,7 +214,7 @@ def collect_tushare_daily(
 
 
 def collect_tushare_daily_basic(
-    client: TushareRelayClient,
+    client: XiaodefaClient,
     store: DuckDBStore,
     stock_codes: list[str],
     start_date: str,
@@ -439,7 +255,7 @@ def collect_tushare_daily_basic(
 
 
 def collect_tushare_adj_factor(
-    client: TushareRelayClient,
+    client: XiaodefaClient,
     store: DuckDBStore,
     stock_codes: list[str],
     start_date: str,
@@ -475,7 +291,7 @@ def collect_tushare_adj_factor(
 
 
 def collect_tushare_index_daily(
-    client: TushareRelayClient,
+    client: XiaodefaClient,
     store: DuckDBStore,
     index_codes: list[str],
     start_date: str,

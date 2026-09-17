@@ -159,6 +159,23 @@ class MultiSourceStore:
             elif isinstance(data, dict):
                 source_date = source_date or _date(data.get("date") or data.get("trade_date"))
 
+            if status == "fresh":
+                # A cache hit is not another receipt and must not refresh any
+                # observation or canonical row's received/fetched timestamp.
+                exists = self.con.execute(
+                    "SELECT 1 FROM multi_source_observation WHERE data_type=? "
+                    "AND asset_code IS NOT DISTINCT FROM ? AND payload_hash=? "
+                    "AND source_date IS NOT DISTINCT FROM ? "
+                    "AND status IN ('live','refreshed','delayed') LIMIT 1",
+                    [data_type, code, payload_hash, source_date],
+                ).fetchone()
+                if commit:
+                    self.con.commit()
+                return {"status": "fresh" if exists else "cache_unmaterialized",
+                        "provider": provider, "rows_written": 0, "stale": False,
+                        "source_date": source_date, "payload_hash": payload_hash,
+                        "receipt_reused": bool(exists)}
+
             self.con.execute(
                 "INSERT INTO multi_source_observation "
                 "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash) "

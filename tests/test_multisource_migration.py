@@ -19,8 +19,8 @@ def test_migrated_source_plan_contains_non_tushare_capital_flow_paths():
     assert "sector_flow" in resilient_sources.SOURCE_PLAN
     stock_sources = [name for name, _ in resilient_sources.SOURCE_PLAN["stock_flow"]("000001")]
     assert stock_sources[:2] == ["eastmoney", "sina"]
-    assert stock_sources[-1] == "tushare_relay"
-    assert [name for name, _ in resilient_sources.SOURCE_PLAN["sector_flow"]()] == ["eastmoney", "tushare_relay"]
+    assert stock_sources[-1] == "xiaodefa"
+    assert [name for name, _ in resilient_sources.SOURCE_PLAN["sector_flow"]()] == ["eastmoney", "xiaodefa"]
 
 
 def test_sector_flow_parser_normalizes_all_order_buckets(monkeypatch):
@@ -49,7 +49,7 @@ def test_tushare_dc_sector_flow_keeps_yuan_and_direct_net_buckets(monkeypatch):
 
     monkeypatch.setattr(
         kline_sources,
-        "_tushare_query",
+        "_xiaodefa_query",
         lambda api, params, fields="": [{
             "trade_date": "20260714", "content_type": "概念", "ts_code": "BK0001.DC",
             "name": "测试板块", "pct_change": 2.5, "close": 100,
@@ -58,7 +58,7 @@ def test_tushare_dc_sector_flow_keeps_yuan_and_direct_net_buckets(monkeypatch):
             "buy_sm_amount": -900_000_000,
         }] if api == "moneyflow_ind_dc" else [],
     )
-    row = stock_data_sources._from_tushare_sector_flow("20260714")[0]
+    row = stock_data_sources._from_xiaodefa_sector_flow("20260714")[0]
     assert row["main_net"] == 3_000_000_000
     assert row["super_net"] == 700_000_000
     assert row["small_net"] == -900_000_000
@@ -174,3 +174,14 @@ def test_kpl_intraday_flow_promotes_latest_cumulative_point(tmp_path):
         assert store.con.execute(
             "select main_net,super_net,large_net,provider from multi_source_stock_flow"
         ).fetchone() == (25.0, 4.0, 3.0, "kpl")
+
+
+def test_empty_dc_sector_flow_does_not_substitute_ths_definition(monkeypatch):
+    from trade_system.adapters import kline_sources
+    calls = []
+    def empty(api, params, fields=""):
+        calls.append(api)
+        return []
+    monkeypatch.setattr(kline_sources, "_xiaodefa_query", empty)
+    assert kline_sources._from_xiaodefa_sector_flow("20260714") is None
+    assert calls == ["moneyflow_ind_dc"]

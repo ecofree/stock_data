@@ -2,9 +2,6 @@
 from datetime import date, datetime, timedelta
 from collections import Counter
 from pathlib import Path
-import time
-import json
-import urllib.request
 
 
 from .native_enrichment import PRICES
@@ -12,7 +9,7 @@ from .research_receipts import API_FIELDS, rows_for
 from trade_system.v2.daily_session import CALENDAR,CST,seal
 from trade_system.v2.domain import canonical,file_hash,identity,now_utc,number,utc
 from trade_system.v2.gap_evidence import read_json,write_json
-from trade_system.v2.research_receipts import sealed,Relay
+from trade_system.v2.research_receipts import sealed
 
 CODES=['000001.SZ','002767.SZ','600276.SH','600278.SH']
 WINDOWS=[('2025-01-01','2025-03-24'),('2025-03-25','2025-06-16'),('2025-06-17','2025-06-30')]
@@ -66,18 +63,17 @@ def plan(config=None):
 class Client:
     def __init__(self):
         from trade_system.hithink_client import HiThinkClient
-        self.native=HiThinkClient(timeout=15,max_response_bytes=4_000_000,single_attempt=True);self.relay=None
+        self.native=HiThinkClient(timeout=15,max_response_bytes=4_000_000,single_attempt=True)
+        self.relay=None
+
     def query(self,r):
-        if r['provider']=='hithink_native':return self.native._get(r['api'],r['params'])
-        from trade_system.http_transport import open_verified_once
-        self.relay=self.relay or Relay();relay=self.relay
-        time.sleep(max(0,.65-(time.monotonic()-relay.last)));relay.last=time.monotonic()
-        request=urllib.request.Request(relay.url,data=canonical({'api_name':r['api'],'token':relay.token,'params':r['params'],'fields':','.join(FIELDS[r['api']])}).encode(),headers={'Content-Type':'application/json'})
-        with open_verified_once(request,timeout=15) as response:raw=response.read(4_000_001)
-        if len(raw)>4_000_000:raise ValueError('response budget exceeded')
-        envelope=json.loads(raw)
-        if envelope.get('code')!=0:raise ValueError('provider rejected request')
-        return envelope.get('data') or {}
+        if r['provider']=='hithink_native':
+            return self.native._get(r['api'],r['params'])
+        if r['provider']!='xiaodefa_relay':
+            raise ValueError('unapproved research provider')
+        from trade_system.xiaodefa_source import XiaodefaClient
+        self.relay=self.relay or XiaodefaClient(max_retries=1,timeout=15,max_response_bytes=4_000_000)
+        return self.relay.query_data(r['api'],r['params'],','.join(FIELDS[r['api']]))
 
 
 def parse(r,data):

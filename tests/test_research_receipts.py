@@ -120,5 +120,6 @@ def test_transport_uses_bounded_single_attempt_opener(monkeypatch):
             assert n==8_000_001
             return b'x'*n
     monkeypatch.setattr(http_transport,'open_verified_once',lambda *a,**kw:Response())
-    relay=rr.Relay.__new__(rr.Relay);relay.token='test';relay.url='https://example.test/';relay.last=0
-    with pytest.raises(ValueError,match='byte budget'):relay.query('adj_factor','2024-01-02')
+    from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
+    relay=XiaodefaClient(token='test',min_interval_seconds=0)
+    with pytest.raises(XiaodefaError,match='byte budget'):relay.query_rows('adj_factor', {'trade_date':'20240102'})

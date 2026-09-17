@@ -1,4 +1,4 @@
-﻿"""Batch, resumable TuShare history collection for calendar-year analysis.
+"""Batch, resumable TuShare history collection for calendar-year analysis.
 
 The relay accepts date-wide ``daily``/``daily_basic`` requests.  ``moneyflow``
 is paged at 1,000 rows, then normalized into the project's source-aware flow
@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import date, datetime
 import math
 import json
-import os
 from pathlib import Path
 import time
 from typing import Any, Iterable
@@ -19,26 +18,16 @@ import duckdb
 
 from base import DuckDBStore
 from trade_system.schema import init_schema
-from trade_system.tushare_relay import (
-    TushareRelayClient,
-    TushareRelayError,
-    collect_tushare_stock_basic,
-    collect_tushare_trade_cal,
-    ts_code_to_stock_code,
-)
+from trade_system.tushare_store import (collect_tushare_stock_basic, collect_tushare_trade_cal, ts_code_to_stock_code)
 from trade_system.flow_contract import ensure_stock_flow_contract
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
-from trade_system.config import SETTINGS
 
 
 CHECKPOINT_DATE = "1900-01-01"
 DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg"
 DAILY_BASIC_FIELDS = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv"
 ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
-# The relay is more reliable when large field lists are split into two
-# requests.  In particular, an all-field ``moneyflow`` request can fail while
-# either of these smaller projections succeeds.  The collector merges them by
-# the natural key before writing the raw staging table.
+# Stock order buckets share one request and one atomic snapshot.
 MONEYFLOW_MAIN_FIELDS = (
     "ts_code,trade_date,buy_elg_amount,sell_elg_amount,buy_lg_amount,sell_lg_amount,net_mf_amount"
 )
@@ -46,25 +35,11 @@ MONEYFLOW_SIZE_FIELDS = (
     "ts_code,trade_date,buy_sm_amount,sell_sm_amount,buy_md_amount,sell_md_amount,"
     "buy_lg_amount,sell_lg_amount,buy_elg_amount,sell_elg_amount"
 )
-INDUSTRY_MAIN_FIELDS = (
-    "trade_date,ts_code,name,pct_change,close,net_amount,buy_elg_amount,sell_elg_amount,"
-    "buy_lg_amount,sell_lg_amount"
+# DC bucket fields are already net yuan; this endpoint has no sell buckets.
+INDUSTRY_FIELDS = (
+    "trade_date,content_type,ts_code,name,pct_change,close,net_amount,"
+    "net_amount_rate,buy_elg_amount,buy_lg_amount,buy_md_amount,buy_sm_amount"
 )
-INDUSTRY_SIZE_FIELDS = "trade_date,ts_code,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount"
-# The migrated relay accepts up to roughly 1,000 comma-separated codes for
-# the main moneyflow projection.  Keeping the fallback at this size reduces
-# a full-market day from ~13 requests to ~5 without widening the rejected
-# size-bucket projection.
-# The relay accepts date-wide moneyflow for recent sessions, but older
-# partitions silently truncate comma-separated code lists above roughly 50
-# symbols.  Keep the historical fallback at 50; larger batches can return a
-# plausible-looking but incomplete snapshot.
-MONEYFLOW_CODE_BATCH_SIZE = 50
-# Older relay partitions occasionally reject a date-wide ``daily`` or
-# ``daily_basic`` request while accepting the same date when scoped by
-# ``ts_code``.  Keep code batches bounded so the fallback remains resumable
-# and below the relay's request-size ceiling.
-QUOTE_CODE_BATCH_SIZE = 500
 STOCK_SNAPSHOT_DATASETS = {"daily", "daily_basic", "adj_factor"}
 MIN_STOCK_SNAPSHOT_COVERAGE = 0.99
 
@@ -91,7 +66,7 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def _pages(client: TushareRelayClient, api: str, params: dict[str, Any], fields: str,
+def _pages(client: XiaodefaClient, api: str, params: dict[str, Any], fields: str,
            *, page_size: int, max_pages: int = 10) -> Iterable[tuple[int, list[dict[str, Any]]]]:
     for page_no in range(max_pages):
         query = dict(params)
@@ -103,40 +78,17 @@ def _pages(client: TushareRelayClient, api: str, params: dict[str, Any], fields:
 
 
 class TushareHistoryCollector:
-    def __init__(self, db_path: str | Path, *, client: TushareRelayClient | None = None,
+    def __init__(self, db_path: str | Path, *, client: XiaodefaClient | None = None,
                  request_timeout: int = 20, retries: int = 3,
                  batch_limit: int = 5000, moneyflow_page_size: int = 1000,
                  budget_seconds: float = 300.0):
+        # Validate the only approved client before opening a business database.
+        self.client = client if client is not None else XiaodefaClient(
+            timeout=request_timeout, max_retries=retries)
         self.db_path = str(db_path)
         self.store = DuckDBStore(self.db_path)
         init_schema(self.store.conn)
         ensure_stock_flow_contract(self.store.conn)
-        self._relay_client: TushareRelayClient | None = None
-        self._primary_init_error: str | None = None
-        if client is not None:
-            self.client = client
-        else:
-            # xiaodefa is the preferred historical close source.  The fast
-            # relay remains a real fallback, not a second writer.  Operators
-            # can explicitly select the old order for a controlled rollback.
-            preferred = str(
-                os.environ.get("TUSHARE_PRIMARY_PROVIDER")
-                or SETTINGS.get("TUSHARE_PRIMARY_PROVIDER", "xiaodefa")
-                or "xiaodefa"
-            ).strip().lower()
-            if preferred in {"tushare", "fast", "fast_relay", "relay"}:
-                self.client = TushareRelayClient(timeout=request_timeout, retries=retries)
-            else:
-                try:
-                    self.client = XiaodefaClient(
-                        min_interval_seconds=0.65,
-                        max_retries=max(1, int(retries)),
-                    )
-                except (XiaodefaError, ImportError, RuntimeError) as exc:
-                    self._primary_init_error = f"{type(exc).__name__}: {exc}"
-                    self.client = TushareRelayClient(timeout=request_timeout, retries=retries)
-        self._secondary_client: XiaodefaClient | None = None
-        self._secondary_init_error: str | None = None
         self._last_source_provider = self._provider_name(self.client)
         self.batch_limit = max(100, int(batch_limit))
         self.moneyflow_page_size = max(100, min(int(moneyflow_page_size), 1000))
@@ -161,13 +113,13 @@ class TushareHistoryCollector:
             return
         observed = len(rows)
         if observed <= 0:
-            raise TushareRelayError(f"empty {dataset} response for {_iso(trade_date)}")
+            raise XiaodefaError(f"empty {dataset} response for {_iso(trade_date)}")
         expected = self._expected_stock_count()
         # A live listed universe is normally >5,000 rows.  Keep the threshold
         # proportional so a few suspended/unavailable names are acceptable,
         # while a truncated relay page cannot become a successful close.
         if expected >= 1000 and observed < max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE)):
-            raise TushareRelayError(
+            raise XiaodefaError(
                 f"incomplete {dataset} response: {observed}/{expected} rows for {_iso(trade_date)}"
             )
 
@@ -177,50 +129,15 @@ class TushareHistoryCollector:
         ).fetchone()[0] or 0)
 
     def _is_production_source(self) -> bool:
-        return isinstance(self.client, (TushareRelayClient, XiaodefaClient))
+        return isinstance(self.client, XiaodefaClient)
 
     @staticmethod
     def _provider_name(source: Any) -> str:
-        return "xiaodefa" if isinstance(source, XiaodefaClient) else "tushare" if isinstance(source, TushareRelayClient) else "custom"
+        return "xiaodefa" if isinstance(source, XiaodefaClient) else "custom"
 
-    def _xiaodefa_client(self) -> XiaodefaClient | None:
-        """Create the secondary close source lazily and only for the relay.
 
-        Test/fake clients must remain deterministic, and a missing xiaodefa
-        credential must be recorded as a fallback miss rather than preventing
-        the normal fast-relay path from starting.
-        """
-        if not isinstance(self.client, TushareRelayClient):
-            return None
-        if self._secondary_client is not None:
-            return self._secondary_client
-        if self._secondary_init_error:
-            return None
-        try:
-            self._secondary_client = XiaodefaClient(
-                min_interval_seconds=0.65,
-                max_retries=max(1, min(3, int(getattr(self.client, "retries", 1)))),
-            )
-        except (XiaodefaError, ImportError, RuntimeError) as exc:
-            self._secondary_init_error = f"{type(exc).__name__}: {exc}"
-        return self._secondary_client
 
-    def _tushare_relay_client(self) -> TushareRelayClient | None:
-        """Create the fast relay only when xiaodefa needs a fallback."""
-        if isinstance(self.client, TushareRelayClient):
-            return self.client
-        if not isinstance(self.client, XiaodefaClient):
-            return None
-        if self._relay_client is not None:
-            return self._relay_client
-        try:
-            self._relay_client = TushareRelayClient(
-                timeout=20,
-                retries=max(1, min(3, int(getattr(self.client, "max_retries", 1)))),
-            )
-        except Exception:
-            self._relay_client = None
-        return self._relay_client
+
 
     def _is_complete_stock_table(self, table: str, date_column: str, trade_date: str) -> bool:
         expected = self._expected_stock_count()
@@ -322,8 +239,6 @@ class TushareHistoryCollector:
             count = int(self.store.conn.execute(
                 f"SELECT count(*) FROM {table} WHERE {date_column}=?", [_iso(trade_date)]
             ).fetchone()[0] or 0)
-            if count == 5000:
-                return False
             # A success checkpoint with zero stored rows means an empty relay
             # response was recorded as success (observed 2026-08-10 on
             # daily/daily_basic).  Treat it as not-done so the next run
@@ -361,129 +276,25 @@ class TushareHistoryCollector:
         return len(rows)
 
     def _query_date_batch(self, api: str, trade_date: str, fields: str, *, with_limit: bool = True) -> list[dict[str, Any]]:
-        """Fetch a date-wide batch and reject an implausibly short relay response.
-
-        A transient relay response containing only a few dozen stocks is a
-        successful HTTP response but not a complete market snapshot.  Fake
-        clients used by tests are intentionally exempt from this production
-        guard.
-        """
+        """One acquisition; page termination and coverage are independent checks."""
+        target = _iso(trade_date)
         params = {"trade_date": _ymd(trade_date)}
-        if with_limit:
-            params["limit"] = self.batch_limit
-        target = _iso(trade_date)
-        clients: list[Any] = [self.client]
-        secondary = self._xiaodefa_client()
-        if secondary is None:
-            secondary = self._tushare_relay_client()
-        if secondary is not None:
-            clients.append(secondary)
-        last_reason = "empty response"
-        for source in clients:
-            semantic_attempts = max(1, min(4, int(getattr(source, "retries", getattr(source, "max_retries", 1)))))
-            best_rows: list[dict[str, Any]] = []
-            for attempt in range(semantic_attempts):
-                try:
-                    rows = source.query_rows(api, params, fields)
-                except Exception as exc:
-                    if not self._is_production_source():
-                        raise
-                    last_reason = f"{type(exc).__name__}: {exc}"
-                    rows = []
-                dated_rows = []
-                for row in rows:
-                    try:
-                        if row.get("trade_date") and _iso(row.get("trade_date")) == target:
-                            dated_rows.append(row)
-                    except (TypeError, ValueError):
-                        continue
-                if len(dated_rows) > len(best_rows):
-                    best_rows = dated_rows
-                if not self._is_production_source():
-                    self._last_source_provider = "custom"
-                    return dated_rows
-                expected_minimum = max(1000, math.ceil(self._expected_stock_count() * MIN_STOCK_SNAPSHOT_COVERAGE))
-                if not dated_rows:
-                    last_reason = f"empty {api} response for requested date {target}"
-                elif api in STOCK_SNAPSHOT_DATASETS and len(dated_rows) < expected_minimum:
-                    last_reason = f"incomplete {api} response: {len(dated_rows)} rows for requested date {target}"
-                elif len(dated_rows) < 1000:
-                    last_reason = f"suspiciously short {api} response: {len(dated_rows)} rows"
-                else:
-                    self._last_source_provider = self._provider_name(source)
-                    return dated_rows
-                if attempt + 1 < semantic_attempts:
-                    time.sleep(min(15.0, 2.0 ** attempt))
-            if best_rows and isinstance(source, XiaodefaClient):
-                last_reason = f"incomplete xiaodefa {api} response: {len(best_rows)} rows for requested date {target}"
-        raise TushareRelayError(last_reason)
+        if self._is_production_source():
+            rows = self.client.query_all(api, page_size=self.batch_limit,
+                                         fields=fields, **params)
+        else:
+            rows = self.client.query_rows(api, params, fields)
+        if any(not r.get("ts_code") or not r.get("trade_date") or
+               _iso(r["trade_date"]) != target for r in rows):
+            raise XiaodefaError("response contains wrong session or missing identity")
+        keys = [str(r["ts_code"]) for r in rows]
+        if len(keys) != len(set(keys)):
+            raise XiaodefaError("duplicate instrument in snapshot")
+        self._validate_stock_snapshot(api, rows, trade_date)
+        self._last_source_provider = self._provider_name(self.client)
+        return rows
 
-    def _query_code_batches(self, api: str, trade_date: str, fields: str) -> list[dict[str, Any]]:
-        """Fallback for relay shards that fail date-wide quote snapshots.
 
-        The fallback deliberately uses the canonical TuShare relay and the
-        same stock universe stored in ``tushare_stock_basic``.  It never
-        relabels another session's rows and only returns a snapshot when the
-        result is large enough to be useful; callers still checkpoint an
-        incomplete result as an error.
-        """
-        relay = self._tushare_relay_client()
-        if relay is None:
-            return []
-        codes = [str(row[0]) for row in self.store.conn.execute(
-            "SELECT DISTINCT ts_code FROM tushare_stock_basic "
-            "WHERE ts_code IS NOT NULL ORDER BY ts_code"
-        ).fetchall()]
-        if not codes:
-            return []
-        target = _iso(trade_date)
-        out: dict[tuple[str, str], dict[str, Any]] = {}
-        for start in range(0, len(codes), QUOTE_CODE_BATCH_SIZE):
-            if not self._budget_left():
-                break
-            batch = codes[start:start + QUOTE_CODE_BATCH_SIZE]
-            try:
-                rows = relay.query_rows(
-                    api,
-                    {"ts_code": ",".join(batch), "trade_date": _ymd(trade_date)},
-                    fields,
-                )
-            except Exception:
-                # One bounded retry with a smaller slice handles relay URL
-                # limits without turning a transient failure into a storm.
-                if len(batch) <= 100:
-                    continue
-                midpoint = len(batch) // 2
-                for smaller in (batch[:midpoint], batch[midpoint:]):
-                    if not self._budget_left():
-                        break
-                    try:
-                        rows = relay.query_rows(
-                            api,
-                            {"ts_code": ",".join(smaller), "trade_date": _ymd(trade_date)},
-                            fields,
-                        )
-                    except Exception:
-                        continue
-                    for row in rows:
-                        try:
-                            if row.get("ts_code") and _iso(row.get("trade_date")) == target:
-                                out[(str(row.get("ts_code")), target)] = row
-                        except (TypeError, ValueError):
-                            continue
-                continue
-            for row in rows:
-                try:
-                    if row.get("ts_code") and _iso(row.get("trade_date")) == target:
-                        out[(str(row.get("ts_code")), target)] = row
-                except (TypeError, ValueError):
-                    continue
-        minimum = max(1000, int(len(codes) * 0.50))
-        if len(out) < minimum:
-            raise TushareRelayError(
-                f"incomplete {api} code-batch fallback: {len(out)}/{len(codes)} rows"
-            )
-        return list(out.values())
 
     def ensure_calendar(self, start_date: str, end_date: str) -> list[str]:
         start = datetime.strptime(_iso(start_date), "%Y-%m-%d").date()
@@ -519,7 +330,7 @@ class TushareHistoryCollector:
                         "WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE) ORDER BY date",
                         params,
                     ).fetchall()]
-                raise TushareRelayError(
+                raise XiaodefaError(
                     f"trade_cal fetch failed for {_iso(start_date)}..{_iso(end_date)}: {exc}"
                 ) from exc
             stored_calendar_days = int(self.store.conn.execute(
@@ -528,7 +339,7 @@ class TushareHistoryCollector:
                 params,
             ).fetchone()[0])
         if stored_calendar_days < expected_calendar_days:
-            raise TushareRelayError(
+            raise XiaodefaError(
                 "trade_cal incomplete for "
                 f"{_iso(start_date)}..{_iso(end_date)}: "
                 f"{stored_calendar_days}/{expected_calendar_days} calendar days"
@@ -646,178 +457,20 @@ class TushareHistoryCollector:
             raise
 
     def _collect_moneyflow(self, trade_date: str) -> int:
-        total = 0
-        flow_client: Any = self.client
-        relay = self._tushare_relay_client()
-        # Fetch/publish as one transaction.  A failed relay page must not erase
-        # the previous verified market snapshot.
+        # Request the retained provider's full projection once. Missing values stay NULL.
+        fields = ",".join(dict.fromkeys((MONEYFLOW_MAIN_FIELDS+","+MONEYFLOW_SIZE_FIELDS).split(",")))
+        rows = self._query_date_batch("moneyflow", trade_date, fields)
+        out = [(r["ts_code"], ts_code_to_stock_code(r["ts_code"]), _iso(r["trade_date"]),
+                *[_num(r.get(k)) for k in ("buy_sm_amount","sell_sm_amount","buy_md_amount",
+                  "sell_md_amount","buy_lg_amount","sell_lg_amount","buy_elg_amount",
+                  "sell_elg_amount","net_mf_amount")]) for r in rows]
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
-            # The fast relay returns the complete market snapshot when the
-            # date filter is sent without ``limit``/``offset``.  Its paged
-            # form can return an empty first page or an incomplete tail, so
-            # prefer the bounded, date-wide response and only use the older
-            # paging/code-batch path as a fallback.
-            if isinstance(self.client, TushareRelayClient):
-                full_rows = self.client.query_rows(
-                    "moneyflow", {"trade_date": _ymd(trade_date)}, MONEYFLOW_MAIN_FIELDS
-                )
-                if len(full_rows) >= 4000:
-                    details: list[dict[str, Any]] = []
-                    try:
-                        details = self.client.query_rows(
-                            "moneyflow", {"trade_date": _ymd(trade_date)}, MONEYFLOW_SIZE_FIELDS
-                        )
-                    except Exception:
-                        details = []
-                    detail_by_key = {
-                        (str(row.get("ts_code")), _iso(row.get("trade_date"))): row
-                        for row in details
-                    }
-                    merged_rows = []
-                    for row in full_rows:
-                        key = (str(row.get("ts_code")), _iso(row.get("trade_date")))
-                        merged = dict(detail_by_key.get(key) or {})
-                        merged.update(row)
-                        merged_rows.append(merged)
-                    out = [
-                        (row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
-                         _num(row.get("buy_sm_amount")), _num(row.get("sell_sm_amount")),
-                         _num(row.get("buy_md_amount")), _num(row.get("sell_md_amount")),
-                         _num(row.get("buy_lg_amount")), _num(row.get("sell_lg_amount")),
-                         _num(row.get("buy_elg_amount")), _num(row.get("sell_elg_amount")),
-                         _num(row.get("net_mf_amount")))
-                        for row in merged_rows if row.get("ts_code") and row.get("trade_date")
-                    ]
-                    total = self._bulk_replace(
-                        "tushare_moneyflow", out,
-                        ["ts_code", "stock_code", "date", "buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
-                         "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount", "net_mf_amount"],
-                        ["ts_code", "date"],
-                    )
-                    self.store.conn.execute("COMMIT")
-                    return total
-            for page_no in range(10):
-                params = {"trade_date": _ymd(trade_date), "limit": self.moneyflow_page_size,
-                          "offset": page_no * self.moneyflow_page_size}
-                # Main/net amounts are the required projection.  Size buckets
-                # are best-effort because the relay may reject the larger
-                # projection; missing size values remain NULL instead of
-                # losing net flow.
-                try:
-                    rows = flow_client.query_rows("moneyflow", params, MONEYFLOW_MAIN_FIELDS)
-                except Exception:
-                    if relay is None or flow_client is relay:
-                        raise
-                    # A xiaodefa endpoint outage must fall through to the
-                    # fast relay inside the same atomic batch, with provenance
-                    # visible in close_snapshot_certification.
-                    flow_client = relay
-                    self._last_source_provider = "tushare"
-                    rows = flow_client.query_rows("moneyflow", params, MONEYFLOW_MAIN_FIELDS)
-                if not rows:
-                    break
-                detail_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-                try:
-                    details = flow_client.query_rows("moneyflow", params, MONEYFLOW_SIZE_FIELDS)
-                    detail_by_key = {(str(r.get("ts_code")), _iso(r.get("trade_date"))): r for r in details}
-                except Exception:
-                    detail_by_key = {}
-                merged = []
-                for row in rows:
-                    key = (str(row.get("ts_code")), _iso(row.get("trade_date")))
-                    merged_row = dict(detail_by_key.get(key) or {})
-                    merged_row.update(row)
-                    merged.append(merged_row)
-                out = [
-                    (row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
-                     _num(row.get("buy_sm_amount")), _num(row.get("sell_sm_amount")),
-                     _num(row.get("buy_md_amount")), _num(row.get("sell_md_amount")),
-                     _num(row.get("buy_lg_amount")), _num(row.get("sell_lg_amount")),
-                     _num(row.get("buy_elg_amount")), _num(row.get("sell_elg_amount")),
-                     _num(row.get("net_mf_amount")))
-                    for row in merged if row.get("ts_code") and row.get("trade_date")
-                ]
-                total += self._bulk_replace(
-                    "tushare_moneyflow", out,
-                    ["ts_code", "stock_code", "date", "buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
-                     "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount", "net_mf_amount"],
-                    ["ts_code", "date"],
-                )
-                if len(rows) < self.moneyflow_page_size:
-                    break
-            if relay is not None and total < 4000:
-                # Some relay deployments index recent moneyflow rows by
-                # ``ts_code`` but return an empty/short result for the same
-                # request filtered only by ``trade_date``.  Retry the date in
-                # bounded comma-separated code batches before declaring a
-                # missing day.  The main/net projection is intentionally
-                # used here: the relay rejects the wider size-bucket
-                # projection for large code lists, while net/main values are
-                # sufficient for the normalized capital-flow tables.
-                codes = [row[0] for row in self.store.conn.execute(
-                    "SELECT DISTINCT ts_code FROM tushare_stock_basic "
-                    "WHERE ts_code IS NOT NULL ORDER BY ts_code"
-                ).fetchall()]
-                fallback_rows: list[dict[str, Any]] = []
-                def query_code_batch(code_batch: list[str], depth: int = 0) -> list[dict[str, Any]]:
-                    if not code_batch or not self._budget_left():
-                        return []
-                    best_batch: list[dict[str, Any]] = []
-                    for attempt in range(2):
-                        try:
-                            candidate = relay.query_rows(
-                                "moneyflow",
-                                {"ts_code": ",".join(code_batch), "trade_date": _ymd(trade_date), "limit": 2000},
-                                MONEYFLOW_MAIN_FIELDS,
-                            )
-                            if len(candidate) > len(best_batch):
-                                best_batch = candidate
-                            if len(candidate) >= max(1, int(len(code_batch) * 0.75)):
-                                return candidate
-                        except Exception:
-                            if attempt:
-                                break
-                    # A transiently short 1,000-code response can often be
-                    # recovered by splitting the offending slice.  Stop at
-                    # 250 codes so the relay URL remains bounded.
-                    if depth < 2 and len(code_batch) > 250 and self._budget_left():
-                        midpoint = len(code_batch) // 2
-                        return query_code_batch(code_batch[:midpoint], depth + 1) + query_code_batch(code_batch[midpoint:], depth + 1)
-                    return best_batch
-
-                for start in range(0, len(codes), MONEYFLOW_CODE_BATCH_SIZE):
-                    fallback_rows.extend(query_code_batch(codes[start:start + MONEYFLOW_CODE_BATCH_SIZE]))
-                deduped = {}
-                for row in fallback_rows:
-                    if row.get("ts_code") and row.get("trade_date"):
-                        deduped[(str(row.get("ts_code")), _iso(row.get("trade_date")))] = row
-                out = [
-                    (row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
-                     _num(row.get("buy_sm_amount")), _num(row.get("sell_sm_amount")),
-                     _num(row.get("buy_md_amount")), _num(row.get("sell_md_amount")),
-                     _num(row.get("buy_lg_amount")), _num(row.get("sell_lg_amount")),
-                     _num(row.get("buy_elg_amount")), _num(row.get("sell_elg_amount")),
-                     _num(row.get("net_mf_amount")))
-                    for row in deduped.values()
-                ]
-                self.store.conn.execute("DELETE FROM tushare_moneyflow WHERE date=?", [_iso(trade_date)])
-                total = self._bulk_replace(
-                    "tushare_moneyflow", out,
-                    ["ts_code", "stock_code", "date", "buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
-                     "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount", "net_mf_amount"],
-                    ["ts_code", "date"],
-                )
-                if total < 4000:
-                    raise TushareRelayError(f"incomplete moneyflow response: {total} rows")
-            if self._is_production_source():
-                expected = int(self.store.conn.execute(
-                    "SELECT count(*) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
-                ).fetchone()[0] or 0)
-                if expected >= 1000 and total < max(1000, int(expected * 0.80)):
-                    raise TushareRelayError(
-                        f"incomplete moneyflow response: {total}/{expected} rows"
-                    )
+            self.store.conn.execute("DELETE FROM tushare_moneyflow WHERE date=?", [_iso(trade_date)])
+            total = self._bulk_replace("tushare_moneyflow", out,
+                ["ts_code","stock_code","date","buy_sm_amount","sell_sm_amount","buy_md_amount",
+                 "sell_md_amount","buy_lg_amount","sell_lg_amount","buy_elg_amount","sell_elg_amount","net_mf_amount"],
+                ["ts_code","date"])
             self.store.conn.execute("COMMIT")
             return total
         except Exception:
@@ -825,42 +478,17 @@ class TushareHistoryCollector:
             raise
 
     def _collect_industry_flow(self, trade_date: str) -> int:
-        last_error = None
-        rows: list[dict[str, Any]] = []
-        for api in ("moneyflow_ind_dc", "moneyflow_ind_ths"):
-            try:
-                params = {"trade_date": _ymd(trade_date)}
-                try:
-                    # Industry endpoints commonly return the full daily set
-                    # (about 1,000 rows) without pagination.  This avoids the
-                    # relay's unreliable offset-at-page-boundary behaviour.
-                    core = self.client.query_rows(api, params, INDUSTRY_MAIN_FIELDS)
-                except Exception:
-                    core = self.client.query_rows(
-                        api, {**params, "limit": 1000, "offset": 0}, INDUSTRY_MAIN_FIELDS
-                    )
-                details: list[dict[str, Any]] = []
-                try:
-                    details = self.client.query_rows(api, params, INDUSTRY_SIZE_FIELDS)
-                except Exception:
-                    details = []
-                detail_by_key = {(str(r.get("ts_code")), _iso(r.get("trade_date"))): r for r in details}
-                rows = []
-                for row in core:
-                    key = (str(row.get("ts_code")), _iso(row.get("trade_date")))
-                    merged = dict(detail_by_key.get(key) or {})
-                    merged.update(row)
-                    rows.append(merged)
-                if rows and (not isinstance(self.client, TushareRelayClient) or len(rows) >= 500):
-                    break
-            except Exception as exc:
-                last_error = exc
-        if not rows and last_error:
-            raise last_error
-        if isinstance(self.client, TushareRelayClient) and not rows:
-            raise TushareRelayError("empty industry flow response")
-        if isinstance(self.client, TushareRelayClient) and 0 < len(rows) < 500:
-            raise TushareRelayError(f"incomplete industry flow response: {len(rows)} rows")
+        api = "moneyflow_ind_dc"
+        fields = INDUSTRY_FIELDS
+        if self._is_production_source():
+            rows = self.client.query_all(api, fields=fields, trade_date=_ymd(trade_date))
+        else:
+            rows = self.client.query_rows(api, {"trade_date": _ymd(trade_date)}, fields)
+        if not rows and self._is_production_source():
+            raise XiaodefaError("empty industry flow response")
+        if any(_iso(r.get("trade_date")) != _iso(trade_date) for r in rows):
+            raise XiaodefaError("industry flow session mismatch")
+        rows = [{**r, "source_api":api} for r in rows]
         out = [
             (_iso(row.get("trade_date") or trade_date), row.get("ts_code"), row.get("name"), _num(row.get("pct_change")),
              _num(row.get("close")), _num(row.get("net_amount")), _num(row.get("buy_elg_amount")),
@@ -899,12 +527,14 @@ class TushareHistoryCollector:
             if row[1] in seen:
                 continue
             seen.add(row[1])
-            small = ((_num(row[2]) or 0) - (_num(row[3]) or 0)) * 10000
-            mid = ((_num(row[4]) or 0) - (_num(row[5]) or 0)) * 10000
-            large = ((_num(row[6]) or 0) - (_num(row[7]) or 0)) * 10000
-            super_net = ((_num(row[8]) or 0) - (_num(row[9]) or 0)) * 10000
-            total = (_num(row[10]) * 10000) if row[10] is not None else small + mid + large + super_net
-            main = super_net + large
+            def net(buy, sell):
+                buy, sell = _num(buy), _num(sell)
+                return (buy - sell) * 10000 if buy is not None and sell is not None else None
+            small, mid, large, super_net = [net(row[i], row[i+1]) for i in (2, 4, 6, 8)]
+            buckets = (small, mid, large, super_net)
+            total = _num(row[10])
+            total = total * 10000 if total is not None else (sum(buckets) if all(v is not None for v in buckets) else None)
+            main = super_net + large if super_net is not None and large is not None else None
             out.append([_iso(trade_date), row[1], main, total, super_net, large, mid, small, "tushare",
                         "yuan", "main_orders_net", "moneyflow", "tushare", "stock_flow_v2", False,
                         _json({"ts_code": row[0], "source": "tushare_moneyflow", "unit": "yuan",
@@ -944,10 +574,7 @@ class TushareHistoryCollector:
             # Unlike stock-level ``moneyflow`` (万元), TuShare's DC industry
             # endpoint documents these fields as yuan.  Do not multiply them
             # again or sector totals become four orders of magnitude too high.
-            super_net = (_num(row[5]) or 0) - (_num(row[6]) or 0)
-            large = (_num(row[7]) or 0) - (_num(row[8]) or 0)
-            mid = (_num(row[9]) or 0) - (_num(row[10]) or 0)
-            small = (_num(row[11]) or 0) - (_num(row[12]) or 0)
+            super_net, large, mid, small = [_num(row[i]) for i in (5, 7, 9, 11)]
             out.append([_iso(trade_date), row[0], row[1], _num(row[4]) if row[4] is not None else None,
                         super_net, large, mid, small, row[2], "tushare_sector_full",
                         "tushare_dc_sector", "yuan", False,

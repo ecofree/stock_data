@@ -95,7 +95,7 @@ legacy per-endpoint collectors driven by `fetch_all.py`; prefer
 `audit_data_quality.py`, `audit_p0_p3_acceptance.py`,
 `audit_p0_five_day_observation.py`, `audit_p3_candidates.py`,
 `check_capital_flow_health.py`, `build_empty_table_catalog.py`,
-`describe_collection_profiles.py`, `run_maintenance_gate.py`,
+`describe_collection_profiles.py`,
 `audit_maintenance_surface.py`, `lint_migrations.py`
 
 ## Maintenance (explicit, backup first)

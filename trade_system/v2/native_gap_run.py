@@ -1,17 +1,12 @@
 """Bounded native evidence collection. Secrets stay in memory/stdin, never artifacts."""
 from collections import Counter
-import json
-import os
 from pathlib import Path
-import sqlite3
-import subprocess
 import time
-from urllib.parse import urlencode
 
-from .domain import canonical, identity, now_utc, utc
+from .domain import identity, now_utc, utc
 from .gap_audit import adjudicate_audit, read_package
 from .gap_evidence import ingest_response, read_evidence, read_json, sha, write_json
-from .native_gap_sources import RELAY, VERSION, build_requests, convert_response, request_spec
+from .native_gap_sources import VERSION, build_requests, convert_response
 from .rolling_research import file_hash
 
 
@@ -20,70 +15,14 @@ def fingerprint():
 
 
 def credentials():
-    from trade_system.config import SETTINGS
-    def value(key):
-        return str(os.environ.get(key) or SETTINGS.get(key) or '').strip()
-    relay_url = value('TUSHARE_FAST_RELAY_URL') or value('TUSHARE_RELAY_URL') or RELAY
-    if relay_url.rstrip('/') != RELAY:
-        raise ValueError('configured relay differs from inspected allowed HTTPS origin')
-    return {'hithink_official': value('HITHINK_FINANCE_API_KEY'),
-            'xiaodefa_tushare': value('TUSHARE_FAST_RELAY_TOKEN') or value('TUSHARE_RELAY_TOKEN') or value('TUSHARE_TOKEN')}
+    raise ValueError('fixed-case live collector retired; use the configured research campaign')
 
 
-def reserve_rate_slot(family, max_wait=5):
-    # Cooperates with the existing shared host limiter but has a bounded wait.
-    from trade_system.host_limiter import shared_host_limiter
-    host = 'tushare_relay' if family == 'xiaodefa_tushare' else 'hithink_gap_evidence'
-    deadline = time.monotonic() + max_wait
-    while True:
-        now = time.time()
-        with sqlite3.connect(shared_host_limiter.db_path, timeout=1) as con:
-            con.execute('BEGIN IMMEDIATE')
-            row = con.execute('SELECT last_started,cooldown_until FROM host_rate_limit WHERE host=?', [host]).fetchone()
-            previous, cooldown = row or (0, 0)
-            delay = max(1.0-(now-previous), cooldown-now, 0)
-            if delay <= 0:
-                con.execute('''INSERT INTO host_rate_limit(host,last_started,cooldown_until,updated_at) VALUES(?,?,0,?)
-                    ON CONFLICT(host) DO UPDATE SET last_started=excluded.last_started,updated_at=excluded.updated_at''', [host, now, now])
-                return
-        if time.monotonic()+delay > deadline:
-            raise TimeoutError('rate slot unavailable in bounded budget')
-        time.sleep(min(delay, .5))
+
 
 
 def http_fetch(spec, secret):
-    """curl config on stdin prevents both auth headers and POST token in argv.
-
-    Redirects are not followed. Curl defaults keep certificate verification on.
-    Errors are represented by codes only; stderr may contain sensitive details.
-    """
-    if request_spec(spec, spec['api']) != spec:
-        raise ValueError('request not in exact read-only allowlist')
-    reserve_rate_slot(spec['family'])
-    url = spec['url']
-    headers = ['Accept: application/json', 'User-Agent: stock-data-gap-evidence/1']
-    body = None
-    if spec['method'] == 'GET':
-        url += '?' + urlencode(spec['params'])
-        headers.append('X-api-key: ' + secret)
-    else:
-        headers.append('Content-Type: application/json')
-        headers += ['Origin: '+RELAY, 'Referer: '+RELAY+'/']
-        body = canonical({'api_name': spec['api'], 'token': secret, 'params': spec['params'], 'fields': spec['fields']})
-    config = ['url = '+json.dumps(url), 'request = '+json.dumps(spec['method'])]
-    config += ['header = '+json.dumps(header) for header in headers]
-    if body is not None:
-        config.append('data = '+json.dumps(body, ensure_ascii=False))
-    proc = subprocess.run(['curl.exe' if os.name == 'nt' else 'curl', '--silent', '--show-error',
-        '--max-time', '15', '--max-filesize', '4194304', '--proto', '=https', '--config', '-',
-        '--write-out', '\n%{http_code}'], input=('\n'.join(config)+'\n').encode('utf-8'),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18)
-    if proc.returncode:
-        return {'http_status': None, 'transport_error': 'curl_exit_'+str(proc.returncode), 'raw': b''}
-    raw, _, status = proc.stdout.rpartition(b'\n')
-    if len(raw) > 4*1024*1024:
-        raise ValueError('native response byte budget exceeded')
-    return {'http_status': int(status), 'transport_error': None, 'raw': raw}
+    raise ValueError('fixed-case live collector retired before any network request')
 
 
 def collect(audit_folder, output, *, fetch=http_fetch, secrets=None, clock=now_utc, wall_seconds=240,

@@ -58,6 +58,20 @@ def test_publish_failure_preserves_previous_complete_pointer(tmp_path, monkeypat
         publish(tmp_path, 'second', {'review.html': b'new'}, generation=2)
     assert read_current(tmp_path)[1]['review.html'] == b'complete'
     assert json.loads((tmp_path / 'current.json').read_text())['run_id'] == 'first'
+    assert sorted(p.name for p in (tmp_path / 'runs').iterdir()) == ['first']
+    assert not list(tmp_path.glob('.current-*'))
+
+
+def test_identical_render_reuses_verified_bundle_without_disk_growth(tmp_path):
+    artifacts = {'index.html': b'inline page', 'desk.json': b'{"date":"2026-09-17"}'}
+    first = publish(tmp_path, 'first', artifacts, generation=1)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert publish(tmp_path, 'second', artifacts, generation=2) == first
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()} == before
+    (tmp_path / 'runs/first/index.html').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='checksum'):
+        publish(tmp_path, 'third', artifacts, generation=2)
+    assert not (tmp_path / 'runs/third').exists()
 
 
 def test_bundle_path_escape_is_rejected(tmp_path):

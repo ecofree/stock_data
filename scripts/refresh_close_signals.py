@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from trade_system.normalize import build_normalized_views  # noqa: E402
 from trade_system.stage_signals import refresh_close_signals_if_needed  # noqa: E402
-from trade_system.tushare_relay import sync_tushare_ohlc_to_core_tables  # noqa: E402
+from trade_system.tushare_store import (sync_tushare_ohlc_to_core_tables)
 
 
 def main() -> int:

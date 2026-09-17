@@ -1,4 +1,4 @@
-﻿"""Recoverable TuShare backfill planning.
+"""Recoverable TuShare backfill planning.
 
 This module keeps TuShare supplementation incremental: identify missing rows,
 create resumable tasks, and run only the pending work. It stores operational
@@ -15,16 +15,8 @@ import duckdb
 
 from base import DuckDBStore
 from trade_system.schema import init_schema
-from trade_system.tushare_relay import (
-    TushareRelayClient,
-    collect_tushare_adj_factor,
-    collect_tushare_daily,
-    collect_tushare_daily_basic,
-    collect_tushare_index_daily,
-    index_code_to_ts_code,
-    sync_tushare_ohlc_to_core_tables,
-    ts_code_to_index_code,
-)
+from trade_system.xiaodefa_source import XiaodefaClient
+from trade_system.tushare_store import (collect_tushare_adj_factor, collect_tushare_daily, collect_tushare_daily_basic, collect_tushare_index_daily, index_code_to_ts_code, sync_tushare_ohlc_to_core_tables, ts_code_to_index_code)
 from trade_system.trading_calendar import open_session_dates
 
 
@@ -222,7 +214,7 @@ def plan_tushare_backfill_tasks(db_path: str | Path, gap_rows: list[dict[str, An
         store.close()
 
 
-def _collect_task(client: TushareRelayClient, store: DuckDBStore, task: dict[str, Any]) -> int:
+def _collect_task(client: XiaodefaClient, store: DuckDBStore, task: dict[str, Any]) -> int:
     data_kind = task["data_kind"]
     code = task["code"]
     start_date = _compact_date(task["start_date"])
@@ -241,15 +233,15 @@ def _collect_task(client: TushareRelayClient, store: DuckDBStore, task: dict[str
 def run_pending_tushare_backfill_tasks(
     db_path: str | Path,
     *,
-    client: TushareRelayClient | None = None,
+    client: XiaodefaClient | None = None,
     limit: int = 10,
     retry_errors: bool = False,
     sync_core: bool = False,
 ) -> list[dict[str, Any]]:
     """Run a bounded batch of pending tasks and keep status resumable."""
 
+    client = client or XiaodefaClient()
     store = DuckDBStore(str(db_path))
-    client = client or TushareRelayClient()
     sync_requests: list[dict[str, Any]] = []
     try:
         init_schema(store.conn)
@@ -397,3 +389,67 @@ def write_tushare_gap_report(db_path: str | Path, out_path: str | Path) -> Path:
     )
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
+
+
+def _fetch_values(db_path: str | Path, queries: list[tuple[str, list]], limit: int) -> list[str]:
+    values: list[str] = []
+    seen = set()
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        for sql, params in queries:
+            if len(values) >= limit:
+                break
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except Exception:
+                continue
+            for row in rows:
+                value = str(row[0] or "").strip()
+                if value and value not in seen:
+                    seen.add(value)
+                    values.append(value)
+                if len(values) >= limit:
+                    break
+    finally:
+        con.close()
+    return values
+
+def infer_stock_codes(db_path: str | Path, limit: int) -> list[str]:
+    return _fetch_values(
+        db_path,
+        [
+            (
+                """
+                SELECT stock_code
+                FROM stock_candidate_stage_signal
+                WHERE stock_code IS NOT NULL AND stock_code != ''
+                GROUP BY stock_code
+                ORDER BY max(score) DESC NULLS LAST, stock_code
+                LIMIT ?
+                """,
+                [limit],
+            ),
+            (
+                """
+                SELECT stock_code
+                FROM kline
+                WHERE stock_code IS NOT NULL AND stock_code != ''
+                GROUP BY stock_code
+                ORDER BY count(*) DESC, stock_code
+                LIMIT ?
+                """,
+                [limit],
+            ),
+            (
+                """
+                SELECT stock_code
+                FROM tushare_stock_basic
+                WHERE stock_code IS NOT NULL AND stock_code != ''
+                ORDER BY stock_code
+                LIMIT ?
+                """,
+                [limit],
+            ),
+        ],
+        limit,
+    )
