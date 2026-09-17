@@ -46,6 +46,8 @@ def main():
     module = Path(trade_system.__file__).resolve()
     if 'site-packages' not in module.parts:
         raise RuntimeError('probe must use installed package, not checkout')
+    from trade_system.hithink_client import HiThinkClient
+    assert HiThinkClient(api_key='synthetic-offline-probe', min_interval=0).call_count == 0
     if '--wheel' in sys.argv:
         import zipfile
         with zipfile.ZipFile(sys.argv[sys.argv.index('--wheel')+1]) as archive:

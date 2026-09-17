@@ -71,7 +71,7 @@ packages = ["trade_system", "trade_system.v2"]
 scope = "operational_core_only_research_from_isolated_source"
 modules = [
   "trade_system.__init__", "trade_system.config", "trade_system.db_utils",
-  "trade_system.file_lock", "trade_system.hithink_client", "trade_system.http_transport",
+  "trade_system.file_lock", "trade_system.hithink_client", "trade_system.http_transport", "trade_system.host_limiter",
   "trade_system.logging_setup", "trade_system.v2.__init__", "trade_system.v2.__main__",
   "trade_system.v2.accounts", "trade_system.v2.attribution", "trade_system.v2.context_storage",
   "trade_system.v2.daily_session", "trade_system.v2.daily_session_cli", "trade_system.v2.daily_session_view", "trade_system.v2.native_enrichment",

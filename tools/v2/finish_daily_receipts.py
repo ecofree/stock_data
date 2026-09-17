@@ -43,7 +43,7 @@ def run(partial,parent,following,output):
     responses=list(prefix)
     try:
         from trade_system.hithink_client import HiThinkClient
-        client=HiThinkClient(timeout=15,max_response_bytes=8_000_000,single_attempt=True)
+        client=HiThinkClient(timeout=15,max_response_bytes=8_000_000)
         for i,(path,params) in enumerate(requests[count:],count):
             time.sleep(.75)
             rec={'path':path,'params':params,'data':client._get(path,params),'received_at':now_utc().isoformat()}

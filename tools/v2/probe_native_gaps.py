@@ -23,7 +23,7 @@ def run(report_path,output):
                   'source_sha256':source_hash,'execution_ready':False}
     write_json(output/'registration.json',registration)
     from trade_system.hithink_client import HiThinkClient
-    client=HiThinkClient(timeout=15,max_response_bytes=8_000_000,single_attempt=True)
+    client=HiThinkClient(timeout=15,max_response_bytes=8_000_000)
     receipts=[];failures=[]
     def request(path,params):
         try:
