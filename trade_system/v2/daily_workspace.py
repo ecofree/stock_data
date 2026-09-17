@@ -34,7 +34,7 @@ def projection(output, *, market=None, research_loader=None):
     return journal_projection(output,data)
 
 
-def update_market(output):
+def update_market(output, *, expected_date=None):
     """Explicit local-data update, using the same owner as CLI/research/quotes."""
     from trade_system.file_lock import FileLock
     from .market_workspace import latest_snapshot
@@ -44,8 +44,13 @@ def update_market(output):
         config=read_json(output/'workspace-config.json')[0]
         if config.get('read_only') is not True:raise ValueError('read-only market source required')
         market=latest_snapshot(config['market_database'],now_utc().isoformat())
+        if expected_date and market['trade_date'] != expected_date:
+            if market.get('session_state') == 'closed' and market.get('calendar_checked_date') == expected_date:
+                return {'status':'market_closed','date':market['trade_date'],
+                        'expected_date':expected_date,'provider_requests':0,'fits':0,'execution_ready':False}
+            raise ValueError(f"expected market session {expected_date}, received {market['trade_date']}; keep last publication")
         publish_desk(output,market=market)
-        return {'date':market['trade_date'],'snapshot_id':market['snapshot_id'],
+        return {'status':'market_published','date':market['trade_date'],'snapshot_id':market['snapshot_id'],
                 'provider_requests':0,'fits':0,'execution_ready':False}
 
 

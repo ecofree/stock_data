@@ -1,9 +1,14 @@
 [CmdletBinding()]
 param([switch]$Build, [switch]$Update, [switch]$NoBrowser, [switch]$Background, [int]$Port=8769,
-      [string]$Python='D:\anaconda\python.exe')
+      [string]$Python='')
 $ErrorActionPreference='Stop'
 $projectPath=Split-Path -Parent $PSScriptRoot
-if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw 'Python interpreter not found' }
+if (-not $Python) { $Python=Join-Path $projectPath '.venv\Scripts\python.exe' }
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw 'Dedicated runtime missing. Create .venv and install requirements-research-replay.lock with --require-hashes, or explicitly supply -Python. No fallback to the global environment.'
+}
+& $Python -m pip check
+if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency check failed; no build, update or service was started.' }
 Set-Location -LiteralPath $projectPath
 if (($Build -or $Update) -and -not $env:KPL_ENV_FILE) { $env:KPL_ENV_FILE='D:\accio\stock_data\.env' }
 if ($Build) {
@@ -33,6 +38,10 @@ if (Test-WorkspaceIdentity $existing) {
 if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
     throw 'Port occupied by another/old service. Do not reuse it or kill its owner. Stop the known workspace normally or select a free -Port.'
 }
+# Explicit startup maintenance, not a GET side effect or human-record write.
+# Existing healthy services returned above without even touching this cache.
+& $Python -m trade_system.v2.research_product journal-index --ensure-index
+if ($LASTEXITCODE -ne 0) { throw 'Journal cache could not be reconciled. Saved events retained; inspect before starting.' }
 if ($Background) {
     $logPath=Join-Path $projectPath 'reports\research-delivery\service-logs'
     $null=New-Item -ItemType Directory -Path $logPath -Force

@@ -3,7 +3,7 @@
 qlib 已接入研究候选融合和复盘展示，但仍不直接参与
 `stock_data` 的交易信号、仓位建议或订单执行。
 
-## 已接入边界
+## 历史研究表边界（不是当前调度产物）
 
 - `qlib_model_registry`：记录外部模型元信息。
 - `qlib_prediction`：导入外部预测分数。
@@ -23,5 +23,5 @@ qlib 已接入研究候选融合和复盘展示，但仍不直接参与
 1. 外部生成 CSV：`trade_date,symbol,score,rank,horizon`。
 2. 使用 `scripts/import_qlib_shadow_predictions.py` 导入。
 3. 使用 `scripts/evaluate_qlib_shadow.py` 评估。
-4. `scripts/run_qlib_research_daily.py` 可在收盘认证后刷新特征、当日预测、融合候选和后验评估。
+4. 旧每日研究回填入口已在整改目录删除；任务提案改接 `scripts/run_research_daily.ps1 -RefreshResearch`，使用当前研究产品的冻结模型与独立产物，不再回填这些历史表。任务实际切换仍待审批与验证。
 5. 连续样本验证有效、通过模型门禁并完成人工复核后，才讨论模型晋级；在此之前统一保持 `shadow`。

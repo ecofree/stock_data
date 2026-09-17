@@ -10,8 +10,13 @@ canonical path.
 |---|---|---|
 | Auction | `scripts/collect_auction_market_daily.py` | One KPL `/auction/market` request; writes `auction_tick` and `auction_quote_snapshot`. |
 | Close history | `TushareHistoryCollector` | xiaodefa first, fast relay fallback; publish only certified same-date snapshots. |
-| Review | `scripts/run_integrated_daily.py` | Single lock, staging publish, one self-contained HTML artifact. |
-| QLib | `scripts/run_qlib_research_daily.py` | Feature refresh, frozen-model ranking, candidate fusion and posterior evaluation; research-only. |
+| Collection | `scripts/run_integrated_daily.py` | Shared lock, calendar gate and bounded receipts; no user pages. Supplemental phase retains LHB, auction, index and chips/margin. |
+| Review | `scripts/run_research_daily.ps1` | Unified local market workspace; independent of model refresh. |
+| QLib | `scripts/run_research_daily.ps1 -RefreshResearch` | Current frozen-model update, no training/promotion or legacy registry backfill. |
+
+2026-09-17: the four old supplemental/QLib scheduler files were deleted from
+the remediation checkout, not the live checkout. Seven-task replacement is
+proposal-only until protected installation and a new window are approved.
 
 ## Retain for recovery or comparison
 

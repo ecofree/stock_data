@@ -16,7 +16,7 @@ def service_identity(root, output):
     from .domain import identity, file_hash
     folder=Path(__file__).parent
     files=('research_product_server.py','research_product.py','research_product_view.py',
-           'research_journal.py','daily_workspace.py','market_workspace.py','operator_workflow.py','accounts.py','research_followup.py','observation_workspace.py','observation_capture.py','publisher.py')
+           'research_journal.py','journal_index.py','daily_workspace.py','market_workspace.py','operator_workflow.py','accounts.py','research_followup.py','observation_workspace.py','observation_capture.py','publisher.py')
     return {'protocol':'stock-data-workspace-v1',
             'workspace_id':identity({'root':str(Path(root).resolve()).casefold(),
                                      'output':str(Path(output).resolve()).casefold()}),

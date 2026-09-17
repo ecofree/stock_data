@@ -3,40 +3,13 @@ from datetime import date, datetime
 import hashlib
 import json
 import math
-import duckdb
-from trade_system.quality import table_exists
 from trade_system.source_authority import provider_rank_sql
 from trade_system.units import _number
 
-THS_MEMBERSHIP_MAX_AGE_DAYS = 10
-
-
-def _ths_membership_snapshot(con: duckdb.DuckDBPyConnection, trade_date: str):
-    """Return (snapshot_date, age_days) for the THS concept membership in effect on
-    trade_date, or (None, None) when no membership snapshot exists at or before it."""
-    try:
-        # Prefer the canonical quality-gated view.  Small legacy/test databases
-        # may predate that view, in which case the raw table is the only
-        # available relation; production schema initialization always creates
-        # the view, so stale/partial rows cannot silently re-enter there.
-        relation = (
-            "v_default_concept_stock_history"
-            if table_exists(con, "v_default_concept_stock_history")
-            else "ths_concept_stock_history"
-        )
-        row = con.execute(
-            f"SELECT max(trade_date) FROM {relation} "
-            "WHERE trade_date<=CAST(? AS DATE)",
-            [trade_date],
-        ).fetchone()
-        snap = row[0] if row else None
-        if snap is None:
-            return None, None
-        snap_d = snap if isinstance(snap, date) else date.fromisoformat(str(snap)[:10])
-        trade_d = date.fromisoformat(str(trade_date)[:10])
-        return snap_d, (trade_d - snap_d).days
-    except Exception:
-        return None, None
+from trade_system.ths_quality import (
+    qualified_membership_snapshot as _ths_membership_snapshot,
+    THS_MEMBERSHIP_MAX_AGE_DAYS,
+)
 
 
 def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, allow_subset=False):

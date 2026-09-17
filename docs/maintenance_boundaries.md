@@ -1,81 +1,53 @@
 # Maintenance boundaries
 
-This project has one production path and several research/compatibility paths.
-The following boundaries are now the maintenance contract.
+Updated 2026-09-17 in the remediation checkout. This describes prepared
+responsibilities, not successful production deployment.
 
-## Canonical path
+## One collection owner, one product publisher
 
-1. `scripts/run_integrated_daily.py --phase close` is the close operator path.
-2. `trade_system/gate_contract.py` owns the operator state vocabulary:
-   `data_certified_ready`, `flow_certified_ready`, `analysis_ready`, and
-   `execution_ready`.
-3. `trade_system/daily_review.py` assembles the shared review context.
-4. `trade_system/review_facts.py` assembles page-only facts.
-5. `trade_system/review_web.py` renders HTML and must not issue page-specific
-   SQL queries. `write_review_web` publishes one self-contained
-   `daily_review_latest.html`; all interactive data is embedded in that file
-   and the first 50 stock cards are shown before explicit user expansion.
-6. `trade_system/pipeline_runtime.py` publishes latest artifacts through the
-   run transaction and `reports/pipeline_run_latest.json`.
+- The existing integrated runner owns auction, intraday, close and explicit
+  supplemental collection. All use the same database lock, calendar gate,
+  runtime/source contract, bounded child processes and per-run receipts.
+- Supplemental retains LHB, auction, index and bounded chips/margin retrieval.
+  It does not render legacy pages or run research. After its lock is released,
+  the PowerShell adapter may request StockData-ResearchDaily using a unique
+  completed receipt; a degraded source remains degraded. No request is made
+  after a lock conflict, calendar block or failed normalization.
+- A publication request is not proof of a successful publication. If the
+  destination is disabled, unsafe or already running, the adapter fails
+  explicitly; it does not enable it or assume a request was queued.
+- run_research_daily.ps1 owns local market publication. RefreshResearch adds
+  the current research product's frozen-model update, never training,
+  promotion, legacy registry backfill or old page callbacks.
+- The workspace separates current market data from dated historical
+  predictions. Missing forecasts/accounts do not block local observation.
+  Date mismatch does block a purported current publication.
+- Pages remain self-contained; no sidecar data or runtime fetch is introduced.
 
-The close path excludes Qlib, backtests, news, AI snapshots, and other
-research steps by default. Use `--include-research` only for a deliberate
-research run.
+## Scheduler and recovery
 
-Late supplements and QLib are separate scheduled paths:
-`scripts/run_supplemental_retry.ps1` retries the KPL full-market auction route,
-LHB/index and bounded xiaodefa chip/margin batches at 20:00, while
-`scripts/run_qlib_research_daily.ps1` refreshes features, shadow predictions,
-candidate fusion and posterior evaluation at 20:30. Register both with
-`scripts/install_stock_data_task.ps1 -RegisterAll -Register`; the installer
-also removes the retired intraday task. They share the pipeline lock and
-republish the static review only after the write phase releases it.
-KPL/HiThink requests use verified direct HTTPS first, then the configured
-proxy; do not replace this with certificate bypass.
+install_stock_data_task.ps1 is proposal-only. It requires the administrator's
+complete seven-task export and hashes; Register/RegisterAll are rejected.
+Auction, intraday, close and supplemental retain their existing schedules and
+collector identity. Both research tasks propose the retained dedicated
+Limited/Password identity. MonthlyCompact stays disabled with its action intact.
+All before-XML definitions are included for a separately authenticated rollback.
 
-`scripts/collect_multisource.py` and `trade_system/staged_multisource.py` are
-compatibility/recovery paths. They keep provider-separated evidence by
-default and do not promote rows into canonical `kline` or `sector_capital`.
-The explicit `--allow-core-sync` flag is reserved for a controlled migration
-or repair run after the authority and lock checks have been reviewed.
+Do not run old deployment Apply commands or renew old windows. Before cutover:
+compare all seven current task definitions, verify rollback and ACL restoration,
+protect exact runtimes/release/configuration, validate dedicated-identity launch
+and authenticated task updates, then approve a new scope and time window.
+A current-version installer still needs implementation and rehearsal.
 
-The two read/render-only daily reports run in-process by default to remove
-interpreter and DuckDB reconnect churn. Collection, migration, signal and
-other write-sensitive tasks remain isolated subprocesses. Use
-`--subprocess-reports` only for compatibility troubleshooting.
+## Evidence and cleanup
 
-## Compatibility boundary
+Four legacy supplemental/QLib scheduler files and their obsolete catch-up test
+were removed from this checkout. Live scripts, databases, historical receipts,
+human notes and retained recovery directories are not cleanup targets.
+Do not delete immutable guard files or kill writers to make a run pass.
+Tests use synthetic tasks and temporary databases; no real scheduler writes.
 
-Legacy boolean aliases such as `certified_ready` and `analytics_ready` remain
-in payloads so old reports do not break. New code must read the explicit
-operator fields. Private compatibility fallbacks in the web module are not
-entry points and should not acquire new callers.
-
-## Change and acceptance rules
-
-- Do not delete DuckDB tables or historical reports as part of ordinary code
-  cleanup. First classify them as active, compatibility, archive, or orphaned
-  and record the result.
-- Do not treat a passing historical report as current readiness. Use the same
-  trade date and a fresh post-close readiness check.
-- `source_ready` or a populated candidate pool does not imply
-  `analysis_ready` or `execution_ready`; flow certification must be explicitly
-  true before either downstream gate can turn green.
-- Every change to the close path must pass the dry-run plan check, the full
-  pytest suite, and the P2 maintenance gate.
-- The P2 gate is intentionally read-only against the database. It validates
-  source structure and tests; data acceptance remains the responsibility of
-  the P0 readiness and flow gates.
-- Run `scripts/audit_source_conflicts.py` after a close run to inspect same-key
-  multi-provider records before changing a source priority or archiving a
-  compatibility path.
-- Run `scripts/build_empty_table_catalog.py` after an API inventory refresh.
-  Empty tables are classified and retained; no collector may treat an empty
-  optional or permission-denied table as a production failure.
-
-## Routine commands
-
-```powershell
-D:\anaconda\python.exe scripts\run_maintenance_gate.py --pytest
-D:\anaconda\python.exe scripts\run_integrated_daily.py --db kpl_data.duckdb --trade-date YYYY-MM-DD --phase close --skip-collect --dry-run
-```
+Source presence, fresh observations, analysis readiness and execution readiness
+remain distinct. Publication must be checked at the final output directory.
+Passing tests or a generated proposal does not certify live deployment, model
+usefulness, human judgement quality or account acceptance.

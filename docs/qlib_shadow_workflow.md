@@ -1,6 +1,6 @@
 # QLib 在本项目中的使用方式
 
-QLib 作为研究/影子模型层参与候选池排序融合和复盘解释，但不直接改变交易计划、仓位建议或执行信号。数据先由项目自己的 DuckDB 规范化表提供，模型输出再经过数据库评估和人工结果门禁。
+前 3 节记录旧研究表与显式实验工具，不是当前调度安装指南，也不允许对生产库直接执行历史实验。当前调度方案见“每日运行”。QLib 不直接改变交易计划、仓位或执行信号。
 
 ## 1. 导出特征
 
@@ -29,8 +29,13 @@ PowerShell:
 
 ## 每日运行
 
-收盘数据通过认证后，使用隔离的 QLib 环境运行：
+2026-09-17：旧每日回填调度入口已在整改目录删除。计划将 `StockData-QLibResearch`
+接到现有 `scripts/run_research_daily.ps1 -RefreshResearch`；完整参数来自七任务提案，
+包括独立研究 Python、固定发布包及哈希、工作区和显式受保护的来源配置。
 
-    .\.venv-qlib\Scripts\python.exe scripts\run_qlib_research_daily.py --db kpl_data.duckdb --trade-date YYYY-MM-DD --reports-dir reports
+先发布日期匹配的本地市场快照，再由当前研究产品 `update` 使用既有冻结模型推理。
+明确休市时不请求供应商；市场日期不符或发布失败则退出。模型刷新失败保留已发布市场页；
+历史预测必须标明其日期，不能当作当日候选。无自动训练、晋级或旧表回填。
 
-该任务由独立的 `StockData-QLibResearch` 计划任务运行，不阻塞收盘主链；失败时保留失败报告，页面仍以当前已认证数据生成。`qlib_research_latest.json` 中的 `usage` 字段记录当日预测行数、融合候选数、涨停池重合数和当前模型后验评估。当前仍是 `model_status=shadow`、`signal_impact=disabled`，不能直接改变交易计划。
+这是待部署职责，不代表系统任务已经切换。真实运行验收须核对任务返回值、调度日志、
+工作区发布清单和页面日期；排队、非空预测与研究效用分别验收。

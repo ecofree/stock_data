@@ -65,10 +65,53 @@ def test_windows_errors_are_terminating_and_module_path_not_inherited(monkeypatc
     def run(args, **kwargs):
         assert "$ErrorActionPreference='Stop'" in args[-1]
         assert all(k.upper() != 'PSMODULEPATH' for k in kwargs['env'])
-        return SimpleNamespace(returncode=1, stdout='')
+        return SimpleNamespace(returncode=1, stdout='',
+            stderr=json.dumps({'error_id':'InvokeMethodOnNull','category':'InvalidOperation',
+                               'message':'DO_NOT_EXPOSE_SECRET'}))
     monkeypatch.setattr(windows.subprocess, 'run', run)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError,match='InvokeMethodOnNull') as exc:
         windows.powershell('Get-Acl')
+    assert 'DO_NOT_EXPOSE_SECRET' not in str(exc.value)
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows read-only export contract')
+@pytest.mark.parametrize('last_run', ['$null', "[datetime]'1999-11-30'"])
+def test_disabled_task_export_preserves_missing_dates(tmp_path,monkeypatch,last_run):
+    real_powershell=windows.powershell
+    def read_only(command):
+        if 'Get-ScheduledTask ' in command:
+            mocks=r'''
+function Get-ScheduledTask {
+ [pscustomobject]@{TaskName='StockData-ResearchDaily';State='Disabled';
+ Actions=@();Principal=@{UserId='synthetic';LogonType='Password';RunLevel='Limited'};Triggers=$null}
+}
+function Get-ScheduledTaskInfo {
+ [pscustomobject]@{LastTaskResult=267011;LastRunTime=__LAST__;NextRunTime=$null}
+}
+'''.replace('__LAST__',last_run)
+            return real_powershell(mocks+command)
+        if 'Export-ScheduledTask' in command:return '<Task/>'
+        return '{"Owner":"synthetic","Access":[{"FileSystemRights":"Read"}]}'
+    monkeypatch.setattr(windows,'powershell',read_only)
+    out=tmp_path/'capture'
+    result=windows.capture(out)
+    task=json.loads((out/'tasks.json').read_text())[0]
+    assert task['Next'] is None and task['Triggers']==[]
+    assert (task['LastRun'] is None)==(last_run=='$null')
+    assert task['LastResult']==267011 and task['State']=='Disabled'
+    assert result['tasks_exported']==1 and result['task_changes']==result['acl_changes']==0
+    assert 'StockData-Auction' in result['missing_expected_tasks']
+
+
+def test_export_failure_retains_safe_receipt_without_overwriting(tmp_path,monkeypatch):
+    def fail(command):raise RuntimeError('read-only Windows snapshot failed; InvokeMethodOnNull')
+    monkeypatch.setattr(windows,'powershell',fail)
+    out=tmp_path/'capture'
+    with pytest.raises(RuntimeError):windows.capture(out)
+    saved=(out/'error.json').read_bytes()
+    assert json.loads(saved)['system_changes']==0 and not (out/'tasks.json').exists()
+    with pytest.raises(FileExistsError):windows.capture(out)
+    assert (out/'error.json').read_bytes()==saved
 
 
 def test_empty_acl_cannot_be_certified(tmp_path, monkeypatch):

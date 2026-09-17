@@ -15,7 +15,7 @@
 | lhb | `lhb_list` | KPL LHB | EastMoney、TuShare | `collect_lhb_daily.py` | 复盘补充，不阻塞收盘 |
 | chips | `xdf_cyq_chips` | xiaodefa | EastMoney/AkShare | `trade_system/xiaodefa_source.py` | 有界重点股补采 |
 | margin | `xdf_margin_summary` | xiaodefa | TuShare/EastMoney | `trade_system/xiaodefa_source.py` | 收盘后补充 |
-| qlib | `qlib_candidate_pool` | QLib shadow | 外部 QLib 文件 | `scripts/run_qlib_research_daily.py` | 研究排序与后验评估 |
+| qlib | 当前研究产品封存产物；旧 `qlib_candidate_pool` 仅历史 | 冻结 QLib 模型 | 外部文件不能直接晋级 | `trade_system/v2/research_product.py` | 当前冻结模型推理、基线对照；禁止自动训练、晋级或交易 |
 | operator_outcome | `operator_trade_outcome` | 人工复核输入 | - | `trade_system/operator_outcomes.py` | QLib 反馈，不是自动订单 |
 
 ## 强制规则

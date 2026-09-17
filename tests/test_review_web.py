@@ -1,3 +1,6 @@
+import json
+import re
+
 import duckdb
 from pathlib import Path
 
@@ -7,10 +10,23 @@ from trade_system.daily_review import (
     build_review_narrative,
 )
 from trade_system.review_web import _render_tables
+
+
+def test_concept_review_never_uses_future_membership_or_relabels_its_date(tmp_path):
+    db = tmp_path / "membership.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE v_default_concept_stock_history(trade_date DATE,concept_code VARCHAR,concept_name VARCHAR,stock_code VARCHAR,stock_name VARCHAR)")
+        con.execute("INSERT INTO v_default_concept_stock_history VALUES ('2026-09-15','THS-A','known','000001','one'),('2026-09-17','THS-B','future','000002','two')")
+        con.execute("CREATE TABLE v_limit_pool(trade_date DATE,board_level INTEGER,stock_code VARCHAR,stock_name VARCHAR,limit_up_time VARCHAR,fetched_at TIMESTAMP)")
+        con.execute("INSERT INTO v_limit_pool VALUES ('2026-09-16',1,'000001','one','09:35',now()),('2026-09-16',1,'000002','two','09:36',now())")
+        result = _concept_limit_up_review(con, "2026-09-16")
+        assert result["membership_date"] == "2026-09-15"
+        assert {row["concept_code"] for row in result["groups"]} == {"THS-A"}
+        con.execute("DELETE FROM v_default_concept_stock_history WHERE trade_date='2026-09-15'")
+        assert _concept_limit_up_review(con, "2026-09-16")["groups"] == []
 from trade_system.review_web import (
     _render_command_summary,
     _render_concept_limit_up,
-    _build_review_lazy_asset,
     _concept_inline_data,
     _render_loop,
     _render_qlib_research,
@@ -488,7 +504,7 @@ def test_sector_trail_cards_render_across_dates():
     assert "trail-periods" in html
 
 
-def test_review_sidecar_bounds_initial_payload_and_removes_inline_details():
+def test_review_keeps_full_details_inline_with_bounded_initial_cards():
     stocks = [
         {"stock_code": f"{index:06d}", "stock_name": f"stock-{index}", "board_level": 1}
         for index in range(60)
@@ -506,7 +522,7 @@ def test_review_sidecar_bounds_initial_payload_and_removes_inline_details():
                 "id": "THS-1",
                 "name": "concept-a",
                 "daily": {"2026-08-13": {"limit_up": 1, "stocks": stocks[:1]}},
-                "window_stocks": stocks[:1],
+                "members": {"snapshot_date": "2026-08-13", "codes": ["000000"]},
             }],
         },
         "sector_periods": {},
@@ -515,16 +531,22 @@ def test_review_sidecar_bounds_initial_payload_and_removes_inline_details():
     assert len(inline[0]["limit_up_stocks"]) == 50
     assert inline[1]["limit_up_stocks"] == []
 
-    lazy = _build_review_lazy_asset(ctx)
-    assert "window.__REVIEW_LAZY_DATA__" in lazy
-    assert "stock-59" in lazy
+    from trade_system.review_web import _page_html
 
-    external_html = _render_sector_trail(ctx, external_lazy=True)
-    assert "trail-data" in external_html
-    assert "trail-detail-THS-1" not in external_html
+    page = _page_html(ctx, "2026-08-13", "", {"dates": []}, [], [])
+    payload = re.search(r'id="review-concept-data">(.*?)</script>', page, re.S)
+    assert payload is not None
+    groups = json.loads(payload.group(1))
+    assert len(groups[0]["limit_up_stocks"]) == 60
+    assert groups[0]["limit_up_stocks"][-1]["stock_name"] == "stock-59"
+    assert groups[1]["limit_up_stocks"] == stocks[:1]
+    details = re.search(r"id='trail-details'>(.*?)</script>", page, re.S)
+    assert json.loads(details.group(1))["daily"]["THS-1"]["daily"]["2026-08-13"]["stocks"][0]["stock_code"] == "000000"
+    assert "__REVIEW_LAZY_DATA__" not in page
+    assert "document.createElement('script')" not in page
 
 
-def test_daily_sector_overview_keeps_only_latest_rows_without_full_payload():
+def test_daily_sector_trail_keeps_history_inline_without_building_all_day_cards():
     html = _render_sector_trail(
         {
             "sector_trail": {
@@ -543,14 +565,14 @@ def test_daily_sector_overview_keeps_only_latest_rows_without_full_payload():
                 ],
             }
         },
-        compact_overview=True,
     )
 
     assert "概念A" in html
     assert "2026-08-13" in html
     assert "<div class='day-title'>2026-08-12" not in html
-    assert "trail-data" not in html
-    assert "trail-details" not in html
+    data = re.search(r"id='trail-data'>(.*?)</script>", html, re.S)
+    assert json.loads(data.group(1))["dates"] == ["2026-08-13", "2026-08-12"]
+    assert "trail-details" in html
 
 
 def test_theme_table_marks_composite_score_as_experimental():

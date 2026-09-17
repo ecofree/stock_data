@@ -19,7 +19,7 @@ from trade_system.ths_quality import canonical_ths_snapshot
 from trade_system.time_utils import as_local_naive
 
 
-PHASES = ("auction", "intraday", "close", "history")
+PHASES = ("auction", "intraday", "close", "supplemental", "history")
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,12 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
         ProfileTask("collect_executable_quotes", "Tencent qt.gtimg.cn spot", 3600, "final candidate live prices; auto-boost if KPL stale"),
         ProfileTask("collect_review_supplement", "KPL bounded P1 review supplement", 86400, "daily review enhancement; never a close gate"),
         ProfileTask("collect_auction_market_daily", "KPL /auction/market", 3600, "full-market after-close auction evidence"),
+    ),
+    "supplemental": (
+        ProfileTask("collect_lhb_daily", "KPL LHB", None, "late daily LHB evidence"),
+        ProfileTask("collect_auction_market_daily", "KPL /auction/market", None, "late auction evidence"),
+        ProfileTask("collect_index_kline_daily", "KPL index", None, "late index evidence"),
+        ProfileTask("collect_xiaodefa_critical", "TuShare relay", None, "late chips and margin evidence"),
     ),
     "history": (
         ProfileTask("backfill_2026_tushare", "TuShare relay", None, "resumable daily/basic/moneyflow history"),

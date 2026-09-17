@@ -471,9 +471,9 @@
 ```powershell
 D:/anaconda/python.exe -B tools/v2/verify_delivery.py --output <新证据目录> --installed-python <已安装核心的python.exe> --wheel <0.3.3 wheel完整路径> --minimal-runtime
 D:/anaconda/python.exe -B tools/v2/verify_consolidated.py --source D:/accio/stock_data/kpl_data.duckdb --output <新隔离目录> --date 2026-09-11
-D:/anaconda/python.exe -B tools/v2/research_workbench.py preflight --config reports/research-delivery/retraining/recent-20260912/training-config.json
-D:/anaconda/python.exe -B tools/v2/research_workbench.py build --config reports/research-delivery/retraining/recent-20260912/training-config.json
-D:/anaconda/python.exe -B tools/v2/research_workbench.py price-study --donor reports/research-delivery/observations/b93ddf4c6fff4976b2388ed723895311/receipts
+.venv/Scripts/python.exe -B -m trade_system.v2.research_product preflight --config reports/research-delivery/retraining/recent-20260912/training-config.json
+.venv/Scripts/python.exe -B -m trade_system.v2.research_product build --config reports/research-delivery/retraining/recent-20260912/training-config.json
+.venv/Scripts/python.exe -B -m trade_system.v2.research_product price-study --donor reports/research-delivery/observations/b93ddf4c6fff4976b2388ed723895311/receipts
 ```
 
 后两条会写入新的隔离研究工件/候选指针，不是只读命令；不可拿它们当定时自动晋升。当前运行中的旧工作台服务未重启，其内存代码不等于新候选安装身份。

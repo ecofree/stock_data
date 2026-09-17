@@ -1,9 +1,9 @@
 param(
     [string]$Db = "kpl_data.duckdb",
     [string]$TradeDate = "",
-    [ValidateSet("auto", "auction", "intraday", "close", "history", "full")]
-    [string]$Phase = "auto",
-    [ValidateSet("priority", "full")]
+    [ValidateSet("close")]
+    [string]$Phase = "close",
+    [ValidateSet("priority")]
     [string]$CollectionProfile = "priority",
     [switch]$SkipCollection,
     # Keep one week of daily rollback points by default.  Backups are gzip
@@ -12,10 +12,16 @@ param(
     # Operators can override this explicitly.
     [int]$BackupKeep = 7,
     # Weekly anchors (Monday backups) kept on top of the rolling daily set.
-    [int]$WeeklyKeep = 4
+    [int]$WeeklyKeep = 4,
+    [string]$Python = "",
+    [string]$CollectorContract,
+    [string]$CollectorContractSha256,
+    [string]$ReportsDirectory
 )
 
 $ErrorActionPreference = "Stop"
+# Keep -Db usable; advanced parameters reserve that alias for -Debug.
+if (-not $CollectorContract -or -not $CollectorContractSha256 -or -not $ReportsDirectory) { throw 'Explicit collector contract, hash and reports directory required' }
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8NoBom
 [Console]::OutputEncoding = $utf8NoBom
@@ -23,13 +29,12 @@ $OutputEncoding = $utf8NoBom
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $PSScriptRoot
-$Python = "D:\anaconda\python.exe"
+if (-not $Python) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
-$BackupDir = Join-Path $Root "backups"
-$ReportDir = Join-Path $Root "reports"
-$LogDir = Join-Path $Root "logs"
+$BackupDir = Join-Path (Split-Path -Parent $DbPath) "backups"
+$ReportDir = $ReportsDirectory
+$LogDir = Join-Path $ReportsDirectory "scheduled-logs"
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
-$ObservationRunner = Join-Path $Root "scripts\audit_p0_five_day_observation.py"
 
 $NotifyHelper = Join-Path $Root "scripts\pipeline_notify.py"
 
@@ -42,12 +47,12 @@ if (-not (Test-Path -LiteralPath $Python)) {
 if (-not (Test-Path -LiteralPath $IntegratedRunner)) {
     throw "Integrated runner not found: $IntegratedRunner"
 }
-if (-not (Test-Path -LiteralPath $ObservationRunner)) {
-    throw "P0 observation runner not found: $ObservationRunner"
-}
 if (Test-Path -LiteralPath "$DbPath.pipeline.lock") {
     throw "Refusing to copy a database while the pipeline lock exists: $DbPath.pipeline.lock"
 }
+. (Join-Path $PSScriptRoot 'native_process.ps1')
+$preflight=Invoke-StockDataProcess -Executable $Python -Arguments @($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') -WorkingDirectory $Root
+if ($preflight.ExitCode -ne 0) { throw ('Collection contract rejected before backup: '+$preflight.Stderr) }
 if (-not (Test-Path -LiteralPath $BackupDir)) {
     New-Item -ItemType Directory -Path $BackupDir | Out-Null
 }
@@ -129,7 +134,13 @@ try {
     # Record the failure and continue; the integrated runner is the source of
     # truth for the close result.
     try {
-        Copy-Item -LiteralPath $DbPath -Destination $backup
+        # Shared permanent guard protects the copy; metadata alone is not a lock.
+        $backupGuard=[IO.File]::Open($DbPath+'.pipeline.lock.guard',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)
+        try {
+            $backupGuard.Lock(0,1)
+            if (Test-Path -LiteralPath ($DbPath+'.pipeline.lock')) { throw 'Pipeline owner appeared before backup; defer safely' }
+            Copy-Item -LiteralPath $DbPath -Destination $backup
+        } finally { $backupGuard.Dispose() }
         # Python writes its logging to stderr. Under $ErrorActionPreference='Stop'
         # that stderr becomes a terminating NativeCommandError even when the
         # process exits 0, so judge verification by the real process exit code.
@@ -159,6 +170,8 @@ try {
         $IntegratedRunner,
         "--db", $DbPath,
         "--reports-dir", $ReportDir,
+        "--collector-contract", $CollectorContract,
+        "--collector-contract-sha256", $CollectorContractSha256,
         "--collection-profile", $CollectionProfile,
         "--phase", $Phase
     )
@@ -193,24 +206,7 @@ try {
     $ErrorActionPreference = $prevEAP0
     throw
 } finally {
-    $observationDate = if ($TradeDate) { $TradeDate } else { Get-Date -Format "yyyy-MM-dd" }
-    try {
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        $observationOutput = & $Python $ObservationRunner `
-            --db $DbPath `
-            --as-of $observationDate `
-            --reports-dir $ReportDir `
-            --out (Join-Path $ReportDir "p0_five_day_observation_latest.md") 2>&1
-        $observationCode = $LASTEXITCODE
-        $ErrorActionPreference = $prevEAP
-        $observationOutput | Tee-Object -FilePath $Log -Append
-        if ($observationCode -ne 0) {
-            "P0_OBSERVATION_FAILED code=$observationCode" | Tee-Object -FilePath $Log -Append
-        }
-    } catch {
-        "P0_OBSERVATION_FAILED error=$($_.Exception.Message)" | Tee-Object -FilePath $Log -Append
-    }
+    # Five-session product acceptance no longer calls the retired signal-based audit.
     Remove-OldBackups
     Pop-Location
 }

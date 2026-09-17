@@ -9,6 +9,7 @@ from typing import Any
 # The expected catalogue size is source-controlled per snapshot.  A global
 # floor would silently accept a truncated catalogue after the source changed.
 THS_MIN_CONCEPTS: int | None = None
+THS_MEMBERSHIP_MAX_AGE_DAYS = 7
 
 
 def _table_exists(con: Any, name: str) -> bool:
@@ -16,6 +17,24 @@ def _table_exists(con: Any, name: str) -> bool:
         "SELECT count(*) FROM information_schema.tables WHERE table_schema='main' AND table_name=?",
         [name],
     ).fetchone()[0])
+
+
+def qualified_membership_snapshot(con: Any, trade_date: str):
+    """Select only a quality-gated snapshot at or before the observation date.
+
+    Return its date and age separately so consumers can explain stale input.
+    Raw history is deliberately not a fallback for missing qualified views.
+    """
+    if not _table_exists(con, "v_default_concept_stock_history"):
+        return None, None
+    row = con.execute(
+        "SELECT max(CAST(trade_date AS DATE)) FROM v_default_concept_stock_history "
+        "WHERE CAST(trade_date AS DATE)<=CAST(? AS DATE)", [trade_date],
+    ).fetchone()
+    snapshot = row[0] if row else None
+    if snapshot is None:
+        return None, None
+    return snapshot, (date.fromisoformat(str(trade_date)[:10]) - snapshot).days
 
 
 def canonical_ths_snapshot(

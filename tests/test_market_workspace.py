@@ -48,6 +48,25 @@ def test_normalized_turnover_is_not_converted_twice_for_old_view_labels(con):
     assert result['cny']==12345000 and result['legacy_unit_label_mismatch']
 
 
+def test_shared_membership_age_and_future_snapshot_are_not_silently_accepted(con):
+    con.execute("UPDATE v_default_concept_stock_history SET trade_date='2026-09-03'")
+    con.execute("UPDATE v_default_concept_daily SET trade_date='2026-09-03'")
+    stale=project(con)
+    assert stale['membership_status']=='stale' and stale['membership_age_days']==8
+    assert stale['themes']==[]
+    con.execute("UPDATE v_default_concept_stock_history SET trade_date='2026-09-12'")
+    con.execute("UPDATE v_default_concept_daily SET trade_date='2026-09-12'")
+    future=project(con)
+    assert future['membership_status']=='missing' and future['membership_date'] is None
+    assert future['themes']==[]
+
+
+def test_empty_catalog_is_not_complete_membership(con):
+    con.execute('DELETE FROM v_default_concept_daily')
+    result=project(con)
+    assert result['membership_status']=='partial' and result['themes']==[]
+
+
 def test_missing_price_date_and_duplicate_identity_refused(con):
     with pytest.raises(ValueError,match='exact market session'):
         market.project(con,'2026-09-12','2026-09-12T17:00:00',set())
@@ -72,6 +91,25 @@ def test_configured_market_uses_its_own_calendar_not_prediction_date(tmp_path,mo
     assert product.configured_market(tmp_path,{'date':'2026-09-11','rows':[{'instrument':'000001'}]})['trade_date']=='2026-09-14'
     assert calls[0][0]=='synthetic.duckdb' and calls[0][2]==['000001']
     assert read_json(tmp_path/'workspace-config.json')[0]['read_only']
+
+
+def test_scheduled_publication_refuses_yesterday_and_separates_research(tmp_path,monkeypatch):
+    from trade_system.v2.daily_workspace import update_market
+    write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic','read_only':True})
+    snap={'trade_date':'2026-09-15','snapshot_id':'fixture','session_state':'open_session','calendar_checked_date':'2026-09-16'}
+    calls=[]
+    monkeypatch.setattr(market,'latest_snapshot',lambda *a:snap)
+    monkeypatch.setattr(product,'publish_desk',lambda *a,**k:calls.append(k))
+    with pytest.raises(ValueError,match='expected market session 2026-09-16'):
+        update_market(tmp_path,expected_date='2026-09-16')
+    assert calls==[]
+    snap['trade_date']='2026-09-16'
+    result=update_market(tmp_path,expected_date='2026-09-16')
+    assert result['status']=='market_published' and len(calls)==1
+    assert result['provider_requests']==result['fits']==0 and not result['execution_ready']
+    snap.update(trade_date='2026-09-16',calendar_checked_date='2026-09-19',session_state='closed')
+    assert update_market(tmp_path,expected_date='2026-09-19')['status']=='market_closed'
+    assert len(calls)==1
 
 
 def test_one_metadata_authority_and_conflicting_legacy_rejected(tmp_path):

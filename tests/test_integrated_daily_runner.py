@@ -2,107 +2,14 @@ from datetime import date
 import sys
 
 import duckdb
+import pytest
 
 from scripts.run_integrated_daily import (
     _decode_process_bytes,
-    _is_degradable_failure,
-    _report_recovery_plan,
-    _render_only_plan,
     _utf8_subprocess_env,
     command_plan,
     main,
 )
-
-
-def test_report_recovery_plan_excludes_collectors_and_backtests():
-    filtered = _report_recovery_plan(command_plan("kpl_data.duckdb"))
-    names = {step[0] for step in filtered}
-    assert "generate_daily_review_web" in names
-    assert "audit_daily_review_artifact" in names
-    assert "check_data_readiness" in names
-    assert "collect_minute_snapshots" not in names
-    assert "run_stage_backtest" not in names
-    assert "generate_cycle_analytics" not in names
-
-
-def test_render_only_plan_is_atomic_and_does_not_mutate_signals():
-    filtered = _render_only_plan(command_plan("kpl_data.duckdb"))
-    names = [step[0] for step in filtered]
-    assert names == [
-        "check_capital_flow_health",
-        "check_data_readiness",
-        "generate_daily_review",
-        "generate_daily_review_web",
-        "audit_daily_review_artifact",
-        "audit_p0_p3_acceptance",
-    ]
-    assert "generate_signals" not in names
-    assert "run_daily_operator_loop" not in names
-
-
-def test_integrated_daily_command_plan_contains_required_steps():
-    steps = command_plan("kpl_data.duckdb")
-    names = [step[0] for step in steps]
-    assert names == [
-        "build_normalized_views",
-        "audit_multisource_readiness",
-        "audit_source_conflicts",
-        "audit_stock_flow_contract",
-        "reconcile_independent_stock_flow",
-        "build_operator_views",
-        "build_auction_evidence",
-        "check_capital_flow_health",
-        "create_operator_outcome_template",
-        "check_data_readiness",
-        "generate_health_trend",
-        "generate_cycle_analytics",
-        "generate_signal_attribution",
-        "run_stage_backtest",
-        "run_daily_review_statistics",
-        "run_operator_backtest",
-        "build_data_catalog",
-        "audit_p2_gaps",
-        "run_news_radar",
-        "run_api_research_events",
-        "build_research_snapshot",
-        "run_strategy_scan",
-        "run_strategy_result_backtest",
-        "build_flow_features",
-        "export_qlib_features_close",
-        "evaluate_qlib_shadow",
-        "run_qlib_daily",
-        "generate_operator_reports",
-        "generate_daily_review",
-        "generate_daily_review_web",
-        "audit_daily_review_artifact",
-        "build_ai_review_snapshot",
-        "audit_p0_p3_acceptance",
-        "audit_p3_candidates",
-        "report_real_data_backfill",
-        "audit_data_quality",
-        "build_empty_table_catalog",
-        "assess_data_chains",
-        "generate_professional_reports",
-        "generate_web_dashboard",
-        "generate_trading_terminal",
-    ]
-
-
-def test_operator_backtest_is_optional_until_phase_5_exists():
-    steps = command_plan("kpl_data.duckdb")
-    optional = {name for name, _, is_optional in steps if is_optional}
-    assert optional == {"run_operator_backtest", "run_news_radar"}
-
-
-def test_close_runs_auxiliary_reports_before_review_and_isolates_them():
-    from trade_system.pipeline_contract import REVIEW_CHAIN_STEPS
-
-    steps = command_plan("kpl_data.duckdb", "2026-07-09", phase="close")
-    names = [name for name, _, _ in steps]
-    assert names.index("generate_cycle_analytics") < names.index("generate_daily_review")
-    assert names.index("generate_signal_attribution") < names.index("generate_daily_review")
-    assert {"generate_health_trend", "generate_cycle_analytics",
-            "generate_signal_attribution"} <= REVIEW_CHAIN_STEPS
 
 
 def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection():
@@ -111,8 +18,6 @@ def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection
         "2026-07-09",
         include_collection=True,
         phase="close",
-        max_stocks=12,
-        max_sectors=9,
     )
     by_name = {name: cmd for name, cmd, _ in steps}
 
@@ -154,7 +59,7 @@ def test_auction_plan_retains_blocked_diagnostics():
 
     assert 'generate_auction_stage_signals' not in by_name
     assert names.index('collect_realtime_limit_pool') < names.index('check_data_readiness')
-    assert "generate_web_dashboard" in by_name
+    assert "generate_web_dashboard" not in by_name
 
 
 def test_intraday_plan_collects_executable_quotes_before_signals():
@@ -177,7 +82,7 @@ def test_intraday_plan_collects_executable_quotes_before_signals():
     assert quote_cmd[quote_cmd.index("--limit") + 1] == "120"
     assert "--auto-boost-if-kpl-stale" in quote_cmd
     assert "--auto-boost-if-kpl-stale" in by_name["collect_l2_focus"]
-    assert "generate_trading_terminal" in by_name
+    assert "generate_trading_terminal" not in by_name
 
 
 def test_close_plan_reuses_intraday_l2_instead_of_fetching_after_hours():
@@ -221,40 +126,9 @@ def test_close_recovery_as_of_is_applied_to_all_freshness_gates():
     for name in (
         "check_capital_flow_health",
         "check_data_readiness",
-        "audit_p0_p3_acceptance",
     ):
         command = by_name[name]
         assert command[command.index("--as-of") + 1] == as_of
-
-
-def test_close_data_gates_are_deferred_but_empty_signal_set_is_valid():
-    from scripts.run_integrated_daily import _is_degradable_failure
-
-    for name in ("check_data_readiness", "generate_signals"):
-        assert _is_degradable_failure("close", name) is True
-    assert _is_degradable_failure("close", "generate_close_stage_signals") is False
-    assert _is_degradable_failure("close", "check_capital_flow_health") is False
-    assert _is_degradable_failure("close", "generate_daily_review") is False
-
-
-def test_acceptance_audit_is_informational_and_does_not_red_flag_data_run():
-    from scripts.run_integrated_daily import (
-        DEGRADABLE_EXTERNAL_STEPS,
-        INFORMATIONAL_REVIEW_STEPS,
-    )
-
-    assert "audit_p0_p3_acceptance" not in DEGRADABLE_EXTERNAL_STEPS
-    assert "audit_p0_p3_acceptance" in INFORMATIONAL_REVIEW_STEPS
-
-
-def test_northbound_is_optional_close_capability():
-    from scripts.run_integrated_daily import (
-        DEGRADABLE_EXTERNAL_STEPS,
-        OPTIONAL_CLOSE_STEPS,
-    )
-
-    assert "collect_northbound_daily" in OPTIONAL_CLOSE_STEPS
-    assert "collect_northbound_daily" not in DEGRADABLE_EXTERNAL_STEPS
 
 
 def test_integrated_collection_exits_before_network_on_verified_holiday(
@@ -294,16 +168,6 @@ def test_integrated_collection_exits_before_network_on_verified_holiday(
     )
     assert main() == 0
     assert "MARKET_CLOSED" in capsys.readouterr().out
-
-
-def test_intraday_readiness_blocks_signals_without_killing_retry_watcher():
-    assert _is_degradable_failure("intraday", "check_capital_flow_health")
-    assert _is_degradable_failure("intraday", "check_data_readiness")
-    assert _is_degradable_failure("intraday", "generate_intraday_stage_signals")
-    # Close-stage gates are deferred so reports can be generated, but main()
-    # returns non-zero after publishing them.
-    assert not _is_degradable_failure("close", "check_capital_flow_health")
-    assert _is_degradable_failure("close", "check_data_readiness")
 
 
 def test_manifest_upsert_step_transitions_running_to_completed(tmp_path):
@@ -353,42 +217,6 @@ def test_close_tushare_sync_uses_gapfill_lookback():
     assert cmd[cmd.index("--start-date") + 1] < "20260728"
 
 
-def test_close_plan_chains_isolate_research_and_review():
-    """P2-4: research and review steps are categorized for failure isolation; data
-    steps (repairs/views/signals) remain fail-fast (in neither chain)."""
-    from scripts.run_integrated_daily import (
-        RESEARCH_CHAIN_STEPS,
-        REVIEW_CHAIN_STEPS,
-        command_plan,
-    )
-
-    assert "evaluate_qlib_shadow" in RESEARCH_CHAIN_STEPS
-    assert "run_strategy_scan" in RESEARCH_CHAIN_STEPS
-    assert "reconcile_independent_stock_flow" not in RESEARCH_CHAIN_STEPS
-    assert "generate_web_dashboard" in REVIEW_CHAIN_STEPS
-    assert "generate_daily_review" in REVIEW_CHAIN_STEPS
-    # DATA steps are in neither chain (fail-fast).
-    assert "repair_critical_integrity" not in RESEARCH_CHAIN_STEPS | REVIEW_CHAIN_STEPS
-    assert "build_normalized_views" not in RESEARCH_CHAIN_STEPS | REVIEW_CHAIN_STEPS
-    # Close now publishes the operational review without the optional research
-    # chain; research remains an explicit compatibility opt-in.
-    names = {
-        name for name, _, _ in command_plan(
-            "sample.duckdb", "2026-07-28", include_collection=True, phase="close")
-    }
-    assert "evaluate_qlib_shadow" not in names
-    assert "build_flow_features" not in names
-    assert "build_ai_review_snapshot" not in names
-    assert "generate_web_dashboard" in names
-    assert "reconcile_independent_stock_flow" in names
-    research_names = {
-        name for name, _, _ in command_plan(
-            "sample.duckdb", "2026-07-28", include_collection=True,
-            phase="close", include_research=True)
-    }
-    assert {"evaluate_qlib_shadow", "build_flow_features", "build_ai_review_snapshot"} <= research_names
-
-
 def test_close_readiness_gate_is_tightened_to_2h():
     """Audit P2 #1: the close readiness/capital-flow acceptance window is 7200s (2h),
     not the loose 21600s (6h), so a degraded stale intraday snapshot is fail-closed;
@@ -404,12 +232,80 @@ def test_close_readiness_gate_is_tightened_to_2h():
     assert 'generate_close_stage_signals' not in by_name
 
 
-def test_close_as_of_is_propagated_into_both_daily_reports():
-    as_of = "2026-08-28T17:50:53+08:00"
-    steps = command_plan(
-        "sample.duckdb", "2026-08-28", phase="close", as_of_time=as_of
-    )
-    by_name = {name: cmd for name, cmd, _ in steps}
-    for name in ("generate_daily_review", "generate_daily_review_web"):
-        cmd = by_name[name]
-        assert cmd[cmd.index("--as-of") + 1] == as_of
+
+@pytest.mark.parametrize("flag", ["--report-only", "--render-only", "--include-research"])
+def test_retired_cli_flags_fail_before_database_access(tmp_path, monkeypatch, flag):
+    db = tmp_path / "must-not-create.duckdb"
+    monkeypatch.setattr(sys, "argv", ["run_integrated_daily.py", "--db", str(db), flag])
+    with pytest.raises(SystemExit) as failure:
+        main()
+    assert failure.value.code == 2 and not db.exists()
+
+
+def test_all_collection_phases_keep_data_and_retire_user_publications():
+    retired = {"generate_web_dashboard", "generate_daily_review", "generate_daily_review_web",
+               "generate_trading_terminal", "run_strategy_scan", "run_stage_backtest",
+               "run_qlib_daily", "build_flow_features", "build_ai_review_snapshot",
+               "generate_operator_reports", "create_operator_outcome_template"}
+    for phase in ("auction", "intraday", "close", "supplemental", "history"):
+        names = {n for n, _, _ in command_plan("sample.duckdb", "2026-09-16", include_collection=True, phase=phase)}
+        assert not names & retired
+    with pytest.raises(ValueError, match="research retired"):
+        command_plan("sample.duckdb", "2026-09-16", include_research=True)
+
+
+def test_supplemental_keeps_four_collectors_under_shared_plan():
+    from trade_system.collection_profiles import task_due, resolve_phase
+    from trade_system.source_authority import validate_production_plan
+    steps=command_plan('sample.duckdb','2026-09-17',include_collection=True,phase='supplemental')
+    names=[n for n,_,_ in steps]
+    assert names==['collect_lhb_daily','collect_auction_market_daily','collect_index_kline_daily',
+                   'collect_xiaodefa_critical','build_normalized_views']
+    validate_production_plan('supplemental',names)
+    with pytest.raises(ValueError):validate_production_plan('supplemental',names[1:])
+    assert resolve_phase('supplemental')=='supplemental'
+    for name in names[:4]:
+        assert task_due('must-not-open.duckdb','2026-09-17',name,phase='supplemental')[0]
+
+
+def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import subprocess
+    from trade_system.source_authority import collection_contract, verify_collection_contract
+    source=tmp_path/'source';source.mkdir()
+    (source/'fetch_all.py').write_text('# synthetic collector')
+    cache=source/'trade_system/.stock_cache/limiter.json';cache.parent.mkdir(parents=True)
+    cache.write_text('{"attempts":1}')
+    thresholds=source/'config/phase_thresholds.json';thresholds.parent.mkdir()
+    thresholds.write_text('{"threshold":1}')
+    db=tmp_path/'market.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(cal_date DATE)')
+        con.execute('CREATE TABLE v_kline_daily(trade_date DATE)')
+    def runtime(*args,**kwargs):
+        return subprocess.CompletedProcess(args,0,stdout='[[3,12,4],[["fixture","1"]]]')
+    monkeypatch.setattr(subprocess,'run',runtime)
+    output=tmp_path/'data-reports'
+    manifest=collection_contract(source,db,output,sys.executable)
+    path=tmp_path/'contract.json';path.write_text(json.dumps(manifest),encoding='utf-8')
+    digest=hashlib.sha256(path.read_bytes()).hexdigest()
+    assert verify_collection_contract(path,digest,db,output)==manifest
+    cache.write_text('{"attempts":2}')
+    assert verify_collection_contract(path,digest,db,output)==manifest
+    assert 'trade_system/.stock_cache/limiter.json' not in manifest['files']
+    thresholds.write_text('{"threshold":2}')
+    with pytest.raises(ValueError,match='source/runtime changed'):
+        verify_collection_contract(path,digest,db,output)
+    thresholds.write_text('{"threshold":1}')
+    with pytest.raises(ValueError,match='target changed'):
+        verify_collection_contract(path,digest,db,tmp_path/'different')
+    with pytest.raises(ValueError,match='supplied hash'):
+        verify_collection_contract(path,'0'*64,db,output)
+    (source/'fetch_all.py').write_text('# changed fixture')
+    with pytest.raises(ValueError,match='source/runtime changed'):
+        verify_collection_contract(path,digest,db,output)
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE account_snapshot(id INT)')
+    with pytest.raises(ValueError,match='V2/account'):
+        collection_contract(source,db,output,sys.executable)

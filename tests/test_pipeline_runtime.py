@@ -22,10 +22,46 @@ def test_pipeline_lock_blocks_concurrent_run_and_releases(tmp_path):
         with pytest.raises(PipelineAlreadyRunning):
             with PipelineLock(db_path, "run-two"):
                 pass
-
     with PipelineLock(db_path, "run-three"):
         assert db_path.with_name("sample.duckdb.pipeline.lock").exists()
 
+
+def test_runtime_fingerprint_tracks_consumers_and_actual_thresholds_not_git_failure_as_clean(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from trade_system import pipeline_runtime as runtime
+
+    for name in ("trade_system/config.py", "trade_system/schema.py", "trade_system/consumer.py",
+                 "config/phase_thresholds.json", "pyproject.toml"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}" if path.suffix == ".json" else "# fixture", encoding="utf-8")
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=128, stdout="", stderr="synthetic Git failure"))
+    first = runtime.runtime_fingerprint()
+    assert first["worktree_dirty"] is None and first["git_commit"] == "unknown"
+    assert not first["fingerprint_complete"]
+    (tmp_path / "trade_system/consumer.py").write_text("# changed consumer", encoding="utf-8")
+    (tmp_path / "config/phase_thresholds.json").write_text('{"limit": 7}', encoding="utf-8")
+    second = runtime.runtime_fingerprint()
+    assert first["source_hash"] != second["source_hash"]
+    assert first["config_hash"] != second["config_hash"]
+    monkeypatch.setattr(runtime, "_file_fingerprint", lambda paths: (_ for _ in ()).throw(OSError("synthetic")))
+    assert runtime.runtime_fingerprint()["source_hash"] == "unknown"
+
+
+@pytest.mark.parametrize("state", ["completed_with_degradation", "running", "unknown", "completed_with_warnings"])
+def test_non_success_status_never_renders_green_completion(tmp_path, state):
+    reports = tmp_path / "reports"
+    manifest = RunManifest(reports, "degraded", "2026-09-16", "intraday")
+    manifest.add_step("check_kpl_connectivity", "degraded", ["synthetic"])
+    manifest.finish(state, error="synthetic source failure")
+    tx = LatestReportTransaction(reports, "degraded")
+    tx._write_pipeline_status(manifest.run_dir, status=state)
+    page = (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
+    assert "#2f9e6f" not in page and "盘中任务已完成" not in page
+    assert "synthetic source failure" in page
+    payload = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
+    assert payload["degraded_steps"] == ["check_kpl_connectivity"]
 
 def test_run_manifest_is_written_atomically(tmp_path):
     manifest = RunManifest(tmp_path, "run-one", "2026-07-09", "intraday")
@@ -153,8 +189,8 @@ def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
     tx.begin()
     (staging / "daily_review_latest.md").write_text("review", encoding="utf-8")
     (staging / "data_readiness_latest.md").write_text("readiness", encoding="utf-8")
-    (staging / "daily_review_latest.lazy.js").write_text(
-        "window.__REVIEW_LAZY_DATA__ = {};", encoding="utf-8"
+    (staging / "daily_review_latest.html").write_text(
+        "<html><body>Self-contained review</body></html>", encoding="utf-8"
     )
     manifest.finish("completed")
 
@@ -168,7 +204,7 @@ def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
     assert pointer["phase"] == "close"
     assert pointer["run_status"] == "completed"
     assert pointer["artifact_files"] == [
-        "daily_review_latest.lazy.js",
+        "daily_review_latest.html",
         "daily_review_latest.md",
         "data_readiness_latest.md",
     ]

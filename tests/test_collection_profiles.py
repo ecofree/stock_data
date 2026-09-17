@@ -6,6 +6,28 @@ from scripts.run_integrated_daily import command_plan
 from trade_system.collection_profiles import phase_tasks, resolve_phase, task_due
 
 
+def test_candidate_audit_uses_qualified_prior_membership_and_fails_on_missing_snapshot(tmp_path):
+    from scripts.audit_p3_candidates import audit
+
+    db = tmp_path / "p3.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE sector_rotation_score(trade_date DATE,sector_code VARCHAR,sector_name VARCHAR,score DOUBLE)")
+        con.execute("CREATE TABLE v_sector_capital(trade_date DATE,sector_code VARCHAR,sector_name VARCHAR,sector_type VARCHAR,main_net_inflow DOUBLE)")
+        con.execute("INSERT INTO v_sector_capital VALUES ('2026-09-16','THS-A','A','ths_concept_derived',10),('2026-09-16','THS-X','unknown','ths_concept_derived',20),('2026-09-16','EM-A','industry','em_industry',30)")
+        con.execute("CREATE TABLE v_default_concept_daily(trade_date DATE,concept_code VARCHAR)")
+        con.execute("INSERT INTO v_default_concept_daily VALUES ('2026-09-15','THS-A'),('2026-09-17','THS-X')")
+        con.execute("CREATE TABLE v_default_concept_stock_history AS SELECT * FROM v_default_concept_daily")
+    result = audit(str(db), "2026-09-16", str(tmp_path / "available.md"))
+    assert result["membership_snapshot"] == "2026-09-15"
+    assert result["taxonomy_counts"] == {"concept": 1, "industry": 1}
+    assert result["status"] == "pass" and result["membership_age_days"] == 1
+    result = audit(str(db), "2026-09-25", str(tmp_path / "stale.md"))
+    assert result["status"] == "fail" and result["membership_status"] == "stale"
+    with duckdb.connect(str(db)) as con:
+        con.execute("DROP TABLE v_default_concept_stock_history")
+    assert audit(str(db), "2026-09-16", str(tmp_path / "missing.md"))["status"] == "fail"
+
+
 def test_phase_auto_resolves_market_windows():
     assert resolve_phase("auto", datetime(2026, 7, 15, 9, 0)) == "auction"
     assert resolve_phase("auto", datetime(2026, 7, 15, 10, 0)) == "intraday"
@@ -36,9 +58,6 @@ def test_intraday_plan_excludes_after_close_fanout():
         "audit_multisource_readiness",
         "check_capital_flow_health",
         "check_data_readiness",
-        "audit_p3_candidates",
-        "generate_web_dashboard",
-        "generate_trading_terminal",
     ]
     assert "collect_finance_gapfill" not in names
     assert "evaluate_qlib_shadow" not in names
@@ -46,9 +65,13 @@ def test_intraday_plan_excludes_after_close_fanout():
     assert not {'generate_signals','generate_intraday_stage_signals','run_daily_operator_loop'} & set(names)
 
 
-def test_auction_migration_plan_has_no_old_decision_authority():
-    steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase="auction")
-    assert not {'generate_signals','generate_auction_stage_signals','run_daily_operator_loop'} & {s[0] for s in steps}
+def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
+    retired = {'generate_signals.py', 'generate_stage_signals.py',
+               'run_daily_operator_loop.py', 'generate_trading_terminal.py',
+               'repair_critical_integrity.py'}
+    for phase in ('auction', 'intraday', 'close', 'history'):
+        steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase=phase)
+        assert not {arg.removeprefix('scripts/') for _, command, _ in steps for arg in command} & retired
 
 
 def test_profile_declares_full_market_flow_sources():

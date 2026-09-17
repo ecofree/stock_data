@@ -50,7 +50,7 @@
 
 独立产物：`reports/research-delivery/price-studies/91aa2a43de89435caea34f658483b5a5`。包含补充记录、冻结实验、逐折模型及同身份预测、全部日期统计和完整性清单；`price-study-current.json`单独指向它。工作台新增“独立21日价格研究”，与Alpha共同实验分别展示。原批次显示39只、新补充研究显示40只是两个不同数据版本，并非覆盖旧结论。
 
-执行入口：`D:\anaconda\python.exe tools/v2/run_price_study.py --donor reports/research-delivery/observations/b93ddf4c6fff4976b2388ed723895311/receipts`。每次生成新研究目录，不创建委托、不切换当前模型。本轮运行地址为`http://127.0.0.1:8768/`。14项新增定向用例覆盖补充不覆盖原值、冲突保留、日期/证券限制、稀疏日分母、发布回退及证据篡改检测；完整检查记录位于`tmp/price-study-delivery-20260912-r1`。
+执行入口：`.venv/Scripts/python.exe -m trade_system.v2.research_product price-study --donor reports/research-delivery/observations/b93ddf4c6fff4976b2388ed723895311/receipts`。每次生成新研究目录，不创建委托、不切换当前模型。本轮运行地址为`http://127.0.0.1:8768/`。14项新增定向用例覆盖补充不覆盖原值、冲突保留、日期/证券限制、稀疏日分母、发布回退及证据篡改检测；完整检查记录位于`tmp/price-study-delivery-20260912-r1`。
 
 本批关闭“002414该窗口缺复权补充”和“独立价格样本外对照入口”两项，不关闭选股有效性、真实人工判断、未来复盘或生产部署。
 
@@ -72,7 +72,7 @@
 
 1. `tools/v2/research_campaign.py capture --config config/research_recent_capture.json --output <新回执目录>`：会真实请求，现有封存回执无需重复采集。
 2. `tools/v2/prepare_recent_training.py --receipts <回执目录> --output <新训练配置>`：核对来源、范围、证券池、日历及摘要后冻结配置。
-3. `tools/v2/research_workbench.py build --config <新训练配置>`：实际训练、同样本对照、独立价格拟合和发布检查。失败不替换当前模型。
+3. `.venv/Scripts/python.exe -m trade_system.v2.research_product build --config <新训练配置>`：实际训练、同样本对照、独立价格拟合和发布检查。失败不替换当前模型。
 
 `update --replay-build`只适用于已通过发布检查、以回执为训练来源的当前模型；明确标为按封存数据日期重算，不认证最新交易日。本次未对未通过的候选执行该操作。
 
@@ -145,7 +145,7 @@
 
 ## 同一入口与数据存放
 
-维护入口：`tools/v2/research_workbench.py build|update|serve|status`。
+维护入口：`.venv/Scripts/python.exe -m trade_system.v2.research_product build|update|serve|status`。
 
 - `build --config config/research_delivery.json`：输入预算先检查；新目录构建特征、注册三组实验、实际拟合并冻结模型。失败目录保留诊断，不发布为成功。
 - `update`：使用冻结证券池获取当日窗口、核对原始回执、计算同公式特征和预测。连续3次来源失败停止该来源余下请求；不切换成合成数据。

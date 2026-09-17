@@ -141,12 +141,15 @@ def test_workflow_prices_are_wired_but_not_native_or_human_acceptance(tmp_path,m
     assert result['review_prices_observed']==1 and result['review_prices_missing']==0
     assert not result['human_loop_complete'] and not result['price_source_native_authenticated']
     review_path=tmp_path/'run/next_session_review.json'
-    original_open=Path.open
-    def locale_open(path,mode='r',buffering=-1,encoding=None,errors=None,newline=None):
-        if path==review_path and 'b' not in mode and encoding in (None,'locale'):
+    original_read_text=Path.read_text
+    def locale_read_text(path,encoding=None,errors=None):
+        # Inject the simulated locale BEFORE pathlib resolves None. Under
+        # python -X utf8, Path.read_text otherwise passes utf-8 to Path.open,
+        # so patching open never exercised the claimed cp1252 default.
+        if path==review_path and encoding in (None,'locale'):
             encoding=default_encoding
-        return original_open(path,mode,buffering,encoding,errors,newline)
-    monkeypatch.setattr(Path,'open',locale_open)
+        return original_read_text(path,encoding=encoding,errors=errors)
+    monkeypatch.setattr(Path,'read_text',locale_read_text)
     if default_encoding=='cp1252':
         with pytest.raises(UnicodeDecodeError):review_path.read_text()
     review=json.loads(review_path.read_text(encoding='utf-8'))

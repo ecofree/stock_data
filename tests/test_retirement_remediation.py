@@ -89,9 +89,11 @@ def test_no_unguarded_legacy_duckdb_writer_calls():
     import ast
     from pathlib import Path
     root=Path(__file__).resolve().parents[1]
-    files=subprocess.check_output(['git','ls-files','*.py'],cwd=root,text=True).splitlines()
+    files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard','--','*.py'],cwd=root).decode().split('\0')
     offenders=[]
     for relative in files:
+        if not relative or not (root/relative).is_file():
+            continue  # Git's index still lists intentionally deleted working-tree files.
         if relative.startswith(('tests/','tools/v2/','trade_system/v2/','trade_system/vendor/')) or relative=='trade_system/db_utils.py':
             continue
         tree=ast.parse((root/relative).read_text(encoding='utf-8-sig'))

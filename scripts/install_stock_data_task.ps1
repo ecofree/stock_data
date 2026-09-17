@@ -1,161 +1,115 @@
+# Prepare seven task dispositions; no task, credential, ACL or permit changes.
+[CmdletBinding()]
 param(
-[string]$TaskName = "StockData-DailyClose",
-[string]$At = "17:30",
-[string]$SupplementalAt = "20:00",
-[string]$QlibAt = "20:30",
-    [ValidateSet("auction", "intraday", "close")]
-    [string]$Phase = "close",
-    [switch]$IncludeWeekends,
-    [switch]$RegisterAll,
-    [switch]$Register
+    [switch]$Register, [switch]$RegisterAll,
+    [string]$BaselineDirectory, [string]$BaselineInventorySha256,
+    [string]$CollectorContract, [string]$CollectorContractSha256,
+    [string]$AdapterPython, [string]$ResearchPython,
+    [string]$ResearchReleaseDirectory, [string]$ResearchReleaseManifestSha256,
+    [string]$EnvironmentFile, [string]$Workspace, [string]$Output,
+    [string]$ResearchStartBoundary
 )
-
-$ErrorActionPreference = "Stop"
-if ($Register -or $RegisterAll) {
-    throw "Legacy task registration is retired. Export existing tasks and approve a collector-only deployment first."
+$ErrorActionPreference='Stop'
+if ($Register -or $RegisterAll) { throw 'Legacy task registration retired. Confirm recovery, protected release and a new maintenance window before cutover.' }
+foreach ($value in @($BaselineDirectory,$BaselineInventorySha256,$CollectorContract,$CollectorContractSha256,$AdapterPython,$ResearchPython,$ResearchReleaseDirectory,$ResearchReleaseManifestSha256,$EnvironmentFile,$Workspace,$Output)) {
+    if (-not $value -or $value -match '["\r\n]') { throw 'Explicit safe baseline, release, environment, interpreter, workspace and output arguments required' }
 }
-$Root = Split-Path -Parent $PSScriptRoot
-$Runner = Join-Path $Root "scripts\run_stock_data_daily.ps1"
-$Once = Join-Path $Root "scripts\run_phase_once.ps1"
-$Watch = Join-Path $Root "scripts\run_phase_watch.ps1"
-$QlibRunner = Join-Path $Root "scripts\run_qlib_research_daily.py"
-$SupplementalRunner = Join-Path $Root "scripts\run_supplemental_retry.ps1"
-foreach ($requiredScript in @($Runner, $Once, $Watch, $QlibRunner, $SupplementalRunner)) {
-    if (-not (Test-Path -LiteralPath $requiredScript)) {
-        throw "Scheduler script not found: $requiredScript"
-    }
+foreach ($digest in @($BaselineInventorySha256,$CollectorContractSha256,$ResearchReleaseManifestSha256)) {
+    if ($digest -notmatch '^[a-fA-F0-9]{64}$') { throw 'SHA256 required' }
 }
-if ($Register) {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        throw (
-            "SYSTEM task registration requires elevated PowerShell. Re-run as Administrator: " +
-            "PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" " +
-            "-RegisterAll -Register"
-        )
-    }
+$inventory=Join-Path $BaselineDirectory 'tasks.json'
+if ((Get-FileHash -LiteralPath $inventory -Algorithm SHA256).Hash -ne $BaselineInventorySha256) { throw 'Baseline inventory hash mismatch' }
+if ((Get-FileHash -LiteralPath $CollectorContract -Algorithm SHA256).Hash -ne $CollectorContractSha256) { throw 'Collection contract hash mismatch' }
+$manifest=Join-Path $ResearchReleaseDirectory 'research-release.json'
+if ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -ne $ResearchReleaseManifestSha256) { throw 'Research manifest hash mismatch' }
+if (Test-Path -LiteralPath $Output) { throw 'New proposal output required; do not overwrite approved evidence' }
+$contract=Get-Content -LiteralPath $CollectorContract -Raw | ConvertFrom-Json
+if ($contract.scope -ne 'transitional_market_collection_only' -or $contract.execution_ready) { throw 'Unknown collection contract scope' }
+if (-not $contract.python -or [IO.Path]::GetFullPath($contract.python) -ne [IO.Path]::GetFullPath($AdapterPython)) { throw 'Adapter Python differs from collector contract' }
+foreach ($value in @($contract.database,$contract.reports)) { if (-not $value -or $value -match '["\r\n]') { throw 'Unsafe collection target' } }
+$expected=@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-SupplementalRetry','StockData-QLibResearch','StockData-ResearchDaily','StockData-MonthlyCompact')
+$baseline=Get-Content -LiteralPath $inventory -Raw | ConvertFrom-Json
+$baseline=@($baseline)
+if ($baseline.Count -ne 7 -or @($baseline.Name | Select-Object -Unique).Count -ne 7 -or
+    @(Compare-Object $expected @($baseline.Name)).Count) { throw 'Exactly seven classified baseline tasks required' }
+$xmlByName=@{}; $hashByName=@{}
+foreach ($task in $baseline) {
+    $path=Join-Path $BaselineDirectory ($task.Name+'.xml')
+    # Plain strings only: Windows PowerShell 5 serializes Get-Content's
+    # extended PSDrive/provider metadata recursively at a deep JSON depth.
+    $raw=[IO.File]::ReadAllText($path)
+    $xml=[xml]$raw
+    $actions=@($xml.SelectNodes('/*[local-name()="Task"]/*[local-name()="Actions"]/*'))
+    $triggers=@($xml.SelectNodes('/*[local-name()="Task"]/*[local-name()="Triggers"]/*'))
+    if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec' -or @($task.Actions).Count -ne 1 -or
+        [string]$actions[0].Command -cne [string]$task.Actions[0].Execute -or
+        [string]$actions[0].Arguments -cne [string]$task.Actions[0].Arguments -or
+        [string]$actions[0].WorkingDirectory -cne [string]$task.Actions[0].WorkingDirectory -or
+        $triggers.Count -ne @($task.Triggers).Count) { throw ('Baseline XML/inventory mismatch: '+$task.Name) }
+    if ($task.Name -in @('StockData-MonthlyCompact','StockData-ResearchDaily') -and
+        ($task.State -ne 'Disabled' -or $xml.Task.Settings.Enabled -ne 'false')) { throw ('Retained task must be disabled: '+$task.Name) }
+    $xmlByName[$task.Name]=$raw
+    $hashByName[$task.Name]=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 }
-
-$days = if ($IncludeWeekends) { $null } else { @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday") }
-
-function New-PhaseTrigger([string]$timeText) {
-    if ($IncludeWeekends) {
-        return New-ScheduledTaskTrigger -Daily -At $timeText
-    }
-    return New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $days -At $timeText
+$identity=([xml]$xmlByName['StockData-ResearchDaily']).Task.Principals.Principal
+if ($identity.UserId -notmatch '^S-1-5-21-' -or $identity.LogonType -ne 'Password' -or
+    ($identity.RunLevel -and $identity.RunLevel -ne 'LeastPrivilege')) { throw 'Retained dedicated Limited/Password identity required, never SYSTEM' }
+$repo=Split-Path -Parent $PSScriptRoot
+$common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'"'
+$prefix='-NoProfile -NonInteractive -File "'
+$research=$prefix+(Join-Path $PSScriptRoot 'run_research_daily.ps1')+'" -Python "'+$ResearchPython+'" -Workspace "'+$Workspace+'" -ReleaseDirectory "'+$ResearchReleaseDirectory+'" -ReleaseManifestSha256 '+$ResearchReleaseManifestSha256
+$actions=@{
+    'StockData-Auction'=$prefix+(Join-Path $PSScriptRoot 'run_phase_watch.ps1')+'" -Phase auction -IntervalSeconds 120 -EndAt 09:27 -ContinueOnFailure'+$common
+    'StockData-Intraday'=$prefix+(Join-Path $PSScriptRoot 'run_phase_watch.ps1')+'" -Phase intraday -IntervalSeconds 300 -EndAt 15:05 -SkipLunch -ContinueOnFailure'+$common
+    'StockData-DailyClose'=$prefix+(Join-Path $PSScriptRoot 'run_stock_data_daily.ps1')+'" -Phase close -CollectionProfile priority'+$common
+    'StockData-SupplementalRetry'=$prefix+(Join-Path $PSScriptRoot 'run_phase_once.ps1')+'" -Phase supplemental -PublicationTask StockData-ResearchDaily'+$common
+    'StockData-ResearchDaily'=$research
+    'StockData-QLibResearch'=$research+' -RefreshResearch -EnvironmentFile "'+$EnvironmentFile+'"'
 }
-
-function Register-Phase([string]$name, [string]$phaseName, [string]$startAt, [int]$interval, [string]$endAt) {
-    $isWatch = $phaseName -in @("auction", "intraday")
-    if ($isWatch) {
-        $lunchArg = if ($phaseName -eq "intraday") { " -SkipLunch" } else { "" }
-        $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$Watch`" -Phase $phaseName -IntervalSeconds $interval -EndAt $endAt$lunchArg -ContinueOnFailure"
-        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $argument
-        $hours = 8
-    } else {
-        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument (
-            "-NoProfile -ExecutionPolicy Bypass -File `"$Runner`" -Phase close -CollectionProfile priority"
-        )
-        $hours = 4
+$rows=@(foreach ($name in $expected) {
+    $existing=@($baseline | Where-Object Name -eq $name)[0]
+    $preserve=$name -eq 'StockData-MonthlyCompact'
+    $isResearch=$name -in @('StockData-ResearchDaily','StockData-QLibResearch')
+    [pscustomobject]@{
+        Name=$name;Disposition=$(if($preserve){'preserve_disabled'}else{'replace_responsibility'});
+        BeforeState=$existing.State;BeforeXml=$xmlByName[$name];BeforeXmlSha256=$hashByName[$name];
+        Execute=$(if($preserve){$existing.Actions[0].Execute}else{Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'});
+        Arguments=$(if($preserve){$existing.Actions[0].Arguments}else{$actions[$name]});
+        WorkingDirectory=$(if($preserve){$existing.Actions[0].WorkingDirectory}else{$repo});
+        Schedule=$(if($name -eq 'StockData-ResearchDaily'){'proposed weekdays 19:30 plus on-demand request after supplemental; exact start date requires new approval'}else{'preserve existing triggers'});
+        Principal=$(if($isResearch){[ordered]@{UserId=[string]$identity.UserId;LogonType='Password';RunLevel='Limited'}}else{[ordered]@{Mode='preserve_exact_xml';Definition=([xml]$xmlByName[$name]).Task.Principals.OuterXml}});
+        IdentityRule=$(if($isResearch){'dedicated Limited/Password, never SYSTEM'}else{'preserve existing identity'});
+        Responsibility=$(if($preserve){'no compaction; retained disabled'}elseif($name -eq 'StockData-QLibResearch'){'current research product frozen-model update; no fit, promotion, legacy registry or page callback'}elseif($isResearch){'local market snapshot -> unified daily workspace; no provider requests or model fits'}else{'collection and diagnostics only; supplemental requests unified publication after releasing database lock'});
+        Rollback='restore exact BeforeXml and original enabled/disabled state under separately approved authenticated rollback; no database rollback or deletion of human notes'
     }
-    $trigger = New-PhaseTrigger $startAt
-    # The host may report a battery transition even while docked.  Windows'
-    # defaults stop a long intraday watcher immediately in that case, leaving
-    # LastTaskResult=0x41306 and no completion marker.  Data collection should
-    # finish its bounded window regardless of AC/battery state.
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Hours $hours) -MultipleInstances IgnoreNew
-    Write-Output "Task: $name"
-    Write-Output ("Phase: {0}; schedule: {1} at {2}" -f $phaseName, $(if ($IncludeWeekends) { "daily" } else { "weekdays" }), $startAt)
-    Write-Output ("Action: {0}" -f $(if ($isWatch) { $Watch } else { $Runner }))
-    if ($Register) {
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Stock data $phaseName phase with single-instance guard and durable audit" -Force | Out-Null
-        $registered = Get-ScheduledTask -TaskName $name -ErrorAction Stop
-        if ($registered.Principal.UserId -notin @("SYSTEM", "NT AUTHORITY\SYSTEM")) {
-            throw "Task principal verification failed for $name`: $($registered.Principal.UserId)"
-        }
-        Write-Output "REGISTERED $name principal=$($registered.Principal.UserId) state=$($registered.State)"
-    } else {
-        Write-Output "DRY_RUN $name (pass -Register to register)"
-    }
+})
+$files=[ordered]@{}
+foreach ($relative in @('scripts/install_stock_data_task.ps1','scripts/deploy_current_tasks.ps1','scripts/run_integrated_daily.py','scripts/run_phase_once.ps1','scripts/run_phase_watch.ps1','scripts/run_stock_data_daily.ps1','scripts/run_research_daily.ps1','scripts/native_process.ps1','trade_system/source_authority.py','trade_system/collection_profiles.py')) {
+    $files[$relative]=(Get-FileHash -LiteralPath (Join-Path $repo $relative) -Algorithm SHA256).Hash
 }
-
-function Remove-LegacyPhaseTasks {
-    # This task used to hold a read-only DuckDB connection for the whole day.
-    # The supported intraday watcher is now run_phase_watch.ps1, which opens
-    # and closes its connection per attempt under the pipeline guard.
-    foreach ($legacyName in @("StockData-IntradayPush")) {
-        $legacy = Get-ScheduledTask -TaskName $legacyName -ErrorAction SilentlyContinue
-        if ($legacy) {
-            Write-Output "REMOVE_LEGACY_TASK $legacyName"
-            Unregister-ScheduledTask -TaskName $legacyName -Confirm:$false
-        }
-    }
+$proposal=[ordered]@{Schema=2;Scope='task_handover_proposal_only';CapturedAt=[DateTimeOffset]::UtcNow.ToString('o');
+    SystemChanges=0;ProductionCutover=$false;Actions=$rows;AdapterFiles=$files;
+    BaselineInventorySha256=$BaselineInventorySha256;BaselineXmlSha256=$hashByName;
+    CollectionContractSha256=$CollectorContractSha256;ResearchManifestSha256=$ResearchReleaseManifestSha256;
+    MonthlyCompact='retain disabled; no changes';
+    Blockers=@('baseline is historical: compare all seven live XML definitions immediately before cutover',
+        'fresh recovery and ACL rollback verification required',
+        'protect exact collector/research runtimes, release and provider environment before enabling tasks',
+        'dedicated identity must pass offline probe and authenticated task-update/rollback rehearsal',
+        'current transaction engine has no live backend; offline rehearsal is not Windows authentication or approval',
+        'confirm exact new maintenance window and seven-task scope before applying')}
+if ($ResearchStartBoundary) {
+    $releaseMetadata=[IO.File]::ReadAllText($manifest) | ConvertFrom-Json
+    if ($releaseMetadata.version -ne '0.3.15') {throw 'Compiled transaction requires the fixed 0.3.15 research release'}
+    . (Join-Path $PSScriptRoot 'deploy_current_tasks.ps1') -Mode Library
+    $proposal.Schema=3;$proposal.Scope='task_handover_engineering_only'
+    $proposal.Version='0.3.15';$proposal.ResearchStartBoundary=$ResearchStartBoundary
+    $proposal.AuthenticationVerified=$false;$proposal.LiveBackendEnabled=$false
+    foreach ($row in $rows) {$row | Add-Member NoteProperty AfterXml (Replacement-Xml $row $ResearchStartBoundary)}
+    Assert-EngineeringPlan $proposal
 }
-
-function Register-QlibResearch([string]$startAt) {
-    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\run_qlib_research_daily.ps1`""
-    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $argument
-    $trigger = New-PhaseTrigger $startAt
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 6) -MultipleInstances IgnoreNew
-    Write-Output "Task: StockData-QLibResearch"
-    Write-Output ("Phase: qlib-research; schedule: {0} at {1}" -f $(if ($IncludeWeekends) { "daily" } else { "weekdays" }), $startAt)
-    if ($Register) {
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName "StockData-QLibResearch" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Isolated QLib research refresh; never an execution signal" -Force | Out-Null
-        $registered = Get-ScheduledTask -TaskName "StockData-QLibResearch" -ErrorAction Stop
-        if ($registered.Principal.UserId -notin @("SYSTEM", "NT AUTHORITY\SYSTEM")) {
-            throw "Task principal verification failed for StockData-QLibResearch`: $($registered.Principal.UserId)"
-        }
-        Write-Output "REGISTERED StockData-QLibResearch principal=$($registered.Principal.UserId) state=$($registered.State)"
-    } else {
-        Write-Output "DRY_RUN StockData-QLibResearch (pass -Register to register)"
-    }
-}
-
-function Register-SupplementalRetry([string]$startAt) {
-    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$SupplementalRunner`""
-    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument $argument
-    $trigger = New-PhaseTrigger $startAt
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 4) -MultipleInstances IgnoreNew
-    Write-Output "Task: StockData-SupplementalRetry"
-    Write-Output ("Phase: supplemental-retry; schedule: {0} at {1}" -f $(if ($IncludeWeekends) { "daily" } else { "weekdays" }), $startAt)
-    if ($Register) {
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName "StockData-SupplementalRetry" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Retry late close supplements and republish the static review" -Force | Out-Null
-        $registered = Get-ScheduledTask -TaskName "StockData-SupplementalRetry" -ErrorAction Stop
-        if ($registered.Principal.UserId -notin @("SYSTEM", "NT AUTHORITY\SYSTEM")) {
-            throw "Task principal verification failed for StockData-SupplementalRetry`: $($registered.Principal.UserId)"
-        }
-        Write-Output "REGISTERED StockData-SupplementalRetry principal=$($registered.Principal.UserId) state=$($registered.State)"
-    } else {
-        Write-Output "DRY_RUN StockData-SupplementalRetry (pass -Register to register)"
-    }
-}
-
-if ($RegisterAll) {
-    if ($Register) {
-        Remove-LegacyPhaseTasks
-    }
-    # Auction tick data is only meaningful from 09:15.  Starting at 08:30
-    # produced repeated empty KPL calls and increased block risk.  Drain at
-    # 09:27 so the 09:30 intraday task cannot lose its only trigger to the
-    # single-instance pipeline lock.  120s interval gives ~6 auction
-    # snapshots per stock (300s produced only the first and last snap,
-    # too sparse to draw the indicative-price curve).
-    Register-Phase "StockData-Auction" "auction" "09:15" 120 "09:27"
-    Register-Phase "StockData-Intraday" "intraday" "09:30" 300 "15:05"
-    Register-Phase "StockData-DailyClose" "close" "17:30" 0 "18:30"
-    Register-SupplementalRetry $SupplementalAt
-    Register-QlibResearch $QlibAt
-} else {
-    Register-Phase $TaskName $Phase $At $(if ($Phase -eq "auction") { 120 } elseif ($Phase -eq "intraday") { 300 } else { 0 }) $(if ($Phase -eq "auction") { "09:27" } elseif ($Phase -eq "intraday") { "15:05" } else { "18:30" })
-}
+$parent=Split-Path -Parent ([IO.Path]::GetFullPath($Output))
+if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
+$stream=[IO.File]::Open($Output,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try {$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($proposal | ConvertTo-Json -Depth 12));$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)} finally {$stream.Dispose()}
+Write-Output "TASK_PROPOSAL_SAVED: $Output ; system changes=0; not a deployment approval."

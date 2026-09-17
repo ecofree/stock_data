@@ -64,7 +64,7 @@ def preview(source, output, day, as_of=None, *, workspace_only=False):
     if workspace_only:
         return {'snapshot_id':snapshot['snapshot_id'],'trade_date':day,'themes':len(snapshot['themes']),
                 'legacy_page_rendered':False,'execution_ready':False,'production_publication':False}
-    html, selected, _=_render_review_bundle(source,day,context=context,as_of=as_of)
+    html, selected=_render_review_bundle(source,day,context=context,as_of=as_of)
     flow=context['capital_flow']
     explanations={'trade_date':day,'as_of':as_of,'scope':'existing_candidate_context_not_new_scores_or_model_attribution',
                   'candidates':flow['candidate_picks'],'sources':flow['concept_source_evidence'],

@@ -153,6 +153,8 @@ def test_ths_membership_snapshot_age(tmp_path):
         con.execute(
             "CREATE TABLE ths_concept_stock_history ("
             "trade_date DATE, concept_code VARCHAR, concept_name VARCHAR, stock_code VARCHAR)")
+        assert _ths_membership_snapshot(con, "2026-07-28") == (None, None)
+        con.execute("CREATE VIEW v_default_concept_stock_history AS SELECT * FROM ths_concept_stock_history")
         # Membership snapshot 13 days before the trade date -> stale (> 10d).
         con.execute(
             "INSERT INTO ths_concept_stock_history VALUES "
@@ -169,6 +171,8 @@ def test_ths_membership_snapshot_age(tmp_path):
         assert str(snap2) == "2026-07-27"
         assert age2 == 1
         assert age2 <= THS_MEMBERSHIP_MAX_AGE_DAYS
+        con.execute("INSERT INTO ths_concept_stock_history VALUES ('2026-07-29','future','future','000002')")
+        assert _ths_membership_snapshot(con, "2026-07-28") == (snap2, age2)
         # No snapshot at/before the trade date -> (None, None).
         assert _ths_membership_snapshot(con, "2026-07-01") == (None, None)
     finally:

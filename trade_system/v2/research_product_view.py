@@ -37,6 +37,20 @@ def export_projection(data):
     return result
 
 
+def candidate_scope(data):
+    market=data.get('market');prediction=data.get('prediction')
+    parts=[]
+    if market:
+        parts.append(f"市场事实日 {market['trade_date']} · {len(market.get('stocks',{}))} 只可比证券（可用数据范围，非推荐名单）")
+    if prediction:
+        historical=bool(market and prediction['date']!=market['trade_date'])
+        parts.append(('历史研究预测日 ' if historical else '研究预测日 ')+prediction['date']+
+                     f" · {prediction['predictions']} / {len(prediction['rows'])} 只可计算")
+        if historical:parts.append('异日预测不参与当前比较或排序')
+    else:parts.append('尚无冻结预测；市场事实仍可比较与记录')
+    return '；'.join(parts)
+
+
 def render(data, *, include_account=False):
     if not include_account:data=export_projection(data)
     payload=json.dumps(data,ensure_ascii=False,allow_nan=False).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
@@ -64,13 +78,14 @@ def render(data, *, include_account=False):
 <footer>离线显示数据全部内联。研究样本与真实账户分开；未验证选股优势，真实执行关闭。<!--RUNNING_REFRESH--></footer></main>
 <script type="application/json" id="data">'''+payload+'''</script><script>
 'use strict';const D=JSON.parse(document.getElementById('data').textContent),$=x=>document.getElementById(x),P=D.prediction;
+const candidateScope='''+json.dumps(candidate_scope(data),ensure_ascii=True).replace('<','\\u003c')+''';
 const el=(tag,t)=>{const e=document.createElement(tag);e.textContent=t;return e},fmt=x=>x==null?'—':Number(x).toFixed(4);
 const labels={price_baseline:'QLib · 价格',price_money:'QLib · 价格 + 资金',price_alpha158:'QLib · 价格 + Alpha158',constant:'常量预测（误差对照）'};
 const featureNames={ret_1d:'1日涨跌幅 %',ret_5d:'5日涨跌幅 %',ret_20d:'20日涨跌幅 %',volatility_20d:'20日波动率',intraday_range:'当日振幅 / 收盘价',volume_ratio_20d:'成交量 / 20日均量',money_ratio:'当日净流入 / 成交额',money_ratio_5d:'5日净流入 / 成交额',base_value:'模型起始值'};
 const gapNames={source_price_conflict:'双来源价格或量额冲突',missing_dual_source_price:'缺少双来源价格',daily_factor_missing:'缺复权因子',identity_snapshot_missing_or_outside_listing:'身份或上市期间不足',nonpositive_volume:'无有效成交量'};
 const gaps=g=>Object.entries(g||{}).map(([k,v])=>(gapNames[k]||k)+' '+v+'日').join('；')||'无';
-$('session-date').textContent=P?'行情日 '+P.date+' · '+P.predictions+' / '+P.rows.length+' 只可计算 · 保留缺失，不代表全市场':'尚无冻结预测';let draftDirty=false;const compared=new Set();const forecastRows=(P&&D.prediction_matches_market!==false)?P.rows:[],forecastByCode=new Map(forecastRows.map(r=>[r.instrument,r]));const rows=D.market?.stocks?Object.values(D.market.stocks).map(s=>{const r=forecastByCode.get(s.stock_code);return r?{...r,name:r.name||s.stock_name}:{instrument:s.stock_code,name:s.stock_name,prediction:null,features:{change_pct:s.change_pct},contributions:{},market_only:true}}):forecastRows;function table(target,items){target.replaceChildren(...items.map(values=>{const tr=el('tr','');values.forEach(v=>tr.append(el('td',v)));return tr}))}
-[['历史研究证券',D.dataset.summary.universe_count],['滚动对照折数',D.research.folds.length],['当前非空预测',P?P.predictions:0],['判断记录',D.notes.length]].forEach(([a,b])=>{const s=el('article',a);s.append(el('b',b));$('stats').append(s)});
+$('session-date').textContent=candidateScope;let draftDirty=false;const compared=new Set();const forecastRows=(P&&D.prediction_matches_market!==false)?P.rows:[],forecastByCode=new Map(forecastRows.map(r=>[r.instrument,r]));const rows=D.market?.stocks?Object.values(D.market.stocks).map(s=>{const r=forecastByCode.get(s.stock_code);return r?{...r,name:r.name||s.stock_name}:{instrument:s.stock_code,name:s.stock_name,prediction:null,features:{change_pct:s.change_pct},contributions:{},market_only:true}}):forecastRows;function table(target,items){target.replaceChildren(...items.map(values=>{const tr=el('tr','');values.forEach(v=>tr.append(el('td',v)));return tr}))}
+[['历史研究证券',D.dataset.summary.universe_count],['滚动对照折数',D.research.folds.length],[D.prediction_matches_market===false?'历史非空预测':'同日非空预测',P?P.predictions:0],['判断记录',D.notes.length]].forEach(([a,b])=>{const s=el('article',a);s.append(el('b',b));$('stats').append(s)});
 $('scope').textContent=D.dataset.dataset_config.start+' → '+D.dataset.dataset_config.end+'；'+D.dataset.rows+'行特征；事后取得的探索数据，不是原时点回放。';
 $('freshness').textContent=P?'行情日期 '+P.date+' / 数据接收 '+(P.data_received_at||P.captured_at)+' / 本次冻结 '+P.captured_at+' / 模型训练截至 '+P.model_train_end+(P.receipt_replay?' / 原始回执重放':'')+(P.prospective_eligible===false?' / 已错过目标开盘，不计前瞻成绩':P.forecast_status==='pending_future_calendar'?' / 等待未来交易日日历核对，未计前瞻成绩':'')+(P.model_id!==D.model.model_id?' / 当前预测属于上一冻结模型，请更新':''):'尚未获取当前预测。下方历史实验已完成。';
 function show(r){if(r.market_only){$('details').open=true;$('evidence').replaceChildren(el('h3',r.instrument+' '+(r.name||'')));appendMarketEvidence($('evidence'),r);if(!draftDirty&&!$('supersedes').value)$('instrument').value=r.instrument;return}$('details').open=true;const evidence=$('evidence');evidence.replaceChildren(el('h3',r.instrument),el('p',r.prediction==null?'未进入模型观察清单：当前依赖窗口不足，不补值。':'进入观察清单的原因：21日价格依赖完整，冻结QLib模型可计算非空评分；不代表已验证买入机会。'),el('p','QLib价格目标估计 '+fmt(r.prediction)+'%；独立动量规则 '+fmt(r.baseline_momentum_20d)+'%。前者预测短期目标，后者只按过去20日涨跌排序。'),el('p','近21日缺口：'+gaps(r.active_window_gap_counts)+'。完整采集窗口缺口：'+gaps(r.window_gap_counts)),el('p','价格 / 资金 / Alpha158窗口：'+['price_eligible','money_eligible','alpha158_window_eligible'].map(k=>r.eligibility?.[k]?'足够':'不足').join(' / ')+'。Alpha158窗口足够不等于已产生当前Alpha158预测。'));

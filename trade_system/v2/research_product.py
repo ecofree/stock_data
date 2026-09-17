@@ -382,16 +382,15 @@ def journal_projection(output,data):
     """Read-only projection; no model loading, fetching, fitting or business writes."""
     from . import research_journal
     from copy import deepcopy
-    import heapq
+    from .journal_index import recent
     data=deepcopy(data);data.pop('report_id',None)
-    paths=research_journal.note_paths(output)
-    recent=heapq.nlargest(100,paths,key=lambda p:p.stat().st_mtime_ns)
-    notes=sorted([read_json(p)[0] for p in recent],key=lambda n:n['received_at'])
+    note_paths,note_total=recent(output,'note')
+    notes=sorted([research_journal.read_note(output,p.stem) for p in note_paths],key=lambda n:n['received_at'])
     data['notes']=research_journal.annotate(notes)
     data['attention_followups']=research_journal.attention_followups(output,data['notes'],data.get('market'))
-    review_paths=heapq.nlargest(100,research_journal.review_paths(output),key=lambda p:p.stat().st_mtime_ns)
+    review_paths,_=recent(output,'review')
     data['human_reviews']=[research_journal.read_review(output,p.stem) for p in reversed(review_paths)]
-    data['note_scope']={'shown':len(notes),'total':sum(1 for _ in research_journal.note_paths(output)),'limit':100}
+    data['note_scope']={'shown':len(notes),'total':note_total,'limit':100}
     reviews=data.setdefault('reviews',[])
     represented={r['prediction_id'] for r in reviews}
     for note in data['notes']:
@@ -582,10 +581,13 @@ def _save_note(output, values):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market'])
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market','journal-index','journal-history'])
+    p.add_argument('--kind',choices=['note','review','plan'],default='note');p.add_argument('--before')
+    p.add_argument('--ensure-index',action='store_true',help='Rebuild event cache only when missing or invalidated; creates no human events')
     p.add_argument('--config',default='config/research_delivery.json');p.add_argument('--output',default='reports/research-delivery')
     p.add_argument('--receipts');p.add_argument('--replay-build',action='store_true',help='Replay only the frozen training receipts; does not certify the latest market date')
     p.add_argument('--destination',help='New isolated destination for a read-only render')
+    p.add_argument('--expected-date',help='Scheduled market publication must match this ISO trading date')
     p.add_argument('--force-refresh',action='store_true',help='Explicitly recapture the bounded revision window instead of reusing the sealed session')
     p.add_argument('--market-review',help='Same-date immutable market review projection')
     p.add_argument('--market-db',help='Explicit read-only canonical database for daily workspace')
@@ -594,7 +596,17 @@ def main():
     p.add_argument('--quote-receipts',help='Replay a sealed real quote receipt folder without network')
     p.add_argument('--port',type=int,default=8766);p.add_argument('--open-browser',action='store_true')
     a=p.parse_args();root=Path(__file__).resolve().parents[2];output=(root/a.output).resolve()
-    if a.command=='configure-market':
+    if a.command=='journal-history':
+        from .journal_index import history
+        result=history(output,a.kind,a.before)
+    elif a.command=='journal-index':
+        from .journal_index import rebuild, ensure
+        from trade_system.file_lock import FileLock
+        with FileLock(output/'judgement.guard'):
+            if a.ensure_index:
+                ensure(output);result={'index_ready':True,'business_events_created':0}
+            else:result=rebuild(output)
+    elif a.command=='configure-market':
         if not a.market_db:p.error('--market-db is required')
         output.mkdir(parents=True,exist_ok=True)
         source=(root/a.market_db).resolve(strict=True)
@@ -607,7 +619,7 @@ def main():
         result={'configured':True,'snapshot_id':market['snapshot_id'],'production_cutover':False}
     elif a.command=='market-update':
         from .daily_workspace import update_market
-        result=update_market(output)
+        result=update_market(output,expected_date=a.expected_date)
     elif a.command=='observe':result=observe(output,capture_quotes=a.capture_quotes,quote_receipts=a.quote_receipts)
     elif a.command=='present':
         result=present(output,market_review=root/a.market_review if a.market_review else None)

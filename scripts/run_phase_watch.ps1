@@ -6,14 +6,20 @@ param(
     [int]$MinRunWindowSeconds = 0,
     [string]$Db = "kpl_data.duckdb",
     [switch]$SkipLunch,
-    [switch]$ContinueOnFailure
+    [switch]$ContinueOnFailure,
+    [string]$Python = "",
+    [string]$CollectorContract,
+    [string]$CollectorContractSha256,
+    [string]$ReportsDirectory
 )
 
 $ErrorActionPreference = "Continue"
+# Keep -Db usable; advanced parameters reserve that alias for -Debug.
+if (-not $CollectorContract -or -not $CollectorContractSha256 -or -not $ReportsDirectory) { throw 'Explicit collector contract, hash and reports directory required' }
 $Root = Split-Path -Parent $PSScriptRoot
 $Once = Join-Path $Root "scripts\run_phase_once.ps1"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
-$LogDir = Join-Path $Root "logs"
+$LogDir = Join-Path $ReportsDirectory "scheduled-logs"
 if (-not (Test-Path -LiteralPath $Once)) {
     throw "Phase runner not found: $Once"
 }
@@ -59,7 +65,7 @@ while ((Get-Date) -lt $endAtToday) {
     }
     $attempts++
     Write-WatchEvent "PHASE_WATCH_ATTEMPT phase=$Phase attempt=$attempts"
-    & PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File $Once -Db $DbPath -Phase $Phase
+    & PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File $Once -Db $DbPath -Phase $Phase -Python $Python -CollectorContract $CollectorContract -CollectorContractSha256 $CollectorContractSha256 -ReportsDirectory $ReportsDirectory
     $runCode = $LASTEXITCODE
     if ($runCode -eq 0) {
         $successes++

@@ -7,7 +7,7 @@ re-exports these names for backward compatibility.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 
 import duckdb
@@ -16,6 +16,7 @@ from trade_system.db_utils import fetch_dicts as _fetch_dicts
 from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
 from trade_system.source_authority import provider_rank_sql
+from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
 from trade_system.units import normalization_sql
 
 logger = get_logger(__name__)
@@ -208,7 +209,9 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str, *, now
         except Exception:
             pass
 
-    if table_exists(con, "v_default_concept_stock_history") and table_exists(con, "v_limit_pool"):
+    membership_date, membership_age = qualified_membership_snapshot(con, trade_date)
+    if (membership_date is not None and membership_age <= THS_MEMBERSHIP_MAX_AGE_DAYS
+            and table_exists(con, "v_limit_pool")):
         result["sector_limit_up"] = _rows(
             con,
             "v_default_concept_stock_history",
@@ -220,14 +223,11 @@ def _capital_flow_review(con: duckdb.DuckDBPyConnection, trade_date: str, *, now
             JOIN v_limit_pool l
               ON l.stock_code=regexp_replace(CAST(h.stock_code AS VARCHAR), '[.].*$', '')
              AND l.trade_date=?
-            WHERE h.trade_date=(
-                SELECT max(trade_date) FROM v_default_concept_stock_history
-                WHERE trade_date<=CAST(? AS DATE)
-            )
+            WHERE h.trade_date=CAST(? AS DATE)
             GROUP BY h.concept_code
             ORDER BY limit_up_count DESC, sector_name
             """,
-            [trade_date, trade_date],
+            [trade_date, membership_date],
         )
 
     if table_exists(con, "stock_candidate_score"):
@@ -447,26 +447,13 @@ def _concept_limit_up_review(con: duckdb.DuckDBPyConnection, trade_date: str) ->
         return raw.zfill(6) if raw.isdigit() else raw
 
     try:
-        member_date_row = con.execute(
-            "SELECT max(trade_date) FROM v_default_concept_stock_history "
-            "WHERE CAST(trade_date AS DATE) "
-            "BETWEEN CAST(? AS DATE) - INTERVAL 7 DAY "
-            "AND CAST(? AS DATE) + INTERVAL 3 DAY",
-            [trade_date, trade_date],
-        ).fetchone()
-        member_date = member_date_row[0] if member_date_row else None
-        if not member_date:
-            result["message"] = "no THS membership snapshot within [-7, +3] days of the review date"
+        member_date, membership_age = qualified_membership_snapshot(con, trade_date)
+        if member_date is None:
+            result["message"] = "no qualified THS membership snapshot at or before the review date"
             return result
         result["membership_date"] = str(member_date)
-        # Weekend/post-close snapshots taken the next morning still describe
-        # the review date's membership, so age uses absolute distance.
-        membership_age = abs(
-            (date.fromisoformat(str(trade_date)[:10])
-             - date.fromisoformat(str(member_date)[:10])).days
-        )
         result["membership_age_days"] = membership_age
-        if membership_age > 7:
+        if membership_age > THS_MEMBERSHIP_MAX_AGE_DAYS:
             result["message"] = f"THS membership snapshot is stale by {membership_age} days"
             result["membership_stale"] = True
             return result

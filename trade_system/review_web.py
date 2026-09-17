@@ -617,11 +617,7 @@ def _render_loop(ctx: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _render_sector_trail(
-    ctx: dict[str, Any],
-    external_lazy: bool = False,
-    compact_overview: bool = False,
-) -> str:
+def _render_sector_trail(ctx: dict[str, Any]) -> str:
     trail = ctx.get("sector_trail") or {}
     periods = ctx.get("sector_periods") or {}
     dates = trail.get("dates") or []
@@ -630,50 +626,6 @@ def _render_sector_trail(
         message = trail.get("message") or "暂无板块轨迹"
         return f"<div class='empty'>{_e(message)}</div>"
     cards = []
-    if compact_overview:
-        # The daily page is a decision surface. Keep only the latest 50 theme
-        # rows in HTML and send historical/member drill-down users to the
-        # dedicated static sector page. Embedding stock_pct plus all dates
-        # here previously made one daily page nearly 10 MB.
-        day = dates[0]
-        ranked = []
-        for sector in sectors:
-            cell = (sector.get("daily") or {}).get(day)
-            if cell:
-                ranked.append((sector, cell))
-        ranked.sort(
-            key=lambda item: (
-                -int(item[1].get("limit_up") or 0),
-                -float(item[1].get("strength") or -999),
-                -float(item[1].get("main_net") or 0),
-            )
-        )
-        rows = []
-        for index, (sector, cell) in enumerate(ranked[:50], start=1):
-            rows.append(
-                f"<div class='day-row cols5'>"
-                f"<span class='dim'>{index}</span>"
-                f"<span class='n'>{_e(sector.get('name'))}</span>"
-                f"<span class='num {_sign_class(cell.get('strength'))}'>{_pct(cell.get('strength'))}</span>"
-                f"<span class='num up'>{_e(cell.get('limit_up') if cell.get('limit_up') is not None else '—')}</span>"
-                f"<span class='num {_sign_class(cell.get('pct_chg'))}'>{_pct(cell.get('pct_chg'))}</span>"
-                "</div>"
-            )
-        remainder = max(0, len(ranked) - 50)
-        empty = "<div class='empty'>暂无概念数据</div>"
-        return (
-            f"<div class='trail-source-note'>概念源：{_e(trail.get('concept_source') or 'THS完整质量门控快照')}；"
-            f"最新可用成分快照：{_e(trail.get('membership_date') or '—')}。"
-            "日页只保留最新交易日的前50个概念，历史和个股明细进入全宽专页。</div>"
-            f"<div class='trail-window-note'>当前日：{_e(day)} · 共 {len(ranked)} 个可用概念"
-            f"{' · 另有 ' + str(remainder) + ' 个概念请进入全宽专页' if remainder else ''}</div>"
-            "<div class='trail-scroll compact-trail'><div class='day-card'>"
-            f"<div class='day-title'>{_e(day)}</div>"
-            "<div class='day-head cols5'><span>#</span><span>概念</span><span class='num'>强度</span>"
-            "<span class='num'>涨停</span><span class='num'>涨幅</span></div>"
-            f"<div class='day-rows'>{''.join(rows) or empty}</div>"
-            "</div></div>"
-        )
     # Keep the full summary inline for offline drill-down, but limit the
     # initial HTML to the latest day. Older days are rendered after expansion.
     for day in dates[:1]:
@@ -778,7 +730,7 @@ def _render_sector_trail(
             period_details[kind][str(sector.get("id"))] = {"periods": {
                     label: {"stocks": [slim_period_stock(st) for st in (cell.get("stocks") or [])]}
                     for label, cell in (sector.get("periods") or {}).items()
-                }} if not compact_overview else {"periods": {}}
+                }}
         period_summary[kind] = {
             "periods": pack.get("periods") or [],
             "sectors": summary_period_sectors,
@@ -788,14 +740,10 @@ def _render_sector_trail(
         {
             "daily": daily_details,
             "periods": period_details,
-            "compact_overview": compact_overview,
         },
         ensure_ascii=False,
         separators=(",", ":"),
     ).replace("</", "<\\/")
-    detail_scripts = "" if external_lazy else (
-        f"<script type='application/json' id='trail-details'>{detail_payload}</script>"
-    )
     return (
         "<div class='tabs' id='trail-mode-tabs'>"
         "<button type='button' class='active' data-trail-mode='day'>日</button>"
@@ -810,7 +758,7 @@ def _render_sector_trail(
         f"<div class='dim'>点上方概念，下面按同一粒度列出该概念的涨停个股。一只票可以同时出现在多个概念里。</div></div>"
         f"<script type='application/json' id='trail-data'>{daily_payload}</script>"
         f"<script type='application/json' id='trail-periods'>{period_payload}</script>"
-        f"{detail_scripts}"
+        f"<script type='application/json' id='trail-details'>{detail_payload}</script>"
     )
 
 
@@ -1284,53 +1232,15 @@ def _concept_inline_data(ctx: dict[str, Any], stock_limit: int = 50) -> list[dic
         item = dict(group)
         stocks = list(group.get("limit_up_stocks") or [])
         # Only the initially selected concept needs cards in the initial HTML.
-        # Other concepts retain metadata and are hydrated from the sidecar on
-        # click, so a broad concept catalog does not recreate the old payload.
+        # Other concepts retain metadata and read full details from inert inline
+        # JSON on click, without building every stock card on initial load.
         item["limit_up_stocks"] = stocks[:stock_limit] if index == 0 else []
         inline.append(item)
     return inline
 
 
-def _build_review_lazy_payload(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Extract full drill-down data for the optional same-directory sidecar."""
-    trail = ctx.get("sector_trail") or {}
-    periods = ctx.get("sector_periods") or {}
-    payload: dict[str, Any] = {
-        "concept_groups": (ctx.get("concept_limit_up") or {}).get("groups") or [],
-        "trail_details": {},
-        "period_details": {"week": {}, "month": {}, "quarter": {}},
-    }
-    for sector in trail.get("sectors") or []:
-        sector_id = str(sector.get("id") or "")
-        daily: dict[str, Any] = {}
-        for day, cell in (sector.get("daily") or {}).items():
-            daily[str(day)] = {"stocks": cell.get("stocks") or []}
-        payload["trail_details"][sector_id] = {
-            "window_stocks": sector.get("window_stocks") or [],
-            "daily": daily,
-        }
-    for kind in ("week", "month", "quarter"):
-        for sector in (periods.get(kind) or {}).get("sectors") or []:
-            sector_id = str(sector.get("id") or "")
-            cells: dict[str, Any] = {}
-            for label, cell in (sector.get("periods") or {}).items():
-                cells[str(label)] = {"stocks": cell.get("stocks") or []}
-            payload["period_details"][kind][sector_id] = {"periods": cells}
-    return payload
-
-
-def _build_review_lazy_asset(ctx: dict[str, Any]) -> str:
-    payload = json.dumps(
-        _build_review_lazy_payload(ctx),
-        ensure_ascii=False,
-        default=str,
-    ).replace("</", "<\\/")
-    return f"window.__REVIEW_LAZY_DATA__ = {payload};"
-
-
 def _chart_js(ctx: dict[str, Any], trend: dict[str, Any], ladder: list[dict[str, Any]],
               rotation: list[dict[str, Any]], concept_limit_up: dict[str, Any] | None = None,
-              lazy_asset_name: str | None = None,
               concept_data: list[dict[str, Any]] | None = None) -> str:
     themes = [
         {"name": t["name"], "score": t.get("score"), "main_net": t.get("main_net"),
@@ -1343,14 +1253,12 @@ def _chart_js(ctx: dict[str, Any], trend: dict[str, Any], ladder: list[dict[str,
         ensure_ascii=False,
         default=str,
     ).replace("</", "<\\/")
-    lazy_asset_json = json.dumps(lazy_asset_name or "", ensure_ascii=False)
     return f"""
 const trend = {d(trend, ensure_ascii=False)};
 const ladder = {d(ladder)};
 const rotation = {d(rotation, ensure_ascii=False)};
 const themes = {d(themes, ensure_ascii=False)};
 let conceptData = {concept_data_json};
-const lazyAsset = {lazy_asset_json};
 
 const AXIS = {{axisLine:{{lineStyle:{{color:'#3a3226'}}}}, axisLabel:{{color:'#a89880', fontSize:11}},
   splitLine:{{lineStyle:{{color:'rgba(58,50,38,.28)'}}}}}};
@@ -1442,9 +1350,6 @@ window.addEventListener('DOMContentLoaded', () => {{
     + `<span class="concept-name">${{escHtml(item.concept_name || '—')}}</span>`
     + `<span class="concept-lu">${{item.limit_up_count || 0}}</span>`
     + `<span class="concept-meta">最高 ${{item.max_board == null ? '—' : item.max_board}}板 · 成分 ${{item.member_count || 0}}</span></button>`;
-  let lazyReviewData = window.__REVIEW_LAZY_DATA__ || null;
-  let lazyLoadPromise = null;
-  let lazyLoadError = '';
   let fullConceptData = null;
   const loadFullConceptData = () => {{
     if (fullConceptData) return fullConceptData;
@@ -1454,34 +1359,9 @@ window.addEventListener('DOMContentLoaded', () => {{
       const parsed = JSON.parse(payload.textContent || '[]');
       if (Array.isArray(parsed)) fullConceptData = parsed;
     }} catch (err) {{
-      lazyLoadError = '概念详情数据损坏，当前仅显示首屏';
+      console.warn('概念详情数据损坏，当前仅显示首屏', err);
     }}
     return fullConceptData || conceptData;
-  }};
-  const loadLazyData = () => {{
-    if (!lazyAsset) return Promise.resolve(lazyReviewData);
-    if (lazyReviewData) return Promise.resolve(lazyReviewData);
-    if (lazyLoadPromise) return lazyLoadPromise;
-    lazyLoadPromise = new Promise((resolve, reject) => {{
-      const script = document.createElement('script');
-      script.src = lazyAsset;
-      script.async = true;
-      script.onload = () => {{
-        lazyReviewData = window.__REVIEW_LAZY_DATA__ || null;
-        if (!lazyReviewData) {{
-          lazyLoadError = '详情数据未加载：侧车文件为空';
-          reject(new Error(lazyLoadError));
-          return;
-        }}
-        resolve(lazyReviewData);
-      }};
-      script.onerror = () => {{
-        lazyLoadError = '详情数据未加载：请确认同目录 lazy.js 文件存在';
-        reject(new Error(lazyLoadError));
-      }};
-      document.head.appendChild(script);
-    }});
-    return lazyLoadPromise;
   }};
   const money = v => v == null ? '—' : (Math.abs(Number(v)) >= 1e8 ? (Number(v) / 1e8).toFixed(2) + '亿' : Number(v).toFixed(2));
   const fmtTime = v => {{
@@ -1493,7 +1373,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     }}
     return String(v);
   }};
-  const renderConcept = async (index, expand = false) => {{
+  const renderConcept = (index, expand = false) => {{
     if (expand || index > 0) {{
       conceptData = loadFullConceptData();
     }}
@@ -1547,7 +1427,7 @@ window.addEventListener('DOMContentLoaded', () => {{
   const trailDetailsEl = document.getElementById('trail-details');
   let trailData = {{dates: [], sectors: []}};
   let trailPeriods = {{week: {{}}, month: {{}}, quarter: {{}}}};
-  let trailDetails = {{daily: {{}}, periods: {{week: {{}}, month: {{}}, quarter: {{}}}}, compact_overview: false}};
+  let trailDetails = {{daily: {{}}, periods: {{week: {{}}, month: {{}}, quarter: {{}}}}}};
   if (trailDataEl) {{
     try {{ trailData = JSON.parse(trailDataEl.textContent || '{{}}'); }} catch (err) {{ trailData = {{dates: [], sectors: []}}; }}
   }}
@@ -1557,20 +1437,8 @@ window.addEventListener('DOMContentLoaded', () => {{
   if (trailDetailsEl) {{
     try {{ trailDetails = JSON.parse(trailDetailsEl.textContent || '{{}}'); }} catch (err) {{ trailDetails = {{daily: {{}}, periods: {{week: {{}}, month: {{}}, quarter: {{}}}}}}; }}
   }}
-  const trailCompact = Boolean(trailDetails.compact_overview);
   const hydrateTrailSector = sector => {{
     if (!sector || sector.__trailDetailsLoaded) return sector;
-    const sidecarDetail = lazyReviewData && lazyReviewData.trail_details
-      ? lazyReviewData.trail_details[String(sector.id || '')] : null;
-    if (sidecarDetail) {{
-      sector.window_stocks = sidecarDetail.window_stocks || [];
-      for (const [day, cell] of Object.entries(sidecarDetail.daily || {{}})) {{
-        sector.daily = sector.daily || {{}};
-        sector.daily[day] = Object.assign(sector.daily[day] || {{}}, cell);
-      }}
-      sector.__trailDetailsLoaded = true;
-      return sector;
-    }}
     const detail = (trailDetails.daily || {{}})[String(sector.id || '')];
     if (!detail) return sector;
     try {{
@@ -1585,17 +1453,6 @@ window.addEventListener('DOMContentLoaded', () => {{
   }};
   const hydratePeriodSector = (kind, sector) => {{
     if (!sector || sector.__periodDetailsLoaded) return sector;
-    const sidecarDetail = lazyReviewData && lazyReviewData.period_details
-      && lazyReviewData.period_details[kind]
-      ? lazyReviewData.period_details[kind][String(sector.id || '')] : null;
-    if (sidecarDetail) {{
-      for (const [label, cell] of Object.entries(sidecarDetail.periods || {{}})) {{
-        sector.periods = sector.periods || {{}};
-        sector.periods[label] = Object.assign(sector.periods[label] || {{}}, cell);
-      }}
-      sector.__periodDetailsLoaded = true;
-      return sector;
-    }}
     const detail = ((trailDetails.periods || {{}})[kind] || {{}})[String(sector.id || '')];
     if (!detail) return sector;
     try {{
@@ -1730,17 +1587,10 @@ window.addEventListener('DOMContentLoaded', () => {{
     }});
     if (trailSelected) paintTrail(trailSelected);
   }};
-  const paintTrail = async id => {{
+  const paintTrail = id => {{
     trailSelected = id;
     document.querySelectorAll('#trail-board [data-trail-id]').forEach(row => row.classList.toggle('active', row.dataset.trailId === id));
     if (!trailDetail) return;
-    if (lazyAsset) {{
-      try {{ await loadLazyData(); }}
-      catch (err) {{
-        trailDetail.innerHTML = `<div class="empty">${{lazyLoadError || '详情数据未加载'}}</div>`;
-        return;
-      }}
-    }}
     if (trailMode === 'day') {{
       const sector = (trailData.sectors || []).find(item => item.id === id);
       if (!sector) return;
@@ -1800,9 +1650,8 @@ window.addEventListener('DOMContentLoaded', () => {{
       const latestCell = (sector.daily || {{}})[(trailData.dates || [])[0]] || {{}};
       const coverage = latestCell.coverage_pct == null ? '' : ` · 成分 K 线覆盖 ${{fmtRateJs(latestCell.coverage_pct)}}`;
       const snapNote = memberPanel ? ` · 成分快照 ${{panel.snapshot_date || '—'}}` : '';
-      const compactNote = trailCompact ? ' · 总览仅内嵌最新日全部成分，历史日保留涨停明细；全量成分请进入全宽专页' : '';
       trailDetail.innerHTML = `<div class="sec-title"><strong>${{sector.name || id}}</strong>`
-        + `<span class="dim">成分按涨幅排序，涨停股标注连板与封板时间 · 一只票可以同时属于多个概念${{coverage}}${{snapNote}}${{compactNote}}</span></div>`
+        + `<span class="dim">成分按涨幅排序，涨停股标注连板与封板时间 · 一只票可以同时属于多个概念${{coverage}}${{snapNote}}</span></div>`
         + `<div class="trail-scroll">${{cards}}</div>`;
       document.querySelectorAll('#trail-detail [data-day-more]').forEach(button => button.addEventListener('click', () => {{
         const day = button.dataset.dayMore;
@@ -1830,9 +1679,7 @@ window.addEventListener('DOMContentLoaded', () => {{
           + `<span class="num">${{stock.limit_up ?? '—'}}</span>`
           + `<span class="num ${{signCls(stock.pct_chg)}}">${{fmtPctJs(stock.pct_chg)}}</span>`
           + `<span class="num">${{stock.board_level == null ? '—' : stock.board_level + '板'}}</span></div>`;
-      }}).join('') : (trailCompact
-        ? '<div class="empty">总览页仅保留周/月/季汇总；期间个股明细请点击上方“进入全宽专页”。</div>'
-        : '<div class="empty">该期无涨停</div>');
+      }}).join('') : '<div class="empty">该期无涨停</div>';
       const more = stocks.length > TOPN
         ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{stocks.length - TOPN}} 个）</button>` : '';
       return `<div class="day-card wide"><div class="day-title">${{frame.label}} · ${{cell.limit_up || 0}}次`
@@ -2083,7 +1930,6 @@ def _staleness_banner(con: duckdb.DuckDBPyConnection, trade_date: str) -> str:
 def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
                trend: dict[str, Any], ladder: list[dict[str, Any]],
                rotation: list[dict[str, Any]],
-               lazy_asset_name: str | None = None,
                staleness_banner: str = "") -> str:
     ctx["narrative"] = ctx.get("narrative") or build_review_narrative(ctx)
     kpis = _render_kpis(ctx)
@@ -2099,11 +1945,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     named_ladder = _render_named_ladder(ctx)
     yday_limitup = _render_yday_limitup(ctx)
     broken = _render_broken(ctx)
-    sector_trail = _render_sector_trail(
-        ctx,
-        external_lazy=bool(lazy_asset_name),
-        compact_overview=False,
-    )
+    sector_trail = _render_sector_trail(ctx)
     # Keep only the first 50 members in the live JS object.  The complete
     # concept catalogue is embedded as inert JSON below and parsed only when
     # the user opens a later concept or clicks "加载全部个股".  This preserves
@@ -2260,7 +2102,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
 
 <script>{echarts_src}</script>
 <script type="application/json" id="review-concept-data">{concept_payload_json}</script>
-<script>{_chart_js(ctx, trend, ladder, rotation, concept_limit_up, lazy_asset_name=lazy_asset_name, concept_data=concept_data)}</script>
+<script>{_chart_js(ctx, trend, ladder, rotation, concept_limit_up, concept_data=concept_data)}</script>
 <script>document.getElementById('gen-note').textContent = '生成 {generated}';</script>
 </body>
 </html>
@@ -2271,12 +2113,11 @@ def _render_review_bundle(
     db_path: str | Path,
     trade_date: str | None = None,
     echarts_path: str | Path | None = None,
-    lazy_asset_name: str | None = None,
     trail_out: str | Path | None = None,
     context: dict[str, Any] | None = None,
     as_of: datetime | str | None = None,
-) -> tuple[str, str, str | None]:
-    """Build HTML and, when requested, the optional same-directory sidecar."""
+) -> tuple[str, str]:
+    """Build self-contained HTML and optional standalone support pages."""
     if echarts_path is None:
         echarts_path = Path(__file__).resolve().parents[1] / "trade_system" / "vendor" / "echarts.min.js"
     try:
@@ -2313,7 +2154,6 @@ def _render_review_bundle(
             trend,
             ladder,
             rotation,
-            lazy_asset_name=lazy_asset_name,
             staleness_banner=_staleness_banner(con, selected),
         ).replace("<!--EXTRAS-->", "")
 
@@ -2330,7 +2170,6 @@ def _render_review_bundle(
         for _en, _cn in _FIELD_CN_MAP.items():
             html_out = html_out.replace(_en, _cn)
 
-        lazy_out = _build_review_lazy_asset(ctx) if lazy_asset_name else None
         if trail_out:
             support_page = _render_support_page(
                 ctx,
@@ -2361,15 +2200,14 @@ def _render_review_bundle(
             Path(trail_out).write_text(trail_page, encoding="utf-8")
     finally:
         con.close()
-    return html_out, selected, lazy_out
+    return html_out, selected
 
 
 def render_review_web(db_path: str | Path, trade_date: str | None = None,
                       echarts_path: str | Path | None = None, *,
                       as_of: datetime | str | None = None) -> tuple[str, str]:
     """Build the inline-compatible review page and return (html, trade_date)."""
-    html_out, selected, _ = _render_review_bundle(db_path, trade_date, echarts_path, as_of=as_of)
-    return html_out, selected
+    return _render_review_bundle(db_path, trade_date, echarts_path, as_of=as_of)
 
 
 def write_review_web(db_path: str | Path, out_path: str | Path,
@@ -2397,10 +2235,9 @@ def write_review_web(db_path: str | Path, out_path: str | Path,
             "use a staging/preview path or explicitly allow direct publish"
         )
     out.parent.mkdir(parents=True, exist_ok=True)
-    html_out, selected, _lazy_out = _render_review_bundle(
+    html_out, _selected = _render_review_bundle(
         db_path,
         trade_date,
-        lazy_asset_name=None,
         trail_out=out.parent / "sector_trail_latest.html",
         context=context,
         as_of=as_of,

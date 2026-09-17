@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 import duckdb
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
 
 
 def _table(con, name: str) -> bool:
@@ -40,12 +43,20 @@ def audit(db: str, trade_date: str, out: str) -> dict:
         "(s.sector_type = 'em_industry' "
         "OR (coalesce(s.sector_type,'unknown')='unknown' AND s.sector_code NOT LIKE 'THS-%'))"
     )
-    if _table(con, "v_default_concept_daily"):
-        fallback_concept_filter += (
+    snapshot, age = qualified_membership_snapshot(con, trade_date)
+    snapshot_status = "missing" if snapshot is None else "stale" if age > THS_MEMBERSHIP_MAX_AGE_DAYS else "qualified"
+    if snapshot_status == "qualified" and _table(con, "v_default_concept_daily"):
+        membership_filter = (
             " AND EXISTS (SELECT 1 FROM v_default_concept_daily d "
-            "WHERE d.trade_date=CAST(s.trade_date AS DATE) AND d.concept_code LIKE 'THS-%' "
-            "GROUP BY d.trade_date HAVING count(DISTINCT d.concept_code)>0)"
+            f"WHERE CAST(d.trade_date AS DATE)=DATE '{snapshot.isoformat()}' "
+            "AND d.concept_code={code})"
         )
+        fallback_concept_filter += membership_filter.format(code="s.sector_code")
+        concept_filter += membership_filter.format(code="sector_rotation_score.sector_code")
+    else:
+        snapshot_status = "stale" if snapshot_status == "stale" else "missing"
+        fallback_concept_filter += " AND FALSE"
+        concept_filter += " AND FALSE"
     rotation_sector = con.execute(
         """
         SELECT count(*), count(DISTINCT sector_code),
@@ -123,6 +134,10 @@ def audit(db: str, trade_date: str, out: str) -> dict:
     con.close()
     result = {
         "trade_date": trade_date,
+        "membership_snapshot": str(snapshot) if snapshot else None,
+        "membership_age_days": age,
+        "membership_status": snapshot_status,
+        "status": "pass" if snapshot_status == "qualified" and taxonomy_counts["concept"] > 0 and not int(sector[2] or 0) else "fail",
         "sector_rows": int(sector[0] or 0),
         "sector_codes": int(sector[1] or 0),
         "sector_blank_names": int(sector[2] or 0),
@@ -137,7 +152,8 @@ def audit(db: str, trade_date: str, out: str) -> dict:
         "top_industries": [dict(code=r[0], name=r[1], score=r[2]) for r in top_industries],
     }
     lines = [
-        "# P3 候选池与板块映射审计", "", f"- 交易日：`{trade_date}`", "",
+        "# P3 候选池与板块映射审计", "", f"- 交易日：`{trade_date}`",
+        f"- 审计状态：`{result['status']}`；合格成分快照：`{result['membership_snapshot']}`；状态：`{snapshot_status}`", "",
         "| 指标 | 数值 |", "|---|---:|",
         f"| 板块 rotation 行数 | {result['sector_rows']} |",
         f"| 板块代码数 | {result['sector_codes']} |",
@@ -170,7 +186,7 @@ def main() -> int:
     args = parser.parse_args()
     result = audit(args.db, args.date, args.out)
     print(f"report={args.out} sectors={result['sector_codes']} actionable={result['stage_actionable']} outcomes={result['operator_outcomes']}")
-    return 0
+    return 0 if result["status"] == "pass" else 1
 
 
 if __name__ == "__main__":

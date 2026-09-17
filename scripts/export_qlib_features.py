@@ -361,7 +361,7 @@ def _copy_batched(
 def apply_calendar_overlay(con, folder):
     """Temporary research-only calendar replacement; source DB remains read-only."""
     from trade_system.v2.domain import file_hash,identity,now_utc,utc
-    from tools.v2.probe_native_gaps import calendar_overlay
+    from trade_system.v2.research_receipts import calendar_overlay
     folder=Path(folder).resolve(strict=True)
     paths=list(folder.iterdir())
     if any(p.is_symlink() or not p.is_file() for p in paths):

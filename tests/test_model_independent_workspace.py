@@ -25,6 +25,23 @@ def command():
         'request_id':'1'*32,'evidence_id':market()['snapshot_id']}
 
 
+def test_candidate_header_separates_current_market_from_historical_predictions():
+    from trade_system.v2.research_product_view import candidate_scope,render
+    from trade_system.v2.daily_workspace import empty_projection
+    data=empty_projection();data['market']=market()
+    data['prediction']={'date':'2026-09-10','predictions':1,'rows':[{}]}
+    text=candidate_scope(data)
+    assert '市场事实日 2026-09-11' in text
+    assert '历史研究预测日 2026-09-10' in text
+    assert '异日预测不参与当前比较或排序' in text
+    data['prediction']['date']='2026-09-11'
+    assert '历史研究预测日' not in candidate_scope(data)
+    data['prediction']=None
+    assert '市场事实仍可比较与记录' in candidate_scope(data)
+    data['market']['trade_date']='</script><script>alert(1)</script>'
+    assert '</script><script>alert(1)</script>' not in render(data)
+
+
 def test_no_model_publish_judgement_retry_review_and_revision(tmp_path):
     product.publish_desk(tmp_path,market=market())
     note_id=product.save_note(tmp_path,command())

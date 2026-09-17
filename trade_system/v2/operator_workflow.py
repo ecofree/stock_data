@@ -32,18 +32,19 @@ def save_observation_plan(output, values):
     import re
     from trade_system.file_lock import FileLock
     from .domain import now_utc, number
-    from .gap_evidence import read_json
     from .research_journal import read_note, durable_event
+    from .journal_index import ensure, lookup, appended
     output=Path(output)
     command={k:values.get(k,'') for k in ('note_id','operator','condition','threshold','valid_until','supersedes')}
     request_id=values.get('request_id')
     if not isinstance(request_id,str) or not re.fullmatch('[a-f0-9]{32}',request_id):raise ValueError('valid plan request id required')
     with FileLock(output/'judgement.guard'):
-        for path in (output/'notes/plans').glob('*.json'):
-            old=read_observation_plan(output,path.stem)
-            if old['request_id']==request_id:
-                if old['command_id']!=identity(command):raise ValueError('plan request reused with different content')
-                return old['plan_id']
+        ensure(output)
+        old=lookup(output,'plan','request',request_id)
+        if old:
+            read_observation_plan(output,old['plan_id'])
+            if old['command_id']!=identity(command):raise ValueError('plan request reused with different content')
+            return old['plan_id']
         note=read_note(output,command['note_id'])
         if command['operator']!=note['operator']:raise ValueError('plan must preserve declared judgement author')
         if command['condition'] not in ('manual','price_above','price_below'):raise ValueError('explicit supported condition required')
@@ -53,7 +54,7 @@ def save_observation_plan(output, values):
         if command['supersedes']:
             parent=read_observation_plan(output,command['supersedes'])
             if any(parent[k]!=command[k] for k in ('note_id','operator')):raise ValueError('plan revision parent differs')
-            if any(read_json(p)[0].get('supersedes')==command['supersedes'] for p in (output/'notes/plans').glob('*.json')):
+            if lookup(output,'plan','parent',command['supersedes']):
                 raise ValueError('plan already revised')
         risk=configured_account_risk(output,at.isoformat())
         plan=dict(command,request_id=request_id,command_id=identity(command),instrument=note['instrument'],
@@ -62,6 +63,7 @@ def save_observation_plan(output, values):
             invalidation=note['invalidation'],scope='observation_plan_not_order',price_unit='unadjusted_CNY',
             quantity=None,execution_ready=False,account_status=risk['status'])
         plan['plan_id']=identity(plan);durable_event(output/'notes/plans',plan['plan_id'],plan)
+        appended(output,'plan',output/'notes/plans'/(plan['plan_id']+'.json'))
         return plan['plan_id']
 
 
@@ -107,13 +109,12 @@ def evaluate_observation_plan(plan, as_of, *, quote=None, account=None):
 
 
 def observation_plans(output, as_of, quotes=()):
-    from pathlib import Path
-    import heapq
-    paths=heapq.nlargest(100,(Path(output)/'notes/plans').glob('*.json'),key=lambda p:p.stat().st_mtime_ns)
+    from .journal_index import recent
+    paths,_=recent(output,'plan')
     plans=[read_observation_plan(output,p.stem) for p in paths]
     superseded={p.get('supersedes') for p in plans};by_code={q['instrument']:q for q in quotes}
     account=configured_account_risk(output,as_of)
-    invalidations=plan_invalidation_context(output)
+    invalidations=plan_invalidation_context(output,plans)
     rows=[]
     for plan in plans:
         evaluation=evaluate_observation_plan(plan,as_of,quote=by_code.get(plan['instrument']),account=account)
@@ -123,18 +124,13 @@ def observation_plans(output, as_of, quotes=()):
     return {'account':account,'rows':rows}
 
 
-def plan_invalidation_context(output):
-    from pathlib import Path
-    from .gap_evidence import read_json
-    from .research_journal import read_review,note_paths,review_paths
-    plans={read_json(p)[0].get('supersedes') for p in (Path(output)/'notes/plans').glob('*.json')}
-    notes={read_json(p)[0].get('supersedes') for p in note_paths(output)}
-    reviews=[read_review(output,p.stem) for p in review_paths(output)]
-    return {'plans':plans,'notes':notes,'invalid_notes':{r['note_id'] for r in reviews if r['conclusion']=='triggered'}}
+def plan_invalidation_context(output, plans):
+    from .journal_index import invalidations
+    return invalidations(output,plans)
 
 
 def plan_invalidation(output, plan, *, context=None):
-    state=context if context is not None else plan_invalidation_context(output)
+    state=context if context is not None else plan_invalidation_context(output,[plan])
     if plan['plan_id'] in state['plans']:return 'plan_superseded'
     if plan['note_id'] in state['notes']:return 'judgement_revised_requires_new_plan'
     # Once invalidated, a new plan version is required; a later note cannot revive it.

@@ -12,6 +12,80 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
+def collection_contract(source_root, database, reports, python):
+    """Seal existing market collectors for an explicit transitional task adapter.
+
+    This is not an authorization token or a bypass of legacy writer guards.
+    The operator still approves the task actions and protected release directory.
+    No script, database, credentials, account or scheduler state is modified.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+    import subprocess
+    import duckdb
+
+    inputs = [Path(p).absolute() for p in (source_root, database, reports, python)]
+    for path in inputs:
+        if any(p.is_symlink() or (p.exists() and getattr(p, 'is_junction', lambda: False)()) for p in (path, *path.parents)):
+            raise ValueError('collector paths must not traverse links or junctions')
+    root, database, reports, python = (p.resolve() for p in inputs)
+    if not root.is_dir() or not python.is_file() or not database.is_file():
+        raise ValueError('existing collector source, interpreter and market database required')
+    if reports == root or reports == database.parent or database in reports.parents:
+        raise ValueError('collection diagnostics require a separate output directory')
+    with duckdb.connect(str(database), read_only=True) as con:
+        names = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if names & {'v2_schema', 'account_snapshot', 'reservation', 'paper_ledger_event'}:
+            raise ValueError('transitional collection refuses V2/account databases')
+        if not {'tushare_trade_cal', 'v_kline_daily'} <= names:
+            raise ValueError('initialized market database and calendar required')
+    files = set(root.glob('*.py')) | set(root.glob('requirements*.lock'))
+    # These are collector limiter/cache state and historical research outputs,
+    # not executable source/configuration. Their normal updates must not revoke
+    # the next collection run. Research evidence has its own immutable binding.
+    runtime_outputs = ('trade_system/.stock_cache/', 'research/phase_abc/reports/',
+                       'research/phase_abc/snapshot/')
+    for folder in ('scripts', 'trade_system', 'collectors', 'research', 'migrations', 'config'):
+        files.update(p for p in (root / folder).rglob('*') if p.is_file()
+            and p.suffix in ('.py', '.sql', '.json', '.toml', '.yaml', '.yml')
+            and not p.relative_to(root).as_posix().startswith(runtime_outputs))
+    if not (root / 'fetch_all.py').is_file():
+        raise ValueError('canonical collector entry missing')
+    if any(p.is_symlink() or root not in p.resolve().parents for p in files):
+        raise ValueError('collector source member escapes root')
+    digests = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}
+    runtime = subprocess.run([str(python), '-I', '-c',
+        'import importlib.metadata as m,json,sys; print(json.dumps([list(sys.version_info[:3]),sorted((d.metadata["Name"],d.version) for d in m.distributions())]))'],
+        capture_output=True, text=True, timeout=30, check=True)
+    return {'schema': 1, 'scope': 'transitional_market_collection_only', 'source_root': str(root),
+        'database': str(database), 'reports': str(reports), 'python': str(python),
+        'python_sha256': hashlib.sha256(python.read_bytes()).hexdigest(),
+        'runtime_sha256': hashlib.sha256(json.dumps(json.loads(runtime.stdout), sort_keys=True).encode()).hexdigest(),
+        'files': digests, 'execution_ready': False, 'production_cutover': False}
+
+
+def verify_collection_contract(path, expected_sha256, database, reports):
+    import hashlib
+    import json
+    import re
+    from pathlib import Path
+
+    raw = Path(path).read_bytes()
+    if len(raw) > 2_000_000:
+        raise ValueError('collector contract exceeds bounded manifest size')
+    if not re.fullmatch('[0-9a-fA-F]{64}', expected_sha256 or '') or hashlib.sha256(raw).hexdigest() != expected_sha256.lower():
+        raise ValueError('collector contract differs from the explicitly supplied hash')
+    saved = json.loads(raw)
+    if saved.get('scope') != 'transitional_market_collection_only' or saved.get('execution_ready') is not False:
+        raise ValueError('unknown collector handover scope')
+    if Path(database).resolve() != Path(saved['database']) or Path(reports).resolve() != Path(saved['reports']):
+        raise ValueError('collector handover database/output target changed')
+    if collection_contract(saved['source_root'], database, reports, saved['python']) != saved:
+        raise ValueError('collector source/runtime changed; prepare and approve a new handover')
+    return saved
+
+
 @dataclass(frozen=True)
 class SourcePolicy:
     dataset: str
@@ -115,9 +189,9 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
     "qlib": SourcePolicy(
         "qlib", "qlib_candidate_pool", ("qlib_shadow",),
         ("external_qlib_file",),
-        "scripts/run_qlib_research_daily.py",
+        "trade_system/v2/research_product.py (frozen research artifacts; legacy candidate table is historical)",
         ("scripts/run_qlib_daily.py (inference worker)",),
-        "QLib ranks candidates and is evaluated against later K-lines; until promotion evidence exists it cannot create execution signals.",
+        "Scheduled research consumes a frozen model through the research product; legacy candidate tables are historical, not its output. No automatic training, promotion or execution signals.",
     ),
     "operator_outcome": SourcePolicy(
         "operator_outcome", "operator_trade_outcome", ("operator_input",),
@@ -145,6 +219,12 @@ PROVIDER_ALIASES = {
 # covers the data products that determine close/review correctness, while
 # optional research collectors remain outside the close contract.
 PHASE_REQUIRED_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
+    "supplemental": {
+        "lhb": ("collect_lhb_daily",),
+        "auction": ("collect_auction_market_daily",),
+        "index": ("collect_index_kline_daily",),
+        "chips_margin": ("collect_xiaodefa_critical",),
+    },
     "auction": {
         "market_state": ("collect_market_context",),
         "limit_pool": ("collect_realtime_limit_pool",),

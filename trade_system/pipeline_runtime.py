@@ -23,56 +23,63 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def _file_fingerprint(paths: list[Path]) -> str:
     digest = hashlib.sha256()
-    for path in sorted(paths, key=lambda item: str(item).lower()):
-        try:
-            digest.update(str(path.relative_to(PROJECT_ROOT)).encode("utf-8"))
-            digest.update(path.read_bytes())
-        except (OSError, ValueError):
-            continue
+    for path in sorted(paths, key=lambda item: item.as_posix()):
+        digest.update(path.relative_to(PROJECT_ROOT).as_posix().encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
 
-def runtime_fingerprint() -> dict[str, str | bool]:
-    """Capture non-secret inputs that determine a run's interpretation.
+def runtime_fingerprint() -> dict[str, object]:
+    """Bind all local runtime sources and declared configuration, never .env values.
 
-    The fingerprint is deliberately small and source-bound: it records the
-    repository revision/dirty state plus the files that define schema,
-    configuration and publication behavior.  It never serializes credentials
-    or environment values.
+    Git failure is unknown, not clean. An explicit work-tree works with the
+    retained bare-config repository without changing its shared Git settings.
     """
-    git_commit = "unknown"
-    worktree_dirty = False
+    errors = []
+    git_commit, worktree_dirty = "unknown", None
+    git = ["git", "-c", "core.bare=false", "--work-tree=" + str(PROJECT_ROOT)]
     try:
-        git_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False,
-        ).stdout.strip() or "unknown"
-        worktree_dirty = bool(subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False,
-        ).stdout.strip())
+        revision = subprocess.run(git + ["rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+                                  capture_output=True, text=True, check=False)
+        status = subprocess.run(git + ["status", "--porcelain", "--untracked-files=normal"],
+                                cwd=PROJECT_ROOT, capture_output=True, text=True, check=False)
+        if revision.returncode == 0 and len(revision.stdout.strip()) in (40, 64):
+            git_commit = revision.stdout.strip()
+        else:
+            errors.append("git_revision_unavailable")
+        if status.returncode == 0:
+            worktree_dirty = bool(status.stdout.strip())
+        else:
+            errors.append("git_worktree_state_unavailable")
     except OSError:
-        pass
-    schema_paths = [PROJECT_ROOT / "trade_system" / "schema.py"]
-    schema_paths.extend((PROJECT_ROOT / "migrations").glob("*.sql"))
-    config_paths = [PROJECT_ROOT / "trade_system" / "config.py"]
-    source_paths = [
-        PROJECT_ROOT / "trade_system" / "pipeline_runtime.py",
-        PROJECT_ROOT / "scripts" / "run_integrated_daily.py",
-    ]
+        errors.append("git_unavailable")
+    source_paths = [p for folder in ("trade_system", "scripts", "collectors", "research", "tools/v2")
+                    for p in (PROJECT_ROOT / folder).rglob("*.py") if p.is_file()]
+    source_paths += list(PROJECT_ROOT.glob("*.py"))
+    config_paths = [PROJECT_ROOT / "trade_system/config.py", PROJECT_ROOT / "pyproject.toml"]
+    config_paths += [p for p in (PROJECT_ROOT / "config").rglob("*")
+                    if p.is_file() and p.suffix in (".json", ".toml", ".yaml", ".yml")]
+    config_paths += list(PROJECT_ROOT.glob("requirements*.lock"))
+    schema_paths = [PROJECT_ROOT / "trade_system/schema.py", *sorted((PROJECT_ROOT / "migrations").glob("*.sql"))]
+    hashes = {}
+    for kind, paths in (("source", source_paths), ("config", config_paths), ("schema", schema_paths)):
+        try:
+            if not paths:
+                raise ValueError("no fingerprint inputs")
+            hashes[kind + "_hash"] = _file_fingerprint(paths)
+        except (OSError, ValueError):
+            errors.append(kind + "_files_unreadable_or_missing")
+            hashes[kind + "_hash"] = "unknown"
     try:
         import duckdb
         duckdb_version = str(duckdb.__version__)
-    except Exception:
+    except ImportError:
         duckdb_version = "unknown"
     return {
-        "git_commit": git_commit,
-        "worktree_dirty": worktree_dirty,
-        "source_hash": _file_fingerprint(source_paths),
-        "config_hash": _file_fingerprint(config_paths),
-        "schema_hash": _file_fingerprint(schema_paths),
-        "python_version": platform.python_version(),
-        "python_executable": sys.executable,
+        "git_commit": git_commit, "worktree_dirty": worktree_dirty,
+        **hashes, "fingerprint_complete": not errors, "fingerprint_errors": errors,
+        "source_file_count": len(source_paths), "config_file_count": len(config_paths),
+        "python_version": platform.python_version(), "python_executable": sys.executable,
         "duckdb_version": duckdb_version,
     }
 
@@ -322,7 +329,11 @@ class LatestReportTransaction:
             "started_at": manifest.get("started_at"),
             "completed_at": manifest.get("completed_at"),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "error": error,
+            "error": error or manifest.get("error"),
+            "warnings": manifest.get("warnings") or [],
+            "degraded_steps": [step.get("name") for step in manifest.get("steps", [])
+                               if step.get("status") in {"failed", "degraded", "blocked"}],
+            "runtime_fingerprint": manifest.get("runtime_fingerprint"),
             "last_complete_report": "daily_review_last_complete.html"
             if (self.reports_dir / "daily_review_last_complete.html").exists()
             else None,
@@ -337,8 +348,10 @@ class LatestReportTransaction:
         json_temp.replace(json_path)
 
         failed = status == "failed"
+        complete = status == "completed"
+        degraded = status == "completed_with_degradation"
         phase = str(payload.get("phase") or "unknown")
-        color = "#d64545" if failed else "#2f9e6f"
+        color = "#d64545" if failed else "#2f9e6f" if complete else "#d4a017"
         phase_labels = {
             "auction": "竞价",
             "intraday": "盘中",
@@ -348,13 +361,18 @@ class LatestReportTransaction:
         phase_label = phase_labels.get(phase, phase)
         if failed:
             title = f"{phase_label}任务执行失败"
+        elif degraded:
+            title = f"{phase_label}任务降级完成（存在未解决故障）"
+        elif not complete:
+            title = f"{phase_label}任务状态待核验：{html.escape(status)}"
         elif phase == "close" and payload["review_published"]:
             title = "今日收盘复盘已发布"
         elif phase == "close":
             title = "今日收盘任务已完成（复盘未发布）"
         else:
             title = f"{phase_label}任务已完成"
-        detail = html.escape(error or "运行已完成")
+        detail = html.escape(str(payload["error"] or "；".join(payload["degraded_steps"] + payload["warnings"])
+                                 or ("运行已完成" if complete else "请查看运行清单，不能视为完全成功")))
         trade_date = html.escape(str(payload.get("trade_date") or "—"))
         run_id = html.escape(str(payload.get("run_id") or "—"))
         link = (

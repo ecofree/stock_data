@@ -1,5 +1,10 @@
 # QLib 可选依赖环境
 
+2026-09-17：下列手工环境与旧表实验命令仅为历史参考，不是部署基线。
+当前候选环境是独立 Python 3.12.11 研究运行包，绑定 `requirements-research-replay.lock`；
+使用 `python -I -B -m pip check`，不能依赖全局 Anaconda 或未验证的 Scripts 启动器。
+每日任务准备改接 `scripts/run_research_daily.ps1 -RefreshResearch`，尚未切换现网。
+
 QLib 不放入每日采集解释器。核心采集使用 `D:\anaconda\python.exe`，研究/影子模型使用项目内的 `.venv-qlib`，避免 cvxpy、gym、MLflow 等依赖污染核心环境。
 
 ## 安装
@@ -28,5 +33,4 @@ Windows/Python 3.12 下 `gym==0.26.2` 没有 wheel，需要源码构建；全量
 .\.venv-qlib\Scripts\python.exe scripts\export_qlib_features.py --db kpl_data.duckdb --start-date 2026-01-01 --end-date 2026-07-14 --out reports\qlib_features_2026.csv --format both
 .\.venv-qlib\Scripts\python.exe scripts\train_qlib_shadow.py --db kpl_data.duckdb --features reports\qlib_features_2026.parquet --model-id qlib_shadow_lgbm_2026_ytd
 .\.venv-qlib\Scripts\python.exe scripts\evaluate_qlib_shadow.py --db kpl_data.duckdb --out reports\qlib_shadow_latest.md
-.\.venv-qlib\Scripts\python.exe scripts\run_qlib_research_daily.py --db kpl_data.duckdb --trade-date YYYY-MM-DD --reports-dir reports
 ```

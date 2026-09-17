@@ -54,7 +54,8 @@ def save_attention(output, values):
     if parent:
         if parent.get('prediction_id') or any(parent[k]!=command[k] for k in ('instrument','operator','evidence_id')):
             raise ValueError('revision must preserve evidence security and author')
-        if any(read_json(p)[0].get('supersedes')==parent['note_id'] for p in note_paths(output)):
+        from .journal_index import lookup
+        if lookup(output,'note','parent',parent['note_id']):
             raise ValueError('parent already revised')
         evidence_id=parent['evidence_file_id']
     else:
@@ -82,12 +83,14 @@ def retry_note(output, request_id, command):
         return None
     if not isinstance(request_id, str) or not re.fullmatch('[a-f0-9]{32}', request_id):
         raise ValueError('invalid judgement request id')
-    for path in note_paths(output):
-        note = verify_note(read_json(path)[0])
-        if note.get('request_id') == request_id:
-            if note.get('command_id') != identity(command):
-                raise ValueError('request id already used for different judgement; start a new draft')
-            return note['note_id']
+    from .journal_index import ensure, lookup
+    ensure(output)
+    note=lookup(output,'note','request',request_id)
+    if note:
+        if note.get('command_id') != identity(command):
+            raise ValueError('request id already used for different judgement; start a new draft')
+        read_note(output,note['note_id'])
+        return note['note_id']
     return None
 
 
@@ -96,6 +99,8 @@ def append_note(output, note):
     import os
     import uuid
     from .domain import canonical
+    from .journal_index import ensure, appended
+    ensure(output)
     # Keep new event schemas outside legacy readers' glob. One journal owner,
     # not another decision authority; old release rollback cannot parse schema 2.
     folder = Path(output)/('notes/attention' if note.get('schema')==2 else 'notes')
@@ -112,6 +117,7 @@ def append_note(output, note):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(staging, target)
+    appended(output,'note',target)
 
 
 def read_note(output, note_id):
@@ -146,11 +152,13 @@ def save_review(output, values):
         command={key:values[key] for key in ('note_id','conclusion','reviewer','evidence')}
         folder=output/('notes/attention' if note.get('schema')==2 else 'notes')/'reviews'
         folder.mkdir(parents=True,exist_ok=True)
-        for path in review_paths(output):
-            old=read_review(output,path.stem)
-            if old['request_id']==request_id:
-                if old['command_id']!=identity(command):raise ValueError('review request reused with different content')
-                return old['review_id']
+        from .journal_index import ensure, lookup, appended
+        ensure(output)
+        old=lookup(output,'review','request',request_id)
+        if old:
+            read_review(output,old['review_id'])
+            if old['command_id']!=identity(command):raise ValueError('review request reused with different content')
+            return old['review_id']
         review=dict(command,request_id=request_id,command_id=identity(command),
             prediction_id=note['prediction_id'],instrument=note['instrument'],
             received_at=now_utc().isoformat(),identity_scope='caller_declared_not_authenticated',
@@ -164,6 +172,7 @@ def save_review(output, values):
         with staging.open('x',encoding='utf-8') as stream:
             stream.write(canonical(review));stream.flush();os.fsync(stream.fileno())
         os.replace(staging,folder/(review['review_id']+'.json'))
+        appended(output,'review',folder/(review['review_id']+'.json'))
         return review['review_id']
 
 
@@ -213,8 +222,8 @@ def bind(output,note,prediction,supersedes=''):
         if any(previous[k]!=note[k] for k in ('prediction_id','instrument','operator')):
             raise ValueError('revision must preserve prediction, security and declared author')
         if datetime.fromisoformat(previous['received_at'])>datetime.fromisoformat(note['received_at']):raise ValueError('revision predates parent')
-        for item in path.parent.glob('*.json'):
-            if read_json(item)[0].get('supersedes')==supersedes:raise ValueError('parent already revised; refresh and use latest version')
+        from .journal_index import lookup
+        if lookup(output,'note','parent',supersedes):raise ValueError('parent already revised; refresh and use latest version')
 
 
 def annotate(notes):

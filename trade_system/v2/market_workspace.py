@@ -8,6 +8,7 @@ from pathlib import Path
 import math
 
 import duckdb
+from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
 
 from .domain import identity
 
@@ -88,11 +89,11 @@ def project(con, day, as_of, research_codes):
         'scope':'same_stock_provider_adjustment_units_retrospective_not_PIT',
         'current':breadth(current[c]['pct'] for c in common),
         'previous':breadth(keyed[prior,c]['pct'] for c in common)}
-    snap=con.execute('SELECT max(trade_date) FROM v_default_concept_daily WHERE trade_date<=?',[day]).fetchone()[0]
+    snap, membership_age=qualified_membership_snapshot(con,day)
     themes=[];stocks={c:{'stock_code':c,'stock_name':'','research_covered':c in research_codes,
         'change_pct':r['pct'],'close':r['close'],'price_contract':r['contract']} for c,r in current.items()}
-    excluded=[];membership_status='missing';catalog=[]
-    if snap is not None and 0<=(date.fromisoformat(day)-snap).days<=10:
+    excluded=[];membership_status='stale' if snap is not None else 'missing';catalog=[]
+    if snap is not None and membership_age<=THS_MEMBERSHIP_MAX_AGE_DAYS:
         catalog=con.execute('SELECT concept_code,concept_name,stock_count FROM v_default_concept_daily WHERE trade_date=? ORDER BY concept_code LIMIT 10001',[snap]).fetchall()
         members=con.execute('SELECT concept_code,stock_code,stock_name FROM v_default_concept_stock_history WHERE trade_date=? ORDER BY concept_code,stock_code LIMIT 500001',[snap]).fetchall()
         if len(catalog)>10000 or len(members)>500000:raise ValueError('membership budget exceeded')
@@ -118,12 +119,13 @@ def project(con, day, as_of, research_codes):
                 'limit_up_count':sum(c in boards for c in actual) if limits['status']=='available' else None,
                 'max_board':max((boards.get(c,0) for c in actual),default=0) if limits['status']=='available' else None,
                 'limit_status':limits['status']})
-        membership_status='complete' if len(themes)==len(catalog) and set(groups)==seen else 'partial'
+        membership_status='complete' if catalog and len(themes)==len(catalog) and set(groups)==seen else 'partial'
     result={'schema':2,'scope':'read_only_market_review_not_execution','trade_date':day,'as_of':as_of,
         'breadth':breadth(r['pct'] for r in current.values()),'regime':'未评级（价格广度不替代情绪模型）',
         'breadth_scope':'available_canonical_price_rows_not_exchange_total','matched_previous':matched,
         'themes':themes,'stocks':stocks,'theme_scope':'all_quality_gated_declared_members_not_all_market_coverage',
         'membership_status':membership_status,'membership_date':str(snap) if snap else None,
+        'membership_age_days':membership_age,'membership_max_age_days':THS_MEMBERSHIP_MAX_AGE_DAYS,
         'membership_time_scope':'retained_quality_gated_snapshot_not_historical_arrival_certification',
         'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded,
         'account_state':'unknown','missing':['account_snapshot','verified_intraday_quotes','point_in_time_membership'],

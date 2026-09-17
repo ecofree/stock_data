@@ -27,6 +27,23 @@ def test_official_alpha158_qlib_fit_and_frozen_reload(tmp_path, monkeypatch):
         frame, days, tmp_path / 'provider', input_units='adjusted_shares_CNY')
     assert len(expressions) == 158 and len(factors) == 60
     assert factors['ROC5'].notna().all()
+    # Former one-off probe invariants belong in the mandatory research lane.
+    changed = frame.copy()
+    changed.loc[changed.datetime > days[80], 'close'] += .02
+    future_factors, _ = alpha158_research.compute(
+        changed, days, tmp_path / 'future-provider', input_units='adjusted_shares_CNY')
+    columns = list(expressions)
+    np.testing.assert_allclose(
+        factors.loc[factors.datetime <= days[80], columns],
+        future_factors.loc[future_factors.datetime <= days[80], columns],
+        rtol=0, atol=0, equal_nan=True)
+    for code in frame.instrument.unique():
+        original = frame.loc[frame.instrument == code].reset_index(drop=True)
+        last = factors.loc[factors.instrument == code].iloc[-1]
+        bar = original.iloc[-1]
+        assert abs(last.KMID - (bar.close - bar.open) / bar.open) < 1e-6
+        assert abs(last.VWAP0 - bar.turnover / bar.volume / bar.close) < 1e-6
+        assert abs(last.ROC60 - original.iloc[-61].close / bar.close) < 1e-6
     # This is a synthetic execution contract, never investment-effect evidence.
     factors['label_next_ret'] = np.arange(len(factors)) / 100
     factors = factors.sort_values(['datetime', 'instrument'])

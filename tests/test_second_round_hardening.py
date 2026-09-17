@@ -1,4 +1,3 @@
-import json
 
 import duckdb
 
@@ -48,9 +47,7 @@ def test_sync_index_list_from_real_kline_publishes_requested_date_only(tmp_path)
     assert rows == [("2026-07-06", "SH000001", "上证指数", 4041.24, 41.24)]
 
 from trade_system.data_chain import assess_data_chains
-from trade_system.normalize import build_normalized_views
 from trade_system.quality import dedupe_table, find_duplicate_keys
-from legacy_diagnostics import generate_signals
 
 
 def test_dedupe_table_archives_old_duplicate_rows(tmp_path):
@@ -124,114 +121,3 @@ def test_assess_data_chains_marks_historical_rows_stale_for_requested_date(tmp_p
     sector = next(item for item in chains if item["chain"] == "板块资金")
     assert sector["status"] == "stale"
     assert sector["latest_dates"]["sector_capital"] == "2026-07-08"
-
-
-def test_generate_signals_writes_explainable_evidence(tmp_path):
-    db_path = tmp_path / "sample.duckdb"
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE daily_summary("
-        "date DATE, limit_up_count INTEGER, limit_down_count INTEGER, "
-        "rise_count INTEGER, fall_count INTEGER, consecutive_count INTEGER, "
-        "raw_json VARCHAR, fetched_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO daily_summary VALUES "
-        "('2026-07-06', 55, 8, 3000, 1100, 6, '{}', '2026-07-06 15:00:00')"
-    )
-    con.execute(
-        "INSERT INTO daily_summary VALUES "
-        "('2026-07-05', 35, 6, 2400, 1600, 4, '{}', '2026-07-05 15:00:00')"
-    )
-    con.execute(
-        "CREATE TABLE market_rise_fall("
-        "date DATE, limit_up_count INTEGER, limit_down_count INTEGER, broken_limit_up_count INTEGER, "
-        "blown_limit_up_count INTEGER, blown_limit_up_rate FLOAT, raw_field_5 INTEGER, raw_json VARCHAR, updated_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO market_rise_fall VALUES "
-        "('2026-07-06', 55, 8, 9, 11, 17.5, NULL, '{}', '2026-07-06 15:00:00')"
-    )
-    con.execute(
-        "CREATE TABLE market_emotion_money("
-        "date DATE, cgl DOUBLE, yll DOUBLE, success_rate DOUBLE, raw_json VARCHAR, fetched_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO market_emotion_money VALUES "
-        "('2026-07-06', 68, 61, 59, '{}', '2026-07-06 15:00:00')"
-    )
-    con.execute(
-        "CREATE TABLE sector_strength("
-        "date DATE, sector_code VARCHAR, strength_value DOUBLE, zhangting INTEGER, "
-        "fengban_rate DOUBLE, dieting INTEGER, up_count INTEGER, down_count INTEGER, "
-        "raw_json VARCHAR, fetched_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO sector_strength VALUES "
-        "('2026-07-06', '801001', 70, 8, 60, 0, 30, 8, '{}', '2026-07-06 15:00:00')"
-    )
-    con.execute(
-        "CREATE TABLE sector_ranking("
-        "date DATE, sector_code VARCHAR, sector_name VARCHAR, stock_count INTEGER, "
-        "fetched_at TIMESTAMP, raw_json VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO sector_ranking VALUES "
-        "('2026-07-06', '801001', 'test sector', 20, '2026-07-06 15:00:00', '{}')"
-    )
-    con.execute(
-        "CREATE TABLE l2_realtime_all_boards("
-        "date DATE, board_level INTEGER, stock_code VARCHAR, stock_name VARCHAR, "
-        "limit_up_time VARCHAR, fetched_at TIMESTAMP, raw_json VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO l2_realtime_all_boards VALUES "
-        "('2026-07-06', 2, '000001', 'test stock', '09:35', '2026-07-06 15:00:00', '{}')"
-    )
-    con.execute(
-        "CREATE TABLE kline("
-        "date DATE, stock_code VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
-        "volume BIGINT, turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, fetched_at TIMESTAMP, raw_json VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO kline VALUES "
-        "('2026-07-06', '000001', 9.5, 10.1, 9.4, 10.0, 100000, 1000000, 5.5, 'D', '2026-07-06 15:00:00', '{}')"
-    )
-    con.execute(
-        "CREATE TABLE advanced_morning_bidding_summary("
-        "date DATE, total_amount BIGINT, limit_up_count INTEGER, limit_down_count INTEGER, fetched_at TIMESTAMP, raw_json VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO advanced_morning_bidding_summary VALUES "
-        "('2026-07-06', 320000000, 6, 1, '2026-07-06 09:25:00', '{}')"
-    )
-    con.close()
-    build_normalized_views(str(db_path))
-
-    generate_signals(str(db_path), "2026-07-06", require_ready=False)
-
-    con = duckdb.connect(str(db_path))
-    sector_evidence = con.execute(
-        "SELECT evidence_json FROM sector_rotation_score LIMIT 1"
-    ).fetchone()[0]
-    stock_evidence = con.execute(
-        "SELECT evidence_json FROM stock_candidate_score LIMIT 1"
-    ).fetchone()[0]
-    market_evidence = con.execute(
-        "SELECT evidence_json FROM market_regime_snapshot LIMIT 1"
-    ).fetchone()[0]
-    con.close()
-    market = json.loads(market_evidence)
-    assert "sample_stats" in market
-    assert "earning_effect_score" in market
-    sector = json.loads(sector_evidence)
-    assert "score_components" in sector
-    assert "sample_stats" in sector
-    assert sector["capital_source"]["source_table"] == "sector_strength"
-    stock = json.loads(stock_evidence)
-    assert stock["entry_reason"]
-    assert stock["risk_points"]
-    assert stock["invalidation"]
-    assert stock["sample_stats"]
-    assert stock["kline_filter"]["source_table"] == "kline"
-    assert stock["auction_confirmation"]["source_table"] == "advanced_morning_bidding_summary"

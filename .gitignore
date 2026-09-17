@@ -11,6 +11,7 @@ __pycache__/
 .mypy_cache/
 .venv/
 .venv-qlib/
+.venv-collector/
 venv/
 build/
 *.egg-info/
