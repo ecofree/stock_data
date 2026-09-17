@@ -104,7 +104,7 @@ def capture(report, day, output, *, themes=(), client=None, clock=now_utc):
     try:
         if client is None:
             from trade_system.hithink_client import HiThinkClient
-            client=HiThinkClient(timeout=15,max_response_bytes=8_000_000,single_attempt=True)
+            client=HiThinkClient(timeout=15,max_response_bytes=8_000_000)
         for path,params in requests:
             data=client._get(path,params)
             rec={'path':path,'params':params,'data':data,'received_at':utc(clock()).isoformat()}

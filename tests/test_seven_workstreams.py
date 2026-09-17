@@ -28,7 +28,7 @@ def test_native_prefix_recovery_calls_only_missing_and_preserves_bytes(tmp_path,
     partial=partial_fixture(tmp_path,monkeypatch);calls=[]
     from trade_system import hithink_client
     class Counted(Client):
-        def __init__(self,**kwargs):assert kwargs['single_attempt'] is True
+        def __init__(self,**kwargs):assert kwargs['max_response_bytes'] <= 8_000_000
         def _get(self,path,params):calls.append((path,params));return super()._get(path,params)
     monkeypatch.setattr(hithink_client,'HiThinkClient',Counted)
     before={p.name:file_hash(p) for p in partial.iterdir()}

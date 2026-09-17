@@ -26,7 +26,8 @@ def digest(path):
 def source_files():
     files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=ROOT).decode().split('\0')
     return {p:digest(ROOT/p) for p in sorted(set(files)) if p and (ROOT/p).is_file()
-            and Path(p).suffix in ('.py','.ps1','.bat','.cmd','.toml','.sql','.lock','.in','.yml','.yaml','.json')
+            and (Path(p).suffix in ('.py','.ps1','.bat','.cmd','.toml','.sql','.lock','.in','.yml','.yaml','.json')
+                 or p == 'recovery/20260916.zip')
             and not p.startswith(('docs/','reports/','tmp/','backups/','.workbuddy/'))}
 
 

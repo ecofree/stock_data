@@ -1188,56 +1188,6 @@ def _print_snapshot(title, snap):
           f"failed={failed} error={err}  → 拿不到数据的类型: {failed + err}")
 
 
-def snapshot_to_html(codes=None, date=None, out_path="snapshot_dashboard.html"):
-    """把盘面快照渲染成自包含 HTML 看板（浏览器直接打开）。
-    颜色：live/fresh=绿（实时/缓存命中拿到），stale=琥珀（全部源阵亡·降级缓存兜底），failed=红（彻底空手）。"""
-    codes = codes or WATCHLIST
-    mkt = market_snapshot(date=date)
-    stocks = {c: stock_snapshot(c, date=date) for c in codes}
-
-    def row(t, v):
-        st = v.get("status") or "?"
-        color = {"live": "#2e7d32", "fresh": "#2e7d32", "stale": "#ef6c00",
-                 "failed": "#c62828"}.get(st, "#555")
-        return (f"<tr><td>{t}</td>"
-                f"<td style='color:{color};font-weight:600'>{st}</td>"
-                f"<td>{v.get('source') or '-'}</td>"
-                f"<td>{v.get('summary', '')}</td>"
-                f"<td>{v.get('count', 0)}</td></tr>")
-
-    mkt_rows = "".join(row(t, v) for t, v in mkt.items())
-    sec = ""
-    for c, snap in stocks.items():
-        srows = "".join(row(t, v) for t, v in snap.items())
-        sec += (f"<h3>个股体检 {c}</h3>"
-                f"<table><tr><th>类型</th><th>状态</th><th>源</th>"
-                f"<th>摘要</th><th>条数</th></tr>{srows}</table>")
-    html = f"""<!doctype html><html lang=zh><head><meta charset=utf-8>
-<title>A股数据中枢 · 盘面看板</title><style>
-body{{font-family:system-ui,'Microsoft YaHei',sans-serif;margin:24px;background:#fafafa}}
-h1{{color:#1a237e}} h3{{color:#283593;margin-top:24px}}
-table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px #0001}}
-th,td{{border:1px solid #e0e0e0;padding:6px 10px;text-align:left;font-size:13px}}
-th{{background:#e8eaf6}} tr:nth-child(even){{background:#f5f5f5}}
-.meta{{color:#666;font-size:12px}}
-</style></head><body>
-<h1>抗封禁 A 股数据中枢 · 盘面看板</h1>
-<p class=meta>生成时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜
-状态图例：<span style='color:#2e7d32'>live/fresh=实时/缓存命中</span>，
-<span style='color:#ef6c00'>stale=全部源阵亡·降级缓存兜底</span>，
-<span style='color:#c62828'>failed=彻底空手</span></p>
-<h3>全市场盘面</h3>
-<table><tr><th>类型</th><th>状态</th><th>源</th><th>摘要</th><th>条数</th></tr>{mkt_rows}</table>
-{sec}
-</body></html>"""
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html)
-    except Exception:
-        pass
-    return out_path
-
-
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="抗封禁 A 股数据中枢")
@@ -1270,12 +1220,6 @@ def main():
     psnap.add_argument("--code", default=None)
     psnap.add_argument("--date", default=None)
     psnap.add_argument("--datatypes", default=None, help="逗号分隔的自定义类型列表")
-    pdash = sub.add_parser("dashboard", help="渲染盘面看板 HTML（snapshot_to_html）")
-    pdash.add_argument("--codes", default=",".join(WATCHLIST))
-    pdash.add_argument("--out", default="snapshot_dashboard.html")
-    sub.add_parser("selftest", help="运行离线回归测试(_test_offline.py)")
-    sub.add_parser("run", help="一次性预热+快照，可直接当定时任务体")
-
     a = ap.parse_args()
     if a.cmd == "status":
         status()
@@ -1308,22 +1252,6 @@ def main():
         else:
             snap = market_snapshot(date=a.date, datatypes=dts)
             _print_snapshot("盘面快照（全市场）", snap)
-    elif a.cmd == "dashboard":
-        path = snapshot_to_html(a.codes.split(","), out_path=a.out)
-        print(f"看板已生成: {path}")
-    elif a.cmd == "selftest":
-        import subprocess, sys
-        print("运行离线回归测试 (_test_offline.py) ...\n")
-        rc = subprocess.run([sys.executable, "_test_offline.py"]).returncode
-        print(f"\nselftest 退出码: {rc}  (0=全部通过)")
-    elif a.cmd == "run":
-        # 定时任务友好：先预热，再出一份盘面快照，全程不抛异常
-        try:
-            warm()
-        except Exception as e:
-            print(f"[warm] 跳过: {e}")
-        snap = market_snapshot()
-        _print_snapshot("盘面快照（全市场 / 定时任务）", snap)
     else:
         ap.print_help()
 

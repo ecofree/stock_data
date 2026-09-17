@@ -4,7 +4,7 @@ from datetime import datetime
 import duckdb
 import pytest
 
-from tools.v2 import normalize_price_units as units
+from tools.incidents import normalize_price_units as units
 from tools.v2 import probe_identity_sources as probe
 from trade_system.v2.daily_session import CST, seal
 from trade_system.v2.domain import file_hash
@@ -59,7 +59,7 @@ def test_relay_rounding_retained_native_priority_and_ambiguous_scale_rejected(mo
     original, evidence = sample()
     evidence[1]['values']['turnover_cny'] = '100000.50'
     assert units.qualify(original, evidence)['turnover_cny'] == '100000'
-    monkeypatch.setitem(units.POLICY, 'scales', [10000, 10000])
+    monkeypatch.setitem(units.OBSERVED_UNIT_POLICY, 'scales', [10000, 10000])
     assert units.qualify(original, evidence)['status'] == 'unit_unqualified'
 
 

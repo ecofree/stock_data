@@ -106,7 +106,7 @@ def test_store_skips_preopen_flow_placeholders(tmp_path):
         assert store.con.execute("select count(*) from multi_source_sector_flow").fetchone()[0] == 0
 
 
-def test_sync_sector_flow_and_kline_to_existing_core_tables(tmp_path):
+def test_sector_writer_and_read_only_kline_projection(tmp_path):
     db = tmp_path / "core.duckdb"
     con = duckdb.connect(str(db))
     con.execute("create table sector_capital(date date, sector_code varchar, main_net_inflow bigint, super_net_inflow bigint, big_net_inflow bigint, mid_net_inflow bigint, small_net_inflow bigint, fetched_at timestamp)")
@@ -116,9 +116,12 @@ def test_sync_sector_flow_and_kline_to_existing_core_tables(tmp_path):
         store.store("sector_flow", None, [{"sector_code": "BK0001", "main_net": 100, "super_net": 50, "large_net": 50, "mid_net": 0, "small_net": 0}], {"source": "eastmoney", "status": "live"}, trade_date="2026-07-10")
         store.store("kline", "000001", [{"date": "2026-07-10", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100, "amount": 1000}], {"source": "sina", "status": "live"})
         assert store.sync_sector_capital("2026-07-10") == 1
-        assert store.sync_core_klines() == 1
+        from trade_system.normalize import _create_kline_daily
+        _create_kline_daily(store.con)
+        assert store.con.execute("SELECT close FROM v_kline_daily").fetchone()[0] == 10.5
+        assert store.con.execute("SELECT COUNT(*) FROM kline").fetchone()[0] == 0
         assert store.con.execute("select main_net_inflow, big_net_inflow from sector_capital").fetchone() == (100, 50)
-        assert store.con.execute("select stock_code, close from kline").fetchone() == ("000001", 10.5)
+        assert store.con.execute("select stock_code, close from v_kline_daily").fetchone() == ("000001", 10.5)
 
 
 def test_readiness_audit_separates_stock_and_sector_coverage(tmp_path):

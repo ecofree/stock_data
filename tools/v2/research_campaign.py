@@ -26,8 +26,8 @@ def export(folder,output):
 
 
 def reconcile(folder,db,output):
-    from tools.v2.normalize_price_units import qualify,FIELDS as RAW_FIELDS
-    from tools.v2.canonical_price_research import resolve
+    from trade_system.v2.research_semantics import qualify_observed_price as qualify, OBSERVED_PRICE_FIELDS as RAW_FIELDS
+    from trade_system.v2.research_semantics import resolve_observed_prices as resolve
     reg,members,data,statuses=replay(folder)
     if reg['origin']!='native_and_relay':raise ValueError('native campaign required')
     before=file_hash(db);evidence={}

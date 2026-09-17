@@ -35,11 +35,10 @@ def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection
 def test_priority_collection_profile_avoids_duplicate_fanout():
     steps = command_plan("sample.duckdb", "2026-07-14", include_collection=True, collection_profile="priority")
     names = [step[0] for step in steps]
-    assert names[:5] == [
+    assert names[:4] == [
         "collect_market_context",
         "check_kpl_connectivity",
         "sync_tushare_close",
-        "sync_tushare_ohlc_core",
         "collect_ths_concepts_api",
     ]
     assert "collect_capital_flow_focus" not in names

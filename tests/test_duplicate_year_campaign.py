@@ -3,8 +3,8 @@ from datetime import datetime
 import duckdb
 import pytest
 
-from tools.v2 import duplicate_year_campaign as campaign
-from tools.v2.normalize_price_units import FIELDS
+from tools.incidents import duplicate_year_campaign as campaign
+from tools.incidents.normalize_price_units import FIELDS
 from tools.v2.probe_identity_sources import API_FIELDS,PRICES
 from trade_system.v2.daily_session import CST,seal
 from trade_system.v2.domain import canonical,file_hash
@@ -97,7 +97,7 @@ def test_resealed_receipt_mutations_still_rejected(tmp_path,monkeypatch,bad):
 
 
 def rate_limited_parent(tmp_path,monkeypatch):
-    from tools.v2 import repair_year_campaign as repair
+    from tools.incidents import repair_year_campaign as repair
     from datetime import timedelta
     from trade_system.v2.domain import now_utc
     monkeypatch.setattr(campaign.time,'sleep',lambda _:None);db=source(tmp_path);folder=tmp_path/'raw'

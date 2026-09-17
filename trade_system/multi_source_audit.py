@@ -14,7 +14,8 @@ TARGETS = {
     "kpl_concept_stock_history": "KPL_concept_members",
     "multi_source_stock_flow": "个股资金流",
     "multi_source_sector_flow": "板块资金流",
-    "multi_source_kline": "行情K线",
+    "v_kline_daily": "标准行情K线",
+    "multi_source_kline": "历史多源行情观测",
     "multi_source_quote": "实时估值/快照",
     "executable_quote_snapshot": "候选可执行报价快照",
     "multi_source_observation": "原始观测日志",
@@ -39,7 +40,7 @@ def audit_multisource(db_path: str | Path, as_of: str | None = None) -> dict:
             current_rows = rows
             if date_column:
                 latest = con.execute(
-                    f"select max({date_column}) from {table} "
+                    f"select max(CAST({date_column} AS DATE)) from {table} "
                     f"where CAST({date_column} AS DATE)<=CAST(? AS DATE)",
                     [requested],
                 ).fetchone()[0]

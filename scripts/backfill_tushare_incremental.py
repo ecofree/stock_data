@@ -59,7 +59,6 @@ def main() -> int:
     parser.add_argument("--run-limit", type=int, default=10)
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
-    parser.add_argument("--sync-core", action="store_true")
     parser.add_argument("--report", default="reports/tushare_gap_latest.md")
     args = parser.parse_args()
 
@@ -114,10 +113,8 @@ def main() -> int:
             args.db,
             limit=max(0, args.run_limit),
             retry_errors=args.retry_errors,
-            sync_core=args.sync_core,
         )
-        if args.sync_core:
-            build_normalized_views(args.db)
+        build_normalized_views(args.db)
     report_path = write_tushare_gap_report(args.db, args.report)
 
     missing = sum(int(row["missing_rows"]) for row in gaps)

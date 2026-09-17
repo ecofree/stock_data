@@ -987,6 +987,10 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             volume DOUBLE,
             turnover DOUBLE,
             change_pct DOUBLE,
+            volume_unit VARCHAR,
+            amount_unit VARCHAR,
+            adjustment VARCHAR,
+            provider VARCHAR,
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)

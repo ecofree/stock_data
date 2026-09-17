@@ -8,8 +8,12 @@ import sys
 import pytest
 
 ROOT=Path(__file__).resolve().parents[1]
-SCRIPT=ROOT/'scripts/recover_research_probe.ps1'
-HELPER=ROOT/'scripts/deploy_research_cutover.ps1'
+@pytest.fixture(scope='module', autouse=True)
+def bind_frozen_recovery(frozen_recovery):
+    global SCRIPT, HELPER
+    SCRIPT = frozen_recovery / 'scripts/recover_research_probe.ps1'
+    HELPER = frozen_recovery / 'scripts/deploy_research_cutover.ps1'
+
 
 
 def run_ps(code, tmp_path):
@@ -445,3 +449,20 @@ $script:journal=@{step=4};Reject {Save-Journal}
 Require ((Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json).step -eq 2) 'authoritative journal overwritten'
 Require ((Get-Content -LiteralPath ($journalPath+'.new') -Raw | ConvertFrom-Json).step -eq 3) 'interrupted evidence overwritten'
 ''',tmp_path)
+
+
+def test_frozen_recovery_resolves_original_hashes(frozen_recovery):
+    import hashlib
+    helper = (frozen_recovery / 'scripts/deploy_research_cutover.ps1').read_bytes()
+    recovery = (frozen_recovery / 'scripts/recover_research_probe.ps1').read_text()
+    assert hashlib.sha256(helper).hexdigest() in recovery
+    text = helper.decode()
+    for name in ('scripts/run_research_daily.ps1', 'tools/v2/deployment_probe.py'):
+        assert hashlib.sha256((frozen_recovery / name).read_bytes()).hexdigest() in text
+
+
+def test_old_recovery_entries_refuse_before_machine_access():
+    for name in ('deploy_research_cutover', 'recover_research_probe', 'retry_research_cutover'):
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File',
+            str(ROOT / 'scripts' / (name + '.ps1'))], capture_output=True, timeout=15)
+        assert result.returncode != 0 and b'Retired historical recovery entry' in result.stderr

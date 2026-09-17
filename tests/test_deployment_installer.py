@@ -9,7 +9,12 @@ from tools.v2.deployment_probe import write_denied
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'scripts/deploy_research_cutover.ps1'
+@pytest.fixture(scope='module', autouse=True)
+def bind_frozen_recovery(frozen_recovery):
+    global SCRIPT, HELPER
+    SCRIPT = frozen_recovery / 'scripts/deploy_research_cutover.ps1'
+    HELPER = frozen_recovery / 'scripts/deploy_research_cutover.ps1'
+
 
 
 def daily_probe_fixture(prediction_date=None):
@@ -352,7 +357,7 @@ Write-Output 'archive_preservation_pass'
 def test_retry_launcher_stops_on_every_failure_without_running_real_installer(tmp_path, failed_step, expected):
     fixture=tmp_path/'synthetic runner with spaces';fixture.mkdir()
     runner=fixture/'retry_research_cutover.ps1'
-    runner.write_bytes((ROOT/'scripts/retry_research_cutover.ps1').read_bytes())
+    runner.write_bytes((SCRIPT.parent/'retry_research_cutover.ps1').read_bytes())
     # The launcher resolves its installer beside itself. Only this synthetic
     # script runs; it records modes, never touches accounts/tasks/live paths.
     (fixture/'deploy_research_cutover.ps1').write_text(

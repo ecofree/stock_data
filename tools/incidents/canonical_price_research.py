@@ -1,6 +1,5 @@
 """Native-authority canonical price slice and v7 diagnostic export; no training approval."""
 import argparse
-from collections import defaultdict
 from datetime import date, timedelta
 import json
 import os
@@ -11,56 +10,17 @@ import uuid
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.v2 import probe_price_unit_batches as batch
+from tools.incidents import probe_price_unit_batches as batch
 from trade_system.file_lock import FileLock
 from trade_system.v2.daily_session import seal
 from trade_system.v2.domain import canonical, file_hash, identity, number
 from trade_system.v2.gap_evidence import read_json, write_json
 from trade_system.v2.research_receipts import sealed
 
-POLICY = {'version': 'native_reconciled_price_slice_v1',
-    'authority': 'hithink_native_same_request_code_and_date',
-    'legacy_selection': 'none_all_variants_retained_and_reconciled',
-    'cross_variant_volume_tolerance': '0.000001', 'cross_variant_amount_tolerance_cny': '0.50',
-    'conflict': 'quarantine_entire_security_day', 'scope': 'registered_observations_only_not_identity_merge',
-    'price_adjustment': 'none', 'volume_unit': 'shares', 'amount_unit': 'CNY'}
+from trade_system.v2 import research_semantics as semantics
+from trade_system.v2.research_semantics import (RECONCILED_PRICE_POLICY as POLICY,
+    resolve_observed_prices as resolve)
 FEATURES = ['open', 'high', 'low', 'close', 'volume', 'turnover']
-
-
-def resolve(rows):
-    """Never pick latest/first old row. The independent native quote is the new row."""
-    grouped = defaultdict(list)
-    for row in rows:
-        key = (row['original']['stock_code'], row['original']['date'])
-        grouped[key].append(row)
-    records = []
-    for (code, day), variants in sorted(grouped.items()):
-        variants = sorted(variants, key=lambda r: r['original_sha256'])
-        record = {'stock_code': code, 'date': day, 'status': 'quarantined',
-            'reason': 'all_source_variants_must_qualify', 'values': None,
-            'source_variants': variants, 'native_evidence': [], 'source_variant_count': len(variants),
-            'identity_qualified': False, 'research_ready': False, 'execution_ready': False}
-        if all(r['status'] == 'observed_row_unit_qualified' for r in variants):
-            evidence = {}
-            for row in variants:
-                for e in row['evidence']:
-                    if e['provider'] == 'hithink_native':
-                        evidence[identity(e)] = e
-            natives = [evidence[k] for k in sorted(evidence)]
-            agree = all(max(number(r[field]) for r in variants)-min(number(r[field]) for r in variants) <= number(tolerance)
-                for field, tolerance in [('volume_shares', POLICY['cross_variant_volume_tolerance']),
-                                         ('turnover_cny', POLICY['cross_variant_amount_tolerance_cny'])])
-            if not natives or any(e['values'] != natives[0]['values'] for e in natives):
-                record['reason'] = 'native_authority_missing_or_conflicting'
-            elif not agree:
-                record['reason'] = 'normalized_source_variants_conflict'
-            else:
-                record.update(status='canonical_price_observation',
-                    reason='all_variants_reconciled_to_native' if len(variants)>1 else 'single_variant_reconciled_to_native',
-                    values=natives[0]['values'], native_evidence=natives)
-        record['record_id'] = identity(record)
-        records.append(record)
-    return records
 
 
 def payload(receipts, db):
@@ -71,7 +31,7 @@ def payload(receipts, db):
         raise ValueError('canonical cohort cardinality differs')
     if source_hash != file_hash(Path(__file__)):
         raise ValueError('canonical source changed')
-    return {'policy': POLICY, 'source_sha256': {**report['source_sha256'], Path(__file__).name: source_hash},
+    return {'policy': POLICY, 'source_sha256': {**report['source_sha256'], Path(__file__).name: source_hash, 'research_semantics.py': file_hash(semantics.__file__)},
         'database_sha256': report['database_sha256'], 'receipt_manifest_id': report['receipt_manifest_id'],
         'origin': report['origin'], 'source_total_rows': report['source_total_rows'],
         'scoped_source_rows': report['scoped_source_rows'], 'scoped_security_days': len(records),
@@ -226,9 +186,14 @@ def export_features(db, output, *, layer, receipts, start_date=None, end_date=No
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['build','verify'])
+    p.add_argument('action', choices=['build','verify','export'])
     p.add_argument('--receipts', required=True); p.add_argument('--db', required=True)
     p.add_argument('--output', required=True)
+    p.add_argument('--layer'); p.add_argument('--format', choices=['csv','parquet','both'], default='csv')
     a = p.parse_args()
-    result = build(a.receipts,a.db,a.output) if a.action=='build' else {'verified': bool(verify(a.output,a.receipts,a.db))}
+    if a.action == 'export':
+        if not a.layer: p.error('--layer is required for export')
+        result = export_features(a.db, a.output, layer=a.layer, receipts=a.receipts, output_format=a.format)
+    else:
+        result = build(a.receipts,a.db,a.output) if a.action=='build' else {'verified': bool(verify(a.output,a.receipts,a.db))}
     print(canonical(result))

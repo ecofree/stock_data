@@ -12,7 +12,7 @@ import time
 import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.v2.probe_price_conflicts import parent
+from tools.incidents.probe_price_conflicts import parent
 from trade_system.v2.daily_session import seal
 from trade_system.v2.domain import canonical, file_hash, identity, now_utc, number, utc
 from trade_system.v2.gap_evidence import read_json, write_json

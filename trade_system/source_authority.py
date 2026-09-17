@@ -47,11 +47,11 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
         "The source_kind/as_of gate remains authoritative.",
     ),
     "kline": SourcePolicy(
-        "kline", "kline", ("xiaodefa", "tushare_daily", "tushare"),
+        "kline", "v_kline_daily", ("xiaodefa", "tushare_daily", "tushare"),
         ("tushare_relay", "baostock", "pytdx", "tencent", "sina", "kpl", "existing_core", "cache"),
-        "sync_tushare_ohlc.py / TushareHistoryCollector",
+        "TushareHistoryCollector (raw facts); normalize (read-only projection)",
         ("collect_professional_sources.py", "fetch_all.py (full compatibility path)"),
-        "xiaodefa is the only retained TuShare transport; historical relay identities remain readable. Only a certified daily snapshot may promote to core kline.",
+        "xiaodefa is the only retained TuShare transport; historical relay identities remain readable. Normalized daily views read source facts without a second physical copy.",
     ),
     "ths_concept": SourcePolicy(
         "ths_concept_daily", "ths_concept_daily", ("hithink_index_api",),

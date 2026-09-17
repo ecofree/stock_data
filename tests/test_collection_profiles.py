@@ -106,11 +106,10 @@ def test_close_priority_plan_keeps_incremental_tushare_and_official_ths():
     )
     names = [name for name, _, _ in steps]
 
-    assert names[:11] == [
+    assert names[:10] == [
         "collect_market_context",
         "check_kpl_connectivity",
         "sync_tushare_close",
-        "sync_tushare_ohlc_core",
         "collect_ths_concepts_api",
         "collect_hithink_limit_pool_daily",
         "collect_realtime_limit_pool",

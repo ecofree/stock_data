@@ -150,21 +150,36 @@ def test_prospective_registration_never_auto_qualifies_with_time(tmp_path):
 
 def test_native_client_caps_read_before_decode_without_fallback(monkeypatch):
     import trade_system.hithink_client as native
-    sizes=[]
-    class Response:
-        def __enter__(self):
-            return self
-        def __exit__(self,*args):
-            pass
-        def read(self,size):
-            sizes.append(size)
-            return b'x'*size
-    monkeypatch.setattr(native,'open_verified_once',lambda *a,**k:Response())
-    monkeypatch.setattr(native,'open_verified',lambda *a,**k:pytest.fail('no legacy fallback'))
-    client=native.HiThinkClient(api_key='synthetic',min_interval=0,max_response_bytes=10,single_attempt=True)
-    with pytest.raises(native.HiThinkError,match='budget'):
-        client._get('/test')
-    assert sizes==[11] and client.call_count==1
+    calls = []
+    def oversized(request, *, timeout, max_bytes):
+        calls.append((request.full_url, timeout, max_bytes))
+        raise ValueError('response byte budget exceeded')
+    monkeypatch.setattr(native, 'read_verified_once', oversized)
+    client = native.HiThinkClient(api_key='synthetic', min_interval=0, max_response_bytes=10)
+    with pytest.raises(native.HiThinkError, match='budget'):
+        client._get('/api/test')
+    assert len(calls) == client.call_count == 1
+    assert calls[0][2] == 10
+
+
+@pytest.mark.parametrize('payloads', [
+    [{'item': [], 'pagination': {'pages': 51}}],
+    [{'item': [], 'pagination': {}}],
+    [{'item': [{'code': 'a'}], 'pagination': {'pages': 2}}] * 2,
+    [{'item': [{'code': 'a'}], 'pagination': {'pages': 2}},
+     {'item': [{'code': 'b'}], 'pagination': {'pages': 3}}],
+])
+def test_native_incomplete_pagination_never_returns_partial(monkeypatch, payloads):
+    import trade_system.hithink_client as native
+    client = native.HiThinkClient(api_key='synthetic', min_interval=0)
+    deadlines = []
+    def get(*args, _deadline=None, **kwargs):
+        deadlines.append(_deadline)
+        return payloads[len(deadlines)-1]
+    monkeypatch.setattr(client, '_get', get)
+    with pytest.raises(native.HiThinkError):
+        client.ths_concept_catalog()
+    assert len(set(deadlines)) == 1
 
 
 def test_strict_transport_refuses_redirects_and_propagates_failure(monkeypatch):

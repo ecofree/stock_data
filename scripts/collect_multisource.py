@@ -151,8 +151,6 @@ def main() -> int:
         # promotion is opt-in; the integrated phase owns canonical writes.
         if "sector_flow" in types and args.allow_core_sync and not args.no_sync_core:
             store.sync_sector_capital(args.date)
-        if args.allow_core_sync and not args.no_sync_core and ("kline" in types or INDEX_TYPES.intersection(types)):
-            store.sync_core_klines()
         finished = datetime.now()
         for data_type in types:
             subset = [x for x in results if x["data_type"] == data_type]

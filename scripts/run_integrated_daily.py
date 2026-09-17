@@ -142,20 +142,13 @@ def command_plan(
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
                 ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
-                # P0#2: close guarantees the newest snapshot here; the following
-                # physical-kline step also repairs the bounded recent-gap window
-                # before copying it, so older history remains a separate batch.
+                # Daily ingestion writes raw facts; normalization projects them without copies.
                 ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
                  "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y%m%d"),
                  "--end-date", selected_date.replace("-", ""),
                  "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--gap-only", "--max-days", "1",
                  "--retry-passes", "1", "--retry-delay-seconds", "2.0",
                  "--report", report("tushare_close_latest.md")], False),
-                # Push TuShare daily into physical kline so data_chain / collectors
-                # that still read ``kline`` see the same session as v_kline_daily.
-                ("sync_tushare_ohlc_core", [py, "scripts/sync_tushare_ohlc.py", "--db", db_path,
-                 "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y-%m-%d"),
-                 "--end-date", selected_date, "--repair-close-gaps", "--repair-budget-seconds", "180"], False),
                 # The official same-day THS snapshot must exist before the
                 # stock-flow aggregate is grouped into concepts.  Running this
                 # after sector flow created same-date rows based on a prior

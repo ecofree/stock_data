@@ -10,7 +10,7 @@ from trade_system.schema import _refresh_default_concept_views
 from trade_system.logging_setup import get_logger
 from trade_system.quality import table_columns, table_exists
 from trade_system.limit_rules import limit_threshold_sql
-from trade_system.source_authority import provider_rank
+from trade_system.source_authority import provider_rank, provider_rank_sql
 from trade_system.units import normalization_sql
 
 logger = get_logger(__name__)
@@ -759,196 +759,56 @@ def _create_kline_daily(con: duckdb.DuckDBPyConnection) -> None:
         ("adjustment", "VARCHAR"),
         ("provider", "VARCHAR"),
     ]
-    # TuShare is the project's bulk daily-history source.  Prefer it for
-    # dates it actually covers, then retain newer/auxiliary rows from the
-    # legacy KPL views instead of letting the legacy table hide fresh history.
-    if _relation_has_rows(con, "tushare_daily"):
-        tushare_order = _timestamp_column(con, "tushare_daily")
-        tushare_latest = (
-            "SELECT * FROM (SELECT *, row_number() OVER ("
-            f"PARTITION BY date, stock_code ORDER BY {tushare_order} DESC NULLS LAST, rowid DESC"
-            ") AS _rn FROM tushare_daily WHERE close IS NOT NULL) WHERE _rn=1"
-        )
-        tushare_columns = set(table_columns(con, "tushare_daily"))
-        tushare_volume_unit = "volume_unit" if "volume_unit" in tushare_columns else "'unknown'"
-        tushare_amount_unit = "amount_unit" if "amount_unit" in tushare_columns else "'unknown'"
-        tushare_adjustment = "adjustment" if "adjustment" in tushare_columns else "'unknown'"
-        tushare_provider = "provider" if "provider" in tushare_columns else "'unknown'"
-        tushare_sql = """
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                stock_code,
-                open,
-                high,
-                low,
-                close,
-                {canonical_volume} AS volume,
-                {canonical_amount} AS turnover,
-                change_pct,
-                'D' AS ktype,
-                'tushare_daily' AS source_table,
-                false AS is_fallback,
-                fetched_at,
-                'shares' AS volume_unit,
-                'yuan' AS amount_unit,
-                coalesce(nullif({tushare_adjustment}, ''), 'none') AS adjustment,
-                coalesce(nullif({tushare_provider}, ''), 'unknown') AS provider
-            FROM ({tushare_latest})
-            WHERE stock_code IS NOT NULL AND date IS NOT NULL
-        """.format(
-            tushare_latest=tushare_latest,
-            tushare_volume_unit=tushare_volume_unit,
-            tushare_amount_unit=tushare_amount_unit,
-            tushare_adjustment=tushare_adjustment,
-            tushare_provider=tushare_provider,
-            canonical_volume=normalization_sql('volume', tushare_volume_unit, 'volume'),
-            canonical_amount=normalization_sql('turnover', tushare_amount_unit, 'amount'),
-        )
-        fallback_sql = None
-        if _relation_has_rows(con, "kline"):
-            latest = _canonical_kline_cte("kline", _timestamp_column(con, "kline"))
-            kline_columns = set(table_columns(con, "kline"))
-            volume_unit = "volume_unit" if "volume_unit" in kline_columns else "'unknown'"
-            amount_unit = "amount_unit" if "amount_unit" in kline_columns else "'unknown'"
-            adjustment = "adjustment" if "adjustment" in kline_columns else "'unknown'"
-            provider = "provider" if "provider" in kline_columns else "'unknown'"
-            fallback_sql = f"""
-                SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, open, high,
-                       low, close,
-                       {normalization_sql('volume', volume_unit, 'volume')} AS volume,
-                       {normalization_sql('turnover', amount_unit, 'amount')} AS turnover,
-                       change_pct,
-                       upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                       'kline' AS source_table, false AS is_fallback, fetched_at,
-                       'shares' AS volume_unit, 'yuan' AS amount_unit,
-                       coalesce(nullif({adjustment}, ''), 'unknown') AS adjustment,
-                       coalesce(nullif({provider}, ''), 'unknown') AS provider
-                FROM ({latest})
-            """
-        elif _relation_has_rows(con, "advanced_kline_today"):
-            latest = _canonical_kline_cte(
-                "advanced_kline_today", _timestamp_column(con, "advanced_kline_today")
-            )
-            fallback_sql = f"""
-                SELECT CAST(date AS VARCHAR) AS trade_date, stock_code, open, high,
-                       low, close, CAST(NULL AS BIGINT) AS volume, CAST(NULL AS BIGINT) AS turnover,
-                       CAST(NULL AS DOUBLE) AS change_pct,
-                       upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                       'advanced_kline_today' AS source_table, true AS is_fallback, fetched_at,
-                       'shares' AS volume_unit, 'yuan' AS amount_unit,
-                       'unknown' AS adjustment, 'advanced_kline_today' AS provider
-                FROM ({latest})
-            """
-        if fallback_sql:
-            con.execute(
-                f"""
-                CREATE OR REPLACE VIEW v_kline_daily AS
-                WITH tushare_rows AS ({tushare_sql}), fallback_rows AS ({fallback_sql})
-                SELECT * FROM tushare_rows
-                UNION ALL
-                SELECT f.* FROM fallback_rows f
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM tushare_rows t
-                    WHERE t.trade_date=f.trade_date AND t.stock_code=f.stock_code
-                )
-                """
-            )
+    sources = []
+    for priority, table in enumerate(('tushare_daily', 'multi_source_kline', 'kline',
+                                       'advanced_kline_today', 'advanced_gujia_kline')):
+        if not _relation_has_rows(con, table):
+            continue
+        columns = set(table_columns(con, table))
+        def column(name, default="NULL"):
+            return name if name in columns else default
+        if table == 'multi_source_kline':
+            latest = _multisource_bar_sql(con, 'stock')
+            day, code, amount = 'source_date', 'asset_code', 'amount'
+        elif table == 'tushare_daily':
+            latest = _latest_cte(table, ['date', 'stock_code'], _timestamp_column(con, table))
+            day, code, amount = 'date', 'stock_code', 'turnover'
         else:
-            con.execute(f"CREATE OR REPLACE VIEW v_kline_daily AS SELECT * FROM ({tushare_sql})")
+            latest = _canonical_kline_cte(table, _timestamp_column(con, table),
+                value_column='gujia_value' if table == 'advanced_gujia_kline' else 'close')
+            day, code, amount = 'date', 'stock_code', 'turnover'
+        price = 'gujia_value' if table == 'advanced_gujia_kline' else 'close'
+        sources.append(f"""
+            SELECT CAST({day} AS VARCHAR) AS trade_date, {code} AS stock_code,
+                   {column('open')} AS open, {column('high')} AS high, {column('low')} AS low,
+                   {price} AS close,
+                   {normalization_sql(column('volume'), column('volume_unit', "'unknown'"), 'volume')} AS volume,
+                   {normalization_sql(column(amount), column('amount_unit', "'unknown'"), 'amount')} AS turnover,
+                   {column('change_pct')} AS change_pct, 'D' AS ktype,
+                   '{table}' AS source_table, {str(table.startswith('advanced_')).lower()} AS is_fallback,
+                   {column('fetched_at', 'current_timestamp')} AS fetched_at,
+                   'shares' AS volume_unit, 'yuan' AS amount_unit,
+                   coalesce(nullif({column('adjustment')}, ''), 'unknown') AS adjustment,
+                   coalesce(nullif({column('provider')}, ''), '{table}') AS provider,
+                   {priority} AS _priority
+            FROM ({latest}) WHERE {price} IS NOT NULL AND {day} IS NOT NULL AND {code} IS NOT NULL
+        """)
+    if not sources:
+        con.execute(_empty_view_sql("v_kline_daily", cols))
         return
-    if _relation_has_rows(con, "kline"):
-        latest = _canonical_kline_cte("kline", _timestamp_column(con, "kline"))
-        kline_columns = set(table_columns(con, "kline"))
-        volume_unit = "volume_unit" if "volume_unit" in kline_columns else "'unknown'"
-        amount_unit = "amount_unit" if "amount_unit" in kline_columns else "'unknown'"
-        adjustment = "adjustment" if "adjustment" in kline_columns else "'unknown'"
-        provider = "provider" if "provider" in kline_columns else "'unknown'"
-        con.execute(
-            f"""
-            CREATE OR REPLACE VIEW v_kline_daily AS
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                stock_code,
-                open,
-                high,
-                low,
-                close,
-                {normalization_sql('volume', volume_unit, 'volume')} AS volume,
-                {normalization_sql('turnover', amount_unit, 'amount')} AS turnover,
-                change_pct,
-                upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                'kline' AS source_table,
-                false AS is_fallback,
-                fetched_at,
-                'shares' AS volume_unit,
-                'yuan' AS amount_unit,
-                coalesce(nullif({adjustment}, ''), 'unknown') AS adjustment,
-                coalesce(nullif({provider}, ''), 'unknown') AS provider
-            FROM ({latest})
-            """
-        )
-        return
-    if _relation_has_rows(con, "advanced_kline_today"):
-        latest = _canonical_kline_cte(
-            "advanced_kline_today", _timestamp_column(con, "advanced_kline_today")
-        )
-        con.execute(
-            f"""
-            CREATE OR REPLACE VIEW v_kline_daily AS
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                stock_code,
-                open,
-                high,
-                low,
-                close,
-                CAST(NULL AS BIGINT) AS volume,
-                CAST(NULL AS BIGINT) AS turnover,
-                CAST(NULL AS DOUBLE) AS change_pct,
-                upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                'advanced_kline_today' AS source_table,
-                true AS is_fallback,
-                fetched_at,
-                'shares' AS volume_unit,
-                'yuan' AS amount_unit,
-                'unknown' AS adjustment,
-                'advanced_kline_today' AS provider
-            FROM ({latest})
-            """
-        )
-        return
-    if _relation_has_rows(con, "advanced_gujia_kline"):
-        latest = _canonical_kline_cte(
-            "advanced_gujia_kline",
-            _timestamp_column(con, "advanced_gujia_kline"),
-            value_column="gujia_value",
-        )
-        con.execute(
-            f"""
-            CREATE OR REPLACE VIEW v_kline_daily AS
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                stock_code,
-                CAST(NULL AS DOUBLE) AS open,
-                CAST(NULL AS DOUBLE) AS high,
-                CAST(NULL AS DOUBLE) AS low,
-                gujia_value AS close,
-                CAST(NULL AS BIGINT) AS volume,
-                CAST(NULL AS BIGINT) AS turnover,
-                CAST(NULL AS DOUBLE) AS change_pct,
-                upper(coalesce(nullif(trim(ktype), ''), 'D')) AS ktype,
-                'advanced_gujia_kline' AS source_table,
-                true AS is_fallback,
-                fetched_at,
-                'shares' AS volume_unit,
-                'yuan' AS amount_unit,
-                'unknown' AS adjustment,
-                'advanced_gujia_kline' AS provider
-            FROM ({latest})
-            """
-        )
-        return
-    con.execute(_empty_view_sql("v_kline_daily", cols))
+    con.execute("CREATE OR REPLACE VIEW v_kline_daily AS WITH source_rows AS ("+
+                " UNION ALL ".join(sources)+") SELECT * EXCLUDE (_priority) FROM source_rows "
+                "QUALIFY row_number() OVER (PARTITION BY trade_date,stock_code ORDER BY _priority, fetched_at DESC NULLS LAST)=1")
+
+
+def _multisource_bar_sql(con, asset_type):
+    """Select existing provider observations, without promoting a physical copy."""
+    policy = 'kline' if asset_type == 'stock' else 'index'
+    rank = provider_rank_sql(policy, 'provider')
+    return ("SELECT * FROM multi_source_kline WHERE asset_type='"+asset_type+"' "
+            "AND provider <> 'existing_core' AND is_stale=FALSE AND close IS NOT NULL "
+            "QUALIFY row_number() OVER (PARTITION BY source_date, asset_code "
+            f"ORDER BY {rank}, fetched_at DESC NULLS LAST, rowid DESC)=1")
 
 
 def _latest_or_empty(
@@ -1079,27 +939,35 @@ def _create_index_state(con: duckdb.DuckDBPyConnection) -> None:
         ("is_fallback", "BOOLEAN"),
         ("fetched_at", "TIMESTAMP"),
     ]
-    if _relation_has_rows(con, "index_kline"):
-        latest = _latest_cte("index_kline", ["date", "index_code", "ktype"], _timestamp_column(con, "index_kline"))
-        con.execute(
-            f"""
-            CREATE OR REPLACE VIEW v_index_state AS
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                index_code,
-                open,
-                high,
-                low,
-                close,
-                change_pct,
-                turnover,
-                'index_kline' AS source_table,
-                false AS is_fallback,
-                fetched_at
-            FROM ({latest})
-            """
-        )
-        return
+    sources = []
+    for priority, table in enumerate(('tushare_index_daily', 'multi_source_kline', 'index_kline')):
+        if not _relation_has_rows(con, table):
+            continue
+        columns = set(table_columns(con, table))
+        if table == 'multi_source_kline':
+            latest = _multisource_bar_sql(con, 'index')
+            day, code, amount = 'source_date', 'asset_code', 'amount'
+        else:
+            latest = _latest_cte(table, ['date', 'index_code'], _timestamp_column(con, table))
+            day, code, amount = 'date', 'index_code', 'turnover'
+            if table == 'index_kline':
+                latest = f"SELECT * FROM ({latest}) WHERE upper(coalesce(nullif(trim(ktype), ''), 'D'))='D'"
+        unit = 'amount_unit' if 'amount_unit' in columns else "'unknown'"
+        sources.append(f"""
+            SELECT CAST({day} AS VARCHAR) AS trade_date, {code} AS index_code,
+                   open, high, low, close, change_pct,
+                   {normalization_sql(amount, unit, 'amount')} AS turnover,
+                   '{table}' AS source_table, false AS is_fallback, fetched_at, {priority} AS _priority
+            FROM ({latest}) WHERE close IS NOT NULL AND {day} IS NOT NULL AND {code} IS NOT NULL
+        """)
+    if sources:
+        combined = ' UNION ALL '.join(sources)
+        # A stock-only multi-source table must not hide index intraday fallback.
+        if con.execute(f'SELECT EXISTS(SELECT 1 FROM ({combined}))').fetchone()[0]:
+            con.execute(f"CREATE OR REPLACE VIEW v_index_state AS WITH source_rows AS ({combined}) "
+                "SELECT * EXCLUDE (_priority) FROM source_rows QUALIFY row_number() OVER ("
+                "PARTITION BY trade_date,index_code ORDER BY _priority, fetched_at DESC NULLS LAST)=1")
+            return
     if _relation_has_rows(con, "index_intraday"):
         latest = _latest_cte(
             "index_intraday",

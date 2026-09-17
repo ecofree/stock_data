@@ -455,9 +455,7 @@ def export_features(
     if canonical_prices is not None or price_receipts is not None:
         if canonical_prices is None or price_receipts is None or any(x is not None for x in (calendar_overlay,research_overlay,semantics,*candidate_options)) or label_mode!='t1_exec':
             raise ValueError('canonical v7 requires paired layer/receipts and excludes unqualified mixed protocols')
-        from tools.v2.canonical_price_research import export_features as export_canonical
-        return export_canonical(db_path, output, layer=canonical_prices, receipts=price_receipts,
-            start_date=start_date, end_date=end_date, output_format=output_format)
+        raise ValueError('fixed v7 incident export retired from current exporter; use tools.incidents.canonical_price_research explicitly')
     out = Path(output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     guard = FileLock(out.with_suffix('.export.guard'))

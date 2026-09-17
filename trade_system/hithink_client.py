@@ -12,6 +12,8 @@ the authorized history window.
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import time
 import urllib.parse
 import urllib.request
@@ -19,7 +21,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trade_system.logging_setup import get_logger
-from trade_system.http_transport import open_verified, open_verified_once
+from trade_system.http_transport import read_verified_once
+from trade_system.host_limiter import shared_host_limiter
 
 logger = get_logger(__name__)
 
@@ -35,8 +38,7 @@ class HiThinkError(RuntimeError):
 class HiThinkClient:
     def __init__(self, api_key: str | None = None,
                  min_interval: float = _DEFAULT_INTERVAL,
-                 timeout: float = 30.0, *, max_response_bytes: int | None = None,
-                 single_attempt: bool = False):
+                 timeout: float = 30.0, *, max_response_bytes: int = 8_000_000):
         import os
 
         from trade_system.config import SETTINGS
@@ -47,13 +49,16 @@ class HiThinkClient:
         if not self.api_key:
             raise HiThinkError(
                 "HITHINK_FINANCE_API_KEY is not configured (.env or env)")
+        if not math.isfinite(timeout) or not 0 < timeout <= 60:
+            raise ValueError('timeout must be finite and within 60 seconds')
+        if not math.isfinite(min_interval) or min_interval < 0:
+            raise ValueError('interval must be finite and nonnegative')
         self.min_interval = min_interval
         self.timeout = timeout
-        if max_response_bytes is not None and (type(max_response_bytes) is not int or not 1<=max_response_bytes<=8_000_000):
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 8_000_000:
             raise ValueError('response budget must be 1..8000000 bytes')
-        self.max_response_bytes=max_response_bytes
-        self.single_attempt=single_attempt
-        self._last_call = 0.0
+        self.max_response_bytes = max_response_bytes
+        self.rate_key = 'hithink:' + hashlib.sha256(self.api_key.encode()).hexdigest()
         self.call_count = 0
 
     @property
@@ -62,28 +67,30 @@ class HiThinkClient:
         return f"hithink calls this session: {self.call_count}"
 
     # ------------------------------------------------------------ transport
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
-        wait = self.min_interval - (time.time() - self._last_call)
-        if wait > 0:
-            time.sleep(wait)
+    def _get(self, path: str, params: dict[str, Any] | None = None, *, _deadline=None) -> dict:
+        if not path.startswith('/api/') or '?' in path or '#' in path or '..' in path:
+            raise HiThinkError('unapproved API path')
+        deadline = min(time.monotonic() + self.timeout, _deadline) if _deadline is not None else time.monotonic() + self.timeout
+        shared_host_limiter.acquire(self.rate_key, self.min_interval, deadline=deadline)
         url = BASE_URL + path
         if params:
-            url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"X-api-key": self.api_key})
+            url += '?' + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={'X-api-key': self.api_key})
         try:
-            opener=open_verified_once if self.single_attempt else open_verified
-            with opener(req, timeout=self.timeout) as resp:
-                raw=resp.read() if self.max_response_bytes is None else resp.read(self.max_response_bytes+1)
-                if self.max_response_bytes is not None and len(raw)>self.max_response_bytes:
-                    raise HiThinkError('native response byte budget exceeded')
-                payload = json.loads(raw.decode("utf-8"))
+            raw = read_verified_once(req, timeout=deadline-time.monotonic(), max_bytes=self.max_response_bytes)
+            payload = json.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeError) as exc:
+            raise HiThinkError('invalid or over-budget native response') from exc
         finally:
-            self._last_call = time.time()
             self.call_count += 1
-        code = payload.get("code")
-        if code != 0:
-            raise HiThinkError(f"{path} -> code={code} message={payload.get('message')}")
-        return payload.get("data") or {}
+        if time.monotonic() >= deadline:
+            raise HiThinkError('native request deadline exhausted')
+        if not isinstance(payload, dict) or type(payload.get('code')) is not int or payload['code'] != 0:
+            raise HiThinkError('provider rejected request; no semantic retry')
+        data = payload.get('data')
+        if not isinstance(data, dict):
+            raise HiThinkError('native response data missing')
+        return data
 
     @staticmethod
     def _date_ms(date_str: str) -> int:
@@ -94,18 +101,32 @@ class HiThinkClient:
     def _paged(self, path: str, params: dict[str, Any],
                item_key: str = "item", max_pages: int = 20) -> list[dict]:
         """Fetch every page of a paginated endpoint; returns combined items."""
+        if type(max_pages) is not int or not 1 <= max_pages <= 50:
+            raise HiThinkError('page budget must be 1..50')
+        deadline = time.monotonic() + self.timeout
         out: list[dict] = []
-        page = 1
-        while page <= max_pages:
-            data = self._get(path, {**params, "page": page})
-            pagination = data.get("pagination") or {}
-            items = data.get(item_key) or []
+        seen = set()
+        expected_pages = None
+        for page in range(1, max_pages + 1):
+            data = self._get(path, {**params, 'page': page}, _deadline=deadline)
+            pagination = data.get('pagination')
+            items = data.get(item_key)
+            if not isinstance(pagination, dict) or not isinstance(items, list) or any(not isinstance(x, dict) for x in items):
+                raise HiThinkError('invalid pagination contract')
+            pages = pagination.get('pages')
+            if type(pages) is not int or not 1 <= pages <= max_pages:
+                raise HiThinkError('unknown or exhausted page budget')
+            if expected_pages is not None and pages != expected_pages:
+                raise HiThinkError('pagination changed during collection')
+            expected_pages = pages
+            fingerprint = hashlib.sha256(json.dumps(items, sort_keys=True, allow_nan=False).encode()).hexdigest()
+            if fingerprint in seen or (not items and pages > 1):
+                raise HiThinkError('repeated or missing page; collection incomplete')
+            seen.add(fingerprint)
             out.extend(items)
-            pages = int(pagination.get("pages") or 1)
-            if page >= pages:
-                break
-            page += 1
-        return out
+            if page == pages:
+                return out
+        raise HiThinkError('page budget exhausted')
 
     # ------------------------------------------------------- special data
     def limit_up_pool(self, date_str: str, max_pages: int = 20) -> list[dict]:

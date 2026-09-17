@@ -63,7 +63,7 @@ def plan(config=None):
 class Client:
     def __init__(self):
         from trade_system.hithink_client import HiThinkClient
-        self.native=HiThinkClient(timeout=15,max_response_bytes=4_000_000,single_attempt=True)
+        self.native=HiThinkClient(timeout=15,max_response_bytes=4_000_000)
         self.relay=None
 
     def query(self,r):

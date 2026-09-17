@@ -52,7 +52,9 @@ def main():
             for name in archive.namelist():
                 if name.endswith('.py'):
                     assert (module.parent.parent/name).read_bytes()==archive.read(name), 'installed/wheel mismatch: '+name
-    for forbidden in ('trade_system.paper_execution','trade_system.daily_loop','trade_system.v2.rolling_research'):
+    for forbidden in ('trade_system.paper_execution','trade_system.daily_loop','trade_system.v2.rolling_research',
+                      'trade_system.tushare_relay', 'trade_system.web_report',
+                      'trade_system.review', 'stock_screener'):
         assert find_spec(forbidden) is None, 'forbidden installed module: '+forbidden
     if '--minimal-runtime' in sys.argv:
         for research_dependency in ('numpy','pandas','qlib','akshare','pytest'):

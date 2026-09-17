@@ -3,8 +3,8 @@ from datetime import datetime
 
 import pytest
 
-from tools.v2 import probe_price_conflicts as p
-from tools.v2.canonical_price_research import resolve
+from tools.incidents import probe_price_conflicts as p
+from tools.incidents.canonical_price_research import resolve
 from trade_system.v2.daily_session import CST,seal
 from trade_system.v2.domain import canonical,file_hash,identity
 from trade_system.v2.gap_evidence import read_json,write_json

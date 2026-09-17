@@ -472,68 +472,6 @@ class MultiSourceStore:
                 pass
             return 0
 
-    def sync_core_klines(self, asset_type: str | None = None) -> int:
-        """Populate the existing kline/index_kline chains from fresh migrated rows."""
-        try:
-            self.con.execute("BEGIN TRANSACTION")
-            where = "provider <> 'existing_core' AND is_stale=FALSE"
-            params = []
-            if asset_type:
-                where += " AND asset_type=?"
-                params.append(asset_type)
-            count = 0
-            existing_tables = {row[0] for row in self.con.execute("show tables").fetchall()}
-            for kind, target in (("stock", "kline"), ("index", "index_kline")):
-                if asset_type and asset_type != kind:
-                    continue
-                if target not in existing_tables:
-                    continue
-                source_policy = "kline" if kind == "stock" else "index"
-                provider_order = provider_rank_sql(source_policy, "provider")
-                self.con.execute(
-                    f"DELETE FROM {target} WHERE EXISTS (SELECT 1 FROM multi_source_kline s "
-                    f"WHERE s.asset_type=? AND s.provider <> 'existing_core' AND s.is_stale=FALSE "
-                    f"AND s.source_date={target}.date AND s.asset_code={target}.{'stock_code' if kind == 'stock' else 'index_code'} AND {target}.ktype='D')",
-                [kind],
-                )
-                if kind == "stock":
-                    kline_columns = {row[1] for row in self.con.execute("PRAGMA table_info('kline')").fetchall()}
-                    if {"volume_unit", "amount_unit", "adjustment", "provider"} <= kline_columns:
-                        self.con.execute(
-                            "INSERT INTO kline(date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,volume_unit,amount_unit,adjustment,provider,raw_json) "
-                            "SELECT source_date,asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',volume_unit,amount_unit,adjustment,provider,raw_json "
-                            f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
-                            f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
-                            f"FROM multi_source_kline WHERE {where} AND asset_type='stock') ranked WHERE _rn=1", params,
-                        )
-                    else:
-                        self.con.execute(
-                            "INSERT INTO kline(date,stock_code,open,high,low,close,volume,turnover,change_pct,ktype,raw_json) "
-                            "SELECT source_date,asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',raw_json "
-                            f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
-                            f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
-                            f"FROM multi_source_kline WHERE {where} AND asset_type='stock') ranked WHERE _rn=1", params,
-                        )
-                else:
-                    self.con.execute(
-                        "INSERT INTO index_kline(date,index_code,open,high,low,close,volume,turnover,change_pct,ktype,raw_json) "
-                        "SELECT CAST(source_date AS DATE),asset_code,open,high,low,close,CAST(COALESCE(volume,0) AS BIGINT),CAST(COALESCE(amount,0) AS BIGINT),change_pct,'D',raw_json "
-                        f"FROM (SELECT *, row_number() OVER (PARTITION BY source_date,asset_code "
-                        f"ORDER BY is_stale ASC, {provider_order} ASC, fetched_at DESC NULLS LAST) AS _rn "
-                        f"FROM multi_source_kline WHERE {where} AND asset_type='index') ranked WHERE _rn=1", params,
-                    )
-                count += self.con.execute(
-                    "SELECT count(*) FROM multi_source_kline WHERE " + where + f" AND asset_type='{kind}'", params
-                ).fetchone()[0]
-            self.con.commit()
-            return count
-        except Exception:
-            try:
-                self.con.rollback()
-            except Exception:
-                pass
-            return 0
-
     def bootstrap_from_core(self) -> dict[str, int]:
         """Preserve already-collected core rows in the migrated source-aware layer."""
         counts = {"kline": 0, "index_kline": 0, "sector_capital": 0}

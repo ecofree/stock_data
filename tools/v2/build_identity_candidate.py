@@ -7,7 +7,7 @@ import sys
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.v2 import normalize_price_units as units
+from tools.incidents import normalize_price_units as units
 from tools.v2 import probe_identity_sources as probe
 from trade_system.v2 import research_semantics as semantics
 from trade_system.v2.daily_session import seal

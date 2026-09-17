@@ -16,7 +16,7 @@ import duckdb
 from base import DuckDBStore
 from trade_system.schema import init_schema
 from trade_system.xiaodefa_source import XiaodefaClient
-from trade_system.tushare_store import (collect_tushare_adj_factor, collect_tushare_daily, collect_tushare_daily_basic, collect_tushare_index_daily, index_code_to_ts_code, sync_tushare_ohlc_to_core_tables, ts_code_to_index_code)
+from trade_system.tushare_store import (collect_tushare_adj_factor, collect_tushare_daily, collect_tushare_daily_basic, collect_tushare_index_daily, index_code_to_ts_code, ts_code_to_index_code)
 from trade_system.trading_calendar import open_session_dates
 
 
@@ -236,13 +236,11 @@ def run_pending_tushare_backfill_tasks(
     client: XiaodefaClient | None = None,
     limit: int = 10,
     retry_errors: bool = False,
-    sync_core: bool = False,
 ) -> list[dict[str, Any]]:
     """Run a bounded batch of pending tasks and keep status resumable."""
 
     client = client or XiaodefaClient()
     store = DuckDBStore(str(db_path))
-    sync_requests: list[dict[str, Any]] = []
     try:
         init_schema(store.conn)
         statuses = ["pending", "running"]
@@ -302,25 +300,8 @@ def run_pending_tushare_backfill_tasks(
             result = dict(task)
             result.update({"status": status, "rows_inserted": rows_inserted, "last_error": last_error})
             results.append(result)
-            if sync_core and status == "done" and task["data_kind"] in {"daily", "index_daily"}:
-                sync_requests.append(task)
     finally:
         store.close()
-    for task in sync_requests:
-        if task["data_kind"] == "daily":
-            sync_tushare_ohlc_to_core_tables(
-                db_path,
-                stock_codes=[task["code"]],
-                start_date=task["start_date"],
-                end_date=task["end_date"],
-            )
-        elif task["data_kind"] == "index_daily":
-            sync_tushare_ohlc_to_core_tables(
-                db_path,
-                index_codes=[task["code"]],
-                start_date=task["start_date"],
-                end_date=task["end_date"],
-            )
     return results
 
 

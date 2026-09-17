@@ -3,8 +3,8 @@ from datetime import datetime
 import duckdb
 import pytest
 
-from tools.v2 import probe_price_unit_batches as batch
-from tools.v2 import normalize_price_units as units
+from tools.incidents import probe_price_unit_batches as batch
+from tools.incidents import normalize_price_units as units
 from trade_system.v2.daily_session import CST, seal
 from trade_system.v2.domain import file_hash
 from trade_system.v2.gap_evidence import read_json, write_json
@@ -160,7 +160,7 @@ def test_export_duplicate_guard_keeps_previous_pointer_even_outside_requested_da
 
 
 def test_canonical_native_authority_not_first_latest_or_rounding_variant(tmp_path):
-    from tools.v2 import canonical_price_research as canon
+    from tools.incidents import canonical_price_research as canon
     db, receipts = fixtures(tmp_path, declared_native=True)
     report = batch.payload(receipts, db)
     first = canon.resolve(report['rows'])
@@ -172,7 +172,7 @@ def test_canonical_native_authority_not_first_latest_or_rounding_variant(tmp_pat
 
 @pytest.mark.parametrize('conflict', ['unqualified', 'native', 'variants', 'missing_native'])
 def test_canonical_conflict_quarantines_whole_group(tmp_path, conflict):
-    from tools.v2 import canonical_price_research as canon
+    from tools.incidents import canonical_price_research as canon
     db, receipts = fixtures(tmp_path, declared_native=True)
     report = batch.payload(receipts, db)
     rows = report['rows']
@@ -190,13 +190,13 @@ def test_canonical_conflict_quarantines_whole_group(tmp_path, conflict):
 
 
 def test_canonical_build_export_replay_tamper_and_raw_database_unchanged(tmp_path):
-    from tools.v2 import canonical_price_research as canon
+    from tools.incidents import canonical_price_research as canon
     db, receipts = fixtures(tmp_path, declared_native=True, calendar=True)
     before = file_hash(db)
     layer = tmp_path/'canonical'
     assert canon.build(receipts, db, layer)['canonical_rows'] == 1
     report = canon.verify(layer, receipts, db)
-    meta = export_features(db, tmp_path/'v7.csv', canonical_prices=layer, price_receipts=receipts, output_format='both')
+    meta = canon.export_features(db, tmp_path/'v7.csv', layer=layer, receipts=receipts, output_format='both')
     assert meta['rows'] == 1 and meta['labeled_rows'] == 0 and meta['feature_columns'] == canon.FEATURES
     assert not meta['legacy_source_fallback'] and 'raw_price_target_ret' not in meta['feature_columns']
     with duckdb.connect(':memory:') as con:
@@ -214,7 +214,7 @@ def test_canonical_build_export_replay_tamper_and_raw_database_unchanged(tmp_pat
 
 
 def test_canonical_failure_before_pointer_publication(tmp_path, monkeypatch):
-    from tools.v2 import canonical_price_research as canon
+    from tools.incidents import canonical_price_research as canon
     db, receipts = fixtures(tmp_path, declared_native=True, calendar=True)
     layer = tmp_path/'canonical'; canon.build(receipts, db, layer)
     pointer = tmp_path/'v7.current.json'; write_json(pointer, {'prior': 'retained'})
@@ -225,7 +225,7 @@ def test_canonical_failure_before_pointer_publication(tmp_path, monkeypatch):
         write_json(layer/'unexpected.json', {})
         return result
     monkeypatch.setattr(canon, 'diagnostic_rows', changed)
-    with pytest.raises(ValueError): export_features(db, tmp_path/'v7.csv', canonical_prices=layer, price_receipts=receipts)
+    with pytest.raises(ValueError): canon.export_features(db, tmp_path/'v7.csv', layer=layer, receipts=receipts)
     assert file_hash(pointer) == before
 
 
@@ -239,7 +239,7 @@ def test_canonical_mode_cannot_silently_mix_old_protocols(tmp_path, extra):
 
 @pytest.mark.parametrize('condition', ['complete', 'missing_price', 'missing_calendar', 'duplicate_calendar', 'quarantined'])
 def test_canonical_exact_session_proxy_never_becomes_training_label(condition):
-    from tools.v2 import canonical_price_research as canon
+    from tools.incidents import canonical_price_research as canon
     records = []
     for day in ('2025-01-02','2025-01-03','2025-01-06'):
         records.append({'stock_code': '000001', 'date': day, 'values': {'open': '10','high': '12','low': '9','close': '11','volume_shares': '10000','turnover_cny': '100000'},
@@ -258,3 +258,17 @@ def test_canonical_exact_session_proxy_never_becomes_training_label(condition):
             assert rows[0]['raw_price_target_ret'] == (10.0 if condition=='complete' else None)
             assert all(r['label_next_ret'] is None and r['volume_z20'] is None for r in rows)
             assert len(rows) == len(records)
+
+
+def test_current_exporter_cannot_import_incident_workflows(tmp_path, monkeypatch):
+    import builtins
+    from scripts.export_qlib_features import export_features
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name.startswith('tools.incidents'):
+            pytest.fail('current export entered a historical incident workflow')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    with pytest.raises(ValueError, match='retired'):
+        export_features(tmp_path/'absent.db', tmp_path/'out.csv', canonical_prices='old', price_receipts='old')
+    assert not (tmp_path/'absent.db').exists()

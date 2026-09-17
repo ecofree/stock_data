@@ -1,9 +1,10 @@
 """Evidence-bound retrospective exclusions, never a tradability certificate."""
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 import re
 
-from .domain import file_hash, identity, now_utc, utc
+from .domain import file_hash, identity, now_utc, utc, number
 from .gap_evidence import read_json
 
 
@@ -110,3 +111,120 @@ def apply(con, path):
             'identity_policy':'hint_only_no_cross_code_data_merge',
             'suspension_policy':'start_inclusive_resume_exclusive_current_T1_T2',
             'unknown_policy':'absence_of_evidence_is_not_tradeability','source_database_modified':False}
+
+
+OBSERVED_UNIT_POLICY = {'version': 'observed-price-units-v1',
+    'scope': 'exact_observed_rows_only_retrospective_not_identity_authority',
+    'scales': [1, 10, 100, 1000, 10000, 1000000],
+    'ohlc_tolerance': '0.00000001', 'volume_tolerance': '0.000001',
+    'amount_tolerance': '0.01', 'cross_source_amount_tolerance': '0.50',
+    'relative_scale_tolerance': '0.000000001'}
+OBSERVED_PRICE_FIELDS = ['ts_code', 'stock_code', 'date', 'open', 'high', 'low', 'close',
+    'volume', 'turnover', 'volume_unit', 'amount_unit', 'adjustment', 'provider', 'fetched_at']
+
+
+def scale_for(raw, observed, tolerance):
+    if raw is None or observed is None:
+        return None
+    raw, observed = number(raw), number(observed)
+    if raw <= 0 or observed <= 0:
+        return None
+    tolerance = max(number(tolerance), abs(observed)*number(OBSERVED_UNIT_POLICY['relative_scale_tolerance']))
+    matches = [s for s in OBSERVED_UNIT_POLICY['scales'] if abs(raw*s-observed) <= tolerance]
+    return matches[0] if len(matches) == 1 else None
+
+
+def qualify_observed_price(original, evidence, *, exchange='SZ', amount_tolerance=None):
+    """No alias inference: both providers must match the stored six-digit code."""
+    if exchange not in ('SZ', 'SH'):
+        raise ValueError('explicit supported exchange required')
+    amount_tolerance = OBSERVED_UNIT_POLICY['amount_tolerance'] if amount_tolerance is None else amount_tolerance
+    if not 0 < number(amount_tolerance) <= number(OBSERVED_UNIT_POLICY['cross_source_amount_tolerance']):
+        raise ValueError('bounded explicit amount tolerance required')
+    row = {'original': original, 'original_sha256': identity(original),
+        'status': 'unit_unqualified', 'reason': 'native_and_relay_required',
+        'volume_shares': None, 'turnover_cny': None,
+        'volume_scale': None, 'amount_scale': None, 'evidence': evidence}
+    native = [e for e in evidence if e['provider'] == 'hithink_native']
+    relay = [e for e in evidence if e['provider'] == 'xiaodefa_relay']
+    if original['ts_code'] not in (original['stock_code']+'.'+exchange, exchange+'.'+original['stock_code']):
+        row['reason'] = 'stored_code_conflict'
+        return row
+    if not native or not relay:
+        return row
+    if original['adjustment'] != 'none':
+        row['reason'] = 'unadjusted_source_required'
+        return row
+    for e in evidence:
+        if e['request_code'] != original['stock_code']+'.'+exchange or e['date'] != original['date']:
+            raise ValueError('exact code/date binding required; aliases forbidden')
+        if any(original[k] is None or abs(number(e['values'][k])-number(original[k])) > number(OBSERVED_UNIT_POLICY['ohlc_tolerance'])
+               for k in ('open', 'high', 'low', 'close')):
+            row['reason'] = 'source_price_conflict'
+            return row
+    authority = native[0]['values']
+    for e in evidence:
+        for field, tolerance in [('volume_shares', OBSERVED_UNIT_POLICY['volume_tolerance']),
+                                 ('turnover_cny', OBSERVED_UNIT_POLICY['cross_source_amount_tolerance'])]:
+            # Native duplicates must agree exactly, not inherit relay rounding allowance.
+            allowed = 0 if e['provider'] == 'hithink_native' else number(tolerance)
+            if abs(number(e['values'][field])-number(authority[field])) > allowed:
+                row['reason'] = 'source_unit_conflict'
+                return row
+    volume_scale = scale_for(original['volume'], authority['volume_shares'], OBSERVED_UNIT_POLICY['volume_tolerance'])
+    amount_scale = scale_for(original['turnover'], authority['turnover_cny'], amount_tolerance)
+    if volume_scale is None or amount_scale is None:
+        row['reason'] = 'scale_unknown_or_ambiguous'
+        return row
+    row.update(status='observed_row_unit_qualified', reason='native_priority_relay_corroborated',
+        volume_scale=volume_scale, amount_scale=amount_scale,
+        volume_shares=str(number(original['volume'])*volume_scale),
+        turnover_cny=str(number(original['turnover'])*amount_scale),
+        native_volume_residual=str(number(original['volume'])*volume_scale-number(authority['volume_shares'])),
+        native_amount_residual=str(number(original['turnover'])*amount_scale-number(authority['turnover_cny'])))
+    return row
+
+
+
+RECONCILED_PRICE_POLICY = {'version': 'native_reconciled_price_slice_v1',
+    'authority': 'hithink_native_same_request_code_and_date',
+    'legacy_selection': 'none_all_variants_retained_and_reconciled',
+    'cross_variant_volume_tolerance': '0.000001', 'cross_variant_amount_tolerance_cny': '0.50',
+    'conflict': 'quarantine_entire_security_day', 'scope': 'registered_observations_only_not_identity_merge',
+    'price_adjustment': 'none', 'volume_unit': 'shares', 'amount_unit': 'CNY'}
+
+
+def resolve_observed_prices(rows):
+    """Never pick latest/first old row. The independent native quote is the new row."""
+    grouped = defaultdict(list)
+    for row in rows:
+        key = (row['original']['stock_code'], row['original']['date'])
+        grouped[key].append(row)
+    records = []
+    for (code, day), variants in sorted(grouped.items()):
+        variants = sorted(variants, key=lambda r: r['original_sha256'])
+        record = {'stock_code': code, 'date': day, 'status': 'quarantined',
+            'reason': 'all_source_variants_must_qualify', 'values': None,
+            'source_variants': variants, 'native_evidence': [], 'source_variant_count': len(variants),
+            'identity_qualified': False, 'research_ready': False, 'execution_ready': False}
+        if all(r['status'] == 'observed_row_unit_qualified' for r in variants):
+            evidence = {}
+            for row in variants:
+                for e in row['evidence']:
+                    if e['provider'] == 'hithink_native':
+                        evidence[identity(e)] = e
+            natives = [evidence[k] for k in sorted(evidence)]
+            agree = all(max(number(r[field]) for r in variants)-min(number(r[field]) for r in variants) <= number(tolerance)
+                for field, tolerance in [('volume_shares', RECONCILED_PRICE_POLICY['cross_variant_volume_tolerance']),
+                                         ('turnover_cny', RECONCILED_PRICE_POLICY['cross_variant_amount_tolerance_cny'])])
+            if not natives or any(e['values'] != natives[0]['values'] for e in natives):
+                record['reason'] = 'native_authority_missing_or_conflicting'
+            elif not agree:
+                record['reason'] = 'normalized_source_variants_conflict'
+            else:
+                record.update(status='canonical_price_observation',
+                    reason='all_variants_reconciled_to_native' if len(variants)>1 else 'single_variant_reconciled_to_native',
+                    values=natives[0]['values'], native_evidence=natives)
+        record['record_id'] = identity(record)
+        records.append(record)
+    return records

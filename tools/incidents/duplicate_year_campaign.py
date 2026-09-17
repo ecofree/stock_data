@@ -11,8 +11,8 @@ import duckdb
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from tools.v2 import probe_identity_sources as probe
-from tools.v2.normalize_price_units import qualify,FIELDS
-from tools.v2.canonical_price_research import resolve
+from tools.incidents.normalize_price_units import qualify,FIELDS
+from tools.incidents.canonical_price_research import resolve
 from trade_system.v2.daily_session import CST,seal
 from trade_system.v2.domain import canonical,file_hash,identity,now_utc,utc
 from trade_system.v2.gap_evidence import read_json,write_json
@@ -119,7 +119,7 @@ def analyze(db,receipts,output,*,repair=None):
         manifests[name]=identity(members);evidence.update(rows);statuses.extend(state)
     repair_members=None;repair_counts=None
     if repair is not None:
-        from tools.v2.repair_year_campaign import replay as replay_repair
+        from tools.incidents.repair_year_campaign import replay as replay_repair
         repair_members,additional,repair_counts=replay_repair(receipts,repair)
         for key,values in additional.items():evidence.setdefault(key,[]).extend(values)
     qualified=[]
