@@ -19,7 +19,7 @@ import duckdb
 from base import DuckDBStore
 from trade_system.schema import init_schema
 from trade_system.tushare_store import (collect_tushare_stock_basic, collect_tushare_trade_cal, ts_code_to_stock_code)
-from trade_system.flow_contract import ensure_stock_flow_contract
+from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 
 
@@ -527,18 +527,16 @@ class TushareHistoryCollector:
             if row[1] in seen:
                 continue
             seen.add(row[1])
-            def net(buy, sell):
-                buy, sell = _num(buy), _num(sell)
-                return (buy - sell) * 10000 if buy is not None and sell is not None else None
-            small, mid, large, super_net = [net(row[i], row[i+1]) for i in (2, 4, 6, 8)]
-            buckets = (small, mid, large, super_net)
-            total = _num(row[10])
-            total = total * 10000 if total is not None else (sum(buckets) if all(v is not None for v in buckets) else None)
-            main = super_net + large if super_net is not None and large is not None else None
-            out.append([_iso(trade_date), row[1], main, total, super_net, large, mid, small, "tushare",
-                        "yuan", "main_orders_net", "moneyflow", "tushare", "stock_flow_v2", False,
-                        _json({"ts_code": row[0], "source": "tushare_moneyflow", "unit": "yuan",
-                               "net_total": total, "main_net_definition": "super_net+large_net"})])
+            raw = dict(zip(("buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
+                            "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
+                            "net_mf_amount"), row[2:]))
+            normalized = normalize_stock_flow_row({**raw, "source_api": "moneyflow",
+                                                   "amount_unit": "10000_yuan"}, "tushare")
+            out.append([_iso(trade_date), row[1], *[normalized[k] for k in (
+                        "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net")],
+                        "tushare", normalized["amount_unit"], normalized["flow_definition"], "moneyflow",
+                        "tushare", normalized["field_mapping_version"], False,
+                        _json({**raw, "ts_code": row[0], "source": "tushare_moneyflow", "unit": "10000_yuan"})])
         # An empty source batch is not a valid replacement.  In particular,
         # an upstream timeout can leave the raw table empty while the last
         # verified normalized snapshot is still usable.  Return before the

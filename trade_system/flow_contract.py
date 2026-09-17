@@ -65,7 +65,10 @@ def _raw_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, Any]:
     """Return canonical flow fields without discarding provider payload data."""
-    raw = _raw_dict(row)
+    # A canonical missing value is a decision, not permission to reinterpret raw units.
+    already_normalized = (row.get("field_mapping_version") == FLOW_MAPPING_VERSION
+                          and row.get("amount_unit") == "yuan")
+    raw = {} if already_normalized else _raw_dict(row)
     source_api = str(
         row.get("source_api")
         or row.get("api_name")
@@ -115,6 +118,8 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
         mid = mid * 10000 if mid is not None else None
         large = large * 10000 if large is not None else None
         super_net = super_net * 10000 if super_net is not None else None
+
+    small, mid, large, super_net = map(number, (small, mid, large, super_net))
 
     explicit_total = number(row.get("net_total"))
     reported_total = explicit_total

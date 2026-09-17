@@ -385,38 +385,11 @@ def _from_xiaodefa_moneyflow(code, days=120):
     if not rows:
         return None
 
-    def num(row, key):
-        try:
-            return float(row.get(key)) * 10000
-        except (TypeError, ValueError):
-            return 0.0
-
-    out = []
-    for row in rows:
-        small = num(row, "buy_sm_amount") - num(row, "sell_sm_amount")
-        mid = num(row, "buy_md_amount") - num(row, "sell_md_amount")
-        large = num(row, "buy_lg_amount") - num(row, "sell_lg_amount")
-        super_net = num(row, "buy_elg_amount") - num(row, "sell_elg_amount")
-        reported = row.get("net_mf_amount")
-        try:
-            total = float(reported) * 10000
-        except (TypeError, ValueError):
-            total = small + mid + large + super_net
-        # TuShare ``net_mf_amount`` is the total net amount.  The project
-        # contract calls main-order flow super-large + large; never put the
-        # total into ``main_net``.
-        main = super_net + large
-        out.append({"date": str(row.get("trade_date") or "")[:10],
-                    "main_net": main, "small_net": small, "mid_net": mid,
-                    "large_net": large, "super_net": super_net,
-                    "net_total": total, "_src": "xiaodefa",
-                    "source_api": "moneyflow", "flow_definition": "main_orders_net",
-                    "amount_unit": "yuan"})
-    return out or None
-
-
-
-
+    from trade_system.flow_contract import normalize_stock_flow_row
+    return [{**normalize_stock_flow_row({**row, "source_api": "moneyflow",
+                "amount_unit": "10000_yuan"}, "xiaodefa"),
+             "date": str(row.get("trade_date") or "")[:10],
+             "_src": "xiaodefa", "raw": row} for row in rows]
 
 
 

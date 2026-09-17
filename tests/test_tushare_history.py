@@ -30,9 +30,9 @@ def test_adj_factor_date_snapshot_is_persisted(tmp_path):
 
 class XiaodefaDailyFixture(XiaodefaClient):
     def __init__(self):
-        pass
+        super().__init__(token="fixture")
 
-    def query_rows(self, api_name, params=None, fields=""):
+    def query_rows(self, api_name, params=None, fields="", *, _deadline=None):
         assert api_name == "daily"
         return [
             {
@@ -77,7 +77,9 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
             assert api_name == "moneyflow"
             return [{"trade_date": "20260714", "ts_code": "000001.SZ",
                      "buy_elg_amount": 10, "sell_elg_amount": 4,
-                     "buy_lg_amount": 8, "sell_lg_amount": 2}]
+                     "buy_lg_amount": 8, "sell_lg_amount": 2,
+                     "buy_sm_amount": 1, "sell_sm_amount": 1,
+                     "buy_md_amount": 1, "sell_md_amount": 1}]
     with TushareHistoryCollector(tmp_path / "flow.duckdb", client=FlowFixture()) as collector:
         collector._collect_industry_flow("20260714")
         collector.sync_sector_flow("20260714")
@@ -87,5 +89,5 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
         collector._collect_moneyflow("20260714")
         collector.sync_stock_flow("20260714")
         assert collector.store.conn.execute(
-            "SELECT main_net,super_net,large_net,mid_net,small_net FROM multi_source_stock_flow"
-        ).fetchone() == (120000, 60000, 60000, None, None)
+            "SELECT main_net,super_net,large_net,mid_net,small_net,net_total FROM multi_source_stock_flow"
+        ).fetchone() == (120000, 60000, 60000, 0, 0, None)

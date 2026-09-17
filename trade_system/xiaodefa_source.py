@@ -44,30 +44,38 @@ class XiaodefaClient:
         self.runner = runner
         self.rate_key = "xiaodefa:" + hashlib.sha256(self.token.encode()).hexdigest()
 
-    def _request(self, body):
-        from trade_system.http_transport import open_verified_once
+    def _request(self, body, deadline):
+        from trade_system.http_transport import read_verified_once
         from trade_system.host_limiter import shared_host_limiter
-        shared_host_limiter.acquire(self.rate_key, self.min_interval)
+        shared_host_limiter.acquire(self.rate_key, self.min_interval, deadline=deadline)
         request = urllib.request.Request(self.url,
             data=json.dumps(body, allow_nan=False, separators=(",", ":")).encode(),
             headers={"Content-Type": "application/json"})
-        with open_verified_once(request, timeout=self.timeout) as response:
-            raw = response.read(self.max_response_bytes + 1)
-        if len(raw) > self.max_response_bytes:
-            raise XiaodefaError("response byte budget exceeded")
+        try:
+            raw = read_verified_once(request, timeout=deadline-time.monotonic(), max_bytes=self.max_response_bytes)
+        except ValueError as exc:
+            raise XiaodefaError(str(exc)) from None
         try:
             return json.loads(raw)
         except (ValueError, UnicodeError) as exc:
             raise XiaodefaError("invalid JSON response") from exc
 
-    def query_data(self, api_name, params=None, fields=""):
+    def query_data(self, api_name, params=None, fields="", *, _deadline=None):
         """Preserve the native envelope for receipt consumers, without a second HTTP client."""
         body = {"api_name": api_name, "token": self.token,
                 "params": dict(params or {}), "fields": fields}
+        deadline = time.monotonic() + self.timeout
+        if _deadline is not None:
+            deadline = min(deadline, _deadline)
         payload = None
         for attempt in range(self.max_retries):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise XiaodefaError("request deadline exhausted")
             try:
-                payload = self.runner(body, self.timeout) if self.runner else self._request(body)
+                payload = self.runner(body, remaining) if self.runner else self._request(body, deadline)
+                if time.monotonic() >= deadline:
+                    raise XiaodefaError("request deadline exhausted")
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code not in (429, 500, 502, 503, 504) or attempt + 1 == self.max_retries:
@@ -75,7 +83,10 @@ class XiaodefaClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 if attempt + 1 == self.max_retries:
                     raise XiaodefaError("transport retry budget exhausted") from None
-            time.sleep(min(2 ** attempt, 4))
+            delay = min(2 ** attempt, 4)
+            if delay >= deadline - time.monotonic():
+                raise XiaodefaError("request deadline exhausted")
+            time.sleep(delay)
         if not isinstance(payload, dict) or type(payload.get("code")) is not int or payload["code"] != 0:
             raise XiaodefaError("provider rejected request; no semantic retry")
         data = payload.get("data")
@@ -94,22 +105,26 @@ class XiaodefaClient:
                 raise XiaodefaError("non-finite response value")
         return data
 
-    def query_rows(self, api_name, params=None, fields=""):
-        data = self.query_data(api_name, params, fields)
+    def query_rows(self, api_name, params=None, fields="", *, _deadline=None):
+        data = (self.query_data(api_name, params, fields) if _deadline is None
+                else self.query_data(api_name, params, fields, _deadline=_deadline))
         return [dict(zip(data["fields"],row)) for row in data["items"]]
 
     def query(self, api_name, **params):
         fields = params.pop("fields", "")
-        return self.query_rows(api_name, params, fields)
+        deadline = params.pop("_deadline", None)
+        return (self.query_rows(api_name, params, fields) if deadline is None
+                else self.query_rows(api_name, params, fields, _deadline=deadline))
 
     def query_all(self, api_name, *, page_size=DEFAULT_PAGE_SIZE,
                   max_rows=MAX_ROWS_SAFETY, **params):
         if page_size <= 0 or max_rows <= 0:
             raise XiaodefaError("positive pagination budget required")
+        deadline = time.monotonic() + self.timeout
         collected, seen = [], set()
         while len(collected) < max_rows:
             limit = min(page_size, max_rows-len(collected))
-            batch = self.query(api_name, limit=limit, offset=len(collected), **params)
+            batch = self.query(api_name, limit=limit, offset=len(collected), _deadline=deadline, **params)
             signature = json.dumps(batch,sort_keys=True,allow_nan=False)
             if batch and signature in seen:
                 raise XiaodefaError("repeated page; completeness unknown")

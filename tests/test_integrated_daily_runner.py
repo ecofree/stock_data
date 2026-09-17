@@ -274,7 +274,12 @@ def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, m
     import subprocess
     from trade_system.migration_boundary import collection_contract, verify_collection_contract
     source=tmp_path/'source';source.mkdir()
-    (source/'fetch_all.py').write_text('# synthetic collector')
+    (source/'fetch_all.py').write_text('from collectors import retained')
+    adapters=source/'collectors';adapters.mkdir()
+    (adapters/'__init__.py').write_text('')
+    (adapters/'retained.py').write_text('THRESHOLD = 1')
+    research=source/'research';research.mkdir()
+    (research/'experiment.py').write_text('VERSION = 1')
     cache=source/'trade_system/.stock_cache/limiter.json';cache.parent.mkdir(parents=True)
     cache.write_text('{"attempts":1}')
     thresholds=source/'config/phase_thresholds.json';thresholds.parent.mkdir()
@@ -294,6 +299,14 @@ def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, m
     cache.write_text('{"attempts":2}')
     assert verify_collection_contract(path,digest,db,output)==manifest
     assert 'trade_system/.stock_cache/limiter.json' not in manifest['files']
+    (research/'experiment.py').write_text('VERSION = 2')
+    assert verify_collection_contract(path,digest,db,output)==manifest
+    assert 'collectors/retained.py' in manifest['files']
+    assert 'research/experiment.py' not in manifest['files']
+    (adapters/'retained.py').write_text('THRESHOLD = 2')
+    with pytest.raises(ValueError,match='source/runtime changed'):
+        verify_collection_contract(path,digest,db,output)
+    (adapters/'retained.py').write_text('THRESHOLD = 1')
     thresholds.write_text('{"threshold":2}')
     with pytest.raises(ValueError,match='source/runtime changed'):
         verify_collection_contract(path,digest,db,output)

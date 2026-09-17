@@ -194,3 +194,84 @@ def test_kline_receipts_do_not_mix_additional_request_semantics(acquisition, mon
     acquisition.get('kline', '000001', market_scope='first', **args)
     acquisition.get('kline', '000001', market_scope='second', **args)
     assert calls == ['first', 'second']
+
+
+def test_pagination_shares_one_deadline(monkeypatch):
+    from trade_system import xiaodefa_source as source
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(source.time, 'monotonic', lambda: clock[0])
+    def request(body, remaining):
+        calls.append(remaining)
+        clock[0] += 0.6
+        return envelope([[str(len(calls)), '20260916', 12]])
+    client = XiaodefaClient(token='fixture', timeout=1, runner=request)
+    with pytest.raises(XiaodefaError, match='deadline'):
+        client.query_all('daily', page_size=1, max_rows=10)
+    assert calls == [1, pytest.approx(0.4)]
+
+
+def test_shared_cooldown_refuses_out_of_budget_wait(tmp_path, monkeypatch):
+    from trade_system.host_limiter import SharedHostLimiter
+    import time
+    monkeypatch.setenv('KPL_SHARED_RATE_LIMIT', '1')
+    limiter = SharedHostLimiter(tmp_path / 'rate.db')
+    limiter.cooldown('fixture-account', 60)
+    with pytest.raises(TimeoutError, match='cooldown'):
+        limiter.acquire('fixture-account', 1, deadline=time.monotonic()+0.05)
+
+
+def test_blocked_transport_worker_is_reaped_at_deadline(monkeypatch):
+    import subprocess
+    import sys
+    import urllib.request
+    from trade_system.http_transport import read_verified_once
+    original = subprocess.Popen
+    children = []
+    def stall(command, *args, **kwargs):
+        assert 'fixture-secret' not in ' '.join(command)
+        child = original([sys.executable, '-I', '-B', '-c', 'import time;time.sleep(30)'],
+                         *args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(subprocess, 'Popen', stall)
+    request = urllib.request.Request('https://t.xiaodefa.top/', data=b'{"token":"fixture-secret"}')
+    with pytest.raises(TimeoutError, match='deadline'):
+        read_verified_once(request, timeout=0.2, max_bytes=100)
+    assert len(children) == 1 and children[0].poll() is not None
+
+
+@pytest.mark.parametrize('status, body', [(200, b'complete'), (403, b'private'), (200, b'x'*33)])
+def test_real_transport_worker_preserves_http_and_size_boundaries(status, body):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import urllib.request
+    from trade_system.http_transport import read_verified_once
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(status)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    server = HTTPServer(('127.0.0.1', 0), Handler)
+    server.timeout = 5
+    thread = threading.Thread(target=server.handle_request)
+    thread.start()
+    try:
+        request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/fixture')
+        if status != 200:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                read_verified_once(request, timeout=4, max_bytes=32)
+            assert error.value.code == status
+        elif len(body) > 32:
+            with pytest.raises(ValueError, match='byte budget'):
+                read_verified_once(request, timeout=4, max_bytes=32)
+        else:
+            assert read_verified_once(request, timeout=4, max_bytes=32) == body
+    finally:
+        thread.join(5)
+        server.server_close()
+    assert requests == ['/fixture'] and not thread.is_alive()

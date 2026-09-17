@@ -38,14 +38,17 @@ class SharedHostLimiter:
     def enabled(self) -> bool:
         return os.getenv("KPL_SHARED_RATE_LIMIT", "1").strip().lower() not in {"0", "false", "off"}
 
-    def acquire(self, host: str, min_interval: float) -> None:
+    def acquire(self, host: str, min_interval: float, *, deadline: float | None = None) -> None:
         if not self.enabled or min_interval <= 0:
             return
         host = str(host or "unknown")
         while True:
+            remaining = deadline - time.monotonic() if deadline is not None else 30.0
+            if remaining <= 0:
+                raise TimeoutError('shared rate limit deadline exhausted')
             now = time.time()
             wait = 0.0
-            con = sqlite3.connect(self.db_path, timeout=30)
+            con = sqlite3.connect(self.db_path, timeout=min(30.0, remaining))
             try:
                 con.execute("BEGIN IMMEDIATE")
                 row = con.execute(
@@ -66,6 +69,10 @@ class SharedHostLimiter:
                 con.close()
             if wait <= 0:
                 return
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if wait >= remaining:
+                    raise TimeoutError('shared cooldown exceeds request deadline')
             time.sleep(min(wait, 2.0))
 
     def cooldown(self, host: str, seconds: float) -> None:

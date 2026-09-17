@@ -31,6 +31,70 @@ def require_copy(root,db,reports):
             'database':str(db),'reports':str(reports)}
 
 
+def collection_source_files(root):
+    """Bind transitive collector imports and literal script entries without importing them."""
+    import ast
+
+    root = Path(root).resolve()
+    pending = [root / 'fetch_all.py']
+    runner = root / 'scripts/run_integrated_daily.py'
+    if runner.is_file():
+        pending.append(runner)
+    selected = set()
+
+    def module_path(name):
+        path = root.joinpath(*name.split('.'))
+        for candidate in (path.with_suffix('.py'), path / '__init__.py'):
+            if candidate.is_file():
+                pending.append(candidate)
+                return
+
+    while pending:
+        path = pending.pop()
+        if path in selected:
+            continue
+        if any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)()
+               for p in (path, *path.parents)) or root not in path.resolve().parents:
+            raise ValueError('collector source member escapes root')
+        selected.add(path)
+        relative = path.relative_to(root)
+        package = list(relative.parent.parts)
+        # Package initializers execute too, even when only a submodule is imported.
+        for n in range(1, len(package) + 1):
+            initializer = root.joinpath(*package[:n], '__init__.py')
+            if initializer.is_file():
+                pending.append(initializer)
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8-sig'))):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_path(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                prefix = package[:len(package) - node.level + 1] if node.level else []
+                name = '.'.join(prefix + ([node.module] if node.module else []))
+                module_path(name)
+                for alias in node.names:
+                    if alias.name != '*':
+                        module_path('.'.join(filter(None, (name, alias.name))))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                # Subprocess entries are source dependencies even without an import.
+                name = node.value.replace('\\', '/')
+                if name.endswith('.py') and (root / name).is_file():
+                    pending.append(root / name)
+            elif isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name) and node.func.id == '__import__'
+                or isinstance(node.func, ast.Attribute) and node.func.attr == 'import_module'
+            ):
+                if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+                    raise ValueError('unresolved dynamic collector import')
+                module_path(node.args[0].value)
+    # Configuration and migrations stay sealed; runtime caches and research outputs do not.
+    for folder in ('migrations', 'config'):
+        selected.update(p for p in (root / folder).rglob('*') if p.is_file()
+                        and p.suffix in ('.sql', '.json', '.toml', '.yaml', '.yml'))
+    selected.update(p for p in (root / 'requirements.lock', root / 'requirements-build.lock') if p.is_file())
+    return selected
+
+
 def collection_contract(source_root, database, reports, python):
     """Seal existing market collectors for an explicit transitional task adapter.
 
@@ -59,18 +123,9 @@ def collection_contract(source_root, database, reports, python):
             raise ValueError('transitional collection refuses V2/account databases')
         if not {'tushare_trade_cal', 'v_kline_daily'} <= names:
             raise ValueError('initialized market database and calendar required')
-    files = set(root.glob('*.py')) | set(root.glob('requirements*.lock'))
-    # These are collector limiter/cache state and historical research outputs,
-    # not executable source/configuration. Their normal updates must not revoke
-    # the next collection run. Research evidence has its own immutable binding.
-    runtime_outputs = ('trade_system/.stock_cache/', 'research/phase_abc/reports/',
-                       'research/phase_abc/snapshot/')
-    for folder in ('scripts', 'trade_system', 'collectors', 'research', 'migrations', 'config'):
-        files.update(p for p in (root / folder).rglob('*') if p.is_file()
-            and p.suffix in ('.py', '.sql', '.json', '.toml', '.yaml', '.yml')
-            and not p.relative_to(root).as_posix().startswith(runtime_outputs))
     if not (root / 'fetch_all.py').is_file():
         raise ValueError('canonical collector entry missing')
+    files = collection_source_files(root)
     if any(p.is_symlink() or root not in p.resolve().parents for p in files):
         raise ValueError('collector source member escapes root')
     digests = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}

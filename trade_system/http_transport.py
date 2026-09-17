@@ -134,3 +134,77 @@ def open_verified_once(request: urllib.request.Request, *, timeout: float):
     if _direct_first():
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers).open(request,timeout=timeout)
+
+
+def _read_verified_response(request, timeout, max_bytes):
+    with open_verified_once(request, timeout=timeout) as response:
+        raw = response.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError('response byte budget exceeded')
+    return raw
+
+
+def _response_worker():
+    """Private one-request child: the parent can terminate blocked DNS/body reads."""
+    import json
+    import sys
+    data = json.loads(sys.stdin.buffer.read(20_000_000))
+    request = urllib.request.Request(data['url'],
+        data=data['body'].encode('utf-8') if data['body'] is not None else None,
+        headers=data['headers'], method=data['method'])
+    raw = b''
+    try:
+        raw = _read_verified_response(request, data['timeout'], data['max_bytes'])
+        status = {'ok': True}
+    except urllib.error.HTTPError as exc:
+        status = {'http_status': exc.code}
+    except ValueError:
+        status = {'error': 'response byte budget exceeded'}
+    except Exception:
+        status = {'error': 'verified transport failed'}
+    sys.stdout.buffer.write(json.dumps(status).encode('ascii') + b'\n' + raw)
+
+
+def read_verified_once(request, *, timeout, max_bytes):
+    """One verified request, with a wall-clock limit including DNS and body reads."""
+    import json
+    import subprocess
+    import sys
+    import math
+    if not math.isfinite(timeout) or timeout > 60:
+        raise ValueError("transport timeout must be finite and at most 60 seconds")
+    if timeout <= 0:
+        raise TimeoutError('transport deadline exhausted')
+    if not 1 <= max_bytes <= 8_000_000:
+        raise ValueError('bounded response size required')
+    payload = json.dumps({'url': request.full_url, 'headers': dict(request.header_items()),
+        'method': request.get_method(), 'body': request.data.decode('utf-8') if request.data else None,
+        'timeout': timeout, 'max_bytes': max_bytes}).encode('utf-8')
+    if len(payload) > 20_000_000:
+        raise ValueError('request byte budget exceeded')
+    # Credentials travel through stdin, never command-line arguments or diagnostics.
+    command = [sys.executable, '-I', '-B', '-c',
+        'import sys;sys.path.insert(0,sys.argv[1]);from trade_system.http_transport import _response_worker;_response_worker()',
+        str(Path(__file__).resolve().parents[1])]
+    try:
+        result = subprocess.run(command, input=payload, capture_output=True, timeout=timeout,
+                                creationflags=0x08000000 if sys.platform == 'win32' else 0)
+    except subprocess.TimeoutExpired:
+        # run() kills and waits for its one child before raising; no background reader survives.
+        raise TimeoutError('transport deadline exhausted') from None
+    if result.returncode:
+        raise urllib.error.URLError('verified transport worker failed')
+    header, separator, raw = result.stdout.partition(b'\n')
+    try:
+        status = json.loads(header)
+    except ValueError:
+        raise urllib.error.URLError('invalid transport worker response') from None
+    if not separator:
+        raise urllib.error.URLError('incomplete transport worker response')
+    if 'http_status' in status:
+        raise urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed', None, None)
+    if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
+        raise ValueError('response byte budget exceeded')
+    if status.get('ok') is not True:
+        raise urllib.error.URLError('verified transport failed')
+    return raw

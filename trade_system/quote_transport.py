@@ -1,5 +1,6 @@
 """One bounded Tencent transport shared by legacy and research observations."""
 import re
+import time
 from urllib.request import Request
 
 MAX_CODES=200
@@ -31,16 +32,14 @@ def market_prefix(code):
     return 'bj' if code.startswith(('4','8','92')) else 'sh' if code.startswith(('5','6','9')) else 'sz'
 
 
-def request_bytes(codes):
+def request_bytes(codes, *, timeout=12):
     """One verified HTTPS attempt, no transport fallback or retries."""
-    from trade_system.http_transport import open_verified_once
+    from trade_system.http_transport import read_verified_once
     codes=canonical_codes(codes)
     if not 1<=len(codes)<=BATCH_SIZE:raise ValueError('bounded nonempty quote batch required')
     symbols=[market_prefix(c)+c for c in codes]
     request=Request('https://qt.gtimg.cn/q='+','.join(symbols),headers={'User-Agent':'Mozilla/5.0'})
-    with open_verified_once(request,timeout=12) as response:raw=response.read(MAX_BYTES+1)
-    if len(raw)>MAX_BYTES:raise ValueError('quote response byte budget exceeded')
-    return raw
+    return read_verified_once(request, timeout=timeout, max_bytes=MAX_BYTES)
 
 
 def parse_parts(raw,codes):
@@ -61,5 +60,10 @@ def parse_parts(raw,codes):
 
 def fetch_parts(codes):
     result={}
-    for batch in batches(codes):result.update(parse_parts(request_bytes(batch),batch))
+    deadline = time.monotonic() + 12
+    for batch in batches(codes):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('quote batch deadline exhausted')
+        result.update(parse_parts(request_bytes(batch, timeout=remaining), batch))
     return result
