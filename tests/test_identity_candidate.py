@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from tools.v2 import build_identity_candidate as p
+from tools.incidents import build_identity_candidate as p
 from trade_system.v2.domain import identity
 
 

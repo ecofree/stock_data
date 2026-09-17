@@ -12,6 +12,7 @@ import urllib.parse as _up
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
+from trade_system.http_transport import read_verified_once
 
 try:
     from trade_system.config import SETTINGS as _PROJECT_SETTINGS
@@ -45,47 +46,8 @@ def _em_get_json(url, params=None, headers=None, timeout=15, post=False, data=No
     else:
         qs = ("?" + _up.urlencode(params)) if params else ""
         req = _u.Request(url + qs, headers=hdrs)
-    try:
-        with _u.urlopen(req, timeout=timeout) as r:
-            raw = r.read()
-        return json.loads(_auto_decode(raw))
-    except Exception:
-        # Eastmoney's push2 front doors intermittently reset urllib/TLS
-        # connections during paginated pulls.  Retry GETs through the same
-        # public route over a small host/scheme set; POST callers keep the
-        # original exception because their payloads are endpoint-specific.
-        if post:
-            raise
-        try:
-            import requests
-            from urllib.parse import urlsplit, urlunsplit
-            parsed = urlsplit(url)
-            hosts = [parsed.netloc]
-            if "push2" in parsed.netloc:
-                hosts.extend([
-                    "push2his.eastmoney.com", "82.push2.eastmoney.com",
-                    "17.push2.eastmoney.com", "95.push2.eastmoney.com",
-                ])
-            last_exc = None
-            for scheme in (parsed.scheme, "http"):
-                for host in dict.fromkeys(hosts):
-                    try:
-                        target = urlunsplit((scheme, host, parsed.path, "", ""))
-                        session = requests.Session()
-                        session.trust_env = False
-                        response = session.get(
-                            target, params=params, headers=hdrs,
-                            timeout=timeout, verify=(scheme == "https"),
-                        )
-                        response.raise_for_status()
-                        return response.json()
-                    except Exception as exc:
-                        last_exc = exc
-            if last_exc:
-                raise last_exc
-        except Exception:
-            raise
-        raise
+    raw = read_verified_once(req, timeout=timeout, max_bytes=8_000_000)
+    return json.loads(_auto_decode(raw))
 
 
 def _em_get_clist_json(params=None, timeout=15):

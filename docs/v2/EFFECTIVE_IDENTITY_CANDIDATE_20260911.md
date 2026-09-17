@@ -1,5 +1,7 @@
 # 有效期身份与资金候选关联
 
+历史记录（2026-09-17）：下文构建入口已迁至 `tools/incidents/build_identity_candidate.py`。候选研究导出仅由 `tools.incidents.identity_research_columns` 显式执行，当前导出器不再调用此历史链路。
+
 更新：2026-09-11。目录 `D:/accio/stock_data-retirement`。本段仅使用冻结副本和已有原始回执，新增行情/资金网络请求为 0；没有改动生产数据库、任务、旧研究导出或模型。
 
 ## 本段结果

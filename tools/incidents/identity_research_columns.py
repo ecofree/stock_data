@@ -91,3 +91,61 @@ def apply(con, candidate, *, start, end):
         'default_features_changed': False, 'labels_changed': False,
         'historical_PIT_qualified': False, 'research_ready': False,
         'execution_ready': False, 'production_cutover': False}
+
+
+def export(db, output, *, candidate, layer, receipts, policy, calendar, research_overlay,
+           start_date=None, end_date=None):
+    """Explicit historical export; the current exporter never imports this workflow."""
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    import os
+    import duckdb
+    from scripts.export_qlib_features import export_features, apply_calendar_overlay
+    from tools.incidents import build_identity_candidate as build
+    from trade_system.file_lock import FileLock
+    from trade_system.v2.daily_session import seal
+    from trade_system.v2.gap_evidence import write_json
+    output = build.separate(output, db, candidate, layer, receipts, policy, calendar, research_overlay)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(output.with_suffix('.export.guard')):
+        if output.exists():
+            raise ValueError('new historical output required')
+        verified = build.verify(candidate, layer, receipts, db, policy)
+        consumer_hash = file_hash(__file__)
+        with TemporaryDirectory(prefix='identity-export-', dir=output.parent) as scratch:
+            scratch = Path(scratch)
+            meta = export_features(db, scratch/'base.parquet', start_date=start_date,
+                end_date=end_date, output_format='parquet', calendar_overlay=calendar,
+                research_overlay=research_overlay, semantics=policy)
+            start, end = meta['start_date'], meta['end_date']
+            published = scratch/'published'; published.mkdir()
+            artifact = published/'features.parquet'
+            with duckdb.connect(str(db), read_only=True) as con:
+                con.execute('SET threads=2')
+                apply_calendar_overlay(con, calendar)
+                con.execute('CREATE TEMP TABLE semantic_features AS SELECT * FROM read_parquet(?)',
+                            [str(Path(meta['outputs']['parquet'])/'*.parquet')])
+                candidate_meta = apply(con, verified, start=start, end=end)
+                con.execute("COPY (SELECT * FROM candidate_features ORDER BY datetime,instrument) TO '"+
+                            str(artifact).replace("'", "''")+"' (FORMAT PARQUET)")
+            if build.verify(candidate, layer, receipts, db, policy) != verified or file_hash(__file__) != consumer_hash:
+                raise ValueError('historical candidate evidence changed during export')
+            meta.update(identity_candidate=candidate_meta, candidate_feature_columns=candidate_meta['feature_columns'],
+                outputs={'parquet': str(output/'features.parquet')}, format='parquet',
+                export_storage='single_historical_parquet', export_batches=1,
+                artifact_hashes={'features.parquet': file_hash(artifact)},
+                scope='fixed_identity_incident_only_not_current_default', research_ready=False, execution_ready=False)
+            write_json(published/'features.metadata.json', meta)
+            seal(published)
+            os.replace(published, output)
+            return meta
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ('db', 'output', 'candidate', 'layer', 'receipts', 'policy', 'calendar', 'research-overlay'):
+        parser.add_argument('--'+name, required=True)
+    parser.add_argument('--start-date'); parser.add_argument('--end-date')
+    args = parser.parse_args()
+    print(json.dumps(export(**vars(args)), ensure_ascii=False))

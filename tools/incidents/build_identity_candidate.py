@@ -4,8 +4,6 @@ from collections import Counter
 from pathlib import Path
 import sys
 
-import duckdb
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.incidents import normalize_price_units as units
 from tools.v2 import probe_identity_sources as probe
@@ -164,7 +162,8 @@ def verify(folder, layer, receipts, db, policy):
 
 def join_probe(rows):
     """Private in-memory SQL consumer, never attaches a source or production DB."""
-    with duckdb.connect(':memory:') as con:
+    from trade_system.db_utils import legacy_connect
+    with legacy_connect(':memory:') as con:
         con.execute('CREATE TABLE prices(date VARCHAR PRIMARY KEY,original_sha VARCHAR UNIQUE)')
         con.execute('CREATE TABLE candidates(date VARCHAR PRIMARY KEY,original_sha VARCHAR UNIQUE,source_code VARCHAR,net_cny VARCHAR)')
         for row in rows:

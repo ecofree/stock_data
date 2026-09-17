@@ -5,7 +5,7 @@ import duckdb
 import pytest
 
 from scripts.export_qlib_features import export_features
-from tools.v2 import identity_research_columns as p
+from tools.incidents import identity_research_columns as p
 from trade_system.v2.domain import identity
 
 
@@ -76,3 +76,67 @@ def test_invalid_candidate_consumer_inputs_fail(mode):
 def test_export_requires_all_candidate_dependencies_before_opening_db(tmp_path):
     with pytest.raises(ValueError, match='candidate requires'):
         export_features(tmp_path/'absent.db', tmp_path/'out.csv', identity_candidate=tmp_path/'candidate')
+
+
+@pytest.mark.parametrize('complete', [False, True])
+def test_current_export_never_loads_historical_candidate(tmp_path, monkeypatch, complete):
+    import builtins
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name.startswith('tools.incidents'):
+            pytest.fail('current export entered historical workflow')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    options = {'identity_candidate': 'old'}
+    if complete:
+        options.update(identity_price_layer='old', identity_receipts='old',
+                       semantics='old', calendar_overlay='old', research_overlay='old')
+    with pytest.raises(ValueError, match='explicit historical maintenance'):
+        export_features(tmp_path/'absent.db', tmp_path/'out.csv', **options)
+    assert not (tmp_path/'absent.db').exists() and not (tmp_path/'out.csv').exists()
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_explicit_incident_export_retains_columns_and_rejects_changed_evidence(tmp_path, monkeypatch, changed):
+    from pathlib import Path
+    from tools.incidents import build_identity_candidate as build
+    from scripts import export_qlib_features as current
+    from trade_system.v2.gap_evidence import read_json
+    con, candidate, days = fixture()
+    with con:
+        base = tmp_path/'source.parquet'
+        con.execute("COPY semantic_features TO '"+str(base).replace("'", "''")+"' (FORMAT PARQUET)")
+    db = tmp_path/'source.db'
+    with duckdb.connect(str(db)):
+        pass
+    calls = []
+    def verify(*args):
+        calls.append(1)
+        return dict(candidate, changed=True) if changed and len(calls)>1 else candidate
+    monkeypatch.setattr(build, 'verify', verify)
+    def baseline(db, output, **kwargs):
+        folder = Path(output).parent/'parts'; folder.mkdir()
+        (folder/'part.parquet').write_bytes(base.read_bytes())
+        return {'outputs': {'parquet': str(folder)}, 'start_date': days[0], 'end_date': days[-1],
+                'feature_columns': ['net_mf_amount'], 'label_column': 'label_next_ret'}
+    monkeypatch.setattr(current, 'export_features', baseline)
+    def calendar(con, folder):
+        con.execute('CREATE TEMP TABLE verified_calendar_overlay(cal_date DATE,is_open BOOLEAN)')
+        con.executemany('INSERT INTO verified_calendar_overlay VALUES (?,true)', [(d,) for d in days])
+    monkeypatch.setattr(current, 'apply_calendar_overlay', calendar)
+    output = tmp_path/'result'
+    inputs = {k:tmp_path/k for k in ('candidate', 'layer', 'receipts', 'policy', 'calendar', 'research_overlay')}
+    if changed:
+        with pytest.raises(ValueError, match='evidence changed'):
+            p.export(db, output, **inputs)
+        assert not output.exists()
+    else:
+        result = p.export(db, output, **inputs)
+        assert result['feature_columns'] == ['net_mf_amount']
+        assert result['candidate_feature_columns'] == p.FEATURES
+        with duckdb.connect(':memory:') as check:
+            values = check.execute('SELECT net_mf_amount,label_next_ret,candidate_identity_moneyflow_5d_cny FROM read_parquet(?) ORDER BY datetime', [str(output/'features.parquet')]).fetchall()
+        assert values == [(None,None,None)]*4 + [(None,None,-500.0)]*6
+        assert read_json(output/'features.metadata.json')[0]['execution_ready'] is False
+    assert len(calls) == 2
+    assert not list(tmp_path.glob('identity-export-*'))

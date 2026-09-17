@@ -1,5 +1,7 @@
 # 交易所价格修订与候选资金研究导出
 
+历史记录（2026-09-17）：下文旧候选导出参数已从当前导出流程退出。独立维护入口为 `python -m tools.incidents.identity_research_columns --help`；原封存输入与核验要求继续适用。
+
 更新：2026-09-11。工作目录 `D:/accio/stock_data-retirement`。本段是隔离实施，不是生产切换、正式回测验收或交易授权。
 
 ## 结果及未完成项
