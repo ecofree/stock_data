@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import pytest
+from duckdb import ConstraintException
 
 from tools.incidents import build_identity_candidate as p
 from trade_system.v2.domain import identity
@@ -105,7 +106,7 @@ def test_resealed_candidate_tampering_rejected(tmp_path, monkeypatch):
 
 def test_duplicate_candidate_consumer_row_refused():
     prices, obs = fixture(); rows = p.assemble(prices, obs, ALIAS)
-    with pytest.raises(p.duckdb.ConstraintException): p.join_probe(rows+[rows[0]])
+    with pytest.raises(ConstraintException): p.join_probe(rows+[rows[0]])
 
 
 def test_zero_is_distinct_from_missing_money():
