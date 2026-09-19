@@ -2,7 +2,6 @@
 import http.client
 import json
 import threading
-from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
@@ -132,12 +131,6 @@ def test_service_identity_distinguishes_workspace_and_changed_source(tmp_path,mo
     assert server.service_identity(tmp_path,tmp_path/'a')['surface_sha256']!=a['surface_sha256']
 
 
-def test_launcher_does_not_reuse_generic_legacy_header_or_bypass_policy():
-    root=Path(__file__).resolve().parents[1]
-    source=(root/'scripts/start_research_workbench.ps1').read_text(encoding='utf-8')
-    assert 'local-v3' not in source and 'surface_sha256' in source and 'workspace_id' in source
-    assert '-WindowStyle Hidden' in source and '[int]$Port=8769' in source
-    assert 'ExecutionPolicy Bypass' not in (root/'Start Research.cmd').read_text(encoding='utf-8')
 
 
 def test_receipt_escapes_human_text_and_clears_only_matching_draft(tmp_path,monkeypatch):

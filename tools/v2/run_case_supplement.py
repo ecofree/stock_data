@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from trade_system.v2.case_supplement import collect_supplement, verify_supplement
 from trade_system.v2.gap_evidence import read_json
+from trade_system.http_transport import read_public_pdf, request_budget
 
 
 if __name__ == '__main__':
@@ -18,6 +19,7 @@ if __name__ == '__main__':
     verify = commands.add_parser('verify')
     verify.add_argument('--folder', type=Path, required=True)
     args = parser.parse_args()
-    result = (collect_supplement(read_json(args.plan)[0], args.output) if args.command == 'collect'
-              else verify_supplement(args.folder))
+    with request_budget(60):
+        result = (collect_supplement(read_json(args.plan)[0], args.output, fetch=read_public_pdf) if args.command == 'collect'
+                  else verify_supplement(args.folder))
     print(json.dumps({k: result[k] for k in ('scope','public_pdf_requests','classification_counts','execution_ready')}, ensure_ascii=False))

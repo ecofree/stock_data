@@ -86,6 +86,8 @@ def test_workspace_launcher_uses_dedicated_runtime_before_any_mutation():
     assert "[string]$Python='D:\\anaconda\\python.exe'" not in text
     assert text.index('& $Python -m pip check') < text.index('if ($Build)')
     assert 'Runtime dependency check failed' in text
+    assert 'local-v3' not in text and 'surface_sha256' in text and 'workspace_id' in text
+    assert 'ExecutionPolicy Bypass' not in (ROOT/'Start Research.cmd').read_text(encoding='utf-8')
 
 
 def test_diagnostics_preserved_before_rollback_without_secret_export():

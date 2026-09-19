@@ -1,4 +1,4 @@
-from collect_l2 import _extract_index_rows, _intraday_main_net
+from collectors.collect_l2 import _extract_index_rows, _intraday_main_net
 
 
 def test_extract_index_rows_accepts_indexes_payload():

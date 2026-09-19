@@ -1,16 +1,19 @@
+"""Missing frozen artifacts never select a model from the historical SQL registry."""
 import duckdb
+import pytest
 
-from scripts.run_qlib_daily import run
+from trade_system.v2.domain import file_hash
+from trade_system.v2.research_product import read_build
 
 
-def test_qlib_daily_is_fail_closed_without_champion(tmp_path):
-    db = tmp_path / "daily.duckdb"
-    out = tmp_path / "qlib_daily.json"
-    result = run(db, feature_file=tmp_path / "missing.parquet", out=out)
-    assert result["status"] == "no_champion"
-    con = duckdb.connect(str(db), read_only=True)
-    try:
-        names = {row[0] for row in con.execute("select table_name from information_schema.tables").fetchall()}
-        assert not {"paper_order", "paper_position"} & names
-    finally:
-        con.close()
+def test_research_without_frozen_build_preserves_registry_and_manual_facts(tmp_path):
+    db = tmp_path / "historical.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE qlib_model_registry(model_id VARCHAR,status VARCHAR)")
+        con.execute("INSERT INTO qlib_model_registry VALUES ('old','champion')")
+        con.execute("CREATE TABLE watchlist(note VARCHAR); INSERT INTO watchlist VALUES ('human')")
+    before = file_hash(db)
+    with pytest.raises(FileNotFoundError):
+        read_build(tmp_path)
+    assert file_hash(db) == before
+    assert {p.name for p in tmp_path.iterdir()} == {"historical.duckdb"}

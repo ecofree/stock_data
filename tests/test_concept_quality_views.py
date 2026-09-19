@@ -1,6 +1,6 @@
 import duckdb
 
-from schema import init_schema
+from trade_system.schema import init_schema
 
 
 def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):

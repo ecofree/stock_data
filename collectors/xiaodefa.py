@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime
 from typing import Any
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from trade_system.limit_rules import limit_threshold
 from trade_system.trading_calendar import previous_open_session
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
@@ -92,7 +92,7 @@ def fetch_margin_detail(client: XiaodefaClient, trade_date: str) -> list[dict[st
 
 def fetch_margin_detail_fallback(trade_date: str) -> list[dict[str, Any]]:
     """Recover all-stock margin detail from Eastmoney when the relay is late."""
-    from trade_system.stock_data_sources import _from_em_margin_detail_daily
+    from trade_system.adapters.eastmoney_dc import _from_em_margin_detail_daily
 
     rows = _from_em_margin_detail_daily(trade_date)
     out = []
@@ -348,7 +348,7 @@ def collect(
     ts_code: str | None = None,
 ) -> dict[str, Any]:
     client = XiaodefaClient()
-    from base import DuckDBStore
+    from trade_system.data_store import DuckDBStore
     store = DuckDBStore(db_path)
     results: dict[str, Any] = {}
     try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 
 import duckdb
+import pytest
 
 from scripts.create_operator_outcome_template import create_template
 from trade_system.operator_outcomes import OUTCOME_COLUMNS
@@ -20,7 +21,9 @@ def test_create_operator_outcome_template_uses_plans(tmp_path):
     con.close()
 
     out = tmp_path / "outcomes.csv"
+    before = db.read_bytes()
     result = create_template(db, out, "2026-07-14")
+    assert db.read_bytes() == before and result["database_writes"] == 0
     assert result["rows"] == 1
     with out.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -45,10 +48,37 @@ def test_create_operator_outcome_template_uses_actionable_stage_signals(tmp_path
     con.close()
 
     out = tmp_path / "stage-outcomes.csv"
+    before = db.read_bytes()
     result = create_template(db, out)
+    assert db.read_bytes() == before
 
     assert result["trade_date"] == "2026-07-16"
     assert result["rows"] == 1
     with out.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["stock_code"] for row in rows] == ["000001"]
+
+
+@pytest.mark.parametrize("target", ["database", "hardlink", "manual_csv"])
+def test_template_never_overwrites_existing_human_file(tmp_path, target):
+    import os
+    db = tmp_path/"source.duckdb"
+    with duckdb.connect(str(db)):
+        pass
+    before = db.read_bytes()
+    output = db if target == "database" else tmp_path/"existing.csv"
+    if target == "hardlink":
+        os.link(db, output)
+    elif target == "manual_csv":
+        output.write_bytes(b"manual original")
+    previous = output.read_bytes()
+    with pytest.raises(FileExistsError, match="preserve"):
+        create_template(db, output, "2026-07-14")
+    assert output.read_bytes() == previous and db.read_bytes() == before
+
+
+def test_template_missing_database_does_not_initialize_one(tmp_path):
+    db = tmp_path/"absent.duckdb"
+    with pytest.raises(duckdb.Error):
+        create_template(db, tmp_path/"out.csv", "2026-07-14")
+    assert not db.exists() and not (tmp_path/"out.csv").exists()

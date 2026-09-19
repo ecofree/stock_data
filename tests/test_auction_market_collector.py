@@ -1,6 +1,6 @@
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from collectors.collect_misc import collect_auction_market
-from schema import init_schema
+from trade_system.schema import init_schema
 
 
 class FakeAuctionClient:

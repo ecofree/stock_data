@@ -120,7 +120,7 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
         "qlib", "qlib_candidate_pool", ("qlib_shadow",),
         ("external_qlib_file",),
         "trade_system/v2/research_product.py (frozen research artifacts; legacy candidate table is historical)",
-        ("scripts/run_qlib_daily.py (inference worker)",),
+        (),
         "Scheduled research consumes a frozen model through the research product; legacy candidate tables are historical, not its output. No automatic training, promotion or execution signals.",
     ),
     "operator_outcome": SourcePolicy(

@@ -136,13 +136,37 @@ class MultiSourceStore:
         """)
 
     def fetch(self, data_type: str, code: str | None = None, **kwargs) -> tuple[Any, dict]:
+        if (self.fetcher is resilient_sources.get and data_type in resilient_sources._BAR_TYPES
+                and not kwargs.get("full_history") and "start" in kwargs and "end" in kwargs):
+            from trade_system.trading_calendar import open_session_dates
+            kwargs["expected_sessions"] = open_session_dates(self.con, kwargs["start"], kwargs["end"], strict=True)
         return self.fetcher(data_type, code, **kwargs)
 
     def store(self, data_type: str, code: str | None, data: Any, meta: dict, *, asset_type: str | None = None,
               trade_date: str | None = None, commit: bool = True) -> dict[str, Any]:
+        if data_type == "limit_up_sentiment" or meta.get("derived"):
+            raise ValueError("derived statistics are not provider receipts; store the original pools")
         if commit:
             self.con.execute("BEGIN TRANSACTION")
         try:
+            if "receipts" in meta:
+                # Materialize only the original provider receipts, not an assembled
+                # window with invented timestamps or duplicated covered sessions.
+                results = []
+                for receipt in meta["receipts"]:
+                    rows = receipt["data"]
+                    event_rows = rows.get("rows", []) if isinstance(rows, dict) else rows
+                    receipt_date = max((_date(row.get("date")) or "" for row in event_rows if isinstance(row, dict)), default="")
+                    results.append(self.store(data_type, code, rows, receipt["meta"],
+                        asset_type=asset_type, trade_date=receipt_date or trade_date, commit=False))
+                status = meta.get("status", "failed")
+                if any(r["status"] == "cache_unmaterialized" for r in results):
+                    status = "cache_unmaterialized"
+                if commit:
+                    self.con.commit()
+                return {"status": status, "provider": meta.get("source"),
+                        "rows_written": sum(r["rows_written"] for r in results),
+                        "receipt_reused": bool(results) and all(r.get("receipt_reused") for r in results)}
             status = str(meta.get("status") or "failed")
             stale = status == "stale"
             provider = str(meta.get("source") or "unknown")
@@ -163,12 +187,26 @@ class MultiSourceStore:
                 # A cache hit is not another receipt and must not refresh any
                 # observation or canonical row's received/fetched timestamp.
                 exists = self.con.execute(
-                    "SELECT 1 FROM multi_source_observation WHERE data_type=? "
-                    "AND asset_code IS NOT DISTINCT FROM ? AND payload_hash=? "
+                    "SELECT 1 FROM multi_source_observation WHERE data_type IN (?,?) "
+                    "AND asset_code IS NOT DISTINCT FROM ? AND payload_hash=? AND provider=? "
                     "AND source_date IS NOT DISTINCT FROM ? "
                     "AND status IN ('live','refreshed','delayed') LIMIT 1",
-                    [data_type, code, payload_hash, source_date],
+                    [data_type, {"stock_flow": "fund_flow_120d", "fund_flow_120d": "stock_flow"}.get(data_type, data_type),
+                     code, payload_hash, provider, source_date],
                 ).fetchone()
+                if exists and data_type in resilient_sources._BAR_TYPES:
+                    kind = asset_type or {"index_kline": "index", "etf_kline": "etf", "cb_kline": "cb"}.get(data_type, "stock")
+                    requested = set(meta.get("qualified_dates", []))
+                    for row in data:
+                        if requested and resilient_sources._norm_date(row.get("date", "")) not in requested:
+                            continue
+                        materialized = self.con.execute(
+                            "SELECT 1 FROM multi_source_kline WHERE source_date=? AND asset_type=? "
+                            "AND asset_code=? AND provider=? AND raw_json=? AND is_stale=false LIMIT 1",
+                            [_date(row.get("date")), kind, code, provider, _json(row)]).fetchone()
+                        if not materialized:
+                            exists = False
+                            break
                 if commit:
                     self.con.commit()
                 return {"status": "fresh" if exists else "cache_unmaterialized",
@@ -176,23 +214,28 @@ class MultiSourceStore:
                         "source_date": source_date, "payload_hash": payload_hash,
                         "receipt_reused": bool(exists)}
 
+            received_at = datetime.fromtimestamp(meta["received_at"]) if isinstance(meta.get("received_at"), (float, int)) else datetime.now()
             self.con.execute(
                 "INSERT INTO multi_source_observation "
-                "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash,observed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [source_date, data_type, asset_type or data_type, code, provider, status,
-                 int(float(meta.get("latency", 0) or 0) * 1000), stale, _json(payload), payload_hash],
+                 int(float(meta.get("latency", 0) or 0) * 1000), stale, _json(payload), payload_hash, received_at],
             )
 
         # Do not overwrite a live row with an expired cache result.  The stale
         # observation above is enough to make the degradation auditable.
             if data is not None and status in {'live', 'refreshed', 'fresh', 'delayed'}:
                 if data_type in {"kline", "index_kline", "etf_kline", "cb_kline"}:
-                    rows_written = self._store_klines(data_type, code, data, provider, asset_type, stale)
+                    canonical = data
+                    if "qualified_dates" in meta:
+                        qualified = set(meta["qualified_dates"])
+                        canonical = [row for row in data if resilient_sources._norm_date(row.get("date", "")) in qualified]
+                    rows_written = self._store_klines(data_type, code, canonical, provider, asset_type, stale, received_at)
                 elif data_type in {"stock_flow", "fund_flow_120d", "fund_flow"}:
-                    rows_written = self._store_stock_flow(code, data, provider, stale)
+                    rows_written = self._store_stock_flow(code, data, provider, stale, received_at)
                 elif data_type == "sector_flow":
-                    rows_written = self._store_sector_flow(data, provider, trade_date, stale)
+                    rows_written = self._store_sector_flow(data, provider, trade_date, stale, received_at)
                 elif data_type in {"valuation", "index_spot", "etf_info", "cb_quote", "bid_ask"}:
                     rows_written = self._store_quote(data_type, code, data, provider, asset_type, stale, trade_date)
 
@@ -208,7 +251,7 @@ class MultiSourceStore:
                     pass
             raise
 
-    def _store_klines(self, data_type, code, data, provider, asset_type, stale):
+    def _store_klines(self, data_type, code, data, provider, asset_type, stale, received_at=None):
         rows = data if isinstance(data, list) else []
         kind = asset_type or ({"index_kline": "index", "etf_kline": "etf", "cb_kline": "cb"}.get(data_type, "stock"))
         count = 0
@@ -218,23 +261,24 @@ class MultiSourceStore:
             d = _date(row.get("date"))
             ac = str(code or row.get("code") or "")
             self.con.execute(
-                "DELETE FROM multi_source_kline WHERE source_date=? AND asset_type=? AND asset_code=? AND provider=?",
-                [d, kind, ac, provider],
+                "DELETE FROM multi_source_kline WHERE source_date=? AND asset_type=? AND asset_code=? AND provider=? AND adjustment=?",
+                [d, kind, ac, provider, row.get("adjustment") or "unknown"],
             )
             self.con.execute(
-                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,volume_unit,amount_unit,adjustment,is_stale,raw_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO multi_source_kline(source_date,asset_type,asset_code,open,high,low,close,volume,amount,change_pct,provider,volume_unit,amount_unit,adjustment,is_stale,raw_json,fetched_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [d, kind, ac, _number(row.get("open")), _number(row.get("high")), _number(row.get("low")),
                  _number(row.get("close")), _number(row.get("volume")), _number(row.get("amount")),
                  _number(row.get("change_pct") or row.get("pct")), provider,
                  row.get("volume_unit") or "unknown", row.get("amount_unit") or "unknown",
-                 row.get("adjustment") or "unknown", stale, _json(row)],
+                 row.get("adjustment") or "unknown", stale, _json(row), received_at or datetime.now()],
             )
             count += 1
         return count
 
-    def _store_stock_flow(self, code, data, provider, stale):
+    def _store_stock_flow(self, code, data, provider, stale, received_at=None):
         rows = data if isinstance(data, list) else []
+        received_at = received_at or datetime.now()
         count = 0
         for row in rows:
             if not isinstance(row, dict) or not (row.get("date") or row.get("trade_date")):
@@ -248,50 +292,31 @@ class MultiSourceStore:
                 continue
             d = _date(row.get("date") or row.get("trade_date"))
             stock = str(code or row.get("code") or "")
-            values = [
-                canonical["main_net"], canonical["net_total"], canonical["super_net"],
-                canonical["large_net"], canonical["mid_net"], canonical["small_net"],
-                _number(row.get("close")), _number(row.get("change_pct") or row.get("pct")),
-                _number(row.get("turnover")), canonical["amount_unit"], canonical['flow_unit'], canonical['turnover_unit'],
-                canonical["flow_definition"], canonical["source_api"],
-                canonical["origin_provider"], canonical["field_mapping_version"], stale,
-                _json(row), d, stock, provider,
-            ]
-            # DuckDB's ART unique index keeps a deleted key visible until the
-            # surrounding transaction commits.  DELETE + INSERT therefore
-            # fails on the second atomic market refresh even though the
-            # business key is unchanged.  Update an existing observation in
-            # place, then insert only when the key does not exist.  This also
-            # works in fresh test databases before the unique index is added.
+            columns = ("source_date", "stock_code", "provider", "main_net", "net_total", "super_net",
+                       "large_net", "mid_net", "small_net", "close", "change_pct", "turnover",
+                       "amount_unit", "flow_unit", "turnover_unit", "flow_definition", "source_api",
+                       "origin_provider", "field_mapping_version", "is_stale", "raw_json", "fetched_at")
+            values = [d, stock, provider, canonical["main_net"], canonical["net_total"],
+                      canonical["super_net"], canonical["large_net"], canonical["mid_net"], canonical["small_net"],
+                      _number(row.get("close")), _number(row.get("change_pct") if row.get("change_pct") is not None else row.get("pct")),
+                      _number(row.get("turnover")), canonical["amount_unit"], canonical["flow_unit"], canonical["turnover_unit"],
+                      canonical["flow_definition"], canonical["source_api"], canonical["origin_provider"],
+                      canonical["field_mapping_version"], stale, _json(row), received_at]
+            # One atomic statement works before and after the business-key index exists.
+            # No delete/reinsert cycle; raw receipt and original receive time remain paired.
+            names = ",".join(columns)
             self.con.execute(
-                "UPDATE multi_source_stock_flow SET "
-                "main_net=?,net_total=?,super_net=?,large_net=?,mid_net=?,small_net=?,"
-                "close=?,change_pct=?,turnover=?,amount_unit=?,flow_unit=?,turnover_unit=?,flow_definition=?,source_api=?,"
-                "origin_provider=?,field_mapping_version=?,is_stale=?,raw_json=?,"
-                "fetched_at=current_timestamp "
-                "WHERE source_date=? AND stock_code=? AND provider=?",
+                f"MERGE INTO multi_source_stock_flow AS target USING (VALUES ({','.join('?' for _ in columns)})) "
+                f"AS source({names}) ON target.source_date=CAST(source.source_date AS DATE) "
+                "AND target.stock_code=source.stock_code AND target.provider=source.provider "
+                f"WHEN MATCHED THEN UPDATE SET {','.join(f'{c}=source.{c}' for c in columns[3:])} "
+                f"WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({','.join('source.'+c for c in columns)})",
                 values,
-            )
-            self.con.execute(
-                "INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,net_total,super_net,large_net,mid_net,small_net,close,change_pct,turnover,provider,amount_unit,flow_unit,turnover_unit,flow_definition,source_api,origin_provider,field_mapping_version,is_stale,raw_json) "
-                "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
-                "WHERE NOT EXISTS (SELECT 1 FROM multi_source_stock_flow "
-                "WHERE source_date=? AND stock_code=? AND provider=?)",
-                [
-                    d, stock, canonical["main_net"], canonical["net_total"],
-                    canonical["super_net"], canonical["large_net"], canonical["mid_net"],
-                    canonical["small_net"], _number(row.get("close")),
-                    _number(row.get("change_pct") or row.get("pct")),
-                    _number(row.get("turnover")), provider, canonical["amount_unit"], canonical['flow_unit'], canonical['turnover_unit'],
-                    canonical["flow_definition"], canonical["source_api"],
-                    canonical["origin_provider"], canonical["field_mapping_version"], stale,
-                    _json(row), d, stock, provider,
-                ],
             )
             count += 1
         return count
 
-    def _store_sector_flow(self, data, provider, trade_date, stale):
+    def _store_sector_flow(self, data, provider, trade_date, stale, received_at=None):
         rows = data if isinstance(data, list) else []
         count = 0
         d_default = _date(trade_date) or date.today().isoformat()
@@ -299,6 +324,8 @@ class MultiSourceStore:
             if not isinstance(row, dict) or not row.get("sector_code"):
                 continue
             canonical = normalize_sector_flow_row(row, provider)
+            if provider == "existing_core" and row.get("sector_type") == "legacy_core":
+                canonical["sector_type"] = "legacy_core"  # Preserve unqualified historical taxonomy.
             # A pre-open Eastmoney snapshot can contain sector names/prices
             # while all flow fields are ``-``.  Such rows are not a partial
             # flow measurement and must not make readiness look available.
@@ -314,17 +341,22 @@ class MultiSourceStore:
             ).fetchone()
             if conflicting:
                 raise ValueError('sector source/date/code changed taxonomy; explicit migration required')
+            columns = ("source_date", "sector_code", "provider", "sector_name", "main_net", "super_net",
+                       "large_net", "mid_net", "small_net", "change_pct", "main_ratio", "sector_type",
+                       "amount_unit", "is_stale", "raw_json", "fetched_at")
+            values = [d, code, provider, row.get("sector_name"), canonical['main_net'], canonical['super_net'],
+                      canonical['large_net'], canonical['mid_net'], canonical['small_net'],
+                      _number(row.get("change_pct")), _number(row.get("main_ratio")), canonical['sector_type'],
+                      'yuan', stale, _json(dict(row, canonical_contract=canonical)),
+                      received_at or row.get("fetched_at")]
+            names = ",".join(columns)
             self.con.execute(
-                "DELETE FROM multi_source_sector_flow WHERE source_date=? AND sector_code=? AND provider=?",
-                [d, code, provider],
-            )
-            self.con.execute(
-                "INSERT INTO multi_source_sector_flow(source_date,sector_code,sector_name,main_net,super_net,large_net,mid_net,small_net,change_pct,main_ratio,provider,sector_type,amount_unit,is_stale,raw_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [d, code, row.get("sector_name"), canonical['main_net'], canonical['super_net'],
-                 canonical['large_net'], canonical['mid_net'], canonical['small_net'],
-                 _number(row.get("change_pct")), _number(row.get("main_ratio")), provider,
-                 canonical['sector_type'], 'yuan', stale, _json(dict(row, canonical_contract=canonical))],
+                f"MERGE INTO multi_source_sector_flow AS target USING (VALUES ({','.join('?' for _ in columns)})) "
+                f"AS source({names}) ON target.source_date=CAST(source.source_date AS DATE) "
+                "AND target.sector_code=source.sector_code AND target.provider=source.provider "
+                f"WHEN MATCHED THEN UPDATE SET {','.join(f'{c}=source.{c}' for c in columns[3:])} "
+                f"WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({','.join('source.'+c for c in columns)})",
+                values,
             )
             count += 1
         return count
@@ -435,8 +467,8 @@ class MultiSourceStore:
                 return 0
             where = "? IS NULL OR CAST(date AS DATE)=CAST(? AS DATE)"
             rows = self.con.execute(
-                "SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow "
-                "FROM (SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow, "
+                "SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow,fetched_at "
+                "FROM (SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow,fetched_at, "
                 "row_number() OVER (PARTITION BY date,stock_code ORDER BY try_cast(time AS TIME) DESC NULLS LAST, fetched_at DESC) AS rn "
                 "FROM advanced_zjmm_min WHERE " + where + ") q WHERE rn=1",
                 [trade_date, trade_date],
@@ -444,27 +476,18 @@ class MultiSourceStore:
             if not rows:
                 return 0
             self.con.execute("BEGIN TRANSACTION")
-            if trade_date is not None:
-                self.con.execute(
-                    "DELETE FROM multi_source_stock_flow WHERE provider='kpl' AND source_date=CAST(? AS DATE)",
-                    [trade_date],
-                )
-            for row in rows:
-                self.con.execute(
-                    "DELETE FROM multi_source_stock_flow WHERE provider='kpl' AND source_date=? AND stock_code=?",
-                    [row[0], row[1]],
-                )
-                self.con.execute(
-                    "INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,super_net,large_net,mid_net,small_net,close,change_pct,turnover,provider,amount_unit,flow_definition,source_api,origin_provider,field_mapping_version,is_stale,raw_json) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [row[0], row[1], _number(row[2]), _number(row[3]), _number(row[4]),
-                     None, None, None, None, None, "kpl", "yuan",
-                     "provider_main_orders_net", "advanced_zjmm_min", "kpl",
-                     "stock_flow_v2", False,
-                     '{"migrated_from":"advanced_zjmm_min","aggregation":"latest_cumulative_point"}'],
-                )
+            count = 0
+            for day, stock, main, super_net, large, received in rows:
+                if received is None:
+                    continue
+                count += self._store_stock_flow(stock, [{
+                    "date": str(day), "main_net": main, "super_net": super_net, "large_net": large,
+                    "amount_unit": "yuan", "flow_definition": "provider_main_orders_net",
+                    "source_api": "advanced_zjmm_min", "origin_provider": "kpl",
+                    "aggregation": "latest_cumulative_point",
+                }], "kpl", False, received)
             self.con.commit()
-            return len(rows)
+            return count
         except Exception:
             try:
                 self.con.rollback()
@@ -495,12 +518,15 @@ class MultiSourceStore:
                 )
                 counts["index_kline"] = self.con.execute("SELECT count(*) FROM multi_source_kline WHERE provider='existing_core' AND asset_type='index'").fetchone()[0]
             if "sector_capital" in tables:
-                self.con.execute("DELETE FROM multi_source_sector_flow WHERE provider='existing_core'")
-                self.con.execute(
-                    "INSERT INTO multi_source_sector_flow(source_date,sector_code,sector_name,main_net,super_net,large_net,mid_net,small_net,change_pct,main_ratio,provider,sector_type,amount_unit,is_stale,raw_json) "
-                    "SELECT date,sector_code,NULL,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow,NULL,NULL,'existing_core','legacy_core','yuan',FALSE,'{\"migrated_from\":\"sector_capital\"}' FROM sector_capital"
-                )
-                counts["sector_capital"] = self.con.execute("SELECT count(*) FROM multi_source_sector_flow WHERE provider='existing_core'").fetchone()[0]
+                rows = self.con.execute(
+                    "SELECT date,sector_code,main_net_inflow,super_net_inflow,big_net_inflow,"
+                    "mid_net_inflow,small_net_inflow,fetched_at FROM sector_capital "
+                    "QUALIFY row_number() OVER (PARTITION BY date,sector_code ORDER BY fetched_at DESC NULLS LAST)=1"
+                ).fetchall()
+                fields = ("date", "sector_code", "main_net", "super_net", "large_net", "mid_net", "small_net", "fetched_at")
+                counts["sector_capital"] = self._store_sector_flow(
+                    [dict(zip(fields, row), sector_type="legacy_core", amount_unit="yuan",
+                          migrated_from="sector_capital") for row in rows], "existing_core", None, False)
             self.con.commit()
             return counts
         except Exception:

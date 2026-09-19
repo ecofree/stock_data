@@ -1,4 +1,4 @@
-﻿"""Detailed post-market review page renderer (HTML + ECharts).
+"""Detailed post-market review page renderer (HTML + ECharts).
 
 Consumes the same context as the markdown daily review
 (``trade_system.daily_review.build_daily_review_context``) plus one page-facts
@@ -59,15 +59,8 @@ def _e(v: Any) -> str:
 
 
 def _slk(code: str) -> str:
-    """Wrap a stock code as a link only when the target artifact exists."""
-    if not code:
-        return "—"
-    c = str(code).strip()
-    detail_path = Path(__file__).resolve().parents[1] / "reports" / "stocks" / f"{c}.html"
-    if not detail_path.is_file():
-        return _e(c)
-    return (f"<a class='mono' href='stocks/{c}.html' "
-            f"style='color:inherit;text-decoration:none'>{_e(c)}</a>")
+    """Render the code without discovering unrelated historical side pages."""
+    return _e(str(code).strip()) if code else "—"
 
 
 def _fmt(v: Any, default: str = "—") -> str:
@@ -2126,7 +2119,7 @@ def _render_review_bundle(
         echarts_src = "/* echarts unavailable */"
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        selected = trade_date or (context or {}).get("trade_date") or _latest_date(con)
+        selected = trade_date or (context or {}).get("trade_date") or _latest_date(con, as_of)
         ctx = (
             dict(context)
             if context is not None

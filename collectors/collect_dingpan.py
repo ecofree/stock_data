@@ -1,6 +1,6 @@
 """Dingpan (market monitoring) + Fengk (review) collectors (8 endpoints)."""
 import json
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def collect_dingpan_module_versatile(client: KPLClient, store: DuckDBStore, date: str) -> int:

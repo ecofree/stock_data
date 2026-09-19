@@ -31,6 +31,9 @@ class ProfileTask:
     network: bool = True
 
 
+HISTORY_SUPPLEMENT_TYPES = ("financials", "statements", "margin_trading", "dragon_tiger_daily", "northbound_hist")
+
+
 PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
     "auction": (
         ProfileTask("collect_market_context", "KPL market/rise-fall", 300, "market regime and auction context"),
@@ -79,7 +82,7 @@ PROFILE_TASKS: dict[str, tuple[ProfileTask, ...]] = {
     "history": (
         ProfileTask("backfill_2026_tushare", "TuShare relay", None, "resumable daily/basic/moneyflow history"),
         ProfileTask("backfill_2026_ths_concepts", "THS web pages", 7 * 86400, "weekly concept catalogue and constituents snapshot"),
-        ProfileTask("run_staged_after_close", "provider fallback graph", None, "financials, statements, margin and historical northbound"),
+        ProfileTask("collect_history_supplement", "provider fallback graph", None, "financials, statements, margin and historical northbound"),
     ),
 }
 

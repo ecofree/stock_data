@@ -1,38 +1,15 @@
-"""TuShare dataset conversions and storage; transport belongs to XiaodefaClient."""
+"""Pure TuShare field conversion and batch storage; no acquisition or task planning."""
 from __future__ import annotations
-from datetime import datetime, timedelta
-from base import DuckDBStore
-from trade_system.xiaodefa_source import XiaodefaClient
+
+from datetime import date
 from trade_system.units import _number
 
 
-def _iso_date(value) -> str | None:
-    raw = "".join(ch for ch in str(value or "") if ch.isdigit())
-    if len(raw) >= 8:
-        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-    return None
-
-
-def _compact_date(value: str) -> str:
-    raw = "".join(ch for ch in str(value or "") if ch.isdigit())
-    if len(raw) >= 8:
-        return raw[:8]
-    raise ValueError(f"invalid date: {value}")
-
-
-def _date_windows(start_date: str, end_date: str, max_days: int = 365) -> list[tuple[str, str]]:
-    start = datetime.strptime(_compact_date(start_date), "%Y%m%d").date()
-    end = datetime.strptime(_compact_date(end_date), "%Y%m%d").date()
-    if start > end:
-        return []
-    windows: list[tuple[str, str]] = []
-    current = start
-    step = max(1, int(max_days))
-    while current <= end:
-        window_end = min(current + timedelta(days=step - 1), end)
-        windows.append((current.strftime("%Y%m%d"), window_end.strftime("%Y%m%d")))
-        current = window_end + timedelta(days=1)
-    return windows
+def iso_date(value):
+    raw = "".join(c for c in str(value or "") if c.isdigit())
+    if len(raw) < 8:
+        return None
+    return date.fromisoformat(f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}").isoformat()
 
 
 def stock_code_to_ts_code(code: str) -> str:
@@ -72,215 +49,66 @@ def ts_code_to_index_code(ts_code: str) -> str:
     return f"{suffix}{digits}"
 
 
-def collect_tushare_trade_cal(client: XiaodefaClient, store: DuckDBStore, start_date: str, end_date: str) -> int:
-    rows = client.query_rows(
-        "trade_cal",
-        {"exchange": "SSE", "start_date": start_date, "end_date": end_date},
-        fields="exchange,cal_date,is_open,pretrade_date",
-    )
-    out = [
-        (
-            row.get("exchange") or "SSE",
-            _iso_date(row.get("cal_date")),
-            (bool(int(row["is_open"])) if str(row.get("is_open")) in {"0", "1"} else None),
-            _iso_date(row.get("pretrade_date")),
-        )
-        for row in rows
-        if _iso_date(row.get("cal_date"))
-    ]
-    return store.insert_rows(
-        "tushare_trade_cal",
-        out,
-        ["exchange", "cal_date", "is_open", "pretrade_date"],
-        replace_on=["exchange", "cal_date"],
-    )
+MARKET_FIELDS = {
+    "daily": "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg",
+    "index_daily": "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg",
+    "daily_basic": "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
+    "adj_factor": "ts_code,trade_date,adj_factor",
+}
 
 
-def collect_tushare_stock_basic(client: XiaodefaClient, store: DuckDBStore) -> int:
-    rows = client.query_rows(
-        "stock_basic",
-        {"exchange": "", "list_status": "L"},
-        fields="ts_code,symbol,name,area,industry,market,list_date",
-    )
-    out = [
-        (
-            row.get("ts_code"),
-            row.get("symbol") or ts_code_to_stock_code(row.get("ts_code")),
-            row.get("name") or "",
-            row.get("area") or "",
-            row.get("industry") or "",
-            row.get("market") or "",
-            _iso_date(row.get("list_date")),
-        )
-        for row in rows
-        if row.get("ts_code")
-    ]
-    return store.insert_rows(
-        "tushare_stock_basic",
-        out,
-        ["ts_code", "stock_code", "stock_name", "area", "industry", "market", "list_date"],
-        replace_on=["ts_code"],
-    )
+def market_batch(dataset, rows, provider):
+    """One field/unit contract for both date-wide and instrument-scoped reads."""
+    fields = MARKET_FIELDS[dataset].split(",")[2:]
+    values = fields if dataset in {"daily_basic", "adj_factor"} else [
+        "open", "high", "low", "close", "volume", "turnover", "change_pct"]
+    is_index = dataset == "index_daily"
+    columns = ["ts_code", "index_code" if is_index else "stock_code", "date", *values]
+    price = dataset in {"daily", "index_daily"}
+    if price:
+        columns += ["volume_unit", "amount_unit", "adjustment", "provider"]
+    out = []
+    for row in rows:
+        code = row["ts_code"]
+        record = (code, ts_code_to_index_code(code) if is_index else ts_code_to_stock_code(code),
+                  iso_date(row["trade_date"]), *(_number(row.get(f)) for f in fields))
+        if price:
+            record += ("hands", "thousand_yuan", "none", provider)
+        out.append(record)
+    return out, columns
 
 
-def collect_tushare_daily(
-    client: XiaodefaClient,
-    store: DuckDBStore,
-    stock_codes: list[str],
-    start_date: str,
-    end_date: str,
-) -> int:
-    total = 0
-    fields = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg"
-    for code in stock_codes:
-        ts_code = stock_code_to_ts_code(code)
-        for window_start, window_end in _date_windows(start_date, end_date):
-            rows = client.query_rows(
-                "daily",
-                {"ts_code": ts_code, "start_date": window_start, "end_date": window_end},
-                fields=fields,
-            )
-            out = [
-                (
-                    row.get("ts_code") or ts_code,
-                    ts_code_to_stock_code(row.get("ts_code") or ts_code),
-                    _iso_date(row.get("trade_date")),
-                    _number(row.get("open")),
-                    _number(row.get("high")),
-                    _number(row.get("low")),
-                    _number(row.get("close")),
-                    _number(row.get("vol")),
-                    _number(row.get("amount")),
-                    _number(row.get("pct_chg")),
-                    "hands", "thousand_yuan", "none", "tushare",
-                )
-                for row in rows
-                if _iso_date(row.get("trade_date"))
-            ]
-            total += store.insert_rows(
-                "tushare_daily",
-                out,
-                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct", "volume_unit", "amount_unit", "adjustment", "provider"],
-                replace_on=["ts_code", "date"],
-            )
-    return total
+def store_reference(store, dataset, rows):
+    if dataset == "trade_cal":
+        columns = ["exchange", "cal_date", "is_open", "pretrade_date"]
+        out = [(r.get("exchange") or "SSE", iso_date(r.get("cal_date")),
+                bool(int(r["is_open"])) if str(r.get("is_open")) in {"0", "1"} else None,
+                iso_date(r.get("pretrade_date"))) for r in rows if r.get("cal_date")]
+        keys = ["exchange", "cal_date"]
+    elif dataset == "stock_basic":
+        columns = ["ts_code", "stock_code", "stock_name", "area", "industry", "market", "list_date", "delist_date"]
+        out = [(r["ts_code"], r.get("symbol") or ts_code_to_stock_code(r["ts_code"]),
+                r.get("name") or "", r.get("area") or "", r.get("industry") or "",
+                r.get("market") or "", iso_date(r.get("list_date")),
+                iso_date(r.get("delist_date")) if r.get("list_status") == "D" else None) for r in rows if r.get("ts_code")]
+        keys = ["ts_code"]
+    else:
+        raise ValueError(f"unsupported reference dataset: {dataset}")
+    return store.insert_rows("tushare_" + dataset, out, columns, replace_on=keys)
 
 
-def collect_tushare_daily_basic(
-    client: XiaodefaClient,
-    store: DuckDBStore,
-    stock_codes: list[str],
-    start_date: str,
-    end_date: str,
-) -> int:
-    total = 0
-    fields = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv"
-    for code in stock_codes:
-        ts_code = stock_code_to_ts_code(code)
-        for window_start, window_end in _date_windows(start_date, end_date):
-            rows = client.query_rows(
-                "daily_basic",
-                {"ts_code": ts_code, "start_date": window_start, "end_date": window_end},
-                fields=fields,
-            )
-            out = [
-                (
-                    row.get("ts_code") or ts_code,
-                    ts_code_to_stock_code(row.get("ts_code") or ts_code),
-                    _iso_date(row.get("trade_date")),
-                    _number(row.get("turnover_rate")),
-                    _number(row.get("volume_ratio")),
-                    _number(row.get("pe")),
-                    _number(row.get("pb")),
-                    _number(row.get("total_mv")),
-                    _number(row.get("circ_mv")),
-                )
-                for row in rows
-                if _iso_date(row.get("trade_date"))
-            ]
-            total += store.insert_rows(
-                "tushare_daily_basic",
-                out,
-                ["ts_code", "stock_code", "date", "turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv"],
-                replace_on=["ts_code", "date"],
-            )
-    return total
-
-
-def collect_tushare_adj_factor(
-    client: XiaodefaClient,
-    store: DuckDBStore,
-    stock_codes: list[str],
-    start_date: str,
-    end_date: str,
-) -> int:
-    total = 0
-    fields = "ts_code,trade_date,adj_factor"
-    for code in stock_codes:
-        ts_code = stock_code_to_ts_code(code)
-        for window_start, window_end in _date_windows(start_date, end_date):
-            rows = client.query_rows(
-                "adj_factor",
-                {"ts_code": ts_code, "start_date": window_start, "end_date": window_end},
-                fields=fields,
-            )
-            out = [
-                (
-                    row.get("ts_code") or ts_code,
-                    ts_code_to_stock_code(row.get("ts_code") or ts_code),
-                    _iso_date(row.get("trade_date")),
-                    _number(row.get("adj_factor")),
-                )
-                for row in rows
-                if _iso_date(row.get("trade_date"))
-            ]
-            total += store.insert_rows(
-                "tushare_adj_factor",
-                out,
-                ["ts_code", "stock_code", "date", "adj_factor"],
-                replace_on=["ts_code", "date"],
-            )
-    return total
-
-
-def collect_tushare_index_daily(
-    client: XiaodefaClient,
-    store: DuckDBStore,
-    index_codes: list[str],
-    start_date: str,
-    end_date: str,
-) -> int:
-    total = 0
-    fields = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg"
-    for code in index_codes:
-        ts_code = index_code_to_ts_code(code)
-        for window_start, window_end in _date_windows(start_date, end_date):
-            rows = client.query_rows(
-                "index_daily",
-                {"ts_code": ts_code, "start_date": window_start, "end_date": window_end},
-                fields=fields,
-            )
-            out = [
-                (
-                    row.get("ts_code") or ts_code,
-                    ts_code_to_index_code(row.get("ts_code") or ts_code),
-                    _iso_date(row.get("trade_date")),
-                    _number(row.get("open")),
-                    _number(row.get("high")),
-                    _number(row.get("low")),
-                    _number(row.get("close")),
-                    _number(row.get("vol")),
-                    _number(row.get("amount")),
-                    _number(row.get("pct_chg")),
-                    "hands", "thousand_yuan", "none", "tushare",
-                )
-                for row in rows
-                if _iso_date(row.get("trade_date"))
-            ]
-            total += store.insert_rows(
-                "tushare_index_daily",
-                out,
-                ["ts_code", "index_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct", "volume_unit", "amount_unit", "adjustment", "provider"],
-                replace_on=["ts_code", "date"],
-            )
-    return total
+def bulk_replace(con, table, rows, columns, replace_on):
+    """Replace only supplied keys; the caller owns the transaction."""
+    if not rows:
+        return 0
+    temp = "_history_batch"
+    con.execute(f"DROP TABLE IF EXISTS {temp}")
+    projection = ",".join(columns)
+    con.execute(f"CREATE TEMP TABLE {temp} AS SELECT {projection} FROM {table} LIMIT 0")
+    placeholders = ",".join("?" for _ in columns)
+    con.executemany(f"INSERT INTO {temp}({projection}) VALUES ({placeholders})", rows)
+    join = " AND ".join(f"target.{key}=batch.{key}" for key in replace_on)
+    con.execute(f"DELETE FROM {table} AS target WHERE EXISTS (SELECT 1 FROM {temp} AS batch WHERE {join})")
+    con.execute(f"INSERT INTO {table}({projection}) SELECT {projection} FROM {temp}")
+    con.execute(f"DROP TABLE {temp}")
+    return len(rows)

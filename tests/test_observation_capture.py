@@ -93,9 +93,10 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     assert not first['qualified']  # old source date is never promoted by fresh fetch
 
 
-def test_old_quote_entry_delegates_to_shared_transport(monkeypatch):
-    from trade_system.stock_data_sources import _from_tencent_quote
+def test_quote_consumer_delegates_to_shared_transport(monkeypatch):
+    from trade_system import executable_quotes
     calls=[]
     monkeypatch.setattr(transport,'fetch_parts',lambda codes:calls.append(codes) or {'000001':['retained']})
-    assert _from_tencent_quote(['000001'])=={'000001':['retained']}
+    monkeypatch.setattr(executable_quotes,'parse_tencent_parts',lambda parts:{'raw':parts})
+    assert executable_quotes.fetch_tencent_quotes(['000001']) == {'000001':{'raw':['retained']}}
     assert calls==[['000001']]

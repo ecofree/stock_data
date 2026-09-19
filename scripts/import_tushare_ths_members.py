@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.ths_history import render_report
 
 

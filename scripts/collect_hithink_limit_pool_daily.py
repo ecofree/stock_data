@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from datetime import date
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -33,14 +34,15 @@ def _number(value: Any) -> float | None:
     try:
         if value in (None, "", "-"):
             return None
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
 
 def _integer(value: Any) -> int | None:
-    number = _number(value)
-    return int(number) if number is not None else None
+    number = None if isinstance(value, bool) else _number(value)
+    return int(number) if number is not None and number.is_integer() else None
 
 
 def _clean_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -48,13 +50,16 @@ def _clean_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cleaned: dict[str, dict[str, Any]] = {}
     for item in items:
         code = str(item.get("ticker") or item.get("stock_code") or "").strip()
-        if not code.isdigit() or len(code) != 6:
-            continue
+        if not code.isascii() or not code.isdigit() or len(code) != 6 or code in cleaned:
+            raise ValueError("official pool identity missing, invalid or duplicated")
+        height = _integer(item.get("continue_day_cnt", item.get("limit_times")))
+        if height is None or height < 1:
+            raise ValueError("official pool board height is unknown")
         cleaned[code] = {
             "ticker": code,
             "name": item.get("name") or item.get("stock_name") or "",
             "limit_up_time": item.get("limit_up_time") or item.get("last_seal_time") or "",
-            "continue_day_cnt": _integer(item.get("continue_day_cnt") or item.get("limit_times")),
+            "continue_day_cnt": height,
             "limit_up_reason": item.get("limit_up_reason") or item.get("reason") or "",
             "last_price": _number(item.get("last_price") or item.get("close")),
             "price_change_ratio_pct": _number(item.get("price_change_ratio_pct") or item.get("pct_chg")),

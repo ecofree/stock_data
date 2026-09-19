@@ -10,7 +10,7 @@ import urllib.parse
 from datetime import datetime
 
 
-from config import (
+from trade_system.config import (
     API_BASE, API_KEY, DB_PATH, REQUEST_TIMEOUT,
     REQUEST_DELAY, MAX_RETRIES, RETRY_DELAY, LOG_DIR, TODAY,
     RATE_LIMIT_ENDPOINTS, RATE_LIMIT_DELAY, MAX_EMPTY_RETRIES,

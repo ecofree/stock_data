@@ -1,6 +1,6 @@
 """Daily data collectors (4 endpoints)."""
 import json
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
 def collect_daily(client: KPLClient, store: DuckDBStore, date: str) -> int:

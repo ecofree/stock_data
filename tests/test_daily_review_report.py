@@ -1,7 +1,7 @@
 import duckdb
 
 from trade_system.daily_review import build_daily_review_context, render_daily_review_markdown
-from trade_system.risk import init_trading_tables
+from trade_system.operator_outcomes import init_trading_tables
 
 
 def test_daily_review_report_contains_operator_required_sections(tmp_path):
@@ -69,3 +69,50 @@ def test_daily_review_report_contains_operator_required_sections(tmp_path):
         assert section in report
     assert "weak" in report
     assert "pending_review" in report
+
+
+def test_review_queries_distinguish_empty_missing_and_failed():
+    from trade_system.review_queries import _rows, _query_status
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE present(value INTEGER)")
+    outcomes = []
+    token = _query_status.set(outcomes)
+    try:
+        for table, sql in [("missing", "SELECT * FROM missing"), ("present", "SELECT * FROM present"),
+                           ("present", "SELECT nonexistent FROM present")]:
+            assert _rows(con,table,sql,[]) == []
+    finally:
+        _query_status.reset(token)
+        con.close()
+    assert [r["state"] for r in outcomes] == ["missing_table","empty","query_failed"]
+
+
+def test_review_date_uses_calendar_not_old_signal_and_never_future():
+    import pytest
+    from trade_system.review_queries import _latest_date
+    with duckdb.connect(":memory:") as con:
+        con.execute("CREATE TABLE stock_candidate_score(trade_date DATE)")
+        con.execute("INSERT INTO stock_candidate_score VALUES ('2099-01-01')")
+        with pytest.raises(ValueError,match="calendar"):
+            _latest_date(con,"2026-09-18")
+        con.execute("CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)")
+        con.execute("INSERT INTO tushare_trade_cal VALUES ('SSE','2026-09-18',true),('SSE','2026-09-21',true)")
+        assert _latest_date(con,"2026-09-18") == "2026-09-18"
+        con.execute("INSERT INTO tushare_trade_cal VALUES ('SSE','2026-09-18',false)")
+        with pytest.raises(ValueError,match="contradictory"):
+            _latest_date(con,"2026-09-18")
+
+
+def test_query_failure_blocks_every_review_state_even_when_old_readiness_is_green(tmp_path, monkeypatch):
+    from trade_system import daily_review
+    db = tmp_path/"bad_schema.duckdb"
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE watchlist(stock_code VARCHAR)")
+    monkeypatch.setattr(daily_review,"assess_trade_date_readiness",lambda *a,**kw: {
+        "source_ready":True,"pipeline_ready":True,"artifact_current":True,
+        "data_certified_ready":True,"execution_ready":True,"missing_groups":[]})
+    ctx=daily_review.build_daily_review_context(db,"2026-09-18")
+    assert any(row["table"]=="watchlist" and row["state"]=="query_failed" for row in ctx["query_status"])
+    for state in (ctx["readiness"],ctx["readiness"]["operator_state"],ctx["execution_control"]):
+        assert state["operator_status"]=="blocked" and not state["execution_ready"] and not state["analysis_ready"]
+    assert ctx["execution_control"]["effective_position_pct"]==0

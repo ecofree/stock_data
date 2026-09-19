@@ -1,6 +1,6 @@
 import duckdb
 
-from schema import init_schema
+from trade_system.schema import init_schema
 from scripts.collect_auction_evidence import (
     _codes,
     _collect_tencent_auction_quotes,

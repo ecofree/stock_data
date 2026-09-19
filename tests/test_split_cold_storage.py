@@ -67,8 +67,7 @@ def test_rerun_is_idempotent(db, tmp_path):
 
 def test_attach_readthrough_via_env_name(db, tmp_path):
     """KPL_COLD_DB_PATH attach (base.connect_duckdb) makes cold visible as ``cold``."""
-    import base
-
+    from trade_system import data_store as base
     rc = main_with_args(db, tmp_path, execute=True, before="2026-01-01")
     assert rc == 0
     monkey = pytest.MonkeyPatch()

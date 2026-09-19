@@ -120,7 +120,6 @@ DEEPSEEK_API_KEY = _get_deepseek("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = _get_deepseek("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = _get_deepseek("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_TIMEOUT = float(_get_deepseek("DEEPSEEK_TIMEOUT", "45"))
-DEEPSEEK_MAX_RETRIES = int(float(_get_deepseek("DEEPSEEK_MAX_RETRIES", "2")))
 
 # Rate-limit: extra spacing for heavy endpoints
 RATE_LIMIT_ENDPOINTS = ["/sector/ranking", "/sector/stocks", "/sector/strength", "/sector/capital"]

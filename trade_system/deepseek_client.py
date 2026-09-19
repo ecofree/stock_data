@@ -10,16 +10,16 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import requests
+import urllib.request
+
+from trade_system.http_transport import read_verified_once, request_budget
 
 from trade_system.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
-    DEEPSEEK_MAX_RETRIES,
     DEEPSEEK_MODEL,
     DEEPSEEK_TIMEOUT,
 )
@@ -35,7 +35,6 @@ class DeepSeekSettings:
     base_url: str = DEEPSEEK_BASE_URL
     model: str = DEEPSEEK_MODEL
     timeout: float = DEEPSEEK_TIMEOUT
-    max_retries: int = DEEPSEEK_MAX_RETRIES
 
 
 def _json_content(value: str) -> dict[str, Any]:
@@ -92,12 +91,10 @@ class DeepSeekReviewClient:
         self,
         settings: DeepSeekSettings | None = None,
         *,
-        post: Callable[..., requests.Response] | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        read: Callable[..., bytes] = read_verified_once,
     ) -> None:
         self.settings = settings or DeepSeekSettings()
-        self._post = post or requests.post
-        self._sleep = sleep
+        self._read = read
 
     @property
     def configured(self) -> bool:
@@ -137,82 +134,22 @@ class DeepSeekReviewClient:
             "stream": False,
             "max_tokens": 4096,
         }
-        last_error: Exception | None = None
-        attempts = max(0, int(self.settings.max_retries)) + 1
-        for attempt in range(attempts):
-            try:
-                response = self._post(
-                    self.settings.base_url.rstrip("/") + "/chat/completions",
-                    headers={
-                        "Authorization": "Bearer " + self.settings.api_key,
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=self.settings.timeout,
-                )
-                if not response.ok:
-                    raise DeepSeekReviewError(f"provider HTTP {response.status_code}")
-                body = response.json()
-                choices = body.get("choices") or []
-                content = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
-                parsed = _json_content(content)
-                validated = validate_review_output(parsed, snapshot)
-                return {
-                    "status": "success",
-                    "model": str(body.get("model") or self.settings.model),
-                    "attempts": attempt + 1,
-                    "usage": body.get("usage") or {},
-                    "review": validated,
-                }
-            except (requests.RequestException, DeepSeekReviewError, ValueError, TypeError) as exc:
-                last_error = exc
-                if attempt + 1 < attempts:
-                    self._sleep(min(2.0 * (attempt + 1), 5.0))
-        raise DeepSeekReviewError(str(last_error or "provider request failed"))
-
-    def chat(self, user_content: str, *, system: str | None = None,
-             max_tokens: int = 2048) -> str:
-        """Free-form single-turn completion; returns the assistant text.
-
-        Used by callers that need plain-text reasoning (e.g. the daily
-        stock screener's narrative review) rather than the fixed review
-        JSON contract.
-        """
-        if not self.configured:
-            raise DeepSeekReviewError("DeepSeek API key or endpoint is not configured")
-        payload = {
-            "model": self.settings.model,
-            "messages": [
-                {"role": "system", "content": system or (
-                    "你是严谨的A股短线研究助理。只依据给定证据作答，"
-                    "缺失信息明确说“数据不足”，不臆测。")},
-                {"role": "user", "content": user_content},
-            ],
-            "response_format": {"type": "json_object"},
-            "thinking": {"type": "disabled"},
-            "stream": False,
-            "max_tokens": max_tokens,
-        }
-        last_error: Exception | None = None
-        attempts = max(0, int(self.settings.max_retries)) + 1
-        for attempt in range(attempts):
-            try:
-                response = self._post(
-                    self.settings.base_url.rstrip("/") + "/chat/completions",
-                    headers={
-                        "Authorization": "Bearer " + self.settings.api_key,
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=self.settings.timeout,
-                )
-                if not response.ok:
-                    raise DeepSeekReviewError(f"provider HTTP {response.status_code}")
-                body = response.json()
-                choices = body.get("choices") or []
-                return ((choices[0].get("message") or {}).get("content") if choices else "") or ""
-            except (requests.RequestException, DeepSeekReviewError) as exc:
-                last_error = exc
-                if attempt + 1 < attempts:
-                    self._sleep(min(2.0 * (attempt + 1), 5.0))
-        raise DeepSeekReviewError(str(last_error or "provider request failed"))
+        request = urllib.request.Request(
+            self.settings.base_url.rstrip('/') + '/chat/completions',
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={'Authorization': 'Bearer ' + self.settings.api_key,
+                     'Content-Type': 'application/json'}, method='POST')
+        try:
+            with request_budget(self.settings.timeout):
+                body = json.loads(self._read(request, timeout=self.settings.timeout, max_bytes=1_000_000))
+            choices = body.get('choices') or []
+            content = ((choices[0].get('message') or {}).get('content') if choices else '') or ''
+            parsed = _json_content(content)
+            validated = validate_review_output(parsed, snapshot)
+        except DeepSeekReviewError:
+            raise
+        except (OSError, ValueError, TypeError, AttributeError, IndexError):
+            # Transport details can contain a credential or request text.
+            raise DeepSeekReviewError('provider request or response invalid') from None
+        return {'status': 'success', 'model': str(body.get('model') or self.settings.model),
+                'attempts': 1, 'usage': body.get('usage') or {}, 'review': validated}

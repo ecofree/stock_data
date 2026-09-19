@@ -83,3 +83,47 @@ def test_clist_routes_share_budget_and_keep_source_identity(monkeypatch, spent, 
         assert successes == [calls[1][0]]
     assert len(calls) == expected_calls
     assert failures == [calls[0][0]]
+
+
+@pytest.mark.parametrize('failure', [TimeoutError('expired'), ValueError('invalid')])
+def test_finance_report_does_not_multiply_failed_requests(monkeypatch, failure):
+    from trade_system import eastmoney_finance as em
+    calls = []
+    def read(*a, **kw):
+        calls.append(a)
+        raise failure
+    monkeypatch.setattr(em, 'read_verified_once', read)
+    with pytest.raises(type(failure)):
+        em.get_income_statement('000001')
+    assert len(calls) == 1
+
+
+def test_finance_fallback_and_pagination_share_original_budget(monkeypatch, tmp_path):
+    import time
+    from trade_system import eastmoney_finance as em
+    from trade_system.http_transport import request_deadline, request_budget
+    for name in ('DEFAULT_CLIST_GUARD', 'DELAY_CLIST_GUARD'):
+        monkeypatch.setattr(em, name, EastmoneyClistGuard(tmp_path / (name+'.json')))
+    monkeypatch.setattr(em.shared_host_limiter, 'acquire', lambda *a, **kw: None)
+    deadlines = []
+    def read(url, **kw):
+        deadlines.append(request_deadline.get())
+        if 'delay' not in url:
+            raise ValueError('primary failed')
+        return {'data': {'total': 21, 'diff': [{'f12': '000001'}]}}
+    monkeypatch.setattr(em, '_read_json', read)
+    assert request_deadline.get() is None
+    with request_budget(5):
+        original = request_deadline.get()
+        _, meta = em.get_fund_flow_market_realtime('2026-07-15', page_size=20, max_pages=2, pause_seconds=0)
+        assert deadlines == [original, original, original]
+        assert meta['source'] == 'eastmoney_intraday_clist_delay'
+        assert request_deadline.get() == original
+    assert request_deadline.get() is None
+    token = request_deadline.set(time.monotonic()-1)
+    try:
+        with pytest.raises(TimeoutError):
+            em.get_fund_flow_market_realtime('2026-07-15')
+        assert len(deadlines) == 3
+    finally:
+        request_deadline.reset(token)

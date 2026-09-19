@@ -13,8 +13,8 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 from trade_system.eastmoney_finance import get_fund_flow_market, get_fund_flow_market_realtime
 from trade_system.multi_source_store import MultiSourceStore
 

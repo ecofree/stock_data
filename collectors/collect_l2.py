@@ -1,5 +1,5 @@
 """L2 data collectors (11 endpoints)."""
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -213,41 +213,8 @@ def collect_l2_sector_intraday(client: KPLClient, store: DuckDBStore, date: str,
 
 
 def collect_l2_realtime_all_boards(client: KPLClient, store: DuckDBStore, date: str) -> int:
-    """API returns {first_board: [...], second_board: [...], ...} - each key is the board type."""
-    data = client.get("/l2/realtime/all-boards")
-    if not data:
-        return 0
-    total = 0
-    # Map board type keys to level integers
-    board_key_to_level = {
-        "first_board": 1, "second_board": 2, "third_board": 3,
-        "fourth_board": 4, "fifth_board": 5, "gouban": 6,
-    }
-    for key, stocks in data.items():
-        if not isinstance(stocks, list):
-            continue
-        board_level = board_key_to_level.get(key, 0)
-        rows = []
-        for s in stocks:
-            if isinstance(s, dict):
-                rows.append((
-                    date,
-                    s.get("board_type", board_level),
-                    str(s.get("stock_code", s.get("code", ""))),
-                    s.get("stock_name", s.get("name", "")),
-                    str(s.get("timestamp", s.get("limit_up_time", ""))),
-                ))
-            elif isinstance(s, (list, tuple)) and len(s) >= 3:
-                rows.append((date, board_level, str(s[0]), str(s[1]), str(s[2]) if len(s) > 2 else ""))
-        if rows:
-            n = store.insert_rows("l2_realtime_all_boards", rows,
-                ["date", "board_level", "stock_code", "stock_name", "limit_up_time"])
-            total += n
-    if total:
-        store.log_collect("l2_realtime_all_boards", "/l2/realtime/all-boards", total, "ok")
-        return total
-    store.insert_raw("/l2/realtime/all-boards", data)
-    return 0
+    from collectors.collect_ladder import _collect_realtime_boards
+    return _collect_realtime_boards(client, store, date, grouped=True)
 
 
 def collect_l2_realtime_index_list(client: KPLClient, store: DuckDBStore, date: str) -> int:

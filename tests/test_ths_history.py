@@ -245,3 +245,33 @@ def test_ths_full_snapshot_checkpoints_each_board_and_rejects_empty(tmp_path, mo
         assert con.execute("select status from ths_concept_member_checkpoint where concept_code='THS-300002'").fetchone()[0] == "empty"
     finally:
         con.close()
+
+
+def test_ths_pages_share_limiter_and_transport_deadline_without_local_retry(monkeypatch):
+    import pytest
+    from trade_system.http_transport import request_budget, request_deadline
+    calls = []
+    monkeypatch.setattr(ths_history, '_ths_request_cookie', lambda: 'synthetic')
+    monkeypatch.setattr(ths_history.shared_host_limiter, 'acquire',
+        lambda host, interval, **kw: calls.append(('wait', kw['deadline'])))
+    def read(request, **kw):
+        calls.append(('read', request_deadline.get()))
+        raise TimeoutError('fixture timeout')
+    monkeypatch.setattr(ths_history, 'read_verified_once', read)
+    with request_budget(1):
+        deadline = request_deadline.get()
+        with pytest.raises(TimeoutError):
+            ths_history._ths_html('https://fixture.invalid/')
+    assert calls == [('wait', deadline), ('read', deadline)]
+    assert request_deadline.get() is None
+
+
+def test_ths_catalogue_uses_one_existing_html_reader(monkeypatch):
+    calls = []
+    def html(url):
+        calls.append(url)
+        return '<a href="//q.10jqka.com.cn/gn/detail/code/300001/">概念一</a>'
+    monkeypatch.setattr(ths_history, '_ths_html', html)
+    result = ths_history._ths_catalog()
+    assert result == [('300001', '概念一')]
+    assert result.provider == 'ths_html' and len(calls) == 1

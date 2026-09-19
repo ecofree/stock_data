@@ -13,7 +13,7 @@ from trade_system.schema_audit import audit_schema, load_defined_tables
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a data quality report.")
     parser.add_argument("--db", default="kpl_data.duckdb")
-    parser.add_argument("--schema", default="schema.py")
+    parser.add_argument("--schema", default="trade_system/schema.py")
     parser.add_argument("--out", default="reports/data_quality_latest.md")
     args = parser.parse_args()
 

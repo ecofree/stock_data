@@ -15,10 +15,10 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_misc import collect_auction_tick
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_misc import collect_auction_tick
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 
 MAX_CODES = 200
 

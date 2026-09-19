@@ -1,4 +1,4 @@
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from fetch_all import should_collect_finance
 import pytest
 

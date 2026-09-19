@@ -19,17 +19,22 @@ def write_denied(path):
         with Path(path).open('r+b'):
             return False
     except PermissionError as exc:
-        return getattr(exc, 'winerror', None) == 5
+        error = getattr(exc, 'winerror', None)
+        if error is None and sys.platform == 'win32':
+            # CRT open reports EACCES without the underlying Windows error.
+            # Ask Win32 directly so a sharing violation cannot pass as an ACL denial.
+            return directory_write_denied(path, flags=0)
+        return error == 5
 
 
-def directory_write_denied(path):
-    """Request an existing directory's add-file right; never create a note."""
+def directory_write_denied(path, *, flags=0x02000000):
+    """Request write-data/add-file on an existing object without modifying it."""
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                   wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     kernel.CreateFileW.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.CreateFileW(str(path), 0x0002, 7, None, 3, 0x02000000, None)
+    handle = kernel.CreateFileW(str(path), 0x0002, 7, None, 3, flags, None)
     if handle == ctypes.c_void_p(-1).value:
         return ctypes.get_last_error() == 5
     kernel.CloseHandle(handle)
@@ -121,7 +126,7 @@ def run(release, workspace, database, output, nonce, expected_sid, env_file,
         frozen += [Path(model['model_path']), workspace / 'research-current.json']
     denied = {str(p): write_denied(p) for p in frozen}
     if not all(denied.values()):
-        raise ValueError('research identity can modify protected source/model/configuration')
+        raise ValueError('write protection not verified: ' + ', '.join(p for p, ok in denied.items() if not ok))
     if not directory_write_denied(workspace / 'notes'):
         raise ValueError('automated research identity can create human judgement records')
     runtime_denied = {str(p):directory_write_denied(p) for p in

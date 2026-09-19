@@ -50,7 +50,7 @@ def test_eastmoney_l2_fallback_stops_when_shared_budget_is_exhausted(
 ):
     called = []
     monkeypatch.setattr(
-        "trade_system.stock_data_sources._from_em_trends",
+        "trade_system.adapters.eastmoney_dc._from_em_trends",
         lambda *args, **kwargs: called.append(args),
     )
     store = _new_staging_store()
@@ -119,16 +119,9 @@ def test_collect_l2_focus_writes_intraday_for_candidates(tmp_path):
         "(?, 2, '000001', '测试', '09:35', current_timestamp)",
         [trade_date],
     )
-    # Normalized view path for candidates: stock_candidate_score fallback
-    con.execute(
-        "CREATE TABLE stock_candidate_score("
-        "trade_date VARCHAR, stock_code VARCHAR, stock_name VARCHAR, score DOUBLE, "
-        "evidence_json VARCHAR, source VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO stock_candidate_score VALUES (?,?,?,?,?,?)",
-        [trade_date, "000001", "测试", 88, "{}", "limit_pool"],
-    )
+    con.execute("CREATE TABLE watchlist(trade_date VARCHAR,stock_code VARCHAR,status VARCHAR,"
+                "priority INTEGER,created_at TIMESTAMP)")
+    con.execute("INSERT INTO watchlist VALUES (?, '000001','active',1,current_timestamp)", [trade_date])
     ensure_l2_focus_checkpoint(con)
     con.close()
 
@@ -251,7 +244,7 @@ def test_probe_empty_skips_kpl_loop_and_uses_trends(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(
-        "trade_system.stock_data_sources._from_em_trends",
+        "trade_system.adapters.eastmoney_dc._from_em_trends",
         _fake_trends,
     )
 
@@ -312,7 +305,7 @@ def test_eastmoney_trends_fallback_when_kpl_empty(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(
-        "trade_system.stock_data_sources._from_em_trends",
+        "trade_system.adapters.eastmoney_dc._from_em_trends",
         _fake_trends,
     )
 
@@ -374,7 +367,7 @@ def test_l2_failed_refresh_preserves_previous_same_day_rows(tmp_path, monkeypatc
     mod.init_schema = lambda conn: None  # type: ignore
     monkeypatch.setattr(mod, "_probe_kpl_stock_intraday", lambda *a, **k: False)
     monkeypatch.setattr(
-        "trade_system.stock_data_sources._from_em_trends",
+        "trade_system.adapters.eastmoney_dc._from_em_trends",
         lambda code, date=None: {
             "code": code,
             "date": "20260730",

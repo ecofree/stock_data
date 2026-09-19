@@ -10,7 +10,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trade_system.operator_outcomes import OUTCOME_COLUMNS, ensure_operator_outcome_tables
+from trade_system.operator_outcomes import OUTCOME_COLUMNS
 from trade_system.quality import table_exists
 
 
@@ -28,7 +28,9 @@ def _latest_date(con: duckdb.DuckDBPyConnection) -> str:
 
 
 def create_template(db_path: str | Path, output: str | Path, trade_date: str | None = None) -> dict[str, int | str]:
-    ensure_operator_outcome_tables(db_path)
+    path = Path(output)
+    if path.exists():
+        raise FileExistsError("new template path required; preserve existing database and human records")
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         selected_date = trade_date or _latest_date(con)
@@ -53,10 +55,7 @@ def create_template(db_path: str | Path, output: str | Path, trade_date: str | N
                 [selected_date],
             ).fetchall()
         if not rows and table_exists(con, "stock_candidate_stage_signal"):
-            # The stage signal table is the production candidate source when
-            # close-stage trade_plan generation is blocked or has not yet run.
-            # Export only actionable rows, preserving the evidence-gated
-            # distinction between review candidates and orders.
+            # Historical candidate evidence only; no current trading permission.
             rows = con.execute(
                 "SELECT trade_date, stock_code, coalesce(stock_name, '') "
                 "FROM stock_candidate_stage_signal "
@@ -64,9 +63,8 @@ def create_template(db_path: str | Path, output: str | Path, trade_date: str | N
                 "ORDER BY score DESC NULLS LAST, stock_code LIMIT 100",
                 [selected_date],
             ).fetchall()
-        path = Path(output)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        with path.open("x", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=OUTCOME_COLUMNS)
             writer.writeheader()
             for row in rows:
@@ -79,13 +77,14 @@ def create_template(db_path: str | Path, output: str | Path, trade_date: str | N
                     "mistake_tag": "unreviewed",
                     "imported_from": path.name,
                 })
-        return {"trade_date": selected_date, "rows": len(rows), "output": str(path)}
+        return {"trade_date": selected_date, "rows": len(rows), "output": str(path),
+                "scope": "historical_human_review_template", "database_writes": 0}
     finally:
         con.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Create a human-review CSV template; this does not create outcomes.")
+    parser = argparse.ArgumentParser(description="Create a human-review CSV template; read-only historical export to a new file.")
     parser.add_argument("--db", default="kpl_data.duckdb")
     parser.add_argument("--date", dest="trade_date", help="Trade date (YYYY-MM-DD). Defaults to latest plan/candidate date.")
     parser.add_argument("--out", default="reports/operator_outcomes_template.csv")

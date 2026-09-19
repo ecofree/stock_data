@@ -1,7 +1,7 @@
 """Sector data collectors (19 endpoints)."""
 import json
 from datetime import datetime
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
 def collect_sector_plates(client: KPLClient, store: DuckDBStore, date: str) -> list:

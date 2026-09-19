@@ -1,4 +1,4 @@
-﻿"""Bounded L2 stock-curve collection for operator candidates.
+"""Bounded L2 stock-curve collection for operator candidates.
 
 Production phase mode only runs ``fetch_all.py --only-market``, which never
 reaches ``collect_all_l2``.  That froze ``l2_stock_intraday`` at an old date.
@@ -15,8 +15,8 @@ from typing import Any
 
 import duckdb
 
-from base import DuckDBStore, KPLClient, logger
-from collect_l2 import collect_l2_stock_bigorder, collect_l2_stock_intraday
+from trade_system.data_store import DuckDBStore, KPLClient, logger
+from collectors.collect_l2 import collect_l2_stock_bigorder, collect_l2_stock_intraday
 from trade_system.schema import init_schema
 from trade_system.executable_quotes import candidate_codes_for_quotes
 
@@ -91,7 +91,7 @@ def _write_eastmoney_trends_fallback(
     deadline: float | None = None,
 ) -> dict[str, int]:
     """When KPL /l2/stock-intraday is empty, fill minute curves from Eastmoney trends2."""
-    from trade_system.stock_data_sources import _from_em_trends
+    from trade_system.adapters.eastmoney_dc import _from_em_trends
 
     ymd = "".join(ch for ch in trade_date if ch.isdigit())[:8]
     rows_written = 0

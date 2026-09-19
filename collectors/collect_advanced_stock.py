@@ -2,7 +2,7 @@
 
 import json
 
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
 def _to_float(value, default: float = 0.0) -> float:

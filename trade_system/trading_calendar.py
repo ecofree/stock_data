@@ -153,32 +153,34 @@ def open_session_dates(
     con: duckdb.DuckDBPyConnection,
     start_date: str,
     end_date: str,
+    *,
+    strict: bool = False,
 ) -> list[str]:
-    """Return verified open sessions, or an empty list when calendar is absent."""
-    start_date = _calendar_date(start_date)
-    end_date = _calendar_date(end_date)
+    """Return verified sessions; strict coverage requires every calendar day."""
+    from datetime import timedelta
+    start_date, end_date = _calendar_date(start_date), _calendar_date(end_date)
     try:
+        first, last = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if first > last:
+            raise ValueError("calendar range reversed")
         if not _table_exists(con, "tushare_trade_cal"):
-            return []
-        columns = {
-            str(row[1]).lower()
-            for row in con.execute("PRAGMA table_info('tushare_trade_cal')").fetchall()
-        }
-        exchange_filter = "AND exchange='SSE'" if "exchange" in columns else ""
-        rows = con.execute(
-            f"""
-            SELECT CAST(cal_date AS DATE)
-            FROM tushare_trade_cal
-            WHERE coalesce(CAST(is_open AS BOOLEAN), false)
-              {exchange_filter}
-              AND CAST(cal_date AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-            GROUP BY cal_date
-            ORDER BY cal_date
-            """,
-            [start_date, end_date],
-        ).fetchall()
-        return [str(row[0])[:10] for row in rows]
-    except Exception:
+            raise ValueError("calendar table missing")
+        columns = {str(row[1]).lower() for row in con.execute("PRAGMA table_info('tushare_trade_cal')").fetchall()}
+        exchange = "AND exchange='SSE'" if "exchange" in columns else ""
+        rows = con.execute(f"""SELECT CAST(cal_date AS DATE), bool_or(CAST(is_open AS BOOLEAN)),
+            count(is_open)=count(*) AND count(DISTINCT CAST(is_open AS BOOLEAN))=1
+            FROM tushare_trade_cal WHERE CAST(cal_date AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            {exchange} GROUP BY cal_date ORDER BY cal_date""", [start_date, end_date]).fetchall()
+        states = {day: (opened, valid) for day, opened, valid in rows}
+        if strict:
+            for offset in range((last-first).days+1):
+                day = first + timedelta(days=offset)
+                if day not in states or not states[day][1]:
+                    raise ValueError(f"calendar unknown or contradictory: {day}")
+        return [str(day) for day, opened, valid in rows if opened and valid]
+    except Exception as exc:
+        if strict:
+            raise ValueError(f"unverified calendar: {exc}") from exc
         return []
 
 

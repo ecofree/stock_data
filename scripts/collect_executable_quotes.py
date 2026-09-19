@@ -14,7 +14,7 @@ from trade_system.executable_quotes import collect_executable_quotes  # noqa: E4
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Collect candidate-only live quotes for entry-executable signals."
+        description="Collect bounded observation quotes for explicit holdings and manual watchlists."
     )
     parser.add_argument("--db", default="kpl_data.duckdb")
     parser.add_argument("--date", required=True, help="Trade date YYYY-MM-DD")
@@ -27,7 +27,7 @@ def main() -> int:
     parser.add_argument(
         "--codes",
         default="",
-        help="Optional comma-separated stock codes; default uses limit-pool/candidates.",
+        help="Optional comma-separated stock codes; default uses open holdings and active manual attention.",
     )
     args = parser.parse_args()
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None

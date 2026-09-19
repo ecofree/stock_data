@@ -113,3 +113,116 @@ def test_quote_persistence_keeps_raw_and_canonical_caps_without_schema_change():
         assert raw['float_market_cap_cny'] == 100000000
         assert raw['market_cap_quality']['total_market_cap_cny'] is None
         assert row.get('total_market_cap_cny') is None  # caller receipt unchanged
+
+
+@pytest.mark.parametrize('source,args', [('_from_baostock', ('000001','20260901','20260902','')),
+    ('_from_pytdx', ('000001','20260901','20260902','')),
+    ('_from_pytdx_minutes', ('000001','20260901'))])
+def test_sdk_timeout_reaps_owned_child_before_return(monkeypatch, source, args):
+    import subprocess
+    import sys
+    import time
+    from trade_system.http_transport import request_budget, request_deadline
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    children = []
+    def popen(*a, **kw):
+        child = real_popen(*a, **kw)
+        children.append(child)
+        return child
+    def run(command, **kw):
+        assert 0 < kw['timeout'] <= 0.201
+        # Exercise the actual process timeout/reap, with no SDK import or socket.
+        return real_run([sys.executable, '-I', '-B', '-c', 'import time;time.sleep(30)'], **kw)
+    monkeypatch.setattr(subprocess, 'Popen', popen)
+    monkeypatch.setattr(subprocess, 'run', run)
+    with request_budget(.2):
+        with pytest.raises(TimeoutError, match='SDK deadline'):
+            getattr(kline_sources, source)(*args)
+    assert len(children) == 1 and children[0].poll() is not None
+    token = request_deadline.set(time.monotonic()-1)
+    try:
+        with pytest.raises(TimeoutError):
+            getattr(kline_sources, source)(*args)
+        assert len(children) == 1
+    finally:
+        request_deadline.reset(token)
+
+
+def test_sdk_raw_parser_retains_units_and_logs_out(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    calls = []
+    data = iter([True, False])
+    result = SimpleNamespace(error_code='0', next=lambda: next(data),
+        get_row_data=lambda: ['2026-09-01','10','12','9','11','100','1100'])
+    monkeypatch.setitem(sys.modules, 'baostock', SimpleNamespace(
+        login=lambda: SimpleNamespace(error_code='0'),
+        logout=lambda: calls.append('logout'), query_history_k_data_plus=lambda *a, **kw: result))
+    rows = kline_sources._baostock_rows('000001','20260901','20260901','')
+    assert rows[0]['close'] == 11 and rows[0]['volume_unit'] == 'shares'
+    assert rows[0]['amount_unit'] == 'yuan' and rows[0]['adjustment'] == 'none'
+    assert calls == ['logout']
+
+
+def test_sdk_worker_keeps_diagnostics_out_of_result(monkeypatch):
+    import io
+    import json
+    import sys
+    from types import SimpleNamespace
+    output = io.BytesIO()
+    monkeypatch.setattr(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(b'["pytdx", ["000001", "20260901", "20260901", ""]]')))
+    monkeypatch.setattr(sys, 'stdout', SimpleNamespace(buffer=output))
+    def rows(*args):
+        print('SDK log must not enter response')
+        return [{'close': 10, 'adjustment': 'none', 'volume_unit': 'hands'}]
+    monkeypatch.setattr(kline_sources, '_pytdx_rows', rows)
+    kline_sources._sdk_worker()
+    assert json.loads(output.getvalue()) == [{'close': 10, 'adjustment': 'none', 'volume_unit': 'hands'}]
+
+
+@pytest.mark.parametrize('source', ['_from_baostock', '_from_pytdx'])
+@pytest.mark.parametrize('adjustment', ['qfq', 'hfq'])
+def test_raw_only_sdk_never_requests_unsupported_adjustment(monkeypatch, source, adjustment):
+    def forbidden(*a, **kw):
+        pytest.fail('unsupported product must not consume SDK budget')
+    monkeypatch.setattr(kline_sources, '_sdk_call', forbidden)
+    assert getattr(kline_sources, source)('000001', '20260901', '20260902', adjustment) is None
+
+
+@pytest.mark.parametrize('spent', [.2, 1.1])
+def test_cninfo_signature_and_http_share_one_deadline(monkeypatch, tmp_path, spent):
+    from types import SimpleNamespace
+    from trade_system.adapters import cninfo_sources as cn
+    from trade_system.http_transport import request_budget, request_deadline
+    signature=tmp_path/'signature.js';signature.write_text('synthetic local fixture')
+    monkeypatch.setenv('CNINFO_JS',str(signature))
+    clock=[100.0];calls=[]
+    monkeypatch.setattr(cn.time,'monotonic',lambda:clock[0])
+    def run(command, **kw):
+        assert command[-1]==str(signature) and kw['timeout']==pytest.approx(1)
+        clock[0]+=spent
+        return SimpleNamespace(returncode=0,stdout=b'synthetic-token')
+    def read(request, **kw):
+        remaining=request_deadline.get()-clock[0]
+        if remaining<=0:raise TimeoutError('expired before request')
+        calls.append(remaining)
+        assert request.get_header('Accept-enckey')=='synthetic-token'
+        return b'{"records":[{"F001V":"fixture"}]}'
+    monkeypatch.setattr(cn.subprocess,'run',run)
+    monkeypatch.setattr(cn,'read_verified_once',read)
+    with request_budget(1):
+        result=cn._cninfo_webapi('fixture',{})
+    assert calls==pytest.approx([.8] if spent<1 else [])
+    assert bool(result)==(spent<1)
+
+
+def test_cninfo_signature_timeout_does_not_start_http(monkeypatch,tmp_path):
+    import subprocess
+    from trade_system.adapters import cninfo_sources as cn
+    signature=tmp_path/'signature.js';signature.write_text('fixture')
+    monkeypatch.setenv('CNINFO_JS',str(signature))
+    def run(*a,**kw):raise subprocess.TimeoutExpired('node',kw['timeout'])
+    def forbidden(*a,**kw):pytest.fail('HTTP after signature timeout')
+    monkeypatch.setattr(cn.subprocess,'run',run);monkeypatch.setattr(cn,'read_verified_once',forbidden)
+    with pytest.raises(TimeoutError):cn._cninfo_webapi('fixture',{})

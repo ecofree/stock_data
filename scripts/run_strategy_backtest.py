@@ -13,12 +13,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import duckdb  # noqa: E402
 
 from trade_system.backtest_engine import (  # noqa: E402
-    KLINE_DEDUP_CTE,
     BacktestParams,
     load_kline,
     load_universe,
     simulate,
 )
+from trade_system.trading_calendar import open_session_dates  # noqa: E402
 from trade_system.logging_setup import configure  # noqa: E402
 
 
@@ -42,13 +42,11 @@ def main() -> int:
     configure()
     con = duckdb.connect(args.db, read_only=True)
     try:
-        sessions = [
-            str(r[0]) for r in con.execute(
-                f"SELECT DISTINCT d FROM ({KLINE_DEDUP_CTE}) ORDER BY d"
-            ).fetchall()
-        ]
         universe = load_universe(con, args.start, args.end)
         kline = load_kline(con)
+        # Price gaps never define the exchange calendar or shorten a T+1 horizon.
+        last = max((day for day, _ in kline), default=args.end)
+        sessions = open_session_dates(con, args.start, max(args.end, last), strict=True)
     finally:
         con.close()
 
@@ -85,7 +83,7 @@ def main() -> int:
         "Limitations: fractional quantities, no lot-size/fees/corporate-action handling,"
         " no partial fills/intraday stops or limit-down exit constraints;"
         " fixed 10cm-board entry proxy uses the full daily bar. Missing marks are carried"
-        " forward and set valuation_complete=false; sessions come from observed kline dates.",
+        " forward and set valuation_complete=false; sessions come from the verified exchange calendar.",
         f"Ledger: [{out_ledger.name}]({out_ledger.name})",
         "",
     ]

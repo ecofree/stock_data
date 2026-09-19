@@ -9,22 +9,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trade_system.reports.operator_report import (
     build_operator_report_snapshot,
-    persist_operator_report_snapshot,
     render_operator_report_markdown,
 )
 
 
 def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description="Generate Phase 16 professional operator report.")
+    parser = argparse.ArgumentParser(description="Export a read-only historical operator inventory.")
     parser.add_argument("--db", default=str(project_root / "kpl_data.duckdb"))
     parser.add_argument("--trade-date", default=date.today().isoformat())
     parser.add_argument("--out", default=str(project_root / "reports" / "operator_report_latest.md"))
     args = parser.parse_args()
 
-    snapshot = build_operator_report_snapshot(args.db, args.trade_date)
-    persist_operator_report_snapshot(args.db, "daily_operator", snapshot)
-    out = Path(args.out)
+    db, out = Path(args.db).resolve(), Path(args.out).resolve()
+    if out == db or (out.exists() and out.samefile(db)):
+        raise ValueError("report output must not overwrite the source database")
+    snapshot = build_operator_report_snapshot(db, args.trade_date)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_operator_report_markdown(snapshot), encoding="utf-8")
     print(f"operator_report={out}")

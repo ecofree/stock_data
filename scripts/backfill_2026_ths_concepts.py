@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config import DB_PATH  # noqa: E402
+from trade_system.config import DB_PATH  # noqa: E402
 from trade_system.ths_history import THSConceptHistoryCollector, render_report  # noqa: E402
 
 

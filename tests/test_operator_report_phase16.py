@@ -1,13 +1,13 @@
 import duckdb
+import pytest
 
 from trade_system.reports.operator_report import (
     build_operator_report_snapshot,
-    persist_operator_report_snapshot,
     render_operator_report_markdown,
 )
 
 
-def test_operator_report_snapshot_collects_professional_sections(tmp_path):
+def test_operator_report_is_read_only_and_date_scoped(tmp_path):
     db_path = tmp_path / "operator_report.duckdb"
     con = duckdb.connect(str(db_path))
     try:
@@ -32,6 +32,9 @@ def test_operator_report_snapshot_collects_professional_sections(tmp_path):
             "strategy_id VARCHAR, stage VARCHAR, sample_count INTEGER, win_rate DOUBLE, avg_return DOUBLE)"
         )
         con.execute("INSERT INTO strategy_backtest_result VALUES ('stage.pre','pre_market',10,60.0,1.5)")
+        con.execute("INSERT INTO strategy_scan_result SELECT '2026-07-06', strategy_id, '000002', stock_name, stage, 999, evidence_json, selected_reason, risk_points, invalid_conditions FROM strategy_scan_result")
+        con.execute("CREATE TABLE operator_report_snapshot(note VARCHAR)")
+        con.execute("INSERT INTO operator_report_snapshot VALUES ('preserved historical snapshot')")
         con.execute("CREATE TABLE news_radar_item(news_id VARCHAR, trade_date VARCHAR, related_sector VARCHAR, title VARCHAR)")
         con.execute("INSERT INTO news_radar_item VALUES ('n1','2026-07-07','robot','robot catalyst')")
         con.execute("CREATE TABLE qlib_shadow_evaluation(model_id VARCHAR, sample_count INTEGER, hit_rate DOUBLE)")
@@ -68,7 +71,19 @@ def test_operator_report_snapshot_collects_professional_sections(tmp_path):
     finally:
         con.close()
 
+    before = db_path.read_bytes()
     snapshot = build_operator_report_snapshot(db_path, trade_date="2026-07-07")
+    assert snapshot["execution_ready"] is False and snapshot["database_writes"] == 0
+    assert snapshot["candidate_layer"]["top_candidates"][0]["symbol"] == "000001"
+    assert not build_operator_report_snapshot(db_path, "2026-07-08")["candidate_layer"]["top_candidates"]
+    import subprocess, sys
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1]/"scripts/generate_operator_reports.py"
+    output = tmp_path/"inventory.md"
+    result = subprocess.run([sys.executable, "-B", str(script), "--db", str(db_path), "--trade-date", "2026-07-07", "--out", str(output)], capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert "Read-only historical records" in output.read_text(encoding="utf-8")
+    assert db_path.read_bytes() == before
 
     assert snapshot["trade_date"] == "2026-07-07"
     assert snapshot["data_layer"]["source_count"] == 2
@@ -87,8 +102,7 @@ def test_operator_report_snapshot_collects_professional_sections(tmp_path):
     assert "auction not confirmed" in snapshot["candidate_layer"]["top_candidates"][0]["invalid_conditions"]
 
 
-def test_operator_report_persists_snapshot_and_renders_evidence(tmp_path):
-    db_path = tmp_path / "operator_report.duckdb"
+def test_operator_report_renders_historical_evidence():
     snapshot = {
         "trade_date": "2026-07-07",
         "data_layer": {"source_count": 1, "enabled_count": 1},
@@ -131,19 +145,28 @@ def test_operator_report_persists_snapshot_and_renders_evidence(tmp_path):
         },
     }
 
-    assert persist_operator_report_snapshot(db_path, "daily_operator", snapshot) == 1
-    assert persist_operator_report_snapshot(db_path, "daily_operator", snapshot) == 1
     markdown = render_operator_report_markdown(snapshot)
 
-    assert "# Professional Operator Report" in markdown
+    assert "# Historical Operator Inventory" in markdown
     assert "API Utilization" in markdown
     assert "Operator Loop" in markdown
     assert "Operator Outcomes" in markdown
     assert "theme strong" in markdown
     assert "weak market downgrade" in markdown
     assert "auction not confirmed" in markdown
-    con = duckdb.connect(str(db_path))
-    try:
-        assert con.execute("SELECT count(*) FROM operator_report_snapshot").fetchone()[0] == 1
-    finally:
-        con.close()
+
+
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_report_cannot_overwrite_source_database(tmp_path, monkeypatch, hardlink):
+    import os, sys
+    from scripts.generate_operator_reports import main
+    db = tmp_path/"protected.duckdb"
+    db.write_bytes(b"source must remain untouched before any database open")
+    out = tmp_path/"alias.md" if hardlink else db
+    if hardlink:
+        os.link(db, out)
+    before = db.read_bytes()
+    monkeypatch.setattr(sys, "argv", ["report", "--db", str(db), "--out", str(out)])
+    with pytest.raises(ValueError, match="must not overwrite"):
+        main()
+    assert db.read_bytes() == before

@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config import DB_PATH  # noqa: E402
+from trade_system.config import DB_PATH  # noqa: E402
 from trade_system.data_gap_audit import write_data_gap_report  # noqa: E402
 
 

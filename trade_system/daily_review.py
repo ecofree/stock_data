@@ -28,6 +28,7 @@ from trade_system.review_format import (  # noqa: F401
 from trade_system.review_queries import (  # noqa: F401
     _rows,
     _latest_date,
+    _query_status,
     _capital_flow_review,
     _concept_limit_up_review,
     _market_context_review,
@@ -109,7 +110,7 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     blocked = not readiness.get(
         "analysis_ready", readiness.get("certified_ready", False)
     )
-    execution_ready = bool(control.get("execution_ready"))
+    execution_ready = False  # Rendering never grants execution authority.
     effective = control.get("effective_position_pct")
     if effective is None:
         effective = 0 if blocked else regime.get("suggested_position_pct")
@@ -302,8 +303,10 @@ def build_daily_review_context(
     owns_connection = con is None
     con = con or duckdb.connect(str(db_path), read_only=True)
     flow_evidence_present = False
+    query_status = []
+    query_token = _query_status.set(query_status)
     try:
-        selected_date = trade_date or _latest_date(con)
+        selected_date = trade_date or _latest_date(con, review_now)
         regime_order = "generated_at DESC NULLS LAST" if "generated_at" in table_columns(con, "market_regime_snapshot") else "trade_date DESC"
         regime = _rows(
             con,
@@ -326,23 +329,8 @@ def build_daily_review_context(
             + " ORDER BY score DESC LIMIT 10",
             [selected_date],
         )
-        stage_cols = set(table_columns(con, "stock_candidate_stage_signal"))
-        stage_actionable = "is_actionable" in stage_cols
-        stages = _rows(
-            con,
-            "stock_candidate_stage_signal",
-            """
-            SELECT stage, stock_code, stock_name, score, decision
-            FROM stock_candidate_stage_signal
-            WHERE trade_date = ?
-            """
-            + ("AND coalesce(is_actionable, false) = true " if stage_actionable else "")
-            + """
-            ORDER BY stage, score DESC NULLS LAST, stock_code
-            LIMIT 80
-            """,
-            [selected_date],
-        )
+        # Old scored signals are historical research, never current review candidates.
+        stages = []
         alerts = _rows(
             con,
             "alert_events",
@@ -423,6 +411,7 @@ def build_daily_review_context(
                 "executable_candidates": 0,
             }
     finally:
+        _query_status.reset(query_token)
         if owns_connection:
             con.close()
 
@@ -456,6 +445,10 @@ def build_daily_review_context(
                 "warnings": [f"capital_flow_health_error:{type(exc).__name__}"],
             }
     flow_certified = bool(flow_health.get("flow_certified_ready", False)) if flow_health else False
+    query_failures = ["review_query_failed:" + item["table"] for item in query_status if item["state"] == "query_failed"]
+    if query_failures:
+        readiness["data_certified_ready"] = False
+        readiness["missing_groups"] = list(readiness.get("missing_groups") or []) + query_failures
     operator_state = build_operator_state(
         source_ready=bool(readiness.get("source_ready", readiness.get("ready", False))),
         pipeline_ready=bool(readiness.get("pipeline_ready", False)),
@@ -467,7 +460,7 @@ def build_daily_review_context(
             )
         ),
         flow_certified_ready=flow_certified,
-        execution_ready=bool(readiness.get("execution_ready", False)),
+        execution_ready=False,  # A read-only page cannot issue a decision certificate.
         # The data context does not prove that a pipeline run was committed.
         # Keep publication state separate from the review calculation.
         run_status=readiness.get("run_status", "not_published"),
@@ -498,18 +491,17 @@ def build_daily_review_context(
     # below remain in the payload for older consumers only.
     certified_ready = analysis_ready
     analytics_ready = analysis_ready
-    execution_ready = bool(readiness.get("execution_ready"))
-    # A model/regime suggestion is not an executable position allowance.
-    # While the execution gate is closed, surface the actual risk snapshot
-    # position (or zero), never the theoretical suggested cap.
-    effective_position = (
-        suggested
-        if execution_ready
-        else (risk_position if risk_position is not None else 0)
-    )
+    execution_ready = False
+    effective_position = 0  # Current holdings are shown separately, never as a new allowance.
+    for outcome in query_status:
+        if outcome["state"] in {"missing_table", "query_failed"}:
+            state = "缺表" if outcome["state"] == "missing_table" else "查询失败"
+            alerts.append({"severity": "warning", "category": "data_quality",
+                           "message": f"{outcome['table']}：{state}，不能解释为零记录。"})
 
     return {
         "trade_date": selected_date,
+        "query_status": query_status,
         "regime": regime[0] if regime else {},
         "sectors": sectors,
         "stages": stages,
@@ -987,7 +979,7 @@ def render_daily_review_markdown(context: dict) -> str:
     lines.extend(["", "## Risk Alerts", "", "| Severity | Category | Message |", "|---|---|---|"])
     lines.extend(_table_rows(context.get("alerts", []), ["severity", "category", "message"]))
 
-    execution_ready = bool(control.get("execution_ready"))
+    execution_ready = False  # Rendering never grants execution authority.
     plan_heading = "Plan Execution" if execution_ready else "Research Plan Drafts (Execution Gate Closed)"
     lines.extend(["", f"## {plan_heading}", "", "| Stock | Research Limit | Status | Observe | Invalidation |", "|---|---:|---|---|---|"])
     plan_rows = [

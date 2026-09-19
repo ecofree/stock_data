@@ -6,7 +6,6 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables
 from trade_system.ml.shadow_evaluator import evaluate_qlib_shadow
 
 
@@ -14,10 +13,11 @@ def render_qlib_shadow_report(result: dict) -> str:
     lines = [
         "# Qlib Shadow Evaluation",
         "",
-        "- Mode: `shadow`",
+        "- Mode: `read-only historical diagnostic; verified session labels`",
         "- Signal impact: `disabled`",
         f"- Evaluation: daily cross-sectional quantile; quantile=`{result.get('quantile', 0.2)}`; "
         f"round-trip cost=`{result.get('round_trip_cost_bps', 0.0)} bps`",
+        f"- Excluded samples: `{len(result.get('excluded', []))}`",
         f"- Evaluated samples: `{result.get('sample_count', 0)}`",
         "",
         "| Model | Samples | IC | RankIC | Hit Rate | Top Quantile | Bottom Quantile | Spread | Drawdown |",
@@ -42,7 +42,6 @@ def main() -> int:
     parser.add_argument("--round-trip-cost-bps", type=float, default=25.0)
     args = parser.parse_args()
 
-    ensure_qlib_shadow_tables(args.db)
     result = evaluate_qlib_shadow(
         args.db,
         quantile=args.quantile,

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import duckdb
 
-from config import DB_PATH, TODAY
+from trade_system.config import DB_PATH, TODAY
 from scripts.collect_intraday_stock_flow_market import collect_market_stock_flow, render_report
 
 

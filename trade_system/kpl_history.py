@@ -1,4 +1,4 @@
-﻿"""Historical KPL concept/constituent snapshots.
+"""Historical KPL concept/constituent snapshots.
 
 The dated ``/sector/ranking`` endpoint is the project default: it returns the
 daily leading concepts and, when available, their constituent stocks in one
@@ -17,7 +17,7 @@ from typing import Any
 
 import duckdb
 
-from base import DuckDBStore, KPLClient
+from trade_system.data_store import DuckDBStore, KPLClient
 from trade_system.schema import init_schema
 from trade_system.trading_calendar import open_session_dates
 

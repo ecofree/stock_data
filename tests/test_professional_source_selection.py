@@ -1,6 +1,6 @@
 import duckdb
 
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from scripts.collect_professional_sources import select_stock_codes_for_professional_collection
 
 

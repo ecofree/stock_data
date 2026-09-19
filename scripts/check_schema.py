@@ -12,7 +12,7 @@ from trade_system.schema_audit import audit_schema, load_defined_tables, render_
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit schema.py definitions against a DuckDB file.")
     parser.add_argument("--db", default="kpl_data.duckdb")
-    parser.add_argument("--schema", default="schema.py")
+    parser.add_argument("--schema", default="trade_system/schema.py")
     parser.add_argument("--out")
     args = parser.parse_args()
 

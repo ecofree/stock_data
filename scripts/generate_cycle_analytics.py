@@ -23,11 +23,7 @@ logger = get_logger("cycle_analytics")
 def _trading_days(con) -> list[str]:
     rows = con.execute(
         """
-        SELECT d FROM (
-            SELECT DISTINCT CAST(trade_date AS DATE) AS d FROM v_limit_pool
-            UNION
-            SELECT DISTINCT trade_date AS d FROM derived_limit_up_daily
-        ) ORDER BY d
+        SELECT DISTINCT CAST(trade_date AS DATE) AS d FROM v_limit_pool ORDER BY d
         """
     ).fetchall()
     return [str(r[0]) for r in rows]
@@ -35,14 +31,19 @@ def _trading_days(con) -> list[str]:
 
 def build(con, dates: list[str], min_sample: int = 3) -> dict:
     stats = {"phase": 0, "premium": 0, "promotion": 0}
+    if not dates:
+        return stats
+    from trade_system.trading_calendar import open_session_dates
+    verified = open_session_dates(con, min(dates), max(dates), strict=True)
+    if not set(dates) <= set(verified):
+        raise ValueError("cycle dates must be verified open sessions")
     # Materialize only the dates needed by this run. The previous version
     # materialized the complete v_kline_daily history before processing the
     # loop; on the production database that is several GB and can exhaust
     # DuckDB memory before the first phase is written.
-    sessions = sorted({str(day)[:10] for day in dates})
-    relevant_dates = set(sessions)
-    for day in sessions:
-        nxt = next_session(con, day, sessions)
+    relevant_dates = set(dates)
+    for day in dates:
+        nxt = next_session(con, day)
         if nxt:
             relevant_dates.add(nxt)
     con.execute("CREATE OR REPLACE TEMP TABLE _cycle_relevant_dates (trade_date DATE)")
@@ -64,7 +65,7 @@ def build(con, dates: list[str], min_sample: int = 3) -> dict:
                    ) AS _rn
             FROM v_kline_daily
             WHERE ktype = 'D'
-              AND change_pct IS NOT NULL
+              AND change_pct IS NOT NULL AND isfinite(change_pct)
               AND CAST(trade_date AS DATE) IN (
                   SELECT trade_date FROM _cycle_relevant_dates
               )
@@ -89,10 +90,10 @@ def build(con, dates: list[str], min_sample: int = 3) -> dict:
         ).fetchone()[0]
 
         prem_rows = compute_premium(
-            con, day, kline_src=kline_src, sessions=sessions
+            con, day, kline_src=kline_src
         )
         promo_rows = compute_promotion(
-            con, day, kline_src=kline_src, sessions=sessions
+            con, day, kline_src=kline_src
         )
 
         overall_prem = next(

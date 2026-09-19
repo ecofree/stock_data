@@ -1,8 +1,7 @@
-"""Professional operator report snapshot builder."""
+"""Read-only historical operator inventory; never grants current decision authority."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -244,15 +243,18 @@ def build_operator_report_snapshot(db_path: str | Path, trade_date: str) -> dict
             source_count, enabled_count = 0, 0
 
         top_candidates = []
+        candidate_count = 0
         if table_exists(con, "strategy_scan_result"):
+            candidate_count = con.execute("SELECT count(*) FROM strategy_scan_result WHERE trade_date=?", [trade_date]).fetchone()[0]
             top_candidates = _fetch_dicts(
                 con,
                 """
                 SELECT symbol, stock_name, stage, score, selected_reason, risk_points, invalid_conditions
                 FROM strategy_scan_result
+                WHERE trade_date=?
                 ORDER BY score DESC, symbol
                 LIMIT 20
-                """,
+                """, [trade_date],
             )
 
         if table_exists(con, "strategy_backtest_result"):
@@ -274,12 +276,15 @@ def build_operator_report_snapshot(db_path: str | Path, trade_date: str) -> dict
 
         return {
             "trade_date": trade_date,
+            "scope": "read_only_historical_operator_inventory",
+            "execution_ready": False,
+            "database_writes": 0,
             "data_layer": {
                 "source_count": int(source_count or 0),
                 "enabled_count": int(enabled_count or 0),
             },
             "candidate_layer": {
-                "candidate_count": _count(con, "strategy_scan_result"),
+                "candidate_count": int(candidate_count),
                 "top_candidates": top_candidates,
             },
             "research_layer": {
@@ -315,40 +320,16 @@ def build_operator_report_snapshot(db_path: str | Path, trade_date: str) -> dict
         con.close()
 
 
-def persist_operator_report_snapshot(db_path: str | Path, report_type: str, snapshot: dict[str, Any]) -> int:
-    from trade_system.db_utils import legacy_connect
-    con = legacy_connect(str(db_path))
-    try:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS operator_report_snapshot (
-                trade_date VARCHAR,
-                report_type VARCHAR,
-                snapshot_json VARCHAR,
-                generated_at TIMESTAMP DEFAULT current_timestamp
-            )
-            """
-        )
-        con.execute(
-            "DELETE FROM operator_report_snapshot WHERE trade_date = ? AND report_type = ?",
-            [snapshot["trade_date"], report_type],
-        )
-        con.execute(
-            "INSERT INTO operator_report_snapshot (trade_date, report_type, snapshot_json) VALUES (?, ?, ?)",
-            [snapshot["trade_date"], report_type, json.dumps(snapshot, ensure_ascii=False, sort_keys=True)],
-        )
-        return 1
-    finally:
-        con.close()
-
-
 def render_operator_report_markdown(snapshot: dict[str, Any]) -> str:
     api = snapshot.get("api_utilization", {})
     operator_loop = snapshot.get("operator_loop", {})
     workflow = api.get("workflow_evidence", {})
     degradation = api.get("degradation", [])
     lines = [
-        "# Professional Operator Report",
+        "# Historical Operator Inventory",
+        "",
+        "Read-only historical records; no current signals, risk approval or execution authority.",
+        "Candidates and outcomes use the requested date. Other counts and stored research metrics span historical records.",
         "",
         f"- Trade date: `{snapshot['trade_date']}`",
         f"- Data sources: `{snapshot['data_layer']['enabled_count']}/{snapshot['data_layer']['source_count']}` enabled",

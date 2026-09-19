@@ -56,7 +56,7 @@ def test_old_registration_is_physically_removed_and_proposal_preserves_identity(
 
 def _ps(script, *args, executable='powershell.exe'):
     return subprocess.run([executable, '-NoProfile', '-NonInteractive', '-File', str(script), *map(str, args)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, encoding='utf-8' if Path(executable).stem.lower() == 'pwsh' else None, timeout=30,
         env={k:v for k,v in os.environ.items() if k.upper() != 'PSMODULEPATH'})
 
 
@@ -78,6 +78,7 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
             '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal><UserId>S-1-5-21-123-1006</UserId><LogonType>Password</LogonType></Principal></Principals>'
             f'<Settings><Enabled>{str(not disabled).lower()}</Enabled></Settings><Triggers/>'
             '<Actions><Exec><Command>PowerShell.exe</Command><Arguments>old</Arguments></Exec></Actions></Task>')
+    if case=='compiled_pwsh':tasks=[t for t in tasks if t['Name'].split('-')[-1] in ('Auction','Intraday','DailyClose','MonthlyCompact')]
     if case=='missing':tasks.pop()
     if case=='xml_mismatch':tasks[0]['Actions'][0]['Arguments']='changed'
     if case=='enabled_compact':tasks[-1]['State']='Ready'
@@ -85,7 +86,7 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     contract=tmp_path/'contract.json';contract.write_text(json.dumps({'scope':'transitional_market_collection_only',
         'execution_ready':False,'python':str(tmp_path/'wrong.exe') if case=='wrong_runtime' else sys.executable,
         'database':str(tmp_path/'db.duckdb'),'reports':str(tmp_path/'data')}))
-    release=tmp_path/'release';release.mkdir();manifest=release/'research-release.json';manifest.write_text('{"version":"0.3.15"}')
+    release=tmp_path/'release';release.mkdir();manifest=release/'research-release.json';manifest.write_text('{"version":"0.3.26"}')
     sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
     output=tmp_path/'proposal.json'
     args=['-BaselineDirectory',baseline,'-BaselineInventorySha256',sha(inventory) if case!='hash_mismatch' else '0'*64,
@@ -101,10 +102,12 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     saved=output.read_bytes();proposal=json.loads(saved)
     assert proposal['SystemChanges']==0 and proposal['ProductionCutover'] is False
     rows={r['Name']:r for r in proposal['Actions']}
-    assert len(rows)==7 and len(proposal['BaselineXmlSha256'])==7
-    assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
-    assert '-RefreshResearch' in rows['StockData-QLibResearch']['Arguments']
-    assert rows['StockData-QLibResearch']['Principal']['RunLevel']=='Limited'
+    assert len(rows)==len(tasks) and len(proposal['BaselineXmlSha256'])==len(tasks)
+    assert len(proposal['AbsentTasks']) == 7-len(tasks)
+    if 'StockData-QLibResearch' in rows:
+        assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
+        assert '-RefreshResearch' in rows['StockData-QLibResearch']['Arguments']
+        assert rows['StockData-QLibResearch']['Principal']['RunLevel']=='Limited'
     assert rows['StockData-MonthlyCompact']['Arguments']=='old'
     assert rows['StockData-MonthlyCompact']['Disposition']=='preserve_disabled'
     assert _ps(ROOT/'scripts/install_stock_data_task.ps1',*args).returncode != 0
@@ -120,9 +123,11 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
             if name.endswith('MonthlyCompact'):continue
             assert after.find('t:Actions/t:Exec/t:Arguments',ns).text==row['Arguments']
             assert after.find('t:Settings/t:StartWhenAvailable',ns).text=='false'
-        research=ET.fromstring(rows['StockData-ResearchDaily']['AfterXml'])
-        assert research.find('t:Principals/t:Principal/t:RunLevel',ns).text=='LeastPrivilege'
-        assert research.find('t:Triggers/t:CalendarTrigger/t:StartBoundary',ns).text=='2026-09-18T19:30:00+08:00'
+        assert proposal['Version']=='0.3.26'
+        if 'StockData-ResearchDaily' in rows:
+            research=ET.fromstring(rows['StockData-ResearchDaily']['AfterXml'])
+            assert research.find('t:Principals/t:Principal/t:RunLevel',ns).text=='LeastPrivilege'
+            assert research.find('t:Triggers/t:CalendarTrigger/t:StartBoundary',ns).text=='2026-09-18T19:30:00+08:00'
         engine=ROOT/'scripts/deploy_current_tasks.ps1'
         run_engine=lambda *a:_ps(engine,*a,executable='pwsh.exe' if case=='compiled_pwsh' else 'powershell.exe')
         check=run_engine('-Mode','Check','-Plan',output,'-PlanSha256',sha(output))
@@ -136,7 +141,7 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
         assert receipt['plan_sha256']==sha(output) and receipt['installer_sha256'].lower()==sha(engine)
         results={r['scenario']:r for r in receipt['scenarios']}
         assert len(results)==8 and all(r['passed'] for r in results.values())
-        assert results['roundtrip']['fixture_writes']==18
+        assert results['roundtrip']['fixture_writes']==2*(len(tasks)-1)
         assert results['roundtrip']['password_parameter_fixture_writes']>0
         for failure in ('stage_failure','activation_failure','window_expiry'):
             assert results[failure]['status']=='rolled_back'
@@ -150,12 +155,12 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows engineering transaction policy')
 @pytest.mark.parametrize('mode',['Apply','Rollback'])
-def test_current_engine_does_not_expose_a_live_mutation_backend(mode):
+def test_current_engine_requires_explicit_local_handover_before_mutation(mode):
     engine=ROOT/'scripts/deploy_current_tasks.ps1'
     result=_ps(engine,'-Mode',mode)
     assert result.returncode!=0 and 'LIVE_DISABLED' in result.stderr
     text=engine.read_text(encoding='utf-8')
-    for forbidden in ('Register-ScheduledTask','Set-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask',
+    for forbidden in ('Set-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask',
                       'Set-LocalUser','Enable-LocalUser','Set-Acl','Remove-Item','Stop-Process'):
         assert forbidden not in text
 

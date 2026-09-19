@@ -9,7 +9,7 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import API_BASE, API_KEY
+from trade_system.config import API_BASE, API_KEY
 from trade_system.api_health import require_api_key
 from trade_system.http_transport import classify_transport_error, open_verified, ssl_context_note
 

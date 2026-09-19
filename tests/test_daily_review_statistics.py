@@ -4,10 +4,12 @@ from trade_system.review_statistics import build_daily_review_statistics, render
 
 
 def test_daily_review_reads_counts_without_backtest_or_database_writes(tmp_path, monkeypatch):
-    from trade_system import backtest
+    from trade_system import backtest_engine
+    from trade_system.v2 import rolling_research
     def forbidden(*args, **kwargs):
         raise AssertionError("render must not backtest")
-    monkeypatch.setattr(backtest, "run_stage_candidate_backtest", forbidden)
+    monkeypatch.setattr(backtest_engine, "simulate", forbidden)
+    monkeypatch.setattr(rolling_research, "fit_qlib", forbidden)
     db_path = tmp_path / "review_stats.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(

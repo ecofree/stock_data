@@ -17,12 +17,10 @@ def reload_config(monkeypatch, tmp_path, env=None, dotenv_text="", dotenv_exampl
     monkeypatch.setenv("KPL_ENV_FILE", str(dotenv_path))
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
-    # The root config.py is a shim over trade_system.config; both must be
-    # evicted so the re-import picks up the new environment.
-    sys.modules.pop("config", None)
+    # Re-import the package config against the test environment.
     sys.modules.pop("trade_system.config", None)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
-    return importlib.import_module("config")
+    return importlib.import_module("trade_system.config")
 
 
 def test_config_prefers_environment_over_dotenv(monkeypatch, tmp_path):

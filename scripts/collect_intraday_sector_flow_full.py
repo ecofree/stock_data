@@ -24,10 +24,10 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 from trade_system.multi_source_store import MultiSourceStore
-from trade_system.stock_data_sources import _from_em_sector_flow_page
+from trade_system.adapters.eastmoney_dc import _from_em_sector_flow_page
 from trade_system.capital_flow_health import assess_capital_flow_health, render_capital_flow_health_markdown
 from trade_system.host_limiter import shared_host_limiter
 from trade_system.concept_flow import _prepare_ths_aggregate as _prepare_ths_aggregate

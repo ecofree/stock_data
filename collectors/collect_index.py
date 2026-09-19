@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import date as date_type
 
-from base import DuckDBStore, KPLClient
+from trade_system.data_store import DuckDBStore, KPLClient
 
 
 def _items(data, *keys: str) -> list:
@@ -187,7 +187,7 @@ def collect_index_kline_eastmoney(store: DuckDBStore, date: str, index_codes: li
     """
     import json
 
-    from trade_system.stock_data_sources import _from_em_index_kline
+    from trade_system.adapters.eastmoney_dc import _from_em_index_kline
 
     total = 0
     for code in index_codes:

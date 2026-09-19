@@ -7,7 +7,6 @@ from statistics import mean
 
 import duckdb
 
-from trade_system.backtest import run_stage_candidate_backtest
 from trade_system.quality import table_exists
 
 
@@ -93,7 +92,7 @@ def _readiness(sample_count: int, return_sample_count: int, real_outcome_count: 
             f"有效收益样本仅 {return_sample_count} 个，至少需要 {MIN_RETURN_SAMPLES} 个"
         )
     if real_outcome_count == 0:
-        reasons.append("尚无 operator_trade_outcome，当前只能作代理回测")
+        reasons.append("尚无有效真实成交记录；旧信号不再作为代理成交样本")
     elif real_outcome_count < MIN_REAL_OUTCOME_SAMPLES:
         reasons.append(
             f"真实结果仅 {real_outcome_count} 个，至少需要 {MIN_REAL_OUTCOME_SAMPLES} 个"
@@ -272,8 +271,6 @@ def run_operator_stage_backtest(
     db_path: str | Path,
     fee_rate: float = 0.001,
     slippage_bps: float = 10.0,
-    *,
-    enforce_t1: bool = True,
 ) -> dict:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -310,49 +307,14 @@ def run_operator_stage_backtest(
             "readiness": readiness,
         }
 
-    stage_result = run_stage_candidate_backtest(db_path, enforce_t1=enforce_t1)
-    rows = []
-    cost_pct = fee_rate * 100.0 + slippage_bps / 100.0
-    for signal in stage_result.get("rows", []):
-        gross = signal.get("forward_return_pct")
-        if gross is None:
-            continue
-        rows.append(
-            {
-                "signal_date": str(signal["trade_date"]),
-                "entry_date": signal.get("entry_date"),
-                "stage": signal["stage"],
-                "stock_code": signal["stock_code"],
-                "stock_name": signal["stock_name"],
-                "score": float(signal.get("score") or 0),
-                "signal_close": float(signal.get("entry_price") or 0),
-                "t1_close": float(signal.get("exit_price") or 0),
-                "gross_return_pct": round(float(gross), 2),
-                "net_return_pct": round(float(gross) - cost_pct, 2),
-                "source": "proxy_signal",
-                "execution_status": "proxy",
-                "return_method": signal.get("return_method"),
-            }
-        )
-
-    result = {
-        "sample_count": len(rows),
-        "rows": rows,
-        "summary": _summary(rows, fee_rate, slippage_bps),
-        "mode": "proxy_signal",
-        "independent_sample_count": stage_result.get("independent_sample_count", 0),
-        "excluded_count": stage_result.get("excluded_count", 0),
-        "excluded_unfilled_count": 0,
-        "excluded_missing_price_count": 0,
+    # Missing executions remain missing. Historical stage scores cannot become fills.
+    return {
+        "sample_count": 0, "rows": [], "summary": _summary([], fee_rate, slippage_bps),
+        "mode": "no_real_outcomes", "independent_sample_count": 0, "excluded_count": 0,
+        "excluded_unfilled_count": 0, "excluded_missing_price_count": 0,
         "excluded_missing_return_count": 0,
+        "readiness": _readiness(0, 0, 0, context),
     }
-    result["readiness"] = _readiness(
-        len(rows),
-        len(rows),
-        0,
-        context,
-    )
-    return result
 
 
 def render_operator_backtest_markdown(result: dict) -> str:

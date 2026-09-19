@@ -7,9 +7,9 @@ import argparse
 # Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import DB_PATH, TODAY
-from base import KPLClient, DuckDBStore, logger
-from schema import init_schema
+from trade_system.config import DB_PATH, TODAY
+from trade_system.data_store import KPLClient, DuckDBStore, logger
+from trade_system.schema import init_schema
 
 # Import all collectors
 def should_collect_finance(skip_finance: bool, only_market: bool, has_finance: bool) -> bool:
@@ -40,7 +40,7 @@ def main():
     # graph (and its optional dependencies) even though the process returned
     # before any of those collectors ran.  Keep the broad entrypoint for
     # recovery, but load its legacy chain only after the market-only exit.
-    from collect_market import collect_all_market
+    from collectors.collect_market import collect_all_market
 
     date = args.date
     logger.info(f"=" * 80)
@@ -99,20 +99,20 @@ def main():
             return 2
         return 0
 
-    from collect_advanced import collect_all_advanced
-    from collect_advanced_stock import collect_all_advanced_stock
-    from collect_daily import collect_all_daily
-    from collect_dingpan import collect_all_dingpan
-    from collect_fengk import collect_all_fengk
-    from collect_index import collect_all_index
-    from collect_l2 import collect_all_l2
-    from collect_misc import collect_all_misc
-    from collect_news import collect_all_news
-    from collect_sector import collect_all_sector
-    from collect_stock import collect_all_stock
-    from collect_ladder import collect_all_ladder
+    from collectors.collect_advanced import collect_all_advanced
+    from collectors.collect_advanced_stock import collect_all_advanced_stock
+    from collectors.collect_daily import collect_all_daily
+    from collectors.collect_dingpan import collect_all_dingpan
+    from collectors.collect_fengk import collect_all_fengk
+    from collectors.collect_index import collect_all_index
+    from collectors.collect_l2 import collect_all_l2
+    from collectors.collect_misc import collect_all_misc
+    from collectors.collect_news import collect_all_news
+    from collectors.collect_sector import collect_all_sector
+    from collectors.collect_stock import collect_all_stock
+    from collectors.collect_ladder import collect_all_ladder
     try:
-        from collect_finance import collect_all_finance
+        from collectors.collect_finance import collect_all_finance
         has_finance = True
     except ImportError:
         collect_all_finance = None

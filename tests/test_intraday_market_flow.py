@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import date as system_date, datetime as system_datetime
 
 import duckdb
-import requests
 
 import trade_system.eastmoney_finance as eastmoney
 from trade_system.eastmoney_clist_guard import EastmoneyClistGuard
@@ -36,7 +35,7 @@ def test_market_flow_fetcher_paginates_and_normalizes(monkeypatch):
             return {"result": {"pages": 2, "count": 2, "data": [_market_row("000001")]}}
         return {"result": {"pages": 2, "count": 2, "data": [_market_row("600000")]}}
 
-    monkeypatch.setattr(eastmoney, "_curl_json", fake_curl)
+    monkeypatch.setattr(eastmoney, "_read_json", fake_curl)
     rows, meta = eastmoney.get_fund_flow_market("2026-07-14", pause_seconds=0)
     assert {row["code"] for row in rows} == {"000001", "600000"}
     assert rows[0]["main_net"] == 100.0
@@ -334,24 +333,7 @@ def test_realtime_market_flow_normalizes_push2_rows(monkeypatch, tmp_path):
         }]}}
     ]
 
-    class _Response:
-        content = (b'{"data":{"total":1,"diff":[{"f12":"000001",'
-                   b'"f14":"Test","f2":12.3,"f3":1.2,"f62":1000,'
-                   b'"f66":500,"f72":300,"f78":200,"f84":0,"f184":2.5}]}}')
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return payloads[0]
-
-    class _Session:
-        trust_env = True
-
-        def get(self, *args, **kwargs):
-            return _Response()
-
-    monkeypatch.setattr(requests, "Session", lambda: _Session())
+    monkeypatch.setattr(eastmoney, "_read_json", lambda *a, **kw: payloads[0])
     rows, meta = eastmoney.get_fund_flow_market_realtime(
         "2026-07-15", page_size=100, max_pages=1, pause_seconds=0,
     )

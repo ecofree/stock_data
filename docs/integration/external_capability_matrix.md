@@ -6,7 +6,7 @@
 |---|---|---|---|---:|---|---|
 | `kpl_qds.legacy_data` | kpl_qds | data | `port` | `True` | `trade_system.integration.legacy_a_share` |  |
 | `kpl_qds.signal_fusion` | kpl_qds | signal | `port` | `True` | `trade_system.signals evidence scoring` |  |
-| `kpl_qds.risk_enforcer` | kpl_qds | risk | `port` | `True` | `trade_system.operator_risk` |  |
+| `kpl_qds.risk_enforcer` | kpl_qds | risk | `port` | `True` | `trade_system.v2.decisions` |  |
 | `kpl_qds.auction_analyzer` | kpl_qds | auction | `reference` | `True` | `trade_system.auction_deep` |  |
 | `kpl_qds.performance_tracker` | kpl_qds | review | `port` | `True` | `trade_system.review attribution` |  |
 | `kpl_qds.qmt_bridge` | kpl_qds | execution | `forbid` | `True` | `` | 自动交易/下单路径禁止进入 stock_data。 |
@@ -15,7 +15,7 @@
 | `tickflow.strategy_engine` | tickflow | strategy | `port` | `True` | `trade_system.strategy` |  |
 | `tickflow.indicator_pipeline` | tickflow | indicator | `port` | `True` | `trade_system.strategy.indicator_pipeline` |  |
 | `tickflow.backtest_engine` | tickflow | backtest | `port` | `True` | `trade_system.backtest.stage_backtest` |  |
-| `tickflow.monitor_rules` | tickflow | monitor | `reference` | `True` | `trade_system.operator_risk alert rules` |  |
+| `tickflow.monitor_rules` | tickflow | monitor | `reference` | `True` | `trade_system.v2.decisions explicit paper risk policy` |  |
 | `tickflow.custom_data_source` | tickflow | adapter | `port` | `True` | `trade_system.integration.data_catalog` |  |
 | `tickflow.react_workbench` | tickflow | ui | `reference` | `True` | `reports/trading_dashboard_latest.html` |  |
 | `vibe.news_radar` | vibe | research | `port` | `True` | `trade_system.research.news_radar` |  |

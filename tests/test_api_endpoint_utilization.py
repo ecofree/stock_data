@@ -1,13 +1,13 @@
 import duckdb
 
-from base import DuckDBStore
-from collect_index import (
+from trade_system.data_store import DuckDBStore
+from collectors.collect_index import (
     collect_index_full_info,
     collect_index_intraday,
     collect_index_kline,
     collect_index_list,
 )
-from collect_l2 import (
+from collectors.collect_l2 import (
     collect_l2_realtime_index_trend,
     collect_l2_sector_intraday,
     collect_l2_sector_volume,
@@ -16,13 +16,13 @@ from collect_l2 import (
     collect_l2_tick_orders,
     collect_l2_tick_orders_all,
 )
-from collect_sector import (
+from collectors.collect_sector import (
     collect_sector_all_stocks,
     collect_sector_son_plates,
     collect_sector_strength_batch,
     collect_sector_sub_concepts,
 )
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.normalize import build_normalized_views
 
 

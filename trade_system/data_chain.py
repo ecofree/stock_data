@@ -9,7 +9,7 @@ import duckdb
 from trade_system.quality import table_columns
 
 try:
-    from base import connect_duckdb
+    from trade_system.data_store import connect_duckdb
 except Exception:  # pragma: no cover - test isolation without project root
     connect_duckdb = None  # type: ignore
 

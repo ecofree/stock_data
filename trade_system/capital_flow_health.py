@@ -7,7 +7,7 @@ from pathlib import Path
 
 import duckdb
 
-from base import connect_duckdb
+from trade_system.data_store import connect_duckdb
 from trade_system.gate_contract import build_operator_state
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive

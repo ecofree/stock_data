@@ -2,7 +2,7 @@
 import json
 import re
 from datetime import datetime
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def _safe_float(value):

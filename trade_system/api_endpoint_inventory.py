@@ -534,7 +534,7 @@ def build_inventory_from_project(project_root: str | Path) -> list[EndpointInven
     # now; inventory only needs to inspect the supported market entrypoint.
     for path in [root / "fetch_all.py"]:
         candidates.extend(extract_python_candidates(path))
-    candidates.extend(extract_schema_candidates(root / "schema.py"))
+    candidates.extend(extract_schema_candidates(root / "trade_system/schema.py"))
     for path in [root / "trading_data_application.md", *sorted((root / "docs").rglob("*.md"))]:
         if path.name in {"api_data_gap_matrix.md", "api_data_source_audit_latest.md"}:
             continue

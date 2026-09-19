@@ -114,7 +114,7 @@ _PHRASE_CN = [
      "复盘日之前没有可用的同花顺概念成分快照"),
     ("THS membership snapshot is stale by",
      "同花顺概念成分快照已滞后"),
-    # risk-gate decision reasons (trade_system.operator_risk)
+    # historical risk-gate labels retained for saved reports
     ("planned position must be positive", "计划仓位必须大于 0"),
     ("total position limit exceeded", "超出总仓位上限"),
     ("single stock position limit exceeded", "超出单票仓位上限"),

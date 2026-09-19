@@ -8,7 +8,7 @@ library import side-effect free:
 - ``get_logger(name)`` returns a child of the ``trade_system`` logger.
 - Without any configuration, WARNING+ records still surface on stderr via
   the stdlib ``lastResort`` handler, and they flow into the collector log
-  when ``base`` has already configured the root logger.
+  when ``data_store`` has already configured the root logger.
 - Entry-point scripts may call :func:`configure` to attach an explicit
   console/file handler pair (idempotent, env-tunable via KPL_LOG_LEVEL).
 """
@@ -41,7 +41,7 @@ def configure(
     ``level`` defaults to the ``KPL_LOG_LEVEL`` environment variable or INFO.
     ``log_file`` defaults to ``logs/trade_system_<date>.log`` under the
     project log directory.  ``console`` defaults to False when the root
-    logger already has handlers (avoids double printing next to base.py's
+    logger already has handlers (avoids double printing next to data_store.py's
     basicConfig), otherwise True so standalone report scripts stay visible.
     """
     pkg = logging.getLogger(_PACKAGE)

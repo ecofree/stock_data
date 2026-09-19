@@ -24,12 +24,12 @@ sys.path.insert(0, str(ROOT / "collectors"))
 
 import duckdb
 
-from base import DuckDBStore, KPLClient
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, KPLClient
+from trade_system.schema import init_schema
 from trade_system.pipeline_runtime import PipelineLock
 from trade_system.trading_calendar import latest_open_session
 
-from collect_advanced import (
+from collectors.collect_advanced import (
     collect_advanced_his_ranking,
     collect_advanced_his_sharp_withdrawal,
     collect_advanced_his_zhangfu_detail,
@@ -38,8 +38,8 @@ from collect_advanced import (
     collect_advanced_weipan_qiangchou,
     collect_advanced_zhangting_expression,
 )
-from collect_dingpan import collect_dingpan_jijin
-from collect_sector import (
+from collectors.collect_dingpan import collect_dingpan_jijin
+from collectors.collect_sector import (
     collect_sector_bk_fenshi_zhibo,
     collect_sector_son_plates,
     collect_sector_sub_concepts,

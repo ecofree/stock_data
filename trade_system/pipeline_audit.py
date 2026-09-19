@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-from base import connect_duckdb
+from trade_system.data_store import connect_duckdb
 
 
 def reap_stale_pipeline_tasks(

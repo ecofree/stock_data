@@ -2,7 +2,7 @@
 
 ## 已迁移内容
 
-`trade_system/stock_data_sources.py`、`trade_system/resilient_sources.py`、
+`trade_system/adapters/`、`trade_system/resilient_sources.py`、
 `trade_system/eastmoney_finance.py` 与统一数据源层均为项目内生产代码，不再依赖
 `D:\accio\2026-07-08-22-11-38`；历史演示用的重复行情脚本已移除。
 解析器覆盖行情、估值、财务三表、个股资金流、板块排名/资金流、龙虎榜、融资融券、股东、解禁、分红、公告、互动易、热点、涨停池、北向、分时、指数、ETF、可转债、期权、IPO 与宏观等 53 类计划。
@@ -21,8 +21,8 @@ Tushare 凭证只从 `TUSHARE_FAST_RELAY_TOKEN`、`TUSHARE_TOKEN` 或项目设�
 ```powershell
 python scripts/init_schema_tables.py --db kpl_data.duckdb
 python scripts/bootstrap_multisource_from_core.py --db kpl_data.duckdb
-python scripts/run_staged_multisource.py --stage close --stock-codes 000001,600519
-python scripts/run_staged_multisource.py --all-stages --dry-run
+python scripts/collect_multisource.py --types kline,index_kline --stock-codes 000001,600519 --resume
+python scripts/collect_multisource.py --types financials,statements --stock-codes 000001 --dry-run
 python scripts/collect_multisource.py --offline --types stock_flow,sector_flow  # 兼容/离线诊断
 ```
 
@@ -47,29 +47,15 @@ python scripts/collect_multisource.py --offline --types stock_flow,sector_flow  
 
 ## 分阶段调度与断点续跑
 
-不要把 `SOURCE_PLAN` 中的所有接口一次性调用。`scripts/run_staged_multisource.py` 将接口按交易时段分组，默认单线程、单任务串行执行；每个任务在开始时写入 `running` 检查点，获取后立即写入 `multi_source_observation` 及对应的资金流/K 线表，再把任务更新为 `success`、`stale` 或 `failed`。进程中断后，已完成任务会跳过，未完成任务可继续；达到预算后剩余任务标记为 `budget_exhausted`，下次运行会重试。
-
-THS 概念目录及成分股是低频维表：按当前 THS 全量目录（当前约 375 个概念）按自然周执行。周内已有完整检查点时返回 `skipped`，盘中/盘后任务只读取最近快照；只有首次缺失、部分失败或显式 `--force` 才会续传网页。
-
-阶段顺序固定为：
-
-- `premarket`：股票基础信息、指数快照、估值；
-- `open`：板块资金流、五档盘口、分时、北向快照；
-- `midday`：个股资金流、板块资金流、分时、北向快照；
-- `close`：个股/指数日线、收盘个股资金流、板块资金流；
-- `after_close`：财务数据、利润表、融资融券、龙虎榜、北向历史。
-
-常用命令：
+日常和历史计划由 `collection_profiles.py` 与 `run_integrated_daily.py` 维护。原五阶段调度器及其 CLI 已退出；历史阶段的财务、利润表、融资融券、龙虎榜和北向历史需求由已有 `collect_multisource.py` 按明确类型执行。
 
 ```powershell
-python scripts/run_staged_multisource.py --stage close --stock-codes 000001,600519 --max-stocks 20
-python scripts/run_staged_multisource.py --stage midday --stock-codes 000001 --budget-seconds 90
-python scripts/run_staged_multisource.py --all-stages --dry-run --report reports/staged_plan.md
+python scripts/collect_multisource.py --types financials,statements,margin_trading,dragon_tiger_daily,northbound_hist --stock-codes 000001,600519 --periods 8 --resume --budget-seconds 300
+python scripts/collect_multisource.py --types financials,statements --stock-codes 000001 --dry-run
 ```
 
-实时快照类任务在历史日期会被明确跳过，不会把今天的数据错误标记成历史数据；K 线和北向历史默认只请求 `--start/--end` 范围，避免每次重复拉取全历史。每日集成流程的 `collect_multisource_capital_flow` 已切换到 `close` 阶段调度器。
+恢复仅复用同日期、同参数且保留回执的成功请求；空响应、失败、预算耗尽不能成为完成记录。`--force` 显式刷新来源。实时快照不能回填到历史日期。旧 `multi_source_task_checkpoint` 记录保留，新显式请求使用独立键。常规日常计划不再重复执行四路连通性探针；`check_kpl_connectivity.py` 仅用于显式排障。
 
-项目原有的 KPL 专用资金流脚本 `collect_capital_flow_focus.py` 仍作为独立的有界采集步骤运行（它还覆盖 L2/大单等 KPL 专有表），其 DuckDB 写入发生在每个采集器内部；它与新调度器是前后串行关系，不会并发启动。新迁移层负责把 Eastmoney、Sina、Baostock、pytdx、Tencent、Tushare relay 等通用来源的原始响应和规范化个股/板块资金流保存到 `multi_source_*` 表。
 ## 2026 Historical Backfill
 
 Use the resumable, per-trading-day collectors below. Each dataset commits immediately to DuckDB and successful checkpoints are skipped on the next run:
@@ -80,6 +66,15 @@ python scripts/backfill_2026_tushare.py --db kpl_data.duckdb `
   --datasets stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow `
   --max-days 5 --budget-seconds 240
 ```
+
+指定证券补缺也使用同一入口：
+
+```powershell
+python scripts/backfill_2026_tushare.py --start-date 20260701 --end-date 20260709 --datasets daily,daily_basic,adj_factor --stock-codes 000001,600519
+python scripts/backfill_2026_tushare.py --start-date 20260701 --end-date 20260709 --datasets index_daily --index-codes SH000001,SZ399001
+```
+
+`--plan-only` 使用本地已验证日历列出缺口；部分响应保留回执并返回失败。旧增量 CLI 和平行补采执行器已经删除，旧 gap/task 表继续保留供历史读取。
 
 `daily` and `daily_basic` provide per-stock daily bars and valuation/turnover fields. Tushare stock-level `moneyflow` amounts are converted from 10,000 yuan to yuan and normalized into `multi_source_stock_flow`; small/mid/large/extra-large buckets and net flow are a main-money proxy. Tushare DC industry `moneyflow_ind_dc` amounts are already yuan and are not multiplied. Exact institution-seat flow is not a public every-stock daily field; use 龙虎榜/机构席位 data only where available.
 

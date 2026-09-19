@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from scripts import export_qlib_features as exporter
-from scripts.train_qlib_shadow import QlibFrameDataset, _load_features
+from trade_system.v2.rolling_research import FoldDataset, load_frame, fold_frames
 from trade_system.ml.feature_artifacts import resolve_feature_path
 
 
@@ -43,7 +43,7 @@ def test_missing_factor_never_becomes_one_and_codes_keep_leading_zero(tmp_path):
     frame = pd.read_csv(resolve_feature_path(out))
     missing = frame[frame.datetime == dates[1]].iloc[0]
     assert pd.isna(missing.close) and pd.isna(missing.label_next_ret)
-    loaded = _load_features(out, meta['feature_columns'], 0)
+    loaded = load_frame(resolve_feature_path(out), meta['feature_columns'], 100000)
     assert set(loaded.instrument) == {'000001'}
 
 
@@ -66,8 +66,8 @@ def test_csv_and_parquet_sample_the_same_cross_section(tmp_path):
     db, dates = source(tmp_path)
     out = tmp_path / 'formats.csv'
     meta = exporter.export_features(db, out, output_format='both')
-    csv_frame = _load_features(out, meta['feature_columns'], 100)
-    parquet_frame = _load_features(out.with_suffix('.parquet'), meta['feature_columns'], 100)
+    csv_frame = load_frame(resolve_feature_path(out), meta['feature_columns'], 100)
+    parquet_frame = load_frame(resolve_feature_path(out.with_suffix('.parquet')), meta['feature_columns'], 100)
     pd.testing.assert_frame_equal(csv_frame, parquet_frame)
 
 
@@ -76,14 +76,29 @@ def test_label_boundaries_are_purged_and_holdout_is_separate():
     frame = pd.DataFrame({'datetime': dates, 'instrument': ['000001']*6, 'f': range(6),
                           'label_next_ret': range(6), 'label_end_time': dates[2:]+['2026-01-07','2026-01-08'],
                           'label_available_time': dates[2:]+['2026-01-07','2026-01-08']})
-    dataset = QlibFrameDataset(frame, ['f'], dates[1], dates[2], dates[3], dates[4], dates[5])
-    assert dataset.prepare('train').empty  # both training labels cross validation start
-    assert dataset.prepare('valid').empty  # both validation labels cross holdout start
-    assert len(dataset.prepare('test')) == 2
-    with pytest.raises(ValueError, match='unknown'):
+    for column in ('label_end_time', 'label_available_time'):
+        frame[column] = pd.to_datetime(frame[column]).dt.tz_localize('Asia/Shanghai').dt.tz_convert('UTC')
+    fold = {'train_end': dates[1], 'valid_start': dates[2], 'valid_end': dates[3],
+            'test_start': dates[4], 'test_end': dates[5]}
+    # The current engine refuses a fit when purging removes a whole segment.
+    with pytest.raises(ValueError, match='empty fold after label availability purge'):
+        fold_frames(frame, fold, '2026-02-01T00:00:00Z', '2026-02-01')
+    dataset = FoldDataset({'train': frame, 'valid': frame, 'test': frame}, ['f'], fitting=False)
+    assert len(dataset.prepare('test')) == 6
+    with pytest.raises(ValueError, match='segment unavailable'):
         dataset.prepare('typo')
+    with pytest.raises(ValueError, match='test labels unavailable'):
+        dataset.prepare('test', col_set='label')
 
 
-def test_label_columns_cannot_be_declared_as_features(tmp_path):
-    with pytest.raises(ValueError, match='cannot include labels'):
-        _load_features(tmp_path/'does-not-exist.csv', ['label_next_ret'], 0)
+@pytest.mark.parametrize('feature', ['label_next_ret','label_end_time','label_available_time'])
+def test_label_columns_cannot_be_declared_as_features(feature):
+    from trade_system.v2.rolling_research import validate_plan
+    plan = {'experiment_id':'labels','scope':'historical_research_only',
+        'exposure_status':'previously_inspected_not_untouched','evaluation_asof':'2026-09-11T16:00:00+08:00',
+        'label_definition':'synthetic','availability_assumption':'synthetic',
+        **{k:1 for k in ('max_rows','train_observations','valid_observations','test_observations',
+          'excluded_tail_observations','max_folds','num_boost_round','num_threads','top_k')},
+        'seed':1,'variants':{'price':[feature]},'comparison_baseline':'price','round_trip_cost_bps':[0]}
+    with pytest.raises(ValueError, match='non-label feature'):
+        validate_plan(plan)

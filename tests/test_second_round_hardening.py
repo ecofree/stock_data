@@ -1,8 +1,8 @@
 
 import duckdb
 
-from base import DuckDBStore
-from collect_index import sync_index_list_from_kline
+from trade_system.data_store import DuckDBStore
+from collectors.collect_index import sync_index_list_from_kline
 
 
 def test_sync_index_list_from_real_kline_publishes_requested_date_only(tmp_path):

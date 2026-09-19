@@ -1,5 +1,5 @@
 """Fengk (review/replay) data collectors (3 endpoints)."""
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def collect_fengk_list(client: KPLClient, store: DuckDBStore, date: str) -> int:

@@ -69,7 +69,7 @@ def main():
             parser.error('--receipt is required for an additive repair')
         if before['deny']:
             raise ValueError('deny policy present; no repair performed')
-        record={'approval_scope':'20260916_existing_account_batch_logon_only',
+        record={'approval_scope':'existing_disabled_account_batch_logon_only',
                 'account':ACCOUNT,'sid':EXPECTED_SID,'started_at':datetime.now(timezone.utc).isoformat(),
                 'before':before,'account_enabled':False,'task_enabled':False,
                 'status':'prepared_not_confirmed'}

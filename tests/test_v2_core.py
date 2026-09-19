@@ -125,7 +125,10 @@ def test_account_events_are_idempotent_and_force_reconciliation(store):
 
 def test_unknown_live_and_unreconciled_accounts_never_approve(store):
     sig, manifest, _, service = signal_fixture(store)
-    assert 'account_unknown' in service.evaluate('missing', sig, manifest, 'quote:v1')['blockers']
+    unknown = service.evaluate('missing', sig, manifest, 'quote:v1')
+    assert 'account_unknown' in unknown['blockers']
+    assert unknown['allowed_actions'] == ['observe'] and unknown['max_quantity'] == 0
+    assert not unknown['execution_ready']
     import_snapshot(store, account_raw(mode='live'))
     assert 'live_account_not_enabled' in service.evaluate('paper-1', sig, manifest, 'quote:v1')['blockers']
     imported = import_snapshot(store, account_raw(account_id='different', equity='11000'))

@@ -1,6 +1,6 @@
 """Collectors for ETF, Xianhuo, Theme, Auction, Kline (8 endpoints)."""
 import json
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def _normalize_kline_date(value) -> str:

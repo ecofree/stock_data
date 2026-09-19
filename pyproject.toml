@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-trading-assistant"
-version = "0.3.18"
+version = "0.3.26"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -33,9 +33,6 @@ extend-exclude = [".venv-qlib", "trade_system/vendor", "tmp", "backups"]
 
 [tool.ruff.lint]
 # Correctness rules plus unused-import/variable hygiene (F401/F841).
-# The historical `from base import logger` concern is gone: base.py remains
-# imported everywhere it matters for its logging side effect, and the
-# root collect_*.py shims re-expose implementations via collectors.*.
 select = [
   "E9",   # syntax-level errors
   "F63",  # invalid print/str comparisons etc.

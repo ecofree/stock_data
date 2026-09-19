@@ -57,7 +57,7 @@ def check_environment() -> dict[str, Any]:
                 errors.append({"module": module, "error": item["modules"][module]["error"]})
         packages[dist] = item
 
-    # Import the exact project integration used by train_qlib_shadow.py.
+    # Import the exact project integration used by trade_system.v2.rolling_research.
     integration = {"ok": False}
     try:
         from qlib.contrib.model.gbdt import LGBModel

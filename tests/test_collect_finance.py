@@ -1,6 +1,6 @@
-from collect_finance import collect_finance
-from base import DuckDBStore
-from schema import init_schema
+from collectors.collect_finance import collect_finance
+from trade_system.data_store import DuckDBStore
+from trade_system.schema import init_schema
 
 
 def test_finance_collector_persists_rows_and_checkpoint(tmp_path, monkeypatch):

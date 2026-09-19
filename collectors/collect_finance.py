@@ -13,11 +13,11 @@ import json
 from datetime import date, datetime
 from pathlib import Path
 
-from base import DuckDBStore, logger
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, logger
+from trade_system.schema import init_schema
 from trade_system.host_limiter import shared_host_limiter
 from trade_system.eastmoney_finance import get_income_statement
-from trade_system.stock_data_sources import get_financial_statements
+from trade_system.adapters.sina_sources import get_financial_statements
 
 
 ROOT = Path(__file__).resolve().parent

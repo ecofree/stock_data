@@ -4,7 +4,7 @@ from pathlib import Path
 
 import duckdb
 
-from trade_system.risk import init_trading_tables
+from trade_system.operator_outcomes import init_trading_tables
 
 
 ROOT = Path(__file__).resolve().parents[1]

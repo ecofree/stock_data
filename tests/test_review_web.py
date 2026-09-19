@@ -611,3 +611,13 @@ def test_flow_source_column_keeps_provider_cell():
     assert 'provider_main_net' in text and 'yuan' in text
     from trade_system.i18n_labels import PROVIDER_CN, cn
     assert cn(PROVIDER_CN, 'eastmoney_intraday_clist_delay') in text
+
+
+def test_stock_codes_do_not_discover_historical_side_pages(monkeypatch):
+    from trade_system.review_web import _slk
+    def refuse(*args, **kwargs):
+        raise AssertionError('renderer attempted filesystem side-page discovery')
+    monkeypatch.setattr(Path, 'is_file', refuse)
+    assert _slk('000001') == '000001'
+    assert _slk(' <script> ') == '&lt;script&gt;'
+    assert _slk(None) == '—'

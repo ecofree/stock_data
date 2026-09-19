@@ -2,7 +2,7 @@ import duckdb
 
 from trade_system.daily_review import build_daily_review_context, render_daily_review_markdown
 from trade_system.operator_outcomes import ensure_operator_outcome_tables
-from trade_system.risk import init_trading_tables
+from trade_system.operator_outcomes import init_trading_tables
 
 
 def test_daily_review_renders_operator_outcomes(tmp_path):

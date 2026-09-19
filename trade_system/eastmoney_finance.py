@@ -1,32 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-东方财富 财务 / 资金流 数据中心（datacenter-web.eastmoney.com，免 token，沙箱可用）
+"""Eastmoney report and flow readers using the shared bounded transport.
 
-为什么重要：
-  - 东方财富数据面极全（业绩/资金流/分红…），且本沙箱可达（2026-07-12 实测 HTTP 200）。
-  - 这让我们**不依赖 Tushare 中继也能拿财务报表**，多一条独立通路。
-
-参考 akshare 的关键解法（已从源码核对并沙箱实测）：
-  1. datacenter-web 用 **columns=ALL** 即可返回该报表全部列，无需逐个枚举列名
-     （之前逐列枚举极易踩"报表配置不存在"的坑，现已规避）。
-  2. filter 用 (SECURITY_CODE="600519") 形式，单/双引号均可，akshare 用单引号 + = 。
-  3. 必须强制 IPv4：curl -4（本沙箱默认走 IPv6 到 eastmoney 会 TLS 握手死循环 → HTTP 000）。
-  4. 必须 --compressed（返回 gzip）。
-  5. 带浏览器 UA 更稳（实测不加也能通，但保留以防万一）。
-  6. 请求层做指数退避重试（参考 akshare request_with_retry：每次新建连接 + 退避 + 抖动）。
-
-已验证可用（2026-07-12，columns=ALL）：
-  ✅ RPT_F10_FINANCE_GINCOME（个股业绩报表）—— 全部列：营收/归母/每股收益/同比…
-  ✅ RPT_DMSK_TS_STOCKNEW（个股资金流）—— 全部列：超大单/大单/主力 流入流出、涨跌幅…
-
-说明：资产负债 / 现金流 在 datacenter 无对应 reportName（akshare 也不从此取，它用
-cninfo/新浪），这两张表请用 Tushare 中继（tushare_relay）补齐。
-
-依赖：仅标准库（subprocess 调 curl，规避 urllib 在沙箱 TLS 不稳 + 可强制 -4）。
+Pagination preserves provider coverage and delayed-source identity. Acquisition
+owns retries; a reader never starts a second private transport or retry loop.
 """
 
-import subprocess, json, sys, time, random, urllib.parse
+import json, sys, urllib.parse, urllib.request
+
+from trade_system.http_transport import read_verified_once, request_budget, request_deadline
 
 from trade_system.host_limiter import shared_host_limiter
 from trade_system.eastmoney_clist_guard import (
@@ -45,21 +27,15 @@ _REPORTS = {
 }
 
 
-def _curl_json(url: str, *, timeout: int = 20):
-    """返回解析后的 dict；连接/解析失败返回 None。"""
-    out = subprocess.run(
-        ["curl", "-s", "-4", "--compressed", "-m", str(timeout),
-         "-H", f"User-Agent: {_UA}",
-         "-H", "Referer: https://data.eastmoney.com/", url],
-        capture_output=True, text=False, timeout=int(timeout) + 10,
-    )
-    if not out.stdout:
-        return None
+def _read_json(url: str, *, timeout: int = 20):
+    raw = read_verified_once(urllib.request.Request(url, headers={
+        "User-Agent": _UA, "Referer": "https://data.eastmoney.com/"}),
+        timeout=timeout, max_bytes=8_000_000)
     # Eastmoney occasionally serves realtime JSON as GBK.  Decode the raw
     # bytes before json parsing so security names are not replacement glyphs.
     for encoding in ("utf-8", "gbk"):
         try:
-            text = out.stdout.decode(encoding)
+            text = raw.decode(encoding)
             if "\ufffd" in text:
                 continue
             return json.loads(text)
@@ -70,29 +46,20 @@ def _curl_json(url: str, *, timeout: int = 20):
 
 def _query(reportName: str, code: str, pageSize: int = 10,
            sort_col: str = "REPORT_DATE", sort_type: str = "-1"):
-    """通用查询（columns=ALL）。返回 list[dict]（全部列）；失败返回 []。
-    请求层做指数退避重试（每次新建连接 + 退避 + 抖动），对齐 akshare request_with_retry。"""
+    """One report request; failed/empty responses never fabricate rows."""
     flt = '(SECURITY_CODE="%s")' % code
     url = (f"{_HOST}?reportName={reportName}"
            f"&columns=ALL"
            f"&filter={urllib.parse.quote(flt)}"
            f"&pageSize={pageSize}"
            f"&sortColumns={sort_col}&sortTypes={sort_type}")
-    for attempt in range(4):
-        try:
-            d = _curl_json(url)
-            if d and d.get("success") and d.get("result"):
-                rows = d["result"].get("data") or []
-                if rows:
-                    # 已按 sortColumns 排好序；兜底再按日期列确认倒序
-                    return rows
-        except Exception:
-            pass  # swallow and retry with backoff
-        # 指数退避 + 随机抖动（akshare 风格）
-        time.sleep(1.0 * (2 ** attempt) + random.uniform(0.3, 1.0))
+    payload = _read_json(url)
+    if payload and payload.get("success") and payload.get("result"):
+        return payload["result"].get("data") or []
     return []
 
 
+@request_budget(60)
 def get_fund_flow_market(trade_date: str | None = None, *, page_size: int = 500,
                          max_pages: int | None = None, pause_seconds: float = 0.35,
                          on_page=None):
@@ -127,9 +94,10 @@ def get_fund_flow_market(trade_date: str | None = None, *, page_size: int = 500,
             break
         params = {**base_params, "pageNumber": page}
         if pause_seconds > 0:
-            shared_host_limiter.acquire("eastmoney", max(float(pause_seconds), 0.5))
+            shared_host_limiter.acquire("eastmoney", max(float(pause_seconds), 0.5),
+                                        deadline=request_deadline.get())
         query = urllib.parse.urlencode(params)
-        payload = _curl_json(f"{_HOST}?{query}")
+        payload = _read_json(f"{_HOST}?{query}")
         result = payload.get("result") if isinstance(payload, dict) else None
         if not isinstance(result, dict):
             if page == 1:
@@ -147,8 +115,6 @@ def get_fund_flow_market(trade_date: str | None = None, *, page_size: int = 500,
         rows.extend(item for item in page_rows if isinstance(item, dict))
         if on_page is not None:
             on_page(page, page_rows, total_pages, result or {})
-        if page < total_pages and pause_seconds > 0:
-            time.sleep(float(pause_seconds))
         if max_pages is not None and page >= int(max_pages):
             break
 
@@ -200,12 +166,11 @@ def get_fund_flow_market(trade_date: str | None = None, *, page_size: int = 500,
     }
 
 
+@request_budget(60)
 def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
                                   max_pages: int | None = None,
                                   pause_seconds: float = 0.5, on_page=None,
                                   start_page: int = 1, sort_field: str = "f12",
-                                  _reconcile: bool = True,
-                                  _force_curl: bool = False,
                                   _use_delay: bool = False):
     """Fetch the current-session full-market flow snapshot from ``push2``.
 
@@ -238,8 +203,6 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
                 on_page=on_page,
                 start_page=start_page,
                 sort_field=sort_field,
-                _reconcile=_reconcile,
-                _force_curl=_force_curl,
                 _use_delay=True,
             )
         raise
@@ -262,47 +225,15 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
         "https://push2.eastmoney.com/api/qt/clist/get",
         "https://push2his.eastmoney.com/api/qt/clist/get",
         "https://82.push2.eastmoney.com/api/qt/clist/get",
-        # Eastmoney publishes equivalent numeric front doors.  Rotating only
-        # after a transport failure avoids hammering one host and is useful
-        # when the local proxy has cached a reset on the primary hostname.
-        "https://17.push2.eastmoney.com/api/qt/clist/get",
-        "https://29.push2.eastmoney.com/api/qt/clist/get",
-        "https://79.push2.eastmoney.com/api/qt/clist/get",
-        "https://95.push2.eastmoney.com/api/qt/clist/get",
-        # During a provider-side TLS/front-door reset, the same public API is
-        # still available over HTTP.  It carries no credentials; use it only
-        # as a bounded transport fallback and keep the result validation.
-        "http://push2.eastmoney.com/api/qt/clist/get",
-        "http://push2his.eastmoney.com/api/qt/clist/get",
-        "http://82.push2.eastmoney.com/api/qt/clist/get",
-        "http://17.push2.eastmoney.com/api/qt/clist/get",
-        "http://29.push2.eastmoney.com/api/qt/clist/get",
-        "http://79.push2.eastmoney.com/api/qt/clist/get",
-        "http://95.push2.eastmoney.com/api/qt/clist/get",
     ]
-    delay_endpoints = [
-        "https://push2delay.eastmoney.com/api/qt/clist/get",
-        "http://push2delay.eastmoney.com/api/qt/clist/get",
-    ]
+    delay_endpoints = ["https://push2delay.eastmoney.com/api/qt/clist/get"]
     endpoints = delay_endpoints if _use_delay else primary_endpoints
-    # Three front doors per probe is enough to distinguish a local/front-door
-    # issue from a provider-wide reset.  The old implementation tried all 14
-    # URLs (and then eight curl URLs) for every page, which amplified blocks.
+    # Rotate one verified HTTPS front door per page, without private retries.
     front_door_count = min(2 if _use_delay else 3, len(endpoints))
     guard_state = clist_guard.snapshot()
     last_endpoint = guard_state.get("last_endpoint")
     endpoint_start = endpoints.index(last_endpoint) if last_endpoint in endpoints else 0
     probe_endpoints = [endpoints[(endpoint_start + index) % len(endpoints)] for index in range(front_door_count)]
-    try:
-        import requests
-        http_session = requests.Session()
-        # The local proxy intermittently resets Eastmoney's paginated
-        # endpoint after a few pages.  Direct requests are stable here;
-        # keep the proxy-based curl fallback for restricted environments.
-        http_session.trust_env = False
-    except Exception:  # pragma: no cover - optional dependency
-        http_session = None
-
     def number(value):
         try:
             return float(value) if value not in (None, "", "-") else None
@@ -323,100 +254,24 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
         last_error = None
         last_attempt_endpoint = None
         successful_endpoint = None
-        # One primary probe is enough: the independently guarded delay route
-        # is the next transport, not fourteen equivalent front-door retries.
-        attempt_count = 2 if _use_delay else 1
-        for attempt in range(attempt_count):
-            try:
-                shared_host_limiter.acquire("eastmoney", max(float(pause_seconds), 0.5))
-                # The proxy-backed curl path is a separate transport from the
-                # direct requests session.  A complete reconciliation pass
-                # uses it explicitly after a front-door reset so it does not
-                # repeat the same failing transport three more times.
-                if _force_curl:
-                    curl_endpoint = probe_endpoints[(page - 1 + attempt) % front_door_count]
-                    last_attempt_endpoint = curl_endpoint
-                    payload = _curl_json(curl_endpoint + "?" + urllib.parse.urlencode(params), timeout=8)
-                    curl_data = payload.get("data") if isinstance(payload, dict) else None
-                    curl_rows = curl_data.get("diff") if isinstance(curl_data, dict) else None
-                    if isinstance(curl_rows, (list, dict)):
-                        break
-                    last_error = ValueError("curl realtime payload has no data.diff")
-                    payload = None
-                # requests handles the proxy's intermittent Schannel close
-                # more reliably than a bare curl process on Windows.  Keep a
-                # curl fallback for installations where requests is absent.
-                if payload is not None and _force_curl:
-                    # A valid curl response was already accepted above.
-                    pass
-                else:
-                    try:
-                        if http_session is None:
-                            raise RuntimeError("requests unavailable")
-                        # Deliberately omit browser headers: the direct endpoint
-                        # is less likely to reset a low-rate machine client when
-                        # it uses the minimal AkShare-style request.
-                        endpoint = probe_endpoints[(page - 1 + attempt) % front_door_count]
-                        last_attempt_endpoint = endpoint
-                        verify = not endpoint.split("//", 1)[1].startswith(("17.", "29.", "79.", "95."))
-                        if not verify:
-                            try:
-                                import urllib3
-                                urllib3.disable_warnings()
-                            except Exception:
-                                pass
-                        response = http_session.get(endpoint, params=params, timeout=8, verify=verify)
-                        response.raise_for_status()
-                        try:
-                            payload = response.json()
-                        except Exception:
-                            payload = None
-                            for encoding in ("utf-8", "gbk"):
-                                try:
-                                    text = response.content.decode(encoding)
-                                    if "\ufffd" in text:
-                                        continue
-                                    payload = json.loads(text)
-                                    break
-                                except Exception:
-                                    continue
-                            if payload is None:
-                                raise ValueError("realtime response encoding/json invalid")
-                    except Exception as exc:
-                        last_error = exc
-                        payload = None
-                data = payload.get("data") if isinstance(payload, dict) else None
-                if isinstance(data, dict) and isinstance(data.get("diff"), list):
-                    successful_endpoint = endpoint if not _force_curl else curl_endpoint
-                    break
-            except Exception as exc:  # pragma: no cover - network-specific
-                last_error = exc
-            if attempt < attempt_count - 1:
-                time.sleep(min(8.0, 1.0 * (2 ** attempt)) + random.uniform(0.2, 0.8))
+        # One selected front door per page. Delayed data is a separate product,
+        # with its own qualification; it shares the original call's deadline.
+        endpoint = probe_endpoints[(page - 1) % front_door_count]
+        last_attempt_endpoint = endpoint
+        try:
+            shared_host_limiter.acquire("eastmoney", max(float(pause_seconds), 0.5),
+                                        deadline=request_deadline.get())
+            payload = _read_json(endpoint + "?" + urllib.parse.urlencode(params), timeout=8)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            last_error = exc
         data = payload.get("data") if isinstance(payload, dict) else None
         page_rows = data.get("diff") if isinstance(data, dict) else None
         if isinstance(page_rows, dict):
             page_rows = list(page_rows.values())
-        if not isinstance(page_rows, list):
-            # Curl's IPv4 transport can still succeed when the direct
-            # requests session is reset by a front door.  Reuse the same
-            # stable-sort parameters before declaring the page unavailable.
-            for curl_endpoint in (probe_endpoints if _use_delay else []):
-                last_attempt_endpoint = curl_endpoint
-                try:
-                    curl_payload = _curl_json(
-                        curl_endpoint + "?" + urllib.parse.urlencode(params), timeout=8,
-                    )
-                    curl_data = curl_payload.get("data") if isinstance(curl_payload, dict) else None
-                    curl_rows = curl_data.get("diff") if isinstance(curl_data, dict) else None
-                    if isinstance(curl_rows, dict):
-                        curl_rows = list(curl_rows.values())
-                    if isinstance(curl_rows, list):
-                        payload, data, page_rows = curl_payload, curl_data, curl_rows
-                        successful_endpoint = curl_endpoint
-                        break
-                except Exception:
-                    continue
+        if isinstance(page_rows, list):
+            successful_endpoint = endpoint
         if not isinstance(page_rows, list):
             clist_guard.record_failure(last_error or "no data", endpoint=last_attempt_endpoint)
             if not _use_delay:
@@ -428,8 +283,6 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
                     on_page=on_page,
                     start_page=start_page,
                     sort_field=sort_field,
-                    _reconcile=_reconcile,
-                    _force_curl=_force_curl,
                     _use_delay=True,
                 )
             if page == 1:
@@ -446,8 +299,6 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
                     on_page=on_page,
                     start_page=start_page,
                     sort_field=sort_field,
-                    _reconcile=_reconcile,
-                    _force_curl=_force_curl,
                     _use_delay=True,
                 )
             raise RuntimeError(f"Eastmoney realtime clist page {page} empty")
@@ -496,8 +347,6 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
         # Do not stop on a short page: Eastmoney may cap ``pz`` to 100.
         if (total and len({row["code"] for row in rows}) >= total) or page >= total_pages:
             break
-        if pause_seconds > 0:
-            time.sleep(float(pause_seconds))
 
     deduped = {row["code"]: row for row in rows}
     meta = {
@@ -509,14 +358,7 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
         "rows": len(deduped),
         "expected_rows": total,
     }
-    # A second, full pass is intentionally rare and only runs when the
-    # immutable-code pagination still leaves a material gap.  This catches
-    # upstream page resets and transient host inconsistencies without turning
-    # every normal refresh into double traffic.
-    # Do not auto-run a second full pass.  A duplicate-only gap is resumed by
-    # the checkpoint collector, which replays all pages when the denominator
-    # is larger than the stored unique-row count.  This keeps each scheduler
-    # tick bounded and avoids turning a provider reset into a traffic spike.
+    # Gaps are resumed by the checkpoint collector, never an implicit full retry.
     meta["reconciliation_passes"] = 1
     return list(deduped.values()), meta
 

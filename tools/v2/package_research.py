@@ -45,7 +45,7 @@ def source_closure(root=ROOT):
             path = root.joinpath(*module.split('.'), '__init__.py')
         if not path.is_file() or module in selected:
             continue
-        if module in {'base', 'config', 'trade_system.tushare_relay'}:
+        if module in {'base', 'config', 'trade_system.data_store', 'trade_system.tushare_relay'}:
             raise ValueError('research release depends on legacy collector authority: ' + module)
         selected[module] = path
         package = module if path.name == '__init__.py' else module.rpartition('.')[0]

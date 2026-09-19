@@ -10,7 +10,7 @@ import pytest
 
 from trade_system.backtest_engine import BacktestParams, simulate
 from trade_system.gate_contract import build_operator_state
-from trade_system.operator_risk import OperatorRiskConfig, TradePlanInput, evaluate_trade_plan
+from trade_system.v2.decisions import RiskPolicy
 
 
 def test_execution_permission_requires_every_gate_and_no_blockers():
@@ -25,18 +25,13 @@ def test_execution_permission_requires_every_gate_and_no_blockers():
         assert (state['operator_status'] == 'executable') is expected
 
 
-@pytest.mark.parametrize('field', ['score', 'planned_position_pct', 'current_total_position_pct'])
-@pytest.mark.parametrize('value', [float('nan'), float('inf'), -float('inf'), None, True, '5'])
-def test_invalid_risk_input_never_grants_permission(field, value):
-    plan = TradePlanInput('TEST', 90, 5, 0, 'normal')
-    assert not evaluate_trade_plan(replace(plan, **{field: value})).allowed
-
-
-@pytest.mark.parametrize('field', list(OperatorRiskConfig.__dataclass_fields__))
-@pytest.mark.parametrize('value', [float('nan'), float('inf'), -1, None])
+@pytest.mark.parametrize('field', ['max_total_fraction', 'max_single_fraction',
+                                  'lot_size', 'quote_ttl_seconds', 'max_quantity', 'fee_buffer_fen'])
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), -1, None, True])
 def test_invalid_risk_policy_never_grants_permission(field, value):
-    cfg = replace(OperatorRiskConfig(), **{field: value})
-    assert not evaluate_trade_plan(TradePlanInput('TEST', 90, 5, 0, 'normal'), cfg).allowed
+    policy = RiskPolicy('fixture', '.2', '.1', 100, 60, 1000, 0)
+    with pytest.raises((ValueError, TypeError)):
+        replace(policy, **{field: value}).validate()
 
 
 def scenario(closes=(12, 12), entry_close=10):
@@ -132,6 +127,12 @@ def test_cli_exports_trades_and_daily_ledger_using_an_isolated_database(tmp_path
         con.executemany("INSERT INTO v_kline_daily VALUES (?,?,?,?,?,?,'D',false,now())",
                         [(day, code, b['open'], b['high'], b['low'], b['close'])
                          for (day, code), b in bars.items()])
+        from datetime import date, timedelta
+        first, last = date.fromisoformat(sessions[0]), date.fromisoformat(sessions[-1])
+        con.execute('CREATE TABLE tushare_trade_cal(cal_date DATE,is_open BOOLEAN,exchange VARCHAR)')
+        con.executemany("INSERT INTO tushare_trade_cal VALUES (?,?,'SSE')",
+            [(str(first+timedelta(days=i)), str(first+timedelta(days=i)) in sessions)
+             for i in range((last-first).days+1)])
     prefix = tmp_path / 'backtest'
     monkeypatch.setattr(cli, 'configure', lambda: None)
     monkeypatch.setattr(sys, 'argv', ['run_strategy_backtest', '--db', str(db),
@@ -148,3 +149,16 @@ def test_cli_exports_trades_and_daily_ledger_using_an_isolated_database(tmp_path
     assert ledger['daily_ledger'][-1]['equity'] == pytest.approx(1200000)
     assert ledger['scope'] == 'research_only_daily_bar_proxy'
     assert 'research_only_daily_bar_proxy' in (tmp_path / 'backtest_latest.md').read_text(encoding='utf-8')
+
+
+def test_backtest_cli_never_infers_calendar_from_observed_bars(tmp_path, monkeypatch):
+    from scripts import run_strategy_backtest as cli
+    db = tmp_path / 'fixture.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE v_limit_pool(trade_date DATE,stock_code VARCHAR,board_level INTEGER)')
+        con.execute('CREATE TABLE v_kline_daily(trade_date DATE,stock_code VARCHAR,open DOUBLE,high DOUBLE,low DOUBLE,close DOUBLE,ktype VARCHAR,is_fallback BOOLEAN,fetched_at TIMESTAMP)')
+    monkeypatch.setattr(cli, 'configure', lambda: None)
+    monkeypatch.setattr(sys, 'argv', ['backtest', '--db', str(db), '--start', '2026-09-14', '--end', '2026-09-16', '--out-prefix', str(tmp_path/'result')])
+    with pytest.raises(ValueError, match='unverified calendar'):
+        cli.main()
+    assert not list(tmp_path.glob('result*'))

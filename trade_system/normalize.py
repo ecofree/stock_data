@@ -805,9 +805,12 @@ def _multisource_bar_sql(con, asset_type):
     """Select existing provider observations, without promoting a physical copy."""
     policy = 'kline' if asset_type == 'stock' else 'index'
     rank = provider_rank_sql(policy, 'provider')
+    # The core daily relation is a raw-price view. Explicit adjusted products
+    # stay available in their source table, never replacing a raw observation.
+    adjustment = "AND coalesce(adjustment, 'unknown') IN ('none', 'unknown') " if 'adjustment' in table_columns(con, 'multi_source_kline') else ""
     return ("SELECT * FROM multi_source_kline WHERE asset_type='"+asset_type+"' "
             "AND provider <> 'existing_core' AND is_stale=FALSE AND close IS NOT NULL "
-            "QUALIFY row_number() OVER (PARTITION BY source_date, asset_code "
+            + adjustment + "QUALIFY row_number() OVER (PARTITION BY source_date, asset_code "
             f"ORDER BY {rank}, fetched_at DESC NULLS LAST, rowid DESC)=1")
 
 

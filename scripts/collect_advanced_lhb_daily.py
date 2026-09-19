@@ -14,10 +14,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_advanced import collect_advanced_on_the_lhb
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_advanced import collect_advanced_on_the_lhb
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 
 
 def collect_advanced_lhb_daily(db_path: str | Path, trade_date: str) -> dict:

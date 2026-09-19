@@ -5,7 +5,7 @@ import json
 import duckdb
 
 from scripts.export_qlib_features import export_features
-from scripts.train_qlib_shadow import QlibFrameDataset, _load_features
+from trade_system.v2.rolling_research import FoldDataset, load_frame
 from trade_system.ml.feature_artifacts import resolve_feature_path
 
 
@@ -143,7 +143,7 @@ def test_qlib_frame_dataset_returns_multiindex_feature_label():
             'label_available_time': ['2026-01-03', '2026-01-06'],
         }
     )
-    dataset = QlibFrameDataset(frame, ["f"], "2026-01-02", "2026-01-05", "2026-01-05")
+    dataset = FoldDataset({"train": frame, "valid": frame, "test": frame}, ["f"])
     prepared = dataset.prepare("train", col_set=["feature", "label"])
     assert list(prepared.columns) == [("feature", "f"), ("label", "label_next_ret")]
 
@@ -183,7 +183,7 @@ def test_partitioned_parquet_loader_samples_before_pandas_materialization(tmp_pa
     metadata = export_features(
         db, out, start_date="2026-01-02", end_date="2026-01-07", output_format="parquet"
     )
-    frame = _load_features(out, metadata["feature_columns"], max_rows=4)
+    frame = load_frame(resolve_feature_path(out), metadata["feature_columns"], max_rows=4)
     assert len(frame) <= 4
     assert frame["datetime"].nunique() == 4
     assert frame["label_next_ret"].notna().all()

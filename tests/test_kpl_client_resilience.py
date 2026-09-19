@@ -1,6 +1,6 @@
 import urllib.error
 
-import base
+from trade_system import data_store as base
 from trade_system.source_validation import ValidationResult
 
 

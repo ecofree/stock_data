@@ -19,7 +19,10 @@ def main() -> int:
     parser.add_argument("--start-date", default="20260101")
     parser.add_argument("--end-date", default=date.today().strftime("%Y%m%d"))
     parser.add_argument("--datasets", default="stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow",
-                        help="Comma-separated: stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow")
+                        help="Comma-separated: stock_basic,daily,daily_basic,adj_factor,moneyflow,industry_flow,index_daily")
+    parser.add_argument("--stock-codes", help="Explicit comma-separated stock scope; only missing instrument/sessions are fetched.")
+    parser.add_argument("--index-codes", help="Explicit comma-separated index scope required for index_daily.")
+    parser.add_argument("--plan-only", action="store_true", help="Show gaps from the verified local calendar without network requests.")
     parser.add_argument("--max-days", type=int, default=0, help="Limit this invocation; 0 means all open dates.")
     parser.add_argument("--gap-only", action="store_true", help="Only process dates whose requested dataset is not complete.")
     parser.add_argument("--budget-seconds", type=float, default=300.0)
@@ -50,6 +53,7 @@ def main() -> int:
         batch_limit=args.batch_limit,
         moneyflow_page_size=args.moneyflow_page_size,
         budget_seconds=args.budget_seconds,
+        offline=args.plan_only,
     ) as collector:
         result = collector.run(
             args.start_date,
@@ -60,6 +64,9 @@ def main() -> int:
             gap_only=args.gap_only,
             retry_passes=args.retry_passes,
             retry_delay_seconds=args.retry_delay_seconds,
+            stock_codes=[c.strip() for c in args.stock_codes.split(",") if c.strip()] if args.stock_codes is not None else None,
+            index_codes=[c.strip() for c in args.index_codes.split(",") if c.strip()] if args.index_codes is not None else None,
+            plan_only=args.plan_only,
         )
     report = render_report(args.db, result, args.report)
     summary = {}

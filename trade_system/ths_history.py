@@ -21,10 +21,12 @@ from html import unescape
 
 import duckdb
 
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from trade_system.schema import init_schema
-from trade_system.stock_data_sources import _auto_decode, _from_ths_hot_list
+from trade_system.adapters.kline_sources import _auto_decode
+from trade_system.adapters.ths_sources import _from_ths_hot_list
 from trade_system.host_limiter import shared_host_limiter
+from trade_system.http_transport import read_verified_once, request_budget, request_deadline
 from trade_system.ths_quality import canonical_ths_snapshot
 from trade_system.trading_calendar import open_session_dates
 
@@ -36,7 +38,6 @@ THS_CONCEPT_CATALOG_URL = "https://q.10jqka.com.cn/gn/"
 # fetched on the actual current date is verified; historical labels remain
 # explicitly unverified so they cannot leak into backtests.
 THS_REQUEST_INTERVAL_SECONDS = 0.35
-_THS_LAST_REQUEST_AT: float | None = None
 # A browser-authenticated session may be supplied explicitly for a repair or
 # operator-run crawl.  Scheduled runs do not invent credentials: when this is
 # absent, only the public anti-bot cookie is generated and blocked/partial
@@ -78,62 +79,22 @@ class _THSCatalog(list):
         self.provider = provider
 
 
+@request_budget(20)
 def _ths_html(url: str, referer: str = THS_CONCEPT_CATALOG_URL) -> str:
-    global _THS_LAST_REQUEST_AT
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            if _THS_LAST_REQUEST_AT is not None:
-                wait = THS_REQUEST_INTERVAL_SECONDS - (time.monotonic() - _THS_LAST_REQUEST_AT)
-                if wait > 0:
-                    time.sleep(wait)
-            shared_host_limiter.acquire("ths", max(THS_REQUEST_INTERVAL_SECONDS, 0.5))
-            request = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-                "Referer": referer,
-                "Cookie": _ths_request_cookie(),
-                "X-Requested-With": "XMLHttpRequest" if "/ajax/1/" in url else "",
-                "Accept": "text/html, */*; q=0.01",
-            })
-            _THS_LAST_REQUEST_AT = time.monotonic()
-            with urllib.request.urlopen(request, timeout=20) as response:
-                return _auto_decode(response.read())
-        except Exception as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(1.0 * (attempt + 1))
-    detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown error"
-    raise RuntimeError(f"THS page request failed after 3 attempts: {url}; {detail}") from last_error
+    shared_host_limiter.acquire("ths", max(THS_REQUEST_INTERVAL_SECONDS, 0.5),
+                                deadline=request_deadline.get())
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Referer": referer,
+        "Cookie": _ths_request_cookie(),
+        "X-Requested-With": "XMLHttpRequest" if "/ajax/1/" in url else "",
+        "Accept": "text/html, */*; q=0.01",
+    })
+    return _auto_decode(read_verified_once(request, timeout=20, max_bytes=8_000_000))
 
 
 def _ths_catalog() -> list[tuple[str, str]]:
-    """Return the current THS catalogue, preferring the refreshed AKShare adapter."""
-    try:
-        from trade_system.akshare_guard import ensure_akshare_current
-
-        refresh = ensure_akshare_current()
-        import akshare as ak
-
-        frame = ak.stock_board_concept_name_ths()
-        columns = {str(column).lower(): column for column in frame.columns}
-        code_column = next((columns[key] for key in ("代码", "code", "板块代码") if key in columns), None)
-        name_column = next((columns[key] for key in ("名称", "name", "板块名称") if key in columns), None)
-        rows = []
-        seen = set()
-        if code_column is not None and name_column is not None:
-            for _, item in frame.iterrows():
-                code = re.sub(r"\D", "", str(item.get(code_column) or ""))
-                name = str(item.get(name_column) or "").strip()
-                if code and name and code not in seen:
-                    seen.add(code)
-                    rows.append((code, name))
-        if len(rows) >= 350:
-            return _THSCatalog(rows, f"akshare_ths_{refresh.get('version', '')}")
-    except Exception:
-        # Direct THS HTML remains the explicit transport fallback.  It is
-        # still validated by the full member snapshot before publication.
-        pass
-
+    """Read the THS catalogue directly; no runtime SDK update or second fetch."""
     html = _ths_html(THS_CONCEPT_CATALOG_URL)
     items = []
     seen = set()
@@ -226,6 +187,7 @@ def _ths_board_index_code(html: str) -> str:
     return ""
 
 
+@request_budget(20)
 def _ths_blockrank_json(index_code: str, amount: int | str) -> dict[str, Any]:
     """Fetch and decode a THS ``blockrank`` JSONP response.
 
@@ -240,8 +202,9 @@ def _ths_blockrank_json(index_code: str, amount: int | str) -> dict[str, Any]:
         "Host": "d.10jqka.com.cn",
         "Referer": "https://q.10jqka.com.cn/gn/",
     })
-    with urllib.request.urlopen(request, timeout=20) as response:
-        text = _auto_decode(response.read())
+    shared_host_limiter.acquire("ths", max(THS_REQUEST_INTERVAL_SECONDS, 0.5),
+                                deadline=request_deadline.get())
+    text = _auto_decode(read_verified_once(request, timeout=20, max_bytes=8_000_000))
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:

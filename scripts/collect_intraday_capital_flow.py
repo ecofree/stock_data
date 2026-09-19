@@ -8,23 +8,23 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_advanced_stock import (
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_advanced_stock import (
     collect_advanced_dadan_kline,
     collect_advanced_main_activity_kline,
     collect_advanced_main_monitor,
     collect_advanced_pankou,
     collect_advanced_zjmm_min,
 )
-from collect_l2 import (
+from collectors.collect_l2 import (
     collect_l2_sector_intraday,
     collect_l2_sector_volume,
     collect_l2_tick_history,
     collect_l2_tick_orders,
     collect_l2_tick_orders_all,
 )
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 from trade_system.normalize import build_normalized_views
 
 

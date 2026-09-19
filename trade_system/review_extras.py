@@ -361,7 +361,7 @@ def render_qlib_screen(con: duckdb.DuckDBPyConnection) -> str:
             f"Top-Bottom={_cell(evaluation[4], 2)}"
         )
     return (
-        "<div class='sec-title'><strong>QLib 研究模型快照 Top10</strong>"
+        "<div class='sec-title'><strong>QLib 历史研究快照 Top10（旧链已退出）</strong>"
         f"<span class='sec-kicker'>预测日 {day} · 特征截止 {feature_day or '—'} · "
         f"候选截止 {candidate_day or '—'} · 模型 {model_id} · {evaluation_text} · 非当日执行信号 · research-only</span></div>"
         "<div class='table-scroll'><table><thead><tr><th>QLib排名</th><th>代码</th>"

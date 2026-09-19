@@ -1,63 +1,23 @@
 import duckdb
+import pytest
 
 from trade_system.operator_backtest import run_operator_stage_backtest
+from trade_system.v2.domain import file_hash
 
 
-def test_operator_stage_backtest_applies_t1_fees_and_slippage(tmp_path):
-    db_path = tmp_path / "sample.duckdb"
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE stock_candidate_stage_signal("
-        "trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, stock_name VARCHAR, "
-        "score DOUBLE, decision VARCHAR, evidence_json VARCHAR, generated_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO stock_candidate_stage_signal VALUES "
-        "('2026-07-06', 'close_decision', '000001', 'test stock', 90, 'watch', '{}', '2026-07-06')"
-    )
-    con.execute(
-        "CREATE TABLE kline("
-        "date DATE, stock_code VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, "
-        "volume BIGINT, turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, fetched_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO kline VALUES "
-        "('2026-07-06', '000001', 10, 10, 10, 10, 1000, 10000, 0, 'D', '2026-07-06')"
-    )
-    con.execute(
-        "INSERT INTO kline VALUES "
-        "('2026-07-07', '000001', 10.0, 11.0, 9.8, 10.5, 1000, 10500, 5, 'D', '2026-07-07')"
-    )
-    con.execute(
-        "INSERT INTO kline VALUES "
-        "('2026-07-08', '000001', 10.5, 10.6, 10.2, 10.5, 1000, 10500, 0, 'D', '2026-07-08')"
-    )
-    con.close()
-
-    result = run_operator_stage_backtest(db_path, fee_rate=0.001, slippage_bps=10)
-
-    assert result["sample_count"] == 1
-    row = result["rows"][0]
-    assert row["entry_date"] == "2026-07-07"
-    assert row["gross_return_pct"] == 5.0
-    assert row["net_return_pct"] < 5.0
-
-
-def test_operator_stage_backtest_accepts_lowercase_daily_kline_type(tmp_path):
-    db_path = tmp_path / "lowercase.duckdb"
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE stock_candidate_stage_signal("
-        "trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, stock_name VARCHAR, score DOUBLE)"
-    )
-    con.execute("INSERT INTO stock_candidate_stage_signal VALUES ('2026-07-06','close_decision','000001','test stock',80)")
-    con.execute("CREATE TABLE kline(date DATE, stock_code VARCHAR, open DOUBLE, close DOUBLE, ktype VARCHAR)")
-    con.execute("INSERT INTO kline VALUES ('2026-07-06','000001',9.8,10,'d')")
-    con.execute("INSERT INTO kline VALUES ('2026-07-07','000001',10.0,10.5,'d')")
-    con.execute("INSERT INTO kline VALUES ('2026-07-08','000001',10.5,10.5,'d')")
-    con.close()
-
-    result = run_operator_stage_backtest(db_path)
-
-    assert result["sample_count"] == 1
-    assert result["rows"][0]["source"] == "proxy_signal"
+@pytest.mark.parametrize('period', ['D', 'd'])
+def test_historical_signals_never_stand_in_for_real_executions(tmp_path, period):
+    db = tmp_path / 'manual.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE stock_candidate_stage_signal(trade_date DATE,stock_code VARCHAR,score DOUBLE,is_actionable BOOLEAN)')
+        con.execute("INSERT INTO stock_candidate_stage_signal VALUES ('2026-07-06','000001',99,true)")
+        con.execute('CREATE TABLE kline(date DATE,stock_code VARCHAR,open DOUBLE,close DOUBLE,ktype VARCHAR)')
+        con.executemany("INSERT INTO kline VALUES (?,'000001',10,20,?)", [(d,period) for d in ['2026-07-06','2026-07-07','2026-07-08']])
+        con.execute("CREATE TABLE watchlist(note VARCHAR); INSERT INTO watchlist VALUES ('human judgement')")
+    before = file_hash(db)
+    result = run_operator_stage_backtest(db)
+    assert result['mode'] == 'no_real_outcomes'
+    assert result['sample_count'] == 0 and result['rows'] == []
+    assert result['summary']['real_outcome_count'] == result['summary']['proxy_signal_count'] == 0
+    assert result['readiness']['ready'] is False
+    assert file_hash(db) == before

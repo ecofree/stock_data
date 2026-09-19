@@ -74,6 +74,7 @@ def test_research_distribution_runs_outside_checkout_and_rejects_upgrade_residue
         assert b'--require-hashes -r requirements-research-replay.lock' in package.read('README.txt')
         assert not any(p.startswith('tools/') for p in package.namelist())
         assert 'base.py' not in package.namelist()
+        assert 'trade_system/data_store.py' not in package.namelist()
         assert 'trade_system/tushare_relay.py' not in package.namelist()
         package.extractall(target)
     command=[sys.executable,'-I',str(target/'run_research.py'),'--help']
@@ -83,3 +84,22 @@ def test_research_distribution_runs_outside_checkout_and_rejects_upgrade_residue
     (target/'legacy_residue.py').write_text('raise RuntimeError("never import")',encoding='utf-8')
     refused=subprocess.run(command,cwd=tmp_path,capture_output=True)
     assert refused.returncode!=0 and b'unexpected' in refused.stderr
+
+
+def test_base_import_creates_missing_log_directory(tmp_path):
+    target = tmp_path / 'new-runtime' / 'logs'
+    code = (
+        'from trade_system import config; import sys; '
+        'config.LOG_DIR = sys.argv[1]; '
+        'from trade_system import data_store as base; '
+        "base.logger.warning('clean import regression')"
+    )
+    result = subprocess.run(
+        [sys.executable, '-c', code, str(target)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    logs = list(target.glob('collect_*.log'))
+    assert len(logs) == 1
+    assert 'clean import regression' in logs[0].read_text(encoding='utf-8')

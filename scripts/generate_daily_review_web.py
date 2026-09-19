@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config import DB_PATH  # noqa: E402
+from trade_system.config import DB_PATH  # noqa: E402
 from trade_system.review_web import write_review_web  # noqa: E402
 
 
@@ -22,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate the daily review web page.")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--trade-date", default="",
-                        help="Review date (YYYY-MM-DD); defaults to the latest stored session.")
+                        help="Review date (YYYY-MM-DD); defaults to the current verified calendar session.")
     parser.add_argument("--as-of", default="", help="ISO timestamp for freshness gates.")
     parser.add_argument("--out", required=True, help="Explicit historical preview destination; current publication belongs to daily_workspace")
     args = parser.parse_args()

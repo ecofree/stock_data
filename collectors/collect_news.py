@@ -1,5 +1,5 @@
 """News and topic data collectors (15 endpoints)."""
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def collect_news_plate(client: KPLClient, store: DuckDBStore, date: str, sector_codes: list) -> int:

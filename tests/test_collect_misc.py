@@ -1,4 +1,4 @@
-from collect_misc import _normalize_kline_date, _parse_bidding_anomalies
+from collectors.collect_misc import _normalize_kline_date, _parse_bidding_anomalies
 
 
 def test_normalize_kline_date_accepts_compact_api_date():

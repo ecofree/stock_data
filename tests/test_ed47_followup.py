@@ -2,8 +2,6 @@
 from datetime import date, timedelta
 import json
 from pathlib import Path
-import subprocess
-import sys
 
 import duckdb
 import pandas as pd
@@ -13,34 +11,11 @@ from scripts.export_qlib_features import _query
 from trade_system.flow_contract import normalize_stock_flow_row
 from trade_system.flow_features import build_flow_features, STOCK_FEATURE_TABLE
 from trade_system.multi_source_store import MultiSourceStore
-from trade_system.v2.domain import file_hash
 from trade_system.v2.rolling_research import FoldDataset, load_frame
 
 
-@pytest.mark.parametrize('name,args',[
-    ('generate_signals.py',['--allow-partial']),
-    ('generate_stage_signals.py',['--date','2026-09-10','--stage','close_decision','--allow-blocked'])])
-def test_retired_cli_refuses_before_database_write(tmp_path,name,args):
-    db=tmp_path/'unknown.duckdb'
-    script=Path(__file__).resolve().parents[1]/'scripts'/name
-    result=subprocess.run([sys.executable,str(script),'--db',str(db),*args],capture_output=True,cwd=tmp_path)
-    assert result.returncode!=0 and b'legacy signal writes retired' in result.stderr
-    assert not db.exists()
 
 
-@pytest.mark.parametrize('entry', ['signals','stage','refresh'])
-def test_direct_retired_function_preserves_existing_database(tmp_path,entry):
-    from trade_system.signals import generate_signals
-    from trade_system.stage_signals import generate_stage_signals,refresh_close_signals_if_needed
-    db=tmp_path/'manual.duckdb'
-    with duckdb.connect(str(db)) as con:
-        con.execute("CREATE TABLE watchlist(note VARCHAR); INSERT INTO watchlist VALUES ('human')")
-    before=file_hash(db)
-    with pytest.raises(ValueError,match='retired'):
-        if entry=='signals': generate_signals(db,require_ready=False)
-        elif entry=='stage': generate_stage_signals(db,'2026-09-10','close_decision')
-        else: refresh_close_signals_if_needed(db,'2026-09-10')
-    assert file_hash(db)==before
 
 
 def test_unit_zero_and_ths_semantics():

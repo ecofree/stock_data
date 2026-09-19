@@ -8,7 +8,6 @@ from trade_system.strategy.schema import (
     persist_strategy_definitions,
     persist_strategy_scan_results,
 )
-from trade_system.strategy_stage_backtest import run_strategy_result_backtest
 
 
 def test_default_stage_strategies_cover_four_operator_stages():
@@ -119,43 +118,3 @@ def test_persist_strategy_backtest_summary_writes_result_rows(tmp_path):
         assert con.execute("SELECT count(*) FROM strategy_backtest_result").fetchone()[0] == 1
     finally:
         con.close()
-
-
-def test_strategy_result_backtest_uses_next_available_close(tmp_path):
-    db_path = tmp_path / "backtest.duckdb"
-    con = duckdb.connect(str(db_path))
-    try:
-        con.execute(
-            """
-            CREATE TABLE strategy_scan_result (
-                trade_date VARCHAR, strategy_id VARCHAR, symbol VARCHAR, stock_name VARCHAR,
-                stage VARCHAR, score DOUBLE, evidence_json VARCHAR, selected_reason VARCHAR,
-                risk_points VARCHAR, invalid_conditions VARCHAR
-            )
-            """
-        )
-        con.execute(
-            "INSERT INTO strategy_scan_result VALUES ('2026-07-06','test.pre_market','000001','测试股份','pre_market',80,'{}','reason','','')"
-        )
-        con.execute(
-            "CREATE TABLE stock_candidate_stage_signal("
-            "trade_date VARCHAR, stage VARCHAR, stock_code VARCHAR, stock_name VARCHAR, "
-            "score DOUBLE, decision VARCHAR)"
-        )
-        con.execute(
-            "INSERT INTO stock_candidate_stage_signal VALUES "
-            "('2026-07-06','premarket_pool','000001','测试股份',80,'pool')"
-        )
-        con.execute(
-            "CREATE TABLE kline(date DATE, stock_code VARCHAR, open DOUBLE, close DOUBLE, ktype VARCHAR)"
-        )
-        con.execute("INSERT INTO kline VALUES ('2026-07-06','000001',10.0,11.0,'D')")
-        con.execute("INSERT INTO kline VALUES ('2026-07-07','000001',11.0,11.0,'D')")
-    finally:
-        con.close()
-
-    result = run_strategy_result_backtest(db_path, fee_rate=0, slippage_bps=0)
-
-    assert result["sample_count"] == 1
-    assert result["summary"]["win_rate_pct"] == 100.0
-    assert result["rows"][0]["net_return_pct"] == 10.0

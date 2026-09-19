@@ -7,7 +7,8 @@ re-exports these names for backward compatibility.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from contextvars import ContextVar
 from typing import Any
 
 import duckdb
@@ -22,23 +23,54 @@ from trade_system.units import normalization_sql
 logger = get_logger(__name__)
 
 
+# Scoped to a single render; concurrent reviews cannot share query outcomes.
+_query_status = ContextVar("review_query_status", default=None)
+
+
 def _rows(con: duckdb.DuckDBPyConnection, table: str, sql: str, params: list[Any]) -> list[dict]:
-    if not table_exists(con, table):
-        return []
+    rows = []
+    outcome = {"table": table, "state": "missing_table", "rows": 0}
     try:
-        return _fetch_dicts(con, sql, params)
-    except Exception as exc:
-        logger.warning("review query failed for table %s: %s", table, exc)
-        return []
-
-
-def _latest_date(con: duckdb.DuckDBPyConnection) -> str:
-    for table in ("market_regime_snapshot", "stock_candidate_stage_signal", "stock_candidate_score"):
         if table_exists(con, table):
-            row = con.execute(f"SELECT max(trade_date) FROM {table}").fetchone()
-            if row and row[0]:
-                return str(row[0])
-    return ""
+            rows = _fetch_dicts(con, sql, params)
+            outcome.update(state="present" if rows else "empty", rows=len(rows))
+    except Exception as exc:
+        outcome.update(state="query_failed", error=type(exc).__name__)
+        logger.warning("review query failed for table %s: %s", table, exc)
+    diagnostics = _query_status.get()
+    if diagnostics is not None:
+        diagnostics.append(outcome)
+    elif outcome["state"] == "query_failed":
+        raise RuntimeError(f"review query failed: {table} ({outcome['error']})")
+    return rows
+
+
+def _latest_date(con: duckdb.DuckDBPyConnection, as_of=None) -> str:
+    """Use the exchange calendar, never a legacy signal or score timestamp."""
+    if isinstance(as_of, datetime) and as_of.tzinfo is not None:
+        from zoneinfo import ZoneInfo
+        as_of = as_of.astimezone(ZoneInfo("Asia/Shanghai"))
+    upper = str(as_of or date.today())[:10]
+    if not table_exists(con, "tushare_trade_cal"):
+        raise ValueError("review target session required: calendar unavailable")
+    columns = set(table_columns(con, "tushare_trade_cal"))
+    exchange = "AND exchange='SSE'" if "exchange" in columns else ""
+    rows = con.execute(f"""SELECT CAST(cal_date AS DATE), bool_or(CAST(is_open AS BOOLEAN)),
+        count(is_open)=count(*) AND count(DISTINCT CAST(is_open AS BOOLEAN))=1
+        FROM tushare_trade_cal WHERE CAST(cal_date AS DATE)<=CAST(? AS DATE) {exchange}
+        GROUP BY cal_date ORDER BY cal_date DESC""", [upper]).fetchall()
+    if not rows or str(rows[0][0]) != upper:
+        raise ValueError("review target session required: current calendar unknown")
+    expected_day = date.fromisoformat(upper)
+    for day, opened, valid in rows:
+        if day != expected_day:
+            raise ValueError("review target session required: calendar gap")
+        expected_day -= timedelta(days=1)
+        if not valid:
+            raise ValueError("review target session required: contradictory calendar")
+        if opened:
+            return str(day)
+    raise ValueError("review target session required: no verified open session")
 
 
 def _apply_qualified_concept_flow(result, con, trade_date, *, now=None):

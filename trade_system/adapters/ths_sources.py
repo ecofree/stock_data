@@ -1,7 +1,6 @@
 ﻿"""THS (10jqka) source adapters.
 
-Extracted verbatim from ``trade_system.stock_data_sources`` (now a facade).
-All names remain importable from the facade for compatibility.
+Callers import these provider implementations directly.
 """
 from __future__ import annotations
 

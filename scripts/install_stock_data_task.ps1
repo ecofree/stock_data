@@ -1,4 +1,4 @@
-# Prepare seven task dispositions; no task, credential, ACL or permit changes.
+# Prepare dispositions for the captured tasks; no task, credential, ACL or permit changes.
 [CmdletBinding()]
 param(
     [switch]$Register, [switch]$RegisterAll,
@@ -30,8 +30,10 @@ foreach ($value in @($contract.database,$contract.reports)) { if (-not $value -o
 $expected=@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-SupplementalRetry','StockData-QLibResearch','StockData-ResearchDaily','StockData-MonthlyCompact')
 $baseline=Get-Content -LiteralPath $inventory -Raw | ConvertFrom-Json
 $baseline=@($baseline)
-if ($baseline.Count -ne 7 -or @($baseline.Name | Select-Object -Unique).Count -ne 7 -or
-    @(Compare-Object $expected @($baseline.Name)).Count) { throw 'Exactly seven classified baseline tasks required' }
+$required=@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-MonthlyCompact')
+if ($baseline.Count -ne @($baseline.Name | Select-Object -Unique).Count -or
+    @($baseline.Name | Where-Object {$_ -notin $expected}).Count -or
+    @($required | Where-Object {$_ -notin $baseline.Name}).Count) { throw 'Complete captured baseline with all four retained tasks required' }
 $xmlByName=@{}; $hashByName=@{}
 foreach ($task in $baseline) {
     $path=Join-Path $BaselineDirectory ($task.Name+'.xml')
@@ -51,9 +53,13 @@ foreach ($task in $baseline) {
     $xmlByName[$task.Name]=$raw
     $hashByName[$task.Name]=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 }
+$identity=$null
+if ($baseline.Name -contains 'StockData-QLibResearch' -and $baseline.Name -notcontains 'StockData-ResearchDaily') {throw 'Research identity task missing; no inferred account'}
+if ($baseline.Name -contains 'StockData-ResearchDaily') {
 $identity=([xml]$xmlByName['StockData-ResearchDaily']).Task.Principals.Principal
 if ($identity.UserId -notmatch '^S-1-5-21-' -or $identity.LogonType -ne 'Password' -or
     ($identity.RunLevel -and $identity.RunLevel -ne 'LeastPrivilege')) { throw 'Retained dedicated Limited/Password identity required, never SYSTEM' }
+}
 $repo=Split-Path -Parent $PSScriptRoot
 $common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'"'
 $prefix='-NoProfile -NonInteractive -File "'
@@ -66,7 +72,7 @@ $actions=@{
     'StockData-ResearchDaily'=$research
     'StockData-QLibResearch'=$research+' -RefreshResearch -EnvironmentFile "'+$EnvironmentFile+'"'
 }
-$rows=@(foreach ($name in $expected) {
+$rows=@(foreach ($name in $baseline.Name) {
     $existing=@($baseline | Where-Object Name -eq $name)[0]
     $preserve=$name -eq 'StockData-MonthlyCompact'
     $isResearch=$name -in @('StockData-ResearchDaily','StockData-QLibResearch')
@@ -89,21 +95,24 @@ foreach ($relative in @('scripts/install_stock_data_task.ps1','scripts/deploy_cu
 }
 $proposal=[ordered]@{Schema=2;Scope='task_handover_proposal_only';CapturedAt=[DateTimeOffset]::UtcNow.ToString('o');
     SystemChanges=0;ProductionCutover=$false;Actions=$rows;AdapterFiles=$files;
+    AbsentTasks=@($expected | Where-Object {$_ -notin $baseline.Name});
+    MissingRequiredTasks=@('StockData-ResearchDaily' | Where-Object {$_ -notin $baseline.Name});
+    CollectorContract=[IO.Path]::GetFullPath($CollectorContract);ResearchReleaseDirectory=[IO.Path]::GetFullPath($ResearchReleaseDirectory);
     BaselineInventorySha256=$BaselineInventorySha256;BaselineXmlSha256=$hashByName;
     CollectionContractSha256=$CollectorContractSha256;ResearchManifestSha256=$ResearchReleaseManifestSha256;
     MonthlyCompact='retain disabled; no changes';
-    Blockers=@('baseline is historical: compare all seven live XML definitions immediately before cutover',
+    Blockers=@('baseline is historical: compare the complete live inventory and captured XML definitions immediately before cutover',
         'fresh recovery and ACL rollback verification required',
         'protect exact collector/research runtimes, release and provider environment before enabling tasks',
         'dedicated identity must pass offline probe and authenticated task-update/rollback rehearsal',
-        'current transaction engine has no live backend; offline rehearsal is not Windows authentication or approval',
-        'confirm exact new maintenance window and seven-task scope before applying')}
+        'disabled task staging is available; activation still requires production data, recovery and identity verification',
+        'missing publication/research tasks require explicit creation scope; confirm the exact new maintenance window before applying')}
 if ($ResearchStartBoundary) {
     $releaseMetadata=[IO.File]::ReadAllText($manifest) | ConvertFrom-Json
-    if ($releaseMetadata.version -ne '0.3.15') {throw 'Compiled transaction requires the fixed 0.3.15 research release'}
+    if ($releaseMetadata.version -notmatch '^0\.3\.\d+$') {throw 'Versioned research release required'}
     . (Join-Path $PSScriptRoot 'deploy_current_tasks.ps1') -Mode Library
     $proposal.Schema=3;$proposal.Scope='task_handover_engineering_only'
-    $proposal.Version='0.3.15';$proposal.ResearchStartBoundary=$ResearchStartBoundary
+    $proposal.Version=[string]$releaseMetadata.version;$proposal.ResearchStartBoundary=$ResearchStartBoundary
     $proposal.AuthenticationVerified=$false;$proposal.LiveBackendEnabled=$false
     foreach ($row in $rows) {$row | Add-Member NoteProperty AfterXml (Replacement-Xml $row $ResearchStartBoundary)}
     Assert-EngineeringPlan $proposal

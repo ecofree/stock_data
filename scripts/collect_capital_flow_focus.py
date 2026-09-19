@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
@@ -8,22 +8,22 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_advanced_stock import (
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_advanced_stock import (
     collect_advanced_dadan_kline,
     collect_advanced_main_activity_kline,
     collect_advanced_pankou,
     collect_advanced_zjmm_min,
 )
-from collect_l2 import (
+from collectors.collect_l2 import (
     collect_l2_sector_intraday,
     collect_l2_sector_volume,
     collect_l2_stock_bigorder,
     collect_l2_stock_intraday,
 )
-from collect_sector import collect_sector_capital
-from config import DB_PATH, TODAY
-from schema import init_schema
+from collectors.collect_sector import collect_sector_capital
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 from scripts.collect_intraday_capital_flow import infer_sector_codes, infer_stock_codes
 from trade_system.capital_flow_health import (
     assess_capital_flow_health,

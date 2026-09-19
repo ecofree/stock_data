@@ -929,6 +929,7 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
+    db.execute("ALTER TABLE tushare_stock_basic ADD COLUMN IF NOT EXISTS delist_date DATE")
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS tushare_daily (

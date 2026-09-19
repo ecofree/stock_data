@@ -12,37 +12,8 @@ from scripts.run_integrated_daily import (
 )
 
 
-def test_integrated_plan_propagates_date_and_prioritizes_capital_flow_collection():
-    steps = command_plan(
-        "sample.duckdb",
-        "2026-07-09",
-        include_collection=True,
-        phase="close",
-    )
-    by_name = {name: cmd for name, cmd, _ in steps}
-
-    assert [steps[0][0], steps[1][0], steps[2][0]] == [
-        "collect_market_context",
-        "check_kpl_connectivity",
-        "sync_tushare_close",
-    ]
-    assert "collect_capital_flow_focus" not in by_name
-    assert "collect_multisource_capital_flow" not in by_name
-    assert 'generate_signals' not in by_name
-    assert 'run_daily_operator_loop' not in by_name
 
 
-def test_priority_collection_profile_avoids_duplicate_fanout():
-    steps = command_plan("sample.duckdb", "2026-07-14", include_collection=True, collection_profile="priority")
-    names = [step[0] for step in steps]
-    assert names[:4] == [
-        "collect_market_context",
-        "check_kpl_connectivity",
-        "sync_tushare_close",
-        "collect_ths_concepts_api",
-    ]
-    assert "collect_capital_flow_focus" not in names
-    assert "collect_multisource_capital_flow" not in names
 
 
 def test_auction_plan_retains_blocked_diagnostics():

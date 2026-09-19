@@ -1,6 +1,6 @@
 """Stock deep data collectors (8 endpoints)."""
 import json
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
 def collect_stock_company_info(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:

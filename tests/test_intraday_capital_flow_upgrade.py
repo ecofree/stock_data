@@ -1,13 +1,13 @@
 import duckdb
 
-from base import DuckDBStore
-from collect_advanced_stock import (
+from trade_system.data_store import DuckDBStore
+from collectors.collect_advanced_stock import (
     collect_advanced_dadan_kline,
     collect_advanced_main_activity_kline,
     collect_advanced_main_monitor,
     collect_advanced_zjmm_min,
 )
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.normalize import build_normalized_views
 
 

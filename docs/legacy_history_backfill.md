@@ -1,20 +1,8 @@
-# 老日期历史补齐
+# 历史补充职责
 
-TuShare 中转的老日期 `daily/daily_basic` 批量接口不稳定，项目现在提供
-`scripts/backfill_legacy_baostock.py` 作为独立备源。它只补全指定日期范围内
-数据库缺少的股票，不覆盖已有行，并将每只股票的实际来源写入
-`baostock_history_checkpoint`。
+旧 `backfill_legacy_baostock.py` 及其并行版已退出。两者曾把 BaoStock 行情和不完整估值写入 TuShare 表，缺少逐行来源与单位约束；当前实现与历史输入可从 Git 基线 `84141f0` 查阅。
 
-```powershell
-D:\anaconda\python.exe scripts\backfill_legacy_baostock.py `
-  --db kpl_data.duckdb `
-  --start-date 20250101 --end-date 20251231 `
-  --offset 0 --max-stocks 20
-```
+行情补充使用现有 `scripts/collect_multisource.py`：显式指定日期、证券、`--types kline`、原始价格 `--fq ""`，先 `--dry-run` 检查。运行仍受整改目录写入边界约束，生产保持停用。
+它复用供应商取数、限时 SDK、原始回执及交易日覆盖检查，实际来源写入 `multi_source_kline`；缺少交易日历或来源数据时保留缺口，不冒充完成，也不把原始价格改标为复权价格。
 
-批次按 `--offset` 递增恢复。`daily` 的成交量和成交额按 TuShare 的万股/万元
-口径归一化；`daily_basic` 仅能从 BaoStock取得换手率、PE(TTM)、PB(MRQ)，
-市值和量比保持空值，不能冒充完整估值快照。
-
-QLib 导出会自动排除低于全市场覆盖阈值的日期；在 2024/2025 尚未完成全市场
-补齐前，数据契约报告会保持 `research_only`，模型门禁不会放行。
+TuShare 行情、估值继续由 `TushareHistoryCollector` 与 `backfill_2026_tushare.py` 管理。原 BaoStock 检查点、原始表和历史来源争议均保留；旧字段不迁移成获准估值，也不删除历史行。

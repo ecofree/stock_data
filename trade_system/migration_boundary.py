@@ -4,10 +4,6 @@ import json
 from pathlib import Path
 
 
-def require_signal_copy(root, db):
-    if root is None:
-        raise ValueError('legacy signal writes retired; an explicit verified disposable migration copy is required')
-    return require_copy(root, db, Path(root) / 'diagnostic-reports')
 
 
 def require_copy(root,db,reports):

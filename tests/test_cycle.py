@@ -62,6 +62,10 @@ def con():
         " turnover BIGINT, change_pct DOUBLE, ktype VARCHAR, source_table VARCHAR,"
         " is_fallback BOOLEAN, fetched_at TIMESTAMP)"
     )
+    conn.execute("CREATE TABLE tushare_trade_cal(cal_date DATE, is_open BOOLEAN)")
+    conn.executemany("INSERT INTO tushare_trade_cal VALUES (?,?)", [
+        ("2026-08-20", True), ("2026-08-21", True), ("2026-08-22", False),
+        ("2026-08-23", False), ("2026-08-24", True), ("2026-08-25", True)])
     yield conn
     conn.close()
 
@@ -97,19 +101,73 @@ def test_compute_premium_buckets(con):
     assert rows["_all"]["sample_size"] == 3
 
 
-def test_promotion_rate_counts_repeats(con):
-    _add_kline(con, "2026-08-21", "999999", 1.0)  # ensure a next session exists
-    _add_limit(con, "2026-08-20", "000001", 1)
-    _add_limit(con, "2026-08-20", "000002", 1)
-    _add_limit(con, "2026-08-21", "000001", 2)  # promoted
-
-    rows = compute_promotion(con, "2026-08-20")
-    first = next(r for r in rows if r["from_board"] == 1)
-    assert first["candidates"] == 2 and first["promoted"] == 1
-    assert first["rate"] == pytest.approx(0.5)
 
 
-def test_next_session_skips_gaps(con):
+def test_next_session_never_skips_missing_market_bars(con):
     _add_kline(con, "2026-08-20", "000001", 1.0)
     _add_kline(con, "2026-08-25", "000001", 2.0)
-    assert next_session(con, "2026-08-20") == "2026-08-25"
+    assert next_session(con, "2026-08-20") == "2026-08-21"
+
+
+@pytest.mark.parametrize("fault", ["missing_calendar", "null_state", "conflict", "closed_origin", "skipped_session"])
+def test_cycle_calendar_unknown_cannot_use_observed_rows(con, fault):
+    _add_limit(con, "2026-08-20", "000001", 1)
+    _add_kline(con, "2026-08-25", "000001", 10)
+    sessions = None
+    if fault == "missing_calendar":
+        con.execute("DROP TABLE tushare_trade_cal")
+    elif fault == "null_state":
+        con.execute("UPDATE tushare_trade_cal SET is_open=NULL WHERE cal_date='2026-08-21'")
+    elif fault == "conflict":
+        con.execute("INSERT INTO tushare_trade_cal VALUES ('2026-08-21',false)")
+    elif fault == "closed_origin":
+        con.execute("UPDATE tushare_trade_cal SET is_open=false WHERE cal_date='2026-08-20'")
+    else:
+        sessions = ["2026-08-20", "2026-08-25"]
+    assert next_session(con, "2026-08-20", sessions) is None
+    assert compute_premium(con, "2026-08-20", sessions=sessions) == []
+
+
+def test_estimated_pool_never_enters_real_cohort_or_run_dates(con):
+    from scripts.generate_cycle_analytics import _trading_days
+    con.execute("CREATE TABLE derived_limit_up_daily(trade_date DATE, stock_code VARCHAR, board_level INTEGER)")
+    con.execute("INSERT INTO derived_limit_up_daily VALUES ('2026-08-20','000002',8),('2026-08-19','000003',9)")
+    _add_limit(con, "2026-08-20", "000001", 1)
+    _add_kline(con, "2026-08-21", "000001", 5)
+    _add_kline(con, "2026-08-21", "000002", -10)
+    assert _trading_days(con) == ["2026-08-20"]
+    rows = {r["board_bucket"]:r for r in compute_premium(con, "2026-08-20")}
+    assert set(rows) == {"1", "_all"} and rows['_all']['sample_size'] == 1
+    assert rows['_all']['avg_pct'] == 5
+    assert con.execute("SELECT count(*) FROM derived_limit_up_daily").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("bad_value", [None, float('nan'), float('inf')])
+def test_premium_keeps_missing_cohort_unknown_without_replacing_target(con, bad_value):
+    for code in ('000001','000002'):
+        _add_limit(con, "2026-08-20", code, 1)
+    _add_kline(con, "2026-08-21", "000001", 5)
+    _add_kline(con, "2026-08-21", "000002", bad_value)
+    _add_kline(con, "2026-08-24", "000002", 10)
+    row = next(r for r in compute_premium(con, "2026-08-20") if r['board_bucket']=='_all')
+    assert (row['sample_size'],row['observed_count'],row['missing_count']) == (2,1,1)
+    assert row['avg_pct'] is row['median_pct'] is row['win_rate'] is None
+
+
+def test_promotion_uses_max_height_and_requires_actual_increment(con):
+    for code, board in [('000001',1),('000001',2),('000002',2)]:
+        _add_limit(con, "2026-08-20", code, board)
+    _add_limit(con, "2026-08-21", "000001", 3)
+    _add_limit(con, "2026-08-21", "000002", 2)
+    assert compute_promotion(con, "2026-08-20") == [dict(trade_date='2026-08-20',from_board=2,candidates=2,promoted=1,rate=.5)]
+    con.execute("DELETE FROM v_limit_pool WHERE trade_date='2026-08-21'")
+    assert compute_promotion(con, "2026-08-20") == []
+
+
+def test_cycle_builder_rejects_unverified_dates_before_writing(con):
+    from scripts.generate_cycle_analytics import build
+    con.execute("DELETE FROM tushare_trade_cal WHERE cal_date='2026-08-21'")
+    before = con.execute("SHOW TABLES").fetchall()
+    with pytest.raises(ValueError, match='calendar'):
+        build(con, ['2026-08-20','2026-08-21'])
+    assert con.execute("SHOW TABLES").fetchall() == before

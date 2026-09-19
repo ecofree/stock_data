@@ -14,12 +14,12 @@ import duckdb
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from base import DuckDBStore, KPLClient
-from collect_misc import collect_auction_market
-from config import API_KEY, TODAY
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_misc import collect_auction_market
+from trade_system.config import API_KEY, TODAY
+from trade_system.schema import init_schema
 from trade_system.api_health import require_api_key
-from trade_system.stock_data_sources import _from_tencent_quote
+from trade_system.quote_transport import fetch_parts as _from_tencent_quote
 
 
 def _ensure_batch(con: duckdb.DuckDBPyConnection) -> None:

@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trade_system.risk import init_trading_tables
+from trade_system.operator_outcomes import init_trading_tables
 
 
 def main() -> int:

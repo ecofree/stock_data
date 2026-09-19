@@ -162,7 +162,7 @@ def experimental_theme_score(
     return result
 
 
-def _rank(values: Sequence[float]) -> list[float]:
+def average_ranks(values: Sequence[float]) -> list[float]:
     ordered = sorted(enumerate(values), key=lambda item: item[1])
     ranks = [0.0] * len(values)
     index = 0
@@ -177,7 +177,7 @@ def _rank(values: Sequence[float]) -> list[float]:
     return ranks
 
 
-def _correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
+def correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
     if len(left) != len(right) or len(left) < 2:
         return None
     left_mean, right_mean = mean(left), mean(right)
@@ -214,7 +214,7 @@ def validate_experimental_theme_scores(
     returns = [item[2] for item in usable]
     unique_dates = len({item[0] for item in usable})
     enough = len(usable) >= min_samples and unique_dates >= min_dates
-    ic = _correlation(_rank(scores), _rank(returns)) if enough else None
+    ic = correlation(average_ranks(scores), average_ranks(returns)) if enough else None
     result = {
         "contract_version": METRIC_CONTRACT_VERSION,
         "status": "validation_ready" if enough else "insufficient_sample",

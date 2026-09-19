@@ -20,8 +20,8 @@ import duckdb
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from base import connect_duckdb  # noqa: E402
-from schema import init_schema  # noqa: E402
+from trade_system.data_store import connect_duckdb  # noqa: E402
+from trade_system.schema import init_schema  # noqa: E402
 from trade_system.normalize import build_normalized_views  # noqa: E402
 
 

@@ -16,10 +16,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_lhb import collect_all_lhb
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_lhb import collect_all_lhb
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 
 
 def _collect_eastmoney_fallback(db_path: str | Path, trade_date: str) -> int:
@@ -29,7 +29,7 @@ def _collect_eastmoney_fallback(db_path: str | Path, trade_date: str) -> int:
     ``raw_json`` so the source can be audited instead of being mistaken for a
     KPL-authoritative batch.
     """
-    from trade_system.stock_data_sources import _from_em_dragon_tiger_daily
+    from trade_system.adapters.eastmoney_dc import _from_em_dragon_tiger_daily
 
     payload = _from_em_dragon_tiger_daily(trade_date) or {}
     stocks = payload.get("stocks") or []
@@ -78,7 +78,7 @@ def _collect_eastmoney_fallback(db_path: str | Path, trade_date: str) -> int:
 
 def enrich_lhb_reason(db_path: str | Path, trade_date: str) -> int:
     """Fill missing KPL reasons from the direct Eastmoney data-center feed."""
-    from trade_system.stock_data_sources import _from_em_dragon_tiger_daily
+    from trade_system.adapters.eastmoney_dc import _from_em_dragon_tiger_daily
 
     try:
         payload = _from_em_dragon_tiger_daily(trade_date) or {}

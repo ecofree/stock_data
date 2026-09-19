@@ -10,23 +10,24 @@ from __future__ import annotations
 from datetime import date, datetime
 import math
 import json
+import hashlib
 from pathlib import Path
 import time
 from typing import Any, Iterable
 
 import duckdb
 
-from base import DuckDBStore
+from trade_system.data_store import DuckDBStore
 from trade_system.schema import init_schema
-from trade_system.tushare_store import (collect_tushare_stock_basic, collect_tushare_trade_cal, ts_code_to_stock_code)
+from trade_system.tushare_store import (
+    MARKET_FIELDS, bulk_replace, index_code_to_ts_code, market_batch,
+    stock_code_to_ts_code, store_reference, ts_code_to_stock_code,
+)
 from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 
 
 CHECKPOINT_DATE = "1900-01-01"
-DAILY_FIELDS = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg"
-DAILY_BASIC_FIELDS = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv"
-ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
 # Stock order buckets share one request and one atomic snapshot.
 MONEYFLOW_MAIN_FIELDS = (
     "ts_code,trade_date,buy_elg_amount,sell_elg_amount,buy_lg_amount,sell_lg_amount,net_mf_amount"
@@ -41,7 +42,6 @@ INDUSTRY_FIELDS = (
     "net_amount_rate,buy_elg_amount,buy_lg_amount,buy_md_amount,buy_sm_amount"
 )
 STOCK_SNAPSHOT_DATASETS = {"daily", "daily_basic", "adj_factor"}
-MIN_STOCK_SNAPSHOT_COVERAGE = 0.99
 
 
 def _iso(value: str | date) -> str:
@@ -66,25 +66,14 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def _pages(client: XiaodefaClient, api: str, params: dict[str, Any], fields: str,
-           *, page_size: int, max_pages: int = 10) -> Iterable[tuple[int, list[dict[str, Any]]]]:
-    for page_no in range(max_pages):
-        query = dict(params)
-        query.update(limit=page_size, offset=page_no * page_size)
-        rows = client.query_rows(api, query, fields)
-        yield page_no, rows
-        if len(rows) < page_size:
-            break
-
-
 class TushareHistoryCollector:
     def __init__(self, db_path: str | Path, *, client: XiaodefaClient | None = None,
                  request_timeout: int = 20, retries: int = 3,
                  batch_limit: int = 5000, moneyflow_page_size: int = 1000,
-                 budget_seconds: float = 300.0):
+                 budget_seconds: float = 300.0, offline: bool = False):
         # Validate the only approved client before opening a business database.
-        self.client = client if client is not None else XiaodefaClient(
-            timeout=request_timeout, max_retries=retries)
+        self.client = client if client is not None else (None if offline else XiaodefaClient(
+            timeout=request_timeout, max_retries=retries))
         self.db_path = str(db_path)
         self.store = DuckDBStore(self.db_path)
         init_schema(self.store.conn)
@@ -111,22 +100,44 @@ class TushareHistoryCollector:
         """Reject an empty/short real close snapshot before publishing it."""
         if not self._is_production_source():
             return
-        observed = len(rows)
-        if observed <= 0:
+        if not rows:
             raise XiaodefaError(f"empty {dataset} response for {_iso(trade_date)}")
-        expected = self._expected_stock_count()
-        # A live listed universe is normally >5,000 rows.  Keep the threshold
-        # proportional so a few suspended/unavailable names are acceptable,
-        # while a truncated relay page cannot become a successful close.
-        if expected >= 1000 and observed < max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE)):
-            raise XiaodefaError(
-                f"incomplete {dataset} response: {observed}/{expected} rows for {_iso(trade_date)}"
-            )
+        expected = self._expected_stock_codes(trade_date, dataset)
+        observed = {r["ts_code"] if isinstance(r, dict) else r[0] for r in rows}
+        if dataset == 'moneyflow' and expected - observed:
+            self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
+                            'ts_code,trade_date,suspend_timing,suspend_type')
+            expected = self._expected_stock_codes(trade_date, dataset)
+        if not expected or expected - observed:
+            raise XiaodefaError(f"incomplete {dataset} response: "
+                               f"{len(expected - observed)} missing instruments; expected universe={len(expected)}")
 
-    def _expected_stock_count(self) -> int:
-        return int(self.store.conn.execute(
-            "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
-        ).fetchone()[0] or 0)
+    def _expected_stock_codes(self, trade_date, dataset=None):
+        expected = {r[0] for r in self.store.conn.execute(
+            "SELECT DISTINCT ts_code FROM tushare_stock_basic WHERE ts_code IS NOT NULL "
+            "AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
+            "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [_iso(trade_date)] * 2).fetchall()}
+        if dataset == "moneyflow":
+            receipts = self.store.conn.execute(
+                "SELECT payload_json FROM multi_source_observation WHERE data_type='tushare_suspend_d' "
+                "AND provider='xiaodefa' AND json_extract_string(payload_json,'$.params.trade_date')=? "
+                "ORDER BY observed_at DESC LIMIT 1", [_ymd(trade_date)]).fetchall()
+            for (payload,) in receipts:
+                receipt = json.loads(payload)
+                if receipt.get('params', {}).get('trade_date') != _ymd(trade_date):
+                    continue
+                rows = receipt['rows']
+                if (len({r.get('ts_code') for r in rows}) != len(rows)
+                        or any(r.get('trade_date') != _ymd(trade_date) for r in rows)):
+                    break  # Ambiguous suspension evidence cannot shrink the universe.
+                suspended = {r['ts_code'] for r in rows if r.get('trade_date') == _ymd(trade_date)
+                             and r.get('suspend_type') == 'S' and r.get('suspend_timing') in (None, '')}
+                zero = {r[0] for r in self.store.conn.execute(
+                    "SELECT ts_code FROM tushare_daily WHERE date=? AND volume=0 AND turnover=0",
+                    [_iso(trade_date)]).fetchall()}
+                expected -= suspended & zero
+                break
+        return expected
 
     def _is_production_source(self) -> bool:
         return isinstance(self.client, XiaodefaClient)
@@ -140,14 +151,8 @@ class TushareHistoryCollector:
 
 
     def _is_complete_stock_table(self, table: str, date_column: str, trade_date: str) -> bool:
-        expected = self._expected_stock_count()
-        if expected < 1000:
-            return False
-        observed = int(self.store.conn.execute(
-            f"SELECT count(DISTINCT ts_code) FROM {table} WHERE {date_column}=? AND ts_code IS NOT NULL",
-            [_iso(trade_date)],
-        ).fetchone()[0] or 0)
-        return observed >= max(1000, math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE))
+        expected = self._expected_stock_codes(trade_date, table.removeprefix("tushare_"))
+        return bool(expected) and expected <= self._covered_codes(table.removeprefix("tushare_"), trade_date)
 
     def _certify_close_snapshot(self, dataset: str, trade_date: str, *, status: str,
                                 error_message: str = "", provider: str = "tushare") -> None:
@@ -160,7 +165,7 @@ class TushareHistoryCollector:
         if not spec:
             return
         table, date_column, value_column = spec
-        expected = self._expected_stock_count()
+        expected = len(self._expected_stock_codes(trade_date))
         observed = int(self.store.conn.execute(
             f"SELECT count(*) FROM {table} WHERE {date_column}=?", [_iso(trade_date)]
         ).fetchone()[0] or 0)
@@ -178,7 +183,7 @@ class TushareHistoryCollector:
         certified = (
             status == "certified"
             and expected >= 1000
-            and distinct_codes >= math.ceil(expected * MIN_STOCK_SNAPSHOT_COVERAGE)
+            and self._is_complete_stock_table(table, date_column, trade_date)
             and invalid_rows == 0
         )
         final_status = "certified" if certified else (status if status != "certified" else "incomplete")
@@ -245,7 +250,7 @@ class TushareHistoryCollector:
             # re-fetches the date instead of permanently skipping it.
             if count == 0:
                 return False
-            if dataset in STOCK_SNAPSHOT_DATASETS and not self._is_complete_stock_table(table, date_column, trade_date):
+            if dataset in STOCK_SNAPSHOT_DATASETS | {"moneyflow"} and not self._is_complete_stock_table(table, date_column, trade_date):
                 return False
         return True
 
@@ -257,33 +262,60 @@ class TushareHistoryCollector:
         ).fetchone()
         return int((row[0] if row else 0) or 0) + 1
 
-    def _bulk_replace(self, table: str, rows: list[tuple], columns: list[str], replace_on: list[str]) -> int:
-        """Write a batch with one temp-table load and set-based delete/insert."""
+    def _read_rows(self, api, params, fields):
+        if self.client is None:
+            raise XiaodefaError("offline collector cannot acquire data")
+        # Keep the original acquisition time and source identity even when a
+        # later page or coverage validation fails. Reuse the existing receipt table.
+        def record(offset, rows):
+            payload = _json({"source": "tushare", "delivery": self._provider_name(self.client),
+                             "api": api, "params": params, "offset": offset, "rows": rows})
+            self.store.conn.execute(
+                "INSERT INTO multi_source_observation "
+                "(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ["tushare_" + api, "receipt", params.get("ts_code"), self._provider_name(self.client),
+                 "received_unverified", payload, hashlib.sha256(payload.encode()).hexdigest()])
+        if self._is_production_source():
+            return self.client.query_all(api, page_size=self.batch_limit, fields=fields,
+                                         on_page=record, **params)
+        rows = self.client.query_rows(api, params, fields)
+        record(0, rows)
+        return rows
+
+    def _collect_reference(self, dataset, start=None, end=None):
+        if dataset == "trade_cal":
+            params = {"start_date": start, "end_date": end}
+            fields = "exchange,cal_date,is_open,pretrade_date"
+        else:
+            params = {"exchange": "", "list_status": "L"}
+            fields = "ts_code,symbol,name,area,industry,market,list_date,list_status,delist_date"
+        rows = []
+        selectors = ([dict(params, exchange=e) for e in ("SSE", "SZSE")] if dataset == "trade_cal"
+                     else [dict(params, list_status=s) for s in ("L", "D")])
+        for request in selectors:
+            batch = self._read_rows(dataset, request, fields)
+            if dataset == "trade_cal":
+                days = {_iso(r.get("cal_date")) for r in batch}
+                if (len(days) != len(batch) or len(days) != (date.fromisoformat(_iso(end)) - date.fromisoformat(_iso(start))).days + 1
+                        or any(r.get("exchange") != request["exchange"] or not _iso(start) <= _iso(r["cal_date"]) <= _iso(end)
+                               or str(r.get("is_open")) not in {"0", "1"} for r in batch)):
+                    raise XiaodefaError("incomplete or invalid exchange calendar response")
+            elif ((request["list_status"] == "L" and not batch) or any(
+                    r.get("list_status") != request["list_status"] or
+                    (r["list_status"] == "D" and (not r.get("delist_date") or not r.get("list_date")
+                     or _iso(r["delist_date"]) <= _iso(r["list_date"]))) for r in batch)):
+                raise XiaodefaError("invalid stock lifecycle response")
+            rows.extend(batch)
         if not rows:
-            return 0
-        temp = "_history_batch"
-        self.store.conn.execute(f"DROP TABLE IF EXISTS {temp}")
-        projection = ",".join(columns)
-        self.store.conn.execute(f"CREATE TEMP TABLE {temp} AS SELECT {projection} FROM {table} LIMIT 0")
-        placeholders = ",".join("?" for _ in columns)
-        self.store.conn.executemany(f"INSERT INTO {temp}({projection}) VALUES ({placeholders})", rows)
-        join = " AND ".join(f"target.{key}=batch.{key}" for key in replace_on)
-        self.store.conn.execute(
-            f"DELETE FROM {table} AS target WHERE EXISTS (SELECT 1 FROM {temp} AS batch WHERE {join})"
-        )
-        self.store.conn.execute(f"INSERT INTO {table}({projection}) SELECT {projection} FROM {temp}")
-        self.store.conn.execute(f"DROP TABLE {temp}")
-        return len(rows)
+            raise XiaodefaError(f"empty {dataset} response")
+        return store_reference(self.store, dataset, rows)
 
     def _query_date_batch(self, api: str, trade_date: str, fields: str, *, with_limit: bool = True) -> list[dict[str, Any]]:
         """One acquisition; page termination and coverage are independent checks."""
         target = _iso(trade_date)
         params = {"trade_date": _ymd(trade_date)}
-        if self._is_production_source():
-            rows = self.client.query_all(api, page_size=self.batch_limit,
-                                         fields=fields, **params)
-        else:
-            rows = self.client.query_rows(api, params, fields)
+        rows = self._read_rows(api, params, fields)
         if any(not r.get("ts_code") or not r.get("trade_date") or
                _iso(r["trade_date"]) != target for r in rows):
             raise XiaodefaError("response contains wrong session or missing identity")
@@ -296,165 +328,135 @@ class TushareHistoryCollector:
 
 
 
-    def ensure_calendar(self, start_date: str, end_date: str) -> list[str]:
-        start = datetime.strptime(_iso(start_date), "%Y-%m-%d").date()
-        end = datetime.strptime(_iso(end_date), "%Y-%m-%d").date()
+    def ensure_calendar(self, start_date: str, end_date: str, *, allow_fetch: bool = True) -> list[str]:
+        start = date.fromisoformat(_iso(start_date))
+        end = date.fromisoformat(_iso(end_date))
         if end < start:
             raise ValueError("end_date must be on or after start_date")
-        expected_calendar_days = (end - start).days + 1
-        params = [_iso(start_date), _iso(end_date)]
-        stored_calendar_days = int(self.store.conn.execute(
-            "SELECT count(DISTINCT cal_date) FROM tushare_trade_cal "
-            "WHERE cal_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
-            params,
-        ).fetchone()[0])
-        if stored_calendar_days < expected_calendar_days:
+        expected_days = (end - start).days + 1
+
+        def read_calendar():
+            result = {}
+            for day, opened in self.store.conn.execute(
+                "SELECT CAST(cal_date AS VARCHAR),CASE WHEN count(*)=2 AND count(DISTINCT exchange)=2 "
+                "AND count(is_open)=2 AND min(is_open)=max(is_open) THEN bool_and(is_open) END "
+                "FROM tushare_trade_cal WHERE exchange IN ('SSE','SZSE') "
+                "AND cal_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE) GROUP BY cal_date",
+                [start, end]).fetchall():
+                if day in result and result[day] != opened:
+                    raise XiaodefaError("conflicting exchange calendar states")
+                result[day] = opened
+            return result
+
+        calendar = read_calendar()
+        if len(calendar) < expected_days or None in calendar.values():
+            if not allow_fetch:
+                raise XiaodefaError("verified calendar required for offline planning")
             try:
-                collect_tushare_trade_cal(
-                    self.client, self.store, _ymd(start_date), _ymd(end_date)
-                )
-                self.store.conn.commit()
+                self._collect_reference("trade_cal", _ymd(start_date), _ymd(end_date))
             except Exception as exc:
-                # Historical relay partitions may reject trade_cal even when
-                # the canonical daily table already proves the requested
-                # session existed.  Use only those real observed dates as a
-                # fail-safe; never synthesize weekdays.
-                observed = int(self.store.conn.execute(
-                    "SELECT count(DISTINCT date) FROM tushare_daily "
-                    "WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
-                    params,
-                ).fetchone()[0] or 0)
-                if observed == expected_calendar_days:
-                    return [str(row[0])[:10] for row in self.store.conn.execute(
-                        "SELECT DISTINCT CAST(date AS VARCHAR) FROM tushare_daily "
-                        "WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE) ORDER BY date",
-                        params,
-                    ).fetchall()]
-                raise XiaodefaError(
-                    f"trade_cal fetch failed for {_iso(start_date)}..{_iso(end_date)}: {exc}"
-                ) from exc
-            stored_calendar_days = int(self.store.conn.execute(
-                "SELECT count(DISTINCT cal_date) FROM tushare_trade_cal "
-                "WHERE cal_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)",
-                params,
-            ).fetchone()[0])
-        if stored_calendar_days < expected_calendar_days:
-            raise XiaodefaError(
-                "trade_cal incomplete for "
-                f"{_iso(start_date)}..{_iso(end_date)}: "
-                f"{stored_calendar_days}/{expected_calendar_days} calendar days"
-            )
-        rows = self.store.conn.execute(
-            "SELECT CAST(cal_date AS VARCHAR) FROM tushare_trade_cal "
-            "WHERE cal_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE) AND is_open=TRUE ORDER BY cal_date",
-            params,
-        ).fetchall()
-        # An empty result is valid only after the entire calendar range has
-        # been verified (for example a weekend or exchange holiday).  Never
-        # synthesize weekdays when the upstream calendar is absent.
-        return [str(row[0])[:10] for row in rows]
+                raise XiaodefaError(f"trade_cal fetch failed for {start}..{end}: {exc}") from exc
+            calendar = read_calendar()
+        if len(calendar) != expected_days or None in calendar.values():
+            raise XiaodefaError(f"trade_cal incomplete for {start}..{end}: {len(calendar)}/{expected_days}")
+        # Stored prices never substitute for the exchange calendar. Closed and
+        # unknown sessions cannot be silently converted into trading days.
+        return sorted(day for day, opened in calendar.items() if opened)
 
     def collect_stock_basic(self, *, force: bool = False) -> int:
         if self._is_done("stock_basic", CHECKPOINT_DATE, force):
             return 0
         self._checkpoint("stock_basic", CHECKPOINT_DATE, "running", attempts=1)
         try:
-            rows = collect_tushare_stock_basic(self.client, self.store)
+            rows = self._collect_reference("stock_basic")
             self.store.conn.commit()
             self._checkpoint("stock_basic", CHECKPOINT_DATE, "success", rows=rows, attempts=1)
             return rows
         except Exception as exc:
             self._checkpoint("stock_basic", CHECKPOINT_DATE, "error", attempts=1, error=str(exc))
-            return 0
+            raise
 
-    def _collect_daily(self, trade_date: str) -> int:
-        # Date-wide daily responses fit in the relay's 5,000-row envelope for
-        # the current listed universe.  Avoid a second offset request: some
-        # relay deployments reject an offset exactly at the first page size.
-        # The migrated relay returns the complete date snapshot when no limit
-        # is supplied (recent listed universe is >5,000 rows).  Supplying the
-        # nominal 5,000-row limit silently truncates the tail and makes a
-        # partial day look successful.
-        rows = self._query_date_batch("daily", trade_date, DAILY_FIELDS, with_limit=False)
-        deduped = {}
-        for row in rows:
-            if row.get("ts_code") and row.get("trade_date"):
-                deduped[(row.get("ts_code"), _iso(row.get("trade_date")))] = (
-                    row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
-                    _num(row.get("open")), _num(row.get("high")), _num(row.get("low")), _num(row.get("close")),
-                    _num(row.get("vol")), _num(row.get("amount")), _num(row.get("pct_chg")),
-                    "hands", "thousand_yuan", "none", self._last_source_provider)
-        out = list(deduped.values())
-        self._validate_stock_snapshot("daily", out, trade_date)
-        # Clear stale/partial rows only after a complete-looking response has
-        # arrived, so a failed request never destroys the last usable batch.
+    def _applicable_codes(self, codes, trade_date):
+        known = {r[0] for r in self.store.conn.execute("SELECT ts_code FROM tushare_stock_basic").fetchall()}
+        # Unknown identities remain required; only dated lifecycle facts exclude them.
+        return set(codes) - (known - self._expected_stock_codes(trade_date))
+
+    def _covered_codes(self, dataset, trade_date):
+        predicate = "TRUE"
+        if dataset in {"daily", "index_daily"}:
+            predicate = "close>0 AND isfinite(close)"
+        elif dataset == "adj_factor":
+            predicate = "adj_factor>0 AND isfinite(adj_factor)"
+        elif dataset == "moneyflow":
+            predicate = "(" + " OR ".join(f"isfinite({f})" for f in
+                ("net_mf_amount", "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount")) + ")"
+        elif dataset == "daily_basic":
+            predicate = "(" + " OR ".join(f"isfinite({f})" for f in
+                ("turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv")) + ")"
+        return {r[0] for r in self.store.conn.execute(
+            f"SELECT ts_code FROM tushare_{dataset} WHERE date=? AND {predicate} GROUP BY ts_code HAVING count(*)=1",
+            [_iso(trade_date)]).fetchall()}
+
+    def _collect_market(self, dataset, trade_date, *, codes=None, force=False):
+        expected = None if codes is None else (set(codes) if dataset == "index_daily"
+                                               else self._applicable_codes(codes, trade_date))
+        if expected is None:
+            rows = self._query_date_batch(dataset, trade_date, MARKET_FIELDS[dataset])
+        else:
+            missing = expected if force else expected - self._covered_codes(dataset, trade_date)
+            rows = []
+            for code in sorted(missing):
+                if not self._budget_left():
+                    raise XiaodefaError("request budget exhausted; coverage incomplete")
+                batch = self._read_rows(dataset, {"ts_code": code, "trade_date": _ymd(trade_date)},
+                                        MARKET_FIELDS[dataset])
+                if any(r.get("ts_code") != code or _iso(r.get("trade_date")) != _iso(trade_date)
+                       for r in batch):
+                    raise XiaodefaError("scoped response identity/session mismatch")
+                if len(batch) > 1:
+                    raise XiaodefaError("duplicate instrument in scoped snapshot")
+                rows.extend(batch)
+        value = "adj_factor" if dataset == "adj_factor" else "close"
+        if dataset != "daily_basic" and any(
+            _num(r.get(value)) is None or not math.isfinite(_num(r.get(value))) or _num(r.get(value)) <= 0
+            for r in rows
+        ):
+            raise XiaodefaError("invalid price or adjustment in response")
+        if dataset == "daily_basic" and any(not any(
+            _num(r.get(f)) is not None and math.isfinite(_num(r.get(f)))
+            for f in ("turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv")
+        ) for r in rows):
+            raise XiaodefaError("daily_basic contains no qualified fields")
+        out, columns = market_batch(dataset, rows, self._provider_name(self.client))
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
-            self.store.conn.execute("DELETE FROM tushare_daily WHERE date=?", [_iso(trade_date)])
-            count = self._bulk_replace(
-                "tushare_daily", out,
-                ["ts_code", "stock_code", "date", "open", "high", "low", "close", "volume", "turnover", "change_pct", "volume_unit", "amount_unit", "adjustment", "provider"],
-                ["ts_code", "date"],
-            )
+            count = bulk_replace(self.store.conn, "tushare_" + dataset, out, columns, ["ts_code", "date"])
             self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("daily", trade_date, status="certified", provider=self._last_source_provider)
-            return count
         except Exception:
             self.store.conn.execute("ROLLBACK")
             raise
+        if expected is not None:
+            unresolved = (expected - {r["ts_code"] for r in rows} if force
+                          else expected - self._covered_codes(dataset, trade_date))
+            if unresolved:
+                raise XiaodefaError(f"coverage incomplete: {len(unresolved)} missing instruments; "
+                                   "provider absence does not prove suspension")
+        else:
+            missing = self._expected_stock_codes(trade_date) - self._covered_codes(dataset, trade_date)
+            if missing:
+                raise XiaodefaError(f"coverage incomplete: {len(missing)} instruments lack qualified fields")
+            self._certify_close_snapshot(dataset, trade_date, status="certified",
+                                         provider=self._provider_name(self.client))
+        return count
 
-    def _collect_daily_basic(self, trade_date: str) -> int:
-        rows = self._query_date_batch("daily_basic", trade_date, DAILY_BASIC_FIELDS, with_limit=False)
-        deduped = {}
-        for row in rows:
-            if row.get("ts_code") and row.get("trade_date"):
-                deduped[(row.get("ts_code"), _iso(row.get("trade_date")))] = (
-                    row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")), _iso(row.get("trade_date")),
-                    _num(row.get("turnover_rate")), _num(row.get("volume_ratio")), _num(row.get("pe")),
-                    _num(row.get("pb")), _num(row.get("total_mv")), _num(row.get("circ_mv")))
-        out = list(deduped.values())
-        self._validate_stock_snapshot("daily_basic", out, trade_date)
-        self.store.conn.execute("BEGIN TRANSACTION")
-        try:
-            self.store.conn.execute("DELETE FROM tushare_daily_basic WHERE date=?", [_iso(trade_date)])
-            count = self._bulk_replace(
-                "tushare_daily_basic", out,
-                ["ts_code", "stock_code", "date", "turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv"],
-                ["ts_code", "date"],
-            )
-            self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("daily_basic", trade_date, status="certified", provider=self._last_source_provider)
-            return count
-        except Exception:
-            self.store.conn.execute("ROLLBACK")
-            raise
+    def _collect_daily(self, trade_date):
+        return self._collect_market("daily", trade_date)
 
-    def _collect_adj_factor(self, trade_date: str) -> int:
-        # Like daily/daily_basic, the relay's date-wide response is the
-        # complete market snapshot only when no 5,000-row limit is supplied.
-        rows = self._query_date_batch("adj_factor", trade_date, ADJ_FACTOR_FIELDS, with_limit=False)
-        deduped = {}
-        for row in rows:
-            if row.get("ts_code") and row.get("trade_date") and row.get("adj_factor") is not None:
-                deduped[(row.get("ts_code"), _iso(row.get("trade_date")))] = (
-                    row.get("ts_code"), ts_code_to_stock_code(row.get("ts_code")),
-                    _iso(row.get("trade_date")), _num(row.get("adj_factor")))
-        out = list(deduped.values())
-        self._validate_stock_snapshot("adj_factor", out, trade_date)
-        self.store.conn.execute("BEGIN TRANSACTION")
-        try:
-            self.store.conn.execute("DELETE FROM tushare_adj_factor WHERE date=?", [_iso(trade_date)])
-            count = self._bulk_replace(
-                "tushare_adj_factor", out,
-                ["ts_code", "stock_code", "date", "adj_factor"],
-                ["ts_code", "date"],
-            )
-            self.store.conn.execute("COMMIT")
-            self._certify_close_snapshot("adj_factor", trade_date, status="certified", provider=self._last_source_provider)
-            return count
-        except Exception:
-            self.store.conn.execute("ROLLBACK")
-            raise
+    def _collect_daily_basic(self, trade_date):
+        return self._collect_market("daily_basic", trade_date)
+
+    def _collect_adj_factor(self, trade_date):
+        return self._collect_market("adj_factor", trade_date)
 
     def _collect_moneyflow(self, trade_date: str) -> int:
         # Request the retained provider's full projection once. Missing values stay NULL.
@@ -467,7 +469,7 @@ class TushareHistoryCollector:
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute("DELETE FROM tushare_moneyflow WHERE date=?", [_iso(trade_date)])
-            total = self._bulk_replace("tushare_moneyflow", out,
+            total = bulk_replace(self.store.conn, "tushare_moneyflow", out,
                 ["ts_code","stock_code","date","buy_sm_amount","sell_sm_amount","buy_md_amount",
                  "sell_md_amount","buy_lg_amount","sell_lg_amount","buy_elg_amount","sell_elg_amount","net_mf_amount"],
                 ["ts_code","date"])
@@ -502,7 +504,7 @@ class TushareHistoryCollector:
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             self.store.conn.execute("DELETE FROM tushare_moneyflow_industry WHERE trade_date=?", [_iso(trade_date)])
-            count = self._bulk_replace(
+            count = bulk_replace(self.store.conn,
                 "tushare_moneyflow_industry", out,
                 ["trade_date", "ts_code", "sector_name", "change_pct", "close", "net_amount", "buy_elg_amount", "sell_elg_amount",
                  "buy_lg_amount", "sell_lg_amount", "buy_md_amount", "sell_md_amount", "buy_sm_amount", "sell_sm_amount", "raw_json"],
@@ -549,7 +551,7 @@ class TushareHistoryCollector:
                 "DELETE FROM multi_source_stock_flow WHERE source_date=? AND provider='tushare'",
                 [_iso(trade_date)],
             )
-            count = self._bulk_replace(
+            count = bulk_replace(self.store.conn,
                 "multi_source_stock_flow", out,
                 ["source_date", "stock_code", "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net", "provider", "amount_unit", "flow_definition", "source_api", "origin_provider", "field_mapping_version", "is_stale", "raw_json"],
                 ["source_date", "stock_code", "provider"],
@@ -563,20 +565,21 @@ class TushareHistoryCollector:
     def sync_sector_flow(self, trade_date: str) -> int:
         rows = self.store.conn.execute(
             "SELECT ts_code,sector_name,change_pct,close,net_amount,buy_elg_amount,sell_elg_amount,"
-            "buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount "
+            "buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount,raw_json "
             "FROM tushare_moneyflow_industry WHERE trade_date=? AND close IS NOT NULL AND close>0",
             [_iso(trade_date)],
         ).fetchall()
         out = []
         for row in rows:
+            raw = json.loads(row[13] or '{}')
             # Unlike stock-level ``moneyflow`` (万元), TuShare's DC industry
             # endpoint documents these fields as yuan.  Do not multiply them
             # again or sector totals become four orders of magnitude too high.
             super_net, large, mid, small = [_num(row[i]) for i in (5, 7, 9, 11)]
             out.append([_iso(trade_date), row[0], row[1], _num(row[4]) if row[4] is not None else None,
                         super_net, large, mid, small, row[2], "tushare_sector_full",
-                        "tushare_dc_sector", "yuan", False,
-                        _json({"close": row[3], "source": "moneyflow_ind_dc", "unit": "yuan"})])
+                        {"行业": "em_industry", "概念": "em_concept", "地域": "em_region"}.get(raw.get('content_type'), 'tushare_dc_sector'), "yuan", False,
+                        _json({**raw, "close": row[3], "source": "moneyflow_ind_dc", "unit": "yuan"})])
         if not out:
             return 0
         self.store.conn.execute("BEGIN TRANSACTION")
@@ -585,7 +588,7 @@ class TushareHistoryCollector:
                 "DELETE FROM multi_source_sector_flow WHERE source_date=? AND provider IN ('tushare','tushare_sector_full')",
                 [_iso(trade_date)],
             )
-            count = self._bulk_replace(
+            count = bulk_replace(self.store.conn,
                 "multi_source_sector_flow", out,
                 ["source_date", "sector_code", "sector_name", "main_net", "super_net", "large_net", "mid_net", "small_net", "change_pct", "provider", "sector_type", "amount_unit", "is_stale", "raw_json"],
                 ["source_date", "sector_code", "provider"],
@@ -598,14 +601,41 @@ class TushareHistoryCollector:
 
     def run(self, start_date: str, end_date: str, *, datasets: Iterable[str],
             max_days: int | None = None, force: bool = False, gap_only: bool = False,
-            retry_passes: int = 0, retry_delay_seconds: float = 0.0) -> dict[str, Any]:
+            retry_passes: int = 0, retry_delay_seconds: float = 0.0,
+            stock_codes: Iterable[str] | None = None, index_codes: Iterable[str] | None = None,
+            plan_only: bool = False) -> dict[str, Any]:
         datasets = list(dict.fromkeys(datasets))
-        dates = self.ensure_calendar(start_date, end_date)
+        supported = set(MARKET_FIELDS) | {"stock_basic", "moneyflow", "industry_flow"}
+        if not datasets or set(datasets) - supported:
+            raise ValueError("unsupported or empty TuShare datasets")
+        stocks = None if stock_codes is None else sorted({stock_code_to_ts_code(c) for c in stock_codes})
+        indexes = None if index_codes is None else sorted({index_code_to_ts_code(c) for c in index_codes})
+        if stocks is not None and (not stocks or set(datasets) - set(MARKET_FIELDS)):
+            raise ValueError("stock scope requires nonempty codes and only daily/basic/adjustment/index datasets")
+        if "index_daily" in datasets and not indexes:
+            raise ValueError("index_daily requires explicit index_codes")
+        scopes = {d: indexes if d == "index_daily" else stocks for d in datasets if d in MARKET_FIELDS}
+
+        def checkpoint_key(dataset):
+            codes = scopes.get(dataset)
+            if codes is None:
+                return dataset
+            identity = hashlib.sha256(_json(codes).encode()).hexdigest()
+            return f"{dataset}:scope:{identity}"
+
+        def is_done(dataset, trade_date):
+            codes = scopes.get(dataset)
+            if codes is None:
+                return self._is_done(dataset, trade_date, force)
+            expected = set(codes) if dataset == "index_daily" else self._applicable_codes(codes, trade_date)
+            return not force and expected <= self._covered_codes(dataset, trade_date)
+
+        dates = self.ensure_calendar(start_date, end_date, allow_fetch=not plan_only)
         if gap_only:
             dates = [
                 trade_date for trade_date in dates
                 if any(
-                    dataset != "stock_basic" and not self._is_done(dataset, trade_date, force=False)
+                    dataset != "stock_basic" and not is_done(dataset, trade_date)
                     for dataset in datasets
                 )
             ]
@@ -618,12 +648,18 @@ class TushareHistoryCollector:
         # and let the checkpointed history pass repair older gaps afterwards.
         dates = list(reversed(dates))
         results_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        if "stock_basic" in datasets and self._budget_left():
-            results_by_key[("stock_basic", CHECKPOINT_DATE)] = {
-                "dataset": "stock_basic",
-                "trade_date": CHECKPOINT_DATE,
-                "status": "success" if self.collect_stock_basic(force=force) else "empty",
-            }
+        if "stock_basic" in datasets:
+            reference = {"dataset": "stock_basic", "trade_date": CHECKPOINT_DATE}
+            try:
+                if plan_only:
+                    reference["status"] = "planned"
+                elif not self._budget_left():
+                    reference["status"] = "budget_exhausted"
+                else:
+                    reference["status"] = "success" if self.collect_stock_basic(force=force) else "skipped"
+            except Exception as exc:
+                reference.update(status="error", error=str(exc)[:240])
+            results_by_key[("stock_basic", CHECKPOINT_DATE)] = reference
         handlers = {
             "daily": self._collect_daily,
             "daily_basic": self._collect_daily_basic,
@@ -636,7 +672,7 @@ class TushareHistoryCollector:
             failed_keys: set[tuple[str, str]] = set()
             for trade_date in dates:
                 for dataset in datasets:
-                    if dataset == "stock_basic" or dataset not in handlers:
+                    if dataset == "stock_basic" or dataset not in (set(handlers) | set(MARKET_FIELDS)):
                         continue
                     key = (dataset, _iso(trade_date))
                     if retry_keys is not None and key not in retry_keys:
@@ -648,22 +684,38 @@ class TushareHistoryCollector:
                             "status": "budget_exhausted",
                         }
                         continue
-                    if self._is_done(dataset, trade_date, force):
+                    if plan_only:
+                        codes = scopes.get(dataset)
+                        expected = None if codes is None else (set(codes) if dataset == "index_daily"
+                            else self._applicable_codes(codes, trade_date))
+                        results_by_key[key] = {"dataset": dataset, "trade_date": trade_date,
+                            "status": "covered" if is_done(dataset, trade_date) else "planned",
+                            "missing_codes": sorted(expected - self._covered_codes(dataset, trade_date))
+                                             if expected is not None else None,
+                            "not_listed_codes": sorted(set(codes) - expected) if expected is not None else []}
+                        continue
+                    if is_done(dataset, trade_date):
                         results_by_key.setdefault(key, {
                             "dataset": dataset,
                             "trade_date": trade_date,
                             "status": "skipped",
                         })
                         continue
-                    attempt = self._next_attempt(dataset, trade_date)
-                    self._checkpoint(dataset, trade_date, "running", attempts=attempt)
+                    checkpoint = checkpoint_key(dataset)
+                    attempt = self._next_attempt(checkpoint, trade_date)
+                    self._checkpoint(checkpoint, trade_date, "running", attempts=attempt)
                     try:
-                        rows = handlers[dataset](trade_date)
+                        rows = (self._collect_market(dataset, trade_date, codes=scopes.get(dataset), force=force)
+                                if dataset in MARKET_FIELDS else handlers[dataset](trade_date))
                         if dataset == "moneyflow":
+                            if self._expected_stock_codes(trade_date, dataset) - self._covered_codes(dataset, trade_date):
+                                raise XiaodefaError("moneyflow coverage incomplete; missing values are not qualified facts")
                             rows = self.sync_stock_flow(trade_date)
                         elif dataset == "industry_flow":
                             rows = self.sync_sector_flow(trade_date)
-                        self._checkpoint(dataset, trade_date, "success", rows=rows, attempts=attempt)
+                        if dataset in {"moneyflow", "industry_flow"} and rows <= 0:
+                            raise XiaodefaError("no qualified flow rows; request is not complete")
+                        self._checkpoint(checkpoint, trade_date, "success", rows=rows, attempts=attempt)
                         results_by_key[key] = {
                             "dataset": dataset,
                             "trade_date": trade_date,
@@ -675,13 +727,14 @@ class TushareHistoryCollector:
                         # last verified date on a network/validation failure and
                         # make the checkpoint carry the error instead of deleting
                         # good data from the production tables.
-                        self._checkpoint(dataset, trade_date, "error", attempts=attempt, error=str(exc))
-                        if dataset in STOCK_SNAPSHOT_DATASETS:
+                        self._checkpoint(checkpoint, trade_date, "error", attempts=attempt, error=str(exc))
+                        if dataset in STOCK_SNAPSHOT_DATASETS and scopes.get(dataset) is None:
                             self._certify_close_snapshot(
                                 dataset,
                                 trade_date,
                                 status="error",
                                 error_message=str(exc),
+                                provider=self._provider_name(self.client),
                             )
                         results_by_key[key] = {
                             "dataset": dataset,
@@ -717,6 +770,7 @@ def render_report(db_path: str | Path, result: dict[str, Any], out_path: str | P
         table_date_expr = {
             "tushare_stock_basic": "max(list_date)",
             "tushare_daily": "max(date)",
+            "tushare_index_daily": "max(date)",
             "tushare_daily_basic": "max(date)",
             "tushare_adj_factor": "max(date)",
             "tushare_moneyflow": "max(date)",

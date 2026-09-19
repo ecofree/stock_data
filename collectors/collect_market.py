@@ -1,7 +1,7 @@
 """Market sentiment and emotion data collectors."""
 import json
 from datetime import datetime
-from base import KPLClient, DuckDBStore, logger
+from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 # After this many consecutive runs where KPL answers but returns no row for the
 # requested trading date, escalate to an explicit alert (WP5).  At a 5-minute

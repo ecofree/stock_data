@@ -15,7 +15,7 @@ def main() -> int:
     parser.add_argument("--out", default="reports/operator_backtest_latest.md")
     args = parser.parse_args()
 
-    result = run_operator_stage_backtest(args.db, enforce_t1=True)
+    result = run_operator_stage_backtest(args.db)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(render_operator_backtest_markdown(result), encoding="utf-8")

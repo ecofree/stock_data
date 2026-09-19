@@ -131,3 +131,41 @@ def test_semantic_recheck_rejects_escalated_authentication_even_if_resealed(tmp_
     (folder/'completed.json').write_text(__import__('json').dumps({**manifest,'manifest_id':identity(manifest)}),encoding='utf-8')
     with pytest.raises(ValueError, match='transcription cannot certify'):
         source.verify_supplement(folder)
+
+
+@pytest.mark.parametrize('body', [b'%PDF-1.4 synthetic', b'<html>not a PDF</html>'])
+def test_current_public_pdf_fetch_uses_bounded_transport(monkeypatch, body):
+    from trade_system import http_transport as transport
+    calls=[]
+    def read(request, **limits):
+        calls.append((request,limits))
+        return body
+    monkeypatch.setattr(transport,'read_verified_once',read)
+    if body.startswith(b'%PDF-'):
+        assert transport.read_public_pdf(document()['url'])==body
+    else:
+        with pytest.raises(ValueError,match='not a PDF'):transport.read_public_pdf(document()['url'])
+    assert len(calls)==1 and calls[0][1]=={'timeout':15,'max_bytes':4*1024*1024}
+    assert not calls[0][0].has_header('Authorization')
+
+
+@pytest.mark.parametrize('module,command,entry', [('run_case_supplement','collect','collect_supplement'),
+                                                 ('run_disclosure_fields','build','build_fields')])
+def test_current_historical_cli_injects_shared_transport_without_changing_frozen_readers(tmp_path, monkeypatch, module, command, entry):
+    import runpy
+    import sys
+    from trade_system.v2 import case_supplement, disclosure_fields
+    from trade_system.http_transport import read_public_pdf, request_deadline
+    plan_path=tmp_path/'plan.json';write_json(plan_path,{'synthetic': True})
+    calls=[]
+    def collect(plan,output,*,fetch):
+        assert fetch is read_public_pdf and request_deadline.get() is not None
+        calls.append((plan,output))
+        keys=('scope','public_pdf_requests','classification_counts','execution_ready') if entry=='collect_supplement' else (
+            'case_count','potential_windows','new_documents','document_kind_counts','closed_halt_candidates',
+            'mapped_fields_pending_review','cases_with_conflicts','historically_available_new_documents','emitted_parent_events','execution_ready')
+        return dict.fromkeys(keys,False)
+    monkeypatch.setattr(case_supplement if entry=='collect_supplement' else disclosure_fields,entry,collect)
+    monkeypatch.setattr(sys,'argv',[module,command,'--plan',str(plan_path),'--output',str(tmp_path/'unused')])
+    runpy.run_module('tools.v2.'+module,run_name='__main__')
+    assert len(calls)==1 and request_deadline.get() is None

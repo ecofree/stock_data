@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import API_BASE, API_KEY, DB_PATH, TODAY
+from trade_system.config import API_BASE, API_KEY, DB_PATH, TODAY
 from scripts.audit_api_data_sources import infer_sector_code, infer_stock_code
 from trade_system.api_data_audit import latest_local_trade_date
 from trade_system.api_endpoint_inventory import (

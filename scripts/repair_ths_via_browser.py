@@ -26,7 +26,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from schema import init_schema
+from trade_system.schema import init_schema
 from trade_system.ths_history import _ths_index_members
 
 

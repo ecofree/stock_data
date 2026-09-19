@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from trade_system.collection_profiles import resolve_phase
+from trade_system.collection_profiles import HISTORY_SUPPLEMENT_TYPES, resolve_phase
 from trade_system.config import default_trade_date
 from trade_system.source_authority import validate_production_plan
 
@@ -117,7 +117,6 @@ def command_plan(
         if phase == "auction":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
-                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_auction_evidence", [py, "scripts/collect_auction_evidence.py", "--db", db_path, "--date", selected_date, "--max-stocks", str(signal_limit), "--out", report("auction_collection_latest.json")], False),
                 ("build_auction_evidence", [py, "scripts/build_auction_evidence.py", "--db", db_path, "--trade-date", selected_date, "--out", report("auction_evidence_latest.md")], False),
@@ -125,7 +124,6 @@ def command_plan(
         elif phase == "intraday":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
-                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
                 # Phase mode never runs full L2; keep candidate stock curves fresh.
@@ -141,7 +139,6 @@ def command_plan(
         elif phase == "close":
             collection_steps = [
                 ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
-                ("check_kpl_connectivity", [py, "scripts/check_kpl_connectivity.py", "--db", db_path, "--date", selected_date, "--out", report("kpl_connectivity_latest.md")], False),
                 # Daily ingestion writes raw facts; normalization projects them without copies.
                 ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
                  "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y%m%d"),
@@ -219,7 +216,11 @@ def command_plan(
             collection_steps = [
                 ("backfill_2026_tushare", [py, "scripts/backfill_2026_tushare.py", "--db", db_path, "--start-date", start, "--end-date", end, "--max-days", str(max(0, history_max_days)), "--report", report("tushare_2026_backfill_latest.md")], False),
                 ("backfill_2026_ths_concepts", [py, "scripts/backfill_2026_ths_concepts.py", "--db", db_path, "--start-date", start, "--end-date", end, "--mode", "full", "--max-member-pages", "0", "--report", report("ths_2026_concepts_latest.md")], False),
-                ("run_staged_after_close", [py, "scripts/run_staged_multisource.py", "--db", db_path, "--date", selected_date, "--stage", "after_close", "--start", start, "--end", end, "--budget-seconds", "300", "--report", report("multisource_after_close_latest.md")], False),
+                ("collect_history_supplement", [py, "scripts/collect_multisource.py", "--db", db_path,
+                 "--date", selected_date, "--start", start, "--end", end,
+                 "--types", ",".join(HISTORY_SUPPLEMENT_TYPES), "--universe-table", "stock_basic",
+                 "--max-stocks", "20", "--periods", "8", "--resume", "--budget-seconds", "300",
+                 "--report", report("multisource_after_close_latest.md")], False),
             ]
         else:
             raise ValueError(f"Unsupported collection phase: {phase}")
@@ -228,7 +229,7 @@ def command_plan(
     if phase == "history":
         steps.extend([
             ("build_data_catalog", [py, "scripts/build_data_catalog.py", "--db", db_path], False),
-            ("audit_data_quality", [py, "scripts/audit_data_quality.py", "--db", db_path, "--schema", "schema.py", "--out", report("data_quality_history_latest.md")], False),
+            ("audit_data_quality", [py, "scripts/audit_data_quality.py", "--db", db_path, "--schema", "trade_system/schema.py", "--out", report("data_quality_history_latest.md")], False),
         ])
         return steps
     if phase == "supplemental":
@@ -342,7 +343,7 @@ def main() -> int:
             # Existing collector code owns schema setup. The new adapter never
             # weakens legacy_connect's primary/V2 write barrier.
             bootstrap = ("import sys; from trade_system.schema import init_schema; "
-                         "from base import connect_duckdb; c=connect_duckdb(sys.argv[1]); "
+                         "from trade_system.data_store import connect_duckdb; c=connect_duckdb(sys.argv[1]); "
                          "init_schema(c); c.close()")
             initialization = subprocess.run([python, "-X", "utf8", "-c", bootstrap, str(args.db)],
                 cwd=backend, capture_output=True, timeout=args.step_timeout, env=_utf8_subprocess_env())

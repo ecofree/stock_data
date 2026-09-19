@@ -15,10 +15,30 @@ import urllib.request
 from functools import lru_cache
 from pathlib import Path
 from contextvars import ContextVar
+from contextlib import contextmanager
 
 request_deadline = ContextVar('request_deadline', default=None)
 
 from trade_system.config import SETTINGS
+
+
+@contextmanager
+def request_budget(seconds):
+    """Share one wall-clock budget across waiting, fallbacks and pages."""
+    import math
+    import time
+    if isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError('positive finite request budget required')
+    deadline = time.monotonic() + seconds
+    if request_deadline.get() is not None:
+        deadline = min(deadline, request_deadline.get())
+    if deadline <= time.monotonic():
+        raise TimeoutError('request deadline exhausted')
+    token = request_deadline.set(deadline)
+    try:
+        yield deadline
+    finally:
+        request_deadline.reset(token)
 
 
 def _setting(name: str, default: str = "") -> str:
@@ -213,4 +233,13 @@ def read_verified_once(request, *, timeout, max_bytes):
         raise ValueError('response byte budget exceeded')
     if status.get('ok') is not True:
         raise urllib.error.URLError('verified transport failed')
+    return raw
+
+
+def read_public_pdf(url):
+    """Bounded transport for validated public-document plans; no credentials."""
+    raw = read_verified_once(urllib.request.Request(url, headers={'User-Agent': 'stock-data-evidence/1'}),
+                             timeout=15, max_bytes=4*1024*1024)
+    if not raw.startswith(b'%PDF-'):
+        raise ValueError('response is not a PDF')
     return raw

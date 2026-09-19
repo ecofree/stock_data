@@ -1,20 +1,19 @@
 """K-line source adapters with multi-source fallback.
 
-Extracted verbatim from ``trade_system.stock_data_sources`` (now a facade).
-All names remain importable from the facade for compatibility.
+Callers import these provider implementations directly.
 """
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import re
 import subprocess
-import threading
-import atexit
-import urllib.error as _ue  # noqa: F401
+import sys
+import time
+from pathlib import Path
+import urllib.request
 
 from trade_system.logging_setup import get_logger
-from trade_system.http_transport import read_verified_once
+from trade_system.http_transport import read_verified_once, request_budget, request_deadline
 from trade_system.units import requested_adjustment
 
 try:
@@ -24,28 +23,6 @@ except Exception:
 
 logger = get_logger(__name__)
 
-
-# BaoStock is a process-level HTTP session.  Logging in/out for every stock
-# made the historical fallback both slow and prone to server throttling.  A
-# single locked session is reused by this process and closed at interpreter
-# exit; query failures reset it so the next call can reconnect cleanly.
-_BAOSTOCK_LOCK = threading.RLock()
-_BAOSTOCK_MODULE = None
-_BAOSTOCK_LOGGED_IN = False
-
-
-def _close_baostock() -> None:
-    global _BAOSTOCK_LOGGED_IN
-    with _BAOSTOCK_LOCK:
-        if _BAOSTOCK_MODULE is not None and _BAOSTOCK_LOGGED_IN:
-            try:
-                _BAOSTOCK_MODULE.logout()
-            except Exception:
-                pass
-        _BAOSTOCK_LOGGED_IN = False
-
-
-atexit.register(_close_baostock)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 EM_UT = "7eea3edcaed734bea9cbfc24409ed989"
@@ -65,23 +42,6 @@ TDX_HOSTS = [
 
 
 # ---------------------------------------------------------------- 工具
-def _run(func, timeout=10, label=None):
-    """在线程里跑源，超时/异常都返回 None，绝不阻塞主流程。"""
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        fut = executor.submit(func)
-        try:
-            return fut.result(timeout=timeout)
-        except Exception as exc:
-            logger.debug(
-                "source task failed (%s): %r",
-                label or getattr(func, "__name__", "?"), exc,
-            )
-            return None
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-
 def _norm_code(code):
     """返回 (mkt, pure) ；mkt in sh/sz/bj。"""
     c = code.strip().lower().replace(".", "")
@@ -111,16 +71,60 @@ def _yymmdd(d):
     return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
 
-def _curl_json(url, timeout=12):
-    out = subprocess.run(
-        ["curl", "-s", "-4", "--compressed", "-m", str(timeout), "-H", f"User-Agent: {UA}", url],
-        capture_output=True, text=True, timeout=timeout + 5)
+def _read_json(url, timeout=12):
+    raw = read_verified_once(urllib.request.Request(url, headers={"User-Agent": UA}),
+                             timeout=timeout, max_bytes=8_000_000)
+    return json.loads(_auto_decode(raw))
+
+
+@request_budget(10)
+def _sdk_call(operation, *args):
+    """One owned SDK child; timeout reaps it before releasing acquisition."""
+    command = [sys.executable, '-I', '-B', '-c',
+        'import sys;sys.path.insert(0,sys.argv[1]);from trade_system.adapters.kline_sources import _sdk_worker;_sdk_worker()',
+        str(Path(__file__).resolve().parents[2])]
+    timeout = request_deadline.get() - time.monotonic()
+    if timeout <= 0:
+        raise TimeoutError('SDK deadline exhausted')
     try:
-        return json.loads(out.stdout)
-    except Exception as exc:
-        logger.debug("curl json parse failed for %s: %s; body=%r",
-                     url, exc, (out.stdout or "")[:200])
+        result = subprocess.run(command, input=json.dumps([operation, args]).encode('utf-8'),
+            capture_output=True, timeout=timeout,
+            creationflags=0x08000000 if sys.platform == 'win32' else 0)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError('SDK deadline exhausted') from None
+    if result.returncode or len(result.stdout) > 8_000_000:
+        raise RuntimeError('SDK worker failed or response budget exceeded')
+    return json.loads(result.stdout)
+
+
+def _sdk_worker():
+    import os
+    from contextlib import redirect_stdout, redirect_stderr
+    operation, args = json.loads(sys.stdin.buffer.read(4096))
+    readers = {'baostock': _baostock_rows, 'pytdx': _pytdx_rows, 'pytdx_minutes': _pytdx_minutes_rows}
+    # SDK diagnostics never enter the result protocol or grow the pipe buffer.
+    with open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
+        rows = readers[operation](*args)
+    raw = json.dumps(rows, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    if len(raw) > 8_000_000:
+        raise ValueError('SDK response budget exceeded')
+    sys.stdout.buffer.write(raw)
+
+
+def _from_baostock(code, start, end, fq="qfq"):
+    if requested_adjustment(fq) != 'none':
         return None
+    return _sdk_call('baostock', code, start, end, fq)
+
+
+def _from_pytdx(code, start, end, fq="qfq"):
+    if requested_adjustment(fq) != 'none':
+        return None
+    return _sdk_call('pytdx', code, start, end, fq)
+
+
+def _from_pytdx_minutes(code, date=None):
+    return _sdk_call('pytdx_minutes', code, date)
 
 
 def _auto_decode(raw):
@@ -136,55 +140,42 @@ def _auto_decode(raw):
 
 
 
-# ---------------------------------------------------------------- 1) baostock（独立服务器）
-def _from_baostock(code, start, end, fq="qfq"):
-    global _BAOSTOCK_MODULE, _BAOSTOCK_LOGGED_IN
-    # This adapter certifies raw prices only. Other qualified sources may
-    # satisfy adjusted requests; never relabel raw data to obtain coverage.
+# ---------------------------------------------------------------- 1) baostock
+def _baostock_rows(code, start, end, fq="qfq"):
     if requested_adjustment(fq) != 'none':
         return None
     import baostock as bs
-    _BAOSTOCK_MODULE = bs
     mkt, pure = _norm_code(code)
     adj = '3'
-    with _BAOSTOCK_LOCK:
-        if not _BAOSTOCK_LOGGED_IN:
-            login = bs.login()
-            if getattr(login, "error_code", "1") != "0":
-                return None
-            _BAOSTOCK_LOGGED_IN = True
-        try:
-            rs = bs.query_history_k_data_plus(
-                f"{mkt}.{pure}", "date,open,high,low,close,volume,amount",
-                start_date=_yymmdd(start), end_date=_yymmdd(end),
-                frequency="d", adjustflag=adj)
-            if rs.error_code != "0":
-                return None
-            rows = []
-            while (rs.error_code == "0") & rs.next():
-                r = rs.get_row_data()
-                if not r or not r[0]:
-                    continue
-                rows.append({
-                    "date": r[0], "open": float(r[1] or 0), "high": float(r[2] or 0),
-                    "low": float(r[3] or 0), "close": float(r[4] or 0),
-                    "volume": float(r[5] or 0), "amount": float(r[6] or 0),
-                    "volume_unit": "shares", "amount_unit": "yuan",
-                    "adjustment": "none", "_src": "baostock"})
-            return rows or None
-        except Exception:
-            # The next request should perform a fresh login rather than reuse
-            # a server-side session that has been closed or throttled.
-            try:
-                bs.logout()
-            except Exception:
-                pass
-            _BAOSTOCK_LOGGED_IN = False
+    try:
+        login = bs.login()
+        if getattr(login, 'error_code', '1') != '0':
             return None
+        rs = bs.query_history_k_data_plus(
+            f"{mkt}.{pure}", "date,open,high,low,close,volume,amount",
+            start_date=_yymmdd(start), end_date=_yymmdd(end),
+            frequency="d", adjustflag=adj)
+        if rs.error_code != "0":
+            return None
+        rows = []
+        while (rs.error_code == "0") & rs.next():
+            r = rs.get_row_data()
+            if not r or not r[0]:
+                continue
+            rows.append({
+                "date": r[0], "open": float(r[1] or 0), "high": float(r[2] or 0),
+                "low": float(r[3] or 0), "close": float(r[4] or 0),
+                "volume": float(r[5] or 0), "amount": float(r[6] or 0),
+                "volume_unit": "shares", "amount_unit": "yuan",
+                "adjustment": "none", "_src": "baostock"})
+        return rows or None
+    finally:
+        bs.logout()
+
 
 
 # ---------------------------------------------------------------- 2) pytdx（交易所 TCP 直连）
-def _from_pytdx(code, start, end, fq="qfq"):
+def _pytdx_rows(code, start, end, fq="qfq"):
     from pytdx.hq import TdxHq_API
     mkt, pure = _norm_code(code)
     market = {"sh": 1, "sz": 0, "bj": 2}[mkt]
@@ -229,7 +220,7 @@ def _from_tencent(code, start, end, fq="qfq"):
     fqw = {"qfq": "qfq", "hfq": "hfq", "": "bfq"}[fq]
     url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param="
            f"{pre}{pure},day,,,320,{fqw}")  # 起止留空、只给数量，按本地日期过滤
-    d = _curl_json(url)
+    d = _read_json(url)
     node = (d or {}).get("data", {}).get(pre + pure, {})
     key = fqw + "day" if fqw != "bfq" else "day"
     rows = node.get(key) or node.get("day") or []
@@ -252,13 +243,7 @@ def _from_sina(code, start, end, fq="qfq"):
     pre = "sh" if mkt == "sh" else "sz"
     url = (f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={pre}{pure}&scale=240&ma=no&datalen=320")
-    out = subprocess.run(
-        ["curl", "-s", "-4", "--compressed", "-m", "12", "-H", f"User-Agent: {UA}", url],
-        capture_output=True, text=True, timeout=20)
-    try:
-        arr = json.loads(out.stdout)
-    except Exception:
-        return None
+    arr = _read_json(url) or []
     sd, ed = _norm_date(start), _norm_date(end)
     res = []
     for r in arr:
@@ -281,7 +266,7 @@ def _from_eastmoney(code, start, end, fq="qfq"):
     url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}"
            f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57"
            f"&klt=101&fqt={fqt}&beg={_norm_date(start)}&end={_norm_date(end)}&ut={EM_UT}")
-    d = _curl_json(url, timeout=8)
+    d = _read_json(url, timeout=8)
     rows = ((d or {}).get("data") or {}).get("klines") or []
     out = []
     for line in rows:
@@ -435,3 +420,42 @@ def _from_xiaodefa_sector_flow(trade_date=None, limit=300):
         "amount_unit": "yuan", "_src": "xiaodefa",
         "source_api": "moneyflow_ind_dc", "raw": row,
     } for row in rows if row.get("ts_code")] or None
+
+
+import datetime
+
+
+def _from_xiaodefa_basic(list_status="L"):
+    """全量股票列表（ts_code/name/industry/market/list_date），Tushare 中继，用于本地参考镜像（总量容灾）。"""
+    return _xiaodefa_query(
+        "stock_basic", {"list_status": list_status},
+        fields="ts_code,symbol,name,industry,market,list_date",
+    )
+
+def _pytdx_minutes_rows(code, date=None):
+    """分时（通达信）：需装 pytdx/mootdx。沙箱未装时优雅返回 None——东财 trends2 作主源。
+    这是与东财 HTTP 完全异构的 TCP 后端，是分时的最强冗余。"""
+    try:
+        from pytdx.quotes import Quotes
+    except Exception:
+        try:
+            from mootdx.quotes import Quotes
+        except Exception:
+            return None
+    try:
+        client = Quotes.factory(market="std")
+        dt = date or datetime.date.today().strftime("%Y%m%d")
+        df = client.minutes(symbol=code, date=dt)
+        if df is None or len(df) == 0:
+            return None
+        recs = []
+        for _, row in df.iterrows():
+            recs.append({
+                "time": str(row.get("time")),
+                "price": float(row.get("price") or 0),
+                "avg": float(row.get("avg_price", row.get("avg", 0)) or 0),
+                "volume": float(row.get("volume", 0) or 0),
+            })
+        return {"code": code, "name": None, "date": dt, "trends": recs}
+    except Exception:
+        return None

@@ -12,8 +12,6 @@ from trade_system.v2.storage import Store
 from trade_system.v2.paper_storage import open_paper,apply_paper_event
 from trade_system.v2.recovery import backup,restore,check_manifest
 from trade_system.v2 import daily_workflow,prospective_registry
-from trade_system.v2.publisher import publish,read_current
-from trade_system.pipeline_runtime import LatestReportTransaction
 from tests.test_v2_daily_session import Fixture,moment,report
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -87,11 +85,6 @@ def test_old_runner_requires_copy_before_any_live_work(tmp_path):
     assert not db.exists() and not (tmp_path/'reports').exists()
 
 
-def test_v2_publication_rejects_legacy_transaction(tmp_path):
-    publish(tmp_path/'pub','first',{'index.html':b'ok'},generation=1)
-    with pytest.raises(ValueError,match='namespace'):
-        LatestReportTransaction(tmp_path/'pub','legacy')
-    assert read_current(tmp_path/'pub')[0]['run_id']=='first'
 
 
 def test_preclose_workflow_no_network_no_completed_marker(tmp_path):

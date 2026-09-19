@@ -9,14 +9,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from base import DuckDBStore, KPLClient
-from collect_index import (
+from trade_system.data_store import DuckDBStore, KPLClient
+from collectors.collect_index import (
     collect_index_kline,
     collect_index_kline_eastmoney,
     sync_index_list_from_kline,
 )
-from config import DB_PATH, TODAY
-from schema import init_schema
+from trade_system.config import DB_PATH, TODAY
+from trade_system.schema import init_schema
 
 DEFAULT_INDEX_CODES = ["SH000001", "SZ399001", "SZ399006", "SH000688"]
 

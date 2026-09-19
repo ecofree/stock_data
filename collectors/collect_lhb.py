@@ -1,6 +1,6 @@
 """Dragon Tiger Board (LHB) collectors (7 endpoints)."""
 import json
-from base import KPLClient, DuckDBStore
+from trade_system.data_store import KPLClient, DuckDBStore
 
 
 def collect_lhb_list(client: KPLClient, store: DuckDBStore, date: str) -> int:

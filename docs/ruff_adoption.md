@@ -14,7 +14,7 @@ Python 3.12-only f-string syntax in `review_web.py` that broke the stated
 
 - The 89 F401 unused imports were removed with `ruff --fix`; the
   `from base import logger` concern was resolved structurally — files that
-  still need `base.py`'s logging side effect keep a real base import, and
+  still need `trade_system/data_store.py`'s logging side effect import that module, and
   root `collect_*.py` are shims over `collectors.*`.
 - The 14 F841 dead assignments were reviewed individually; one
   (`eastmoney_finance.py`) was an exception bookkeeping leftover converted

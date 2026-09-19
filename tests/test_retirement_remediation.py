@@ -1,7 +1,6 @@
 """Behavioral counterexamples from the f8067b1 audit, using only temporary DBs."""
 from datetime import timedelta
 import subprocess
-import sys
 
 import duckdb
 import pytest
@@ -107,11 +106,31 @@ def test_no_unguarded_legacy_duckdb_writer_calls():
     assert not offenders,offenders
 
 
-def test_current_application_and_tools_do_not_import_fixed_incidents():
+def test_current_application_and_tools_do_not_import_retired_implementations():
+    retired = ['base', 'config', 'schema', 'scripts.backfill_legacy_baostock',
+     'scripts.backfill_legacy_baostock_parallel', 'scripts.build_derived_limit_pool',
+     'scripts.build_qlib_candidate_pool', 'scripts.collect_tushare_basic_data',
+     'scripts.generate_backtest_vs_actual', 'scripts.generate_professional_reports',
+     'scripts.generate_review_report', 'scripts.generate_signals', 'scripts.generate_stage_signals',
+     'scripts.generate_stock_detail', 'scripts.generate_web_dashboard', 'scripts.paper_order',
+     'scripts.predict_qlib_daily', 'scripts.refresh_close_signals', 'scripts.run_backtest',
+     'scripts.run_daily_operator_loop', 'scripts.run_daily_screen', 'scripts.run_qlib_daily',
+     'scripts.run_stage_backtest', 'scripts.run_strategy_result_backtest', 'scripts.screen_with_qlib',
+     'scripts.sync_tushare_ohlc', 'scripts.train_qlib_shadow', 'staged_multisource', 'stock_data_sources',
+     'tools.v2.verify_qlib', 'trade_system.akshare_guard', 'trade_system.backtest',
+     'trade_system.candidate_pool', 'trade_system.daily_loop', 'trade_system.ml.model_gate',
+     'trade_system.operator_risk', 'trade_system.paper_execution', 'trade_system.risk',
+     'trade_system.screening_funnel', 'trade_system.signals', 'trade_system.stage_signals',
+     'trade_system.staged_multisource', 'trade_system.stock_data_sources',
+     'trade_system.strategy_stage_backtest', 'trade_system.trader_signals', 'trade_system.tushare_backfill',
+     'tushare_backfill']
+    from importlib.util import find_spec
+    assert all(find_spec(name) is None for name in retired if name != "config")
     import ast
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     files = subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard','--','*.py'],cwd=root).decode().split('\0')
+    assert not (root/"config.py").exists()
     offenders = []
     for name in set(files):
         if not name.startswith(('scripts/', 'trade_system/', 'tools/v2/')) or not (root/name).is_file():
@@ -121,12 +140,12 @@ def test_current_application_and_tools_do_not_import_fixed_incidents():
             if isinstance(node, ast.Import):modules = [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom):
                 modules = [node.module or '']
-                if node.module == 'tools':modules += ['tools.'+a.name for a in node.names]
+                if node.module in {'tools','trade_system','scripts'}:modules += [node.module+'.'+a.name for a in node.names]
             elif isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
                 fn = node.func
                 if (isinstance(fn, ast.Name) and fn.id == '__import__') or (isinstance(fn, ast.Attribute) and fn.attr == 'import_module'):
                     modules = [str(node.args[0].value)]
-            if any(m == 'tools.incidents' or m.startswith('tools.incidents.') for m in modules):
+            if any(m.startswith('collect_') or m == 'tools.incidents' or m.startswith('tools.incidents.') or m in retired for m in modules):
                 offenders.append((name, node.lineno))
     assert not offenders, offenders
 
@@ -159,46 +178,6 @@ def test_fact_revision_cannot_change_raw_content(tmp_path):
         store.ingest(*args, b'original')
         with pytest.raises(ValueError, match='conflict'):
             store.ingest(*args, b'changed')
-
-
-@pytest.mark.parametrize('method', ['ensure_paper_tables', 'submit_paper_order', 'simulate_fill', 'release_t1_sellable'])
-def test_retired_paper_module_never_opens_database(tmp_path, method):
-    from trade_system import paper_execution
-    db = tmp_path/'must-not-exist.duckdb'
-    with pytest.raises(RuntimeError, match='retired'):
-        getattr(paper_execution, method)(db)
-    assert not db.exists()
-
-
-def test_retired_paper_cannot_write_stopped_v2(tmp_path):
-    from trade_system.paper_execution import ensure_paper_tables
-    db = tmp_path/'v2.duckdb'
-    with Store(db):
-        pass
-    before = db.read_bytes()
-    with pytest.raises(RuntimeError, match='retired'):
-        ensure_paper_tables(db)
-    assert db.read_bytes() == before
-
-
-def test_retired_operator_preserves_manual_records(tmp_path):
-    from trade_system.daily_loop import run_daily_operator_loop
-    db = tmp_path/'manual.duckdb'
-    with duckdb.connect(str(db)) as con:
-        con.execute("CREATE TABLE watchlist(note VARCHAR); INSERT INTO watchlist VALUES ('manual')")
-        con.execute("CREATE TABLE trade_plan(note VARCHAR); INSERT INTO trade_plan VALUES ('manual condition')")
-    before = db.read_bytes()
-    with pytest.raises(RuntimeError, match='retired'):
-        run_daily_operator_loop(db, '2026-09-10')
-    assert db.read_bytes() == before
-
-
-def test_retired_cli_rejects_before_argument_parsing(tmp_path):
-    from pathlib import Path
-    script = Path(__file__).resolve().parents[1]/'scripts/paper_order.py'
-    result = subprocess.run([sys.executable, str(script), '--approve'], cwd=tmp_path, capture_output=True)
-    assert result.returncode == 2 and b'Retired' in result.stderr
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_opportunity_instances_do_not_inherit_yesterday_terminal_state(tmp_path):

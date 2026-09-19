@@ -3,7 +3,7 @@ import duckdb
 
 from trade_system.operator_backtest import run_operator_stage_backtest
 from trade_system.operator_outcomes import import_operator_trade_outcomes
-from trade_system.risk import init_trading_tables
+from trade_system.operator_outcomes import init_trading_tables
 
 
 def test_import_operator_trade_outcomes_links_plan_journal_and_backtest(tmp_path):
@@ -12,6 +12,9 @@ def test_import_operator_trade_outcomes_links_plan_journal_and_backtest(tmp_path
 
     con = duckdb.connect(str(db_path))
     try:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        assert {"watchlist", "trade_plan", "portfolio_snapshot", "trade_journal",
+                "operator_trade_outcome", "risk_snapshot", "v_operator_plan_outcome"} <= tables
         con.execute(
             """
             INSERT INTO trade_plan (

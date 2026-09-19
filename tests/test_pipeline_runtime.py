@@ -5,12 +5,9 @@ import os
 import pytest
 
 from trade_system.pipeline_runtime import (
-    LatestReportTransaction,
     PipelineAlreadyRunning,
     PipelineLock,
     RunManifest,
-    reap_stale_run_manifests,
-    prune_run_reports,
 )
 
 
@@ -30,11 +27,12 @@ def test_runtime_fingerprint_tracks_consumers_and_actual_thresholds_not_git_fail
     from types import SimpleNamespace
     from trade_system import pipeline_runtime as runtime
 
-    for name in ("trade_system/config.py", "trade_system/schema.py", "trade_system/consumer.py",
+    for name in ("fetch_all.py", "trade_system/config.py", "trade_system/schema.py", "trade_system/consumer.py",
                  "config/phase_thresholds.json", "pyproject.toml"):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}" if path.suffix == ".json" else "# fixture", encoding="utf-8")
+    (tmp_path / "fetch_all.py").write_text("import trade_system.consumer", encoding="utf-8")
     monkeypatch.setattr(runtime, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=128, stdout="", stderr="synthetic Git failure"))
     first = runtime.runtime_fingerprint()
@@ -42,26 +40,16 @@ def test_runtime_fingerprint_tracks_consumers_and_actual_thresholds_not_git_fail
     assert not first["fingerprint_complete"]
     (tmp_path / "trade_system/consumer.py").write_text("# changed consumer", encoding="utf-8")
     (tmp_path / "config/phase_thresholds.json").write_text('{"limit": 7}', encoding="utf-8")
+    (tmp_path / 'research').mkdir()
+    (tmp_path / 'research/unrelated.py').write_text('# ignored research', encoding='utf-8')
     second = runtime.runtime_fingerprint()
+    assert first['source_file_count'] == second['source_file_count'] == 2
     assert first["source_hash"] != second["source_hash"]
     assert first["config_hash"] != second["config_hash"]
     monkeypatch.setattr(runtime, "_file_fingerprint", lambda paths: (_ for _ in ()).throw(OSError("synthetic")))
     assert runtime.runtime_fingerprint()["source_hash"] == "unknown"
 
 
-@pytest.mark.parametrize("state", ["completed_with_degradation", "running", "unknown", "completed_with_warnings"])
-def test_non_success_status_never_renders_green_completion(tmp_path, state):
-    reports = tmp_path / "reports"
-    manifest = RunManifest(reports, "degraded", "2026-09-16", "intraday")
-    manifest.add_step("check_kpl_connectivity", "degraded", ["synthetic"])
-    manifest.finish(state, error="synthetic source failure")
-    tx = LatestReportTransaction(reports, "degraded")
-    tx._write_pipeline_status(manifest.run_dir, status=state)
-    page = (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
-    assert "#2f9e6f" not in page and "盘中任务已完成" not in page
-    assert "synthetic source failure" in page
-    payload = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
-    assert payload["degraded_steps"] == ["check_kpl_connectivity"]
 
 def test_run_manifest_is_written_atomically(tmp_path):
     manifest = RunManifest(tmp_path, "run-one", "2026-07-09", "intraday")
@@ -135,164 +123,3 @@ def test_pipeline_lock_does_not_delete_malformed_legacy_lock(tmp_path):
         with PipelineLock(db_path, "recovered-malformed"):
             pass
     assert lock_path.read_text(encoding='utf-8') == '{truncated'
-
-
-def test_reap_stale_running_manifest_marks_parent_and_running_step_aborted(tmp_path):
-    reports = tmp_path / "reports"
-    manifest = RunManifest(reports, "old-run", "2026-08-11", "auction")
-    manifest.upsert_step("collect", "running", ["python", "collect.py"])
-    old = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
-    data = json.loads(manifest.path.read_text(encoding="utf-8"))
-    data["started_at"] = old
-    manifest.path.write_text(json.dumps(data), encoding="utf-8")
-
-    reaped = reap_stale_run_manifests(reports, max_age_seconds=120)
-
-    assert reaped == ["old-run"]
-    updated = json.loads(manifest.path.read_text(encoding="utf-8"))
-    assert updated["status"] == "aborted"
-    assert updated["steps"][0]["status"] == "aborted"
-
-
-def test_failed_run_retains_changed_reports_before_restoring_latest(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    stable = reports / "stable_latest.md"
-    changed = reports / "changed_latest.md"
-    stable.write_text("stable", encoding="utf-8")
-    changed.write_text("previous", encoding="utf-8")
-
-    tx = LatestReportTransaction(reports, "failed-run")
-    tx.begin()
-    changed.write_text("partial current run", encoding="utf-8")
-    created = reports / "created_latest.json"
-    created.write_text('{"status":"partial"}', encoding="utf-8")
-    run_dir = reports / "runs" / "failed-run"
-
-    retained = tx.rollback(run_dir)
-
-    assert set(retained) == {"changed_latest.md", "created_latest.json"}
-    assert stable.read_text(encoding="utf-8") == "stable"
-    assert changed.read_text(encoding="utf-8") == "previous"
-    assert not created.exists()
-    assert not (run_dir / stable.name).exists()
-    assert (run_dir / changed.name).read_text(encoding="utf-8") == "partial current run"
-    assert (run_dir / created.name).read_text(encoding="utf-8") == '{"status":"partial"}'
-    assert not tx.snapshot_dir.exists()
-
-
-def test_commit_publishes_one_run_pointer_for_latest_artifacts(tmp_path):
-    reports = tmp_path / "reports"
-    staging = reports / ".staging" / "run-one"
-    manifest = RunManifest(reports, "run-one", "2026-08-14", "close")
-    tx = LatestReportTransaction(reports, "run-one", staging)
-    tx.begin()
-    (staging / "daily_review_latest.md").write_text("review", encoding="utf-8")
-    (staging / "data_readiness_latest.md").write_text("readiness", encoding="utf-8")
-    (staging / "daily_review_latest.html").write_text(
-        "<html><body>Self-contained review</body></html>", encoding="utf-8"
-    )
-    manifest.finish("completed")
-
-    tx.commit(manifest.run_dir)
-
-    pointer = json.loads(
-        (reports / "pipeline_run_latest.json").read_text(encoding="utf-8")
-    )
-    assert pointer["run_id"] == "run-one"
-    assert pointer["trade_date"] == "2026-08-14"
-    assert pointer["phase"] == "close"
-    assert pointer["run_status"] == "completed"
-    assert pointer["artifact_files"] == [
-        "daily_review_latest.html",
-        "daily_review_latest.md",
-        "data_readiness_latest.md",
-    ]
-    assert (reports / "data_readiness_current.md").read_text(encoding="utf-8") == "readiness"
-    assert (manifest.run_dir / "pipeline_run_latest.json").exists()
-    status = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
-    assert status["status"] == "completed"
-    assert (reports / "pipeline_status_latest.html").exists()
-
-
-def test_failed_run_publishes_status_without_mutating_last_complete_page(tmp_path):
-    reports = tmp_path / "reports"
-    staging = reports / ".staging" / "failed-run"
-    reports.mkdir()
-    complete_page = (
-        "<!doctype html><html><body><main class=\"wrap\">"
-        "<h1>2026-08-27 last complete</h1></main></body></html>"
-    )
-    (reports / "daily_review_latest.html").write_text(complete_page, encoding="utf-8")
-    (reports / "daily_review_last_complete.html").write_text(complete_page, encoding="utf-8")
-    manifest = RunManifest(reports, "failed-run", "2026-08-28", "close")
-    tx = LatestReportTransaction(reports, "failed-run", staging)
-    tx.begin()
-    (staging / "partial_latest.md").write_text("partial", encoding="utf-8")
-    retained = tx.rollback(manifest.run_dir)
-    manifest.finish("failed", "encoding failure")
-    tx.publish_failure_status(manifest.run_dir, "encoding failure")
-
-    page = (reports / "daily_review_latest.html").read_text(encoding="utf-8")
-    status = json.loads((reports / "pipeline_status_latest.json").read_text(encoding="utf-8"))
-    assert retained == ["partial_latest.md"]
-    assert page == complete_page
-    assert (reports / "daily_review_last_complete.html").read_text(encoding="utf-8") == complete_page
-    assert status["status"] == "failed"
-    assert status["trade_date"] == "2026-08-28"
-    assert "收盘任务执行失败" in (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
-
-
-def test_non_close_commit_does_not_publish_review_or_advance_last_complete(tmp_path):
-    reports = tmp_path / "reports"
-    staging = reports / ".staging" / "intraday-run"
-    reports.mkdir()
-    complete_page = "<html><body><h1>last close</h1></body></html>"
-    (reports / "daily_review_latest.html").write_text(complete_page, encoding="utf-8")
-    (reports / "daily_review_last_complete.html").write_text(complete_page, encoding="utf-8")
-    manifest = RunManifest(reports, "intraday-run", "2026-08-28", "intraday")
-    tx = LatestReportTransaction(reports, "intraday-run", staging)
-    tx.begin()
-    (staging / "daily_review_latest.html").write_text("wrong intraday page", encoding="utf-8")
-    (staging / "data_readiness_latest.md").write_text("intraday readiness", encoding="utf-8")
-    manifest.finish("completed")
-
-    tx.commit(manifest.run_dir)
-
-    assert (reports / "daily_review_latest.html").read_text(encoding="utf-8") == complete_page
-    assert (reports / "daily_review_last_complete.html").read_text(encoding="utf-8") == complete_page
-    pointer = json.loads((reports / "pipeline_run_latest.json").read_text(encoding="utf-8"))
-    assert pointer["review_published"] is False
-    status_html = (reports / "pipeline_status_latest.html").read_text(encoding="utf-8")
-    assert "盘中任务已完成" in status_html
-    assert "收盘复盘已发布" not in status_html
-
-
-def test_prune_retains_one_phase_anchor_for_recent_trade_dates(tmp_path):
-    reports = tmp_path / "reports"
-    for trade_date in ("2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"):
-        for phase in ("auction", "intraday", "close"):
-            manifest = RunManifest(
-                reports,
-                f"{trade_date}-{phase}",
-                trade_date,
-                phase,
-            )
-            manifest.finish("completed")
-            stamp = datetime.fromisoformat(trade_date).timestamp()
-            os.utime(manifest.run_dir, (stamp, stamp))
-
-    removed = prune_run_reports(reports, keep=1, anchor_trade_dates=2)
-    remaining = {
-        path.name for path in (reports / "runs").iterdir() if path.is_dir()
-    }
-
-    assert removed == 6
-    assert remaining == {
-        "2026-07-23-auction",
-        "2026-07-23-intraday",
-        "2026-07-23-close",
-        "2026-07-24-auction",
-        "2026-07-24-intraday",
-        "2026-07-24-close",
-    }

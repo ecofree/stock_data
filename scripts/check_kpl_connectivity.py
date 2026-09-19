@@ -21,8 +21,8 @@ import duckdb
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from base import KPLClient  # noqa: E402
-from config import API_BASE, API_KEY, DB_PATH, TODAY  # noqa: E402
+from trade_system.data_store import KPLClient  # noqa: E402
+from trade_system.config import API_BASE, API_KEY, DB_PATH, TODAY  # noqa: E402
 from trade_system.api_data_audit import latest_local_trade_date  # noqa: E402
 from trade_system.http_transport import ssl_context_note  # noqa: E402
 

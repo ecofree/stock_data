@@ -64,3 +64,21 @@ def test_wrong_date_quote_is_rejected(tmp_path):
     assert written == 0
     assert con.execute("SELECT count(*) FROM executable_quote_snapshot").fetchone()[0] == 0
     con.close()
+
+
+def test_quote_universe_uses_manual_state_and_ignores_old_scores(tmp_path):
+    from trade_system.executable_quotes import candidate_codes_for_quotes
+    with duckdb.connect(str(tmp_path / "universe.duckdb")) as con:
+        con.execute("CREATE TABLE stock_candidate_score(trade_date DATE,stock_code VARCHAR,score DOUBLE)")
+        con.execute("INSERT INTO stock_candidate_score VALUES ('2026-09-18','600000',99)")
+        assert candidate_codes_for_quotes(con, '2026-09-18') == []
+        con.execute("CREATE TABLE holdings(stock_code VARCHAR,status VARCHAR,shares INTEGER,entry_date DATE,exit_date DATE)")
+        con.execute("INSERT INTO holdings VALUES ('000001','open',100,'2026-09-17',NULL),"
+                    "('000002','closed',0,'2026-09-17','2026-09-18')")
+        con.execute("CREATE TABLE watchlist(trade_date DATE,stock_code VARCHAR,status VARCHAR,priority INTEGER,created_at TIMESTAMP)")
+        con.execute("INSERT INTO watchlist VALUES ('2026-09-17','000003','active',1,current_timestamp),"
+                    "('2026-09-18','000003','removed',1,current_timestamp),"
+                    "('2026-09-18','000004','active',1,current_timestamp),"
+                    "('2026-09-19','000005','active',1,current_timestamp)")
+        assert candidate_codes_for_quotes(con, '2026-09-18') == ['000001', '000004']
+        assert candidate_codes_for_quotes(con, '2026-09-18', limit=1) == ['000001']

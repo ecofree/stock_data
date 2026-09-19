@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from base import DuckDBStore
-from collect_daily import collect_daily
-from collect_market import collect_market_rise_fall
-from schema import init_schema
+from trade_system.data_store import DuckDBStore
+from collectors.collect_daily import collect_daily
+from collectors.collect_market import collect_market_rise_fall
+from trade_system.schema import init_schema
 
 
 class DailyClient:
@@ -184,7 +184,7 @@ def test_kpl_stale_tracker_accumulates_and_resets(tmp_path):
     literal ``current_timestamp`` inside ``ON CONFLICT DO UPDATE SET``, which DuckDB
     binds as a *column name* (BinderException) and the swallowed error left the table
     empty, so the consecutive-stale alert never fired."""
-    from collect_market import _track_kpl_stale
+    from collectors.collect_market import _track_kpl_stale
 
     store = DuckDBStore(tmp_path / "stale.duckdb")
     try:
@@ -210,7 +210,7 @@ def test_kpl_stale_tracker_accumulates_and_resets(tmp_path):
 
 def test_daily_summary_schema_check_is_read_only(tmp_path):
     """Collection validates the schema but never repairs it with destructive DDL."""
-    from collect_market import _require_daily_summary_schema
+    from collectors.collect_market import _require_daily_summary_schema
 
     store = DuckDBStore(tmp_path / "self-heal.duckdb")
     try:
@@ -283,46 +283,6 @@ def test_stock_code_strips_exchange_suffix():
     assert _stock_code("bj830799") == "830799"
 
 
-def test_intraday_liquidity_gate_requires_complete_sell_side_quote():
-    """An executable intraday candidate must have a positive live ask and size."""
-    from trade_system.stage_signals import _row_evidence_actionable
-
-    base_evidence = {
-        "is_fallback": False,
-        "stock_flow_close": 10.0,
-        "stock_flow_main_net": 1234.0,
-        "source_provider": "eastmoney_intraday_clist",  # live, not delayed
-    }
-    # Missing sell-side depth is analytics-only, never executable.
-    ok, reason = _row_evidence_actionable(
-        "intraday_strength", {"stage_evidence": dict(base_evidence)}, strict_tradability=True)
-    assert ok is False and reason == "missing_sell_side_liquidity"
-
-    # ask_price present but ask_volume missing -> incomplete -> blocked.
-    ok2, reason2 = _row_evidence_actionable(
-        "intraday_strength", {"stage_evidence": {**base_evidence, "ask_price": 10.1}},
-        strict_tradability=True)
-    assert ok2 is False and reason2 == "missing_sell_side_liquidity"
-
-    ok3, reason3 = _row_evidence_actionable(
-        "intraday_strength",
-        {
-            "stage_evidence": {
-                **base_evidence,
-                "ask_price": 10.1,
-                "ask_volume": 5000,
-            }
-        },
-        strict_tradability=True,
-    )
-    assert ok3 is True and reason3 is None
-
-    # Delayed provider still blocks regardless of ask data.
-    ok4, reason4 = _row_evidence_actionable(
-        "intraday_strength",
-        {"stage_evidence": {**base_evidence, "source_provider": "eastmoney_intraday_clist_delay"}},
-        strict_tradability=True)
-    assert ok4 is False and reason4 == "delayed_provider_not_executable"
 
 
 def test_readiness_splits_analytics_and_execution(tmp_path):
@@ -330,7 +290,7 @@ def test_readiness_splits_analytics_and_execution(tmp_path):
     execution_ready (an executable candidate exists) and actionable_candidates, so a
     delayed-only snapshot is not shown as a green 'ready to trade' state."""
     import duckdb
-    from schema import init_schema
+    from trade_system.schema import init_schema
     from trade_system.readiness import assess_trade_date_readiness
 
     db = tmp_path / "readiness.duckdb"

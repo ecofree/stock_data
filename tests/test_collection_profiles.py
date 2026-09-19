@@ -47,7 +47,6 @@ def test_intraday_plan_excludes_after_close_fanout():
     names = [name for name, _, _ in steps]
     assert names == [
         "collect_market_context",
-        "check_kpl_connectivity",
         "collect_realtime_limit_pool",
         "collect_intraday_stock_flow_market",
         "collect_l2_focus",
@@ -105,10 +104,10 @@ def test_close_priority_plan_keeps_incremental_tushare_and_official_ths():
         collection_profile="priority",
     )
     names = [name for name, _, _ in steps]
+    assert not {"collect_capital_flow_focus", "collect_multisource_capital_flow"} & set(names)
 
-    assert names[:10] == [
+    assert names[:9] == [
         "collect_market_context",
-        "check_kpl_connectivity",
         "sync_tushare_close",
         "collect_ths_concepts_api",
         "collect_hithink_limit_pool_daily",
@@ -231,3 +230,17 @@ def test_task_due_is_phase_aware_for_shared_tasks(tmp_path):
     due_auction, reason_auction = task_due(
         str(db), "2026-07-15", "collect_market_context", phase="auction", now=now)
     assert due_auction is True, reason_auction  # 2000s > 300s auction TTL -> due
+
+
+def test_history_uses_single_plan_and_canaries_are_explicit_only():
+    from trade_system.collection_profiles import HISTORY_SUPPLEMENT_TYPES
+    for phase in ("auction", "intraday", "close", "history"):
+        plan = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase=phase)
+        commands = [part for _, command, _ in plan for part in command]
+        assert "scripts/run_staged_multisource.py" not in commands
+        assert "scripts/check_kpl_connectivity.py" not in commands
+        if phase == "history":
+            command = next(command for name, command, _ in plan if name == "collect_history_supplement")
+            assert command[1] == "scripts/collect_multisource.py"
+            assert command[command.index("--types") + 1] == ",".join(HISTORY_SUPPLEMENT_TYPES)
+            assert "--resume" in command

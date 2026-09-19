@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trade_system.quality import DEFAULT_DUPLICATE_KEYS, dedupe_table
-from schema import _ensure_business_indexes
+from trade_system.schema import _ensure_business_indexes
 
 
 def main() -> int:

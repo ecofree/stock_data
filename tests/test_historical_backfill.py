@@ -8,9 +8,9 @@ from trade_system.xiaodefa_source import XiaodefaError
 class FakeTushare:
     def query_rows(self, api, params=None, fields=""):
         if api == "trade_cal":
-            return [{"exchange": "SSE", "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
+            return [{"exchange": params["exchange"], "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
         if api == "stock_basic":
-            return [{"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "industry": "银行"}]
+            return [] if params["list_status"] == "D" else [{"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "industry": "银行", "list_status": "L"}]
         if api == "daily":
             return [{"ts_code": "000001.SZ", "trade_date": "20260710", "open": 10, "high": 11,
                      "low": 9, "close": 10.5, "vol": 100, "amount": 1000, "pct_chg": 1}]
@@ -52,7 +52,7 @@ class ClosedDayTushare:
     def query_rows(self, api, params=None, fields=""):
         assert api == "trade_cal"
         return [{
-            "exchange": "SSE",
+            "exchange": params["exchange"],
             "cal_date": params["start_date"],
             "is_open": 0,
             "pretrade_date": "20260724",
@@ -70,7 +70,7 @@ class TransientDailyTushare:
 
     def query_rows(self, api, params=None, fields=""):
         if api == "trade_cal":
-            return [{"exchange": "SSE", "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
+            return [{"exchange": params["exchange"], "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
         if api == "daily":
             self.daily_attempts += 1
             if self.daily_attempts == 1:

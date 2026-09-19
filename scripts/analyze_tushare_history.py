@@ -10,7 +10,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import DB_PATH
+from trade_system.config import DB_PATH
 
 
 def _split_codes(value: str) -> list[str]:

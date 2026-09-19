@@ -11,62 +11,18 @@ from trade_system.quality import dedupe_table, table_columns, table_exists
 KTYPE_TABLES = ("kline", "index_kline", "advanced_kline_today", "advanced_gujia_kline")
 
 DEDUPE_SPECS = (
-    ("kline", ("date", "stock_code", "ktype"), "fetched_at"),
-    ("index_kline", ("date", "index_code", "ktype"), "fetched_at"),
-    ("advanced_kline_today", ("date", "stock_code", "ktype"), "fetched_at"),
-    ("advanced_gujia_kline", ("date", "stock_code", "ktype"), "fetched_at"),
-    ("market_regime_snapshot", ("trade_date",), "generated_at"),
-    ("sector_rotation_score", ("trade_date", "sector_code"), "generated_at"),
-    ("stock_candidate_score", ("trade_date", "stock_code"), "generated_at"),
-    ("stock_candidate_stage_signal", ("trade_date", "stage", "stock_code"), "generated_at"),
-    ("alert_events", ("trade_date", "severity", "category", "message"), "generated_at"),
-    ("watchlist", ("trade_date", "stock_code"), "created_at"),
-    ("trade_plan", ("trade_date", "stock_code"), "created_at"),
-    ("risk_snapshot", ("trade_date",), "created_at"),
-    ("portfolio_snapshot", ("trade_date", "snapshot_time", "stock_code"), "created_at"),
-    (
-        "ths_concept_stock_history",
-        ("trade_date", "concept_code", "stock_code"),
-        "fetched_at",
-    ),
+    ('kline', ('date', 'stock_code', 'ktype'), 'fetched_at'),
+    ('index_kline', ('date', 'index_code', 'ktype'), 'fetched_at'),
+    ('advanced_kline_today', ('date', 'stock_code', 'ktype'), 'fetched_at'),
+    ('advanced_gujia_kline', ('date', 'stock_code', 'ktype'), 'fetched_at'),
+    ('ths_concept_stock_history', ('trade_date', 'concept_code', 'stock_code'), 'fetched_at'),
 )
 
 UNIQUE_INDEX_SPECS = (
-    ("uq_kline_business", "kline", ("date", "stock_code", "ktype")),
-    ("uq_index_kline_business", "index_kline", ("date", "index_code", "ktype")),
-    ("uq_market_regime_date", "market_regime_snapshot", ("trade_date",)),
-    ("uq_sector_rotation_date_code", "sector_rotation_score", ("trade_date", "sector_code")),
-    ("uq_candidate_date_code", "stock_candidate_score", ("trade_date", "stock_code")),
-    (
-        "uq_stage_signal_date_stage_code",
-        "stock_candidate_stage_signal",
-        ("trade_date", "stage", "stock_code"),
-    ),
-    ("uq_watchlist_date_code", "watchlist", ("trade_date", "stock_code")),
-    ("uq_trade_plan_date_code", "trade_plan", ("trade_date", "stock_code")),
-    ("uq_risk_snapshot_date", "risk_snapshot", ("trade_date",)),
-    (
-        "uq_portfolio_snapshot_business",
-        "portfolio_snapshot",
-        ("trade_date", "snapshot_time", "stock_code"),
-    ),
-    (
-        "uq_ths_concept_member_business",
-        "ths_concept_stock_history",
-        ("trade_date", "concept_code", "stock_code"),
-    ),
+    ('uq_kline_business', 'kline', ('date', 'stock_code', 'ktype')),
+    ('uq_index_kline_business', 'index_kline', ('date', 'index_code', 'ktype')),
+    ('uq_ths_concept_member_business', 'ths_concept_stock_history', ('trade_date', 'concept_code', 'stock_code')),
 )
-
-# These indexes protect the small, frequently replaced signal snapshots.  They
-# are intentionally rebuilt on each integrity pass: DuckDB can retain an index
-# catalog entry after a failed delete, while ``CREATE ... IF NOT EXISTS`` then
-# incorrectly treats the damaged index as healthy.
-SIGNAL_INDEX_NAMES = {
-    "uq_market_regime_date",
-    "uq_sector_rotation_date_code",
-    "uq_candidate_date_code",
-    "uq_stage_signal_date_stage_code",
-}
 
 # These are non-unique operational indexes.  They are deliberately rebuilt on
 # every integrity pass because DuckDB may retain a damaged index catalog entry
@@ -249,14 +205,7 @@ def ensure_unique_indexes(db_path: str | Path) -> list[str]:
             if not set(columns) <= existing:
                 continue
             column_sql = ", ".join(f'"{column}"' for column in columns)
-            if index_name in SIGNAL_INDEX_NAMES:
-                # Rebuild rather than trusting a catalog entry left by a
-                # failed DELETE/INSERT cycle.  This is safe here because the
-                # caller has already run the business-key dedupe pass.
-                con.execute(f'DROP INDEX IF EXISTS "{index_name}"')
-                create_sql = f'CREATE UNIQUE INDEX "{index_name}" ON "{table}" ({column_sql})'
-            else:
-                create_sql = f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" ON "{table}" ({column_sql})'
+            create_sql = f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" ON "{table}" ({column_sql})'
             con.execute(create_sql)
             created.append(index_name)
     finally:
@@ -299,45 +248,15 @@ def repair_critical_integrity(db_path: str | Path, dry_run: bool = False) -> dic
         )
         repairs.append(result)
 
-    plan_rows_blocked = 0
+    # Maintenance owns source normalization, never human plans or legacy signal DDL.
+    indexes = []
     if not dry_run:
-        from trade_system.stage_signals import ensure_stage_signal_schema
-
-        from trade_system.db_utils import legacy_connect
-        con = legacy_connect(str(db_path))
-        try:
-            ensure_stage_signal_schema(con)
-            if table_exists(con, "trade_plan"):
-                plan_rows_blocked = int(
-                    con.execute(
-                        "SELECT count(*) FROM trade_plan "
-                        "WHERE coalesce(max_position_pct, 0) <= 0 "
-                        "AND coalesce(status, '') != 'blocked_data_quality'"
-                    ).fetchone()[0]
-                )
-                con.execute(
-                    "UPDATE trade_plan SET status='blocked_data_quality' "
-                    "WHERE coalesce(max_position_pct, 0) <= 0"
-                )
-                if table_exists(con, "watchlist"):
-                    con.execute(
-                        "UPDATE watchlist SET status='blocked_data_quality' "
-                        "WHERE trade_date IN ("
-                        "SELECT trade_date FROM risk_snapshot "
-                        "WHERE coalesce(max_single_position_pct, 0) <= 0)"
-                    )
-        finally:
-            con.close()
         indexes = ensure_unique_indexes(db_path)
         indexes.extend(rebuild_operational_indexes(db_path))
-    else:
-        indexes = []
-
     return {
         "dry_run": dry_run,
         "normalized_ktype_rows": normalized,
         "ths_member_codes": ths_member_codes,
         "repairs": repairs,
-        "plan_rows_blocked": plan_rows_blocked,
         "unique_indexes": indexes,
     }

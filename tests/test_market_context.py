@@ -2,7 +2,7 @@ from datetime import datetime
 
 import duckdb
 
-from schema import init_schema
+from trade_system.schema import init_schema
 from scripts.derive_market_context import derive_market_context
 
 

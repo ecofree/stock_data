@@ -79,3 +79,15 @@ def test_integrity_ths_normalization_dry_run_does_not_write(tmp_path):
         ).fetchone()[0] == "000001.SZ"
     finally:
         con.close()
+
+
+def test_source_maintenance_preserves_human_plans_and_does_not_create_signal_tables(tmp_path):
+    db = tmp_path / 'manual.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE trade_plan(note VARCHAR,status VARCHAR,max_position_pct DOUBLE,trade_date DATE,stock_code VARCHAR,created_at TIMESTAMP); INSERT INTO trade_plan VALUES ('manual','watch',0,'2026-09-14','000001','2026-09-14'), ('revision','watch',0,'2026-09-14','000001','2026-09-15')")
+        con.execute("CREATE TABLE watchlist(note VARCHAR,status VARCHAR); INSERT INTO watchlist VALUES ('manual','watch')")
+    repair_critical_integrity(db)
+    with duckdb.connect(str(db), read_only=True) as con:
+        assert con.execute('SELECT note,status,max_position_pct FROM trade_plan ORDER BY created_at').fetchall() == [('manual','watch',0),('revision','watch',0)]
+        assert con.execute('SELECT * FROM watchlist').fetchall() == [('manual','watch')]
+        assert not con.execute("SELECT table_name FROM information_schema.tables WHERE table_name='stock_candidate_stage_signal'").fetchall()

@@ -9,6 +9,7 @@ row carries its ``rationale``.  Constants below are tuning knobs, not laws.
 """
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +71,7 @@ SELECT trade_date, stock_code, change_pct FROM (
                ORDER BY is_fallback ASC, fetched_at DESC
            ) AS _rn
     FROM v_kline_daily
-    WHERE ktype = 'D' AND change_pct IS NOT NULL
+    WHERE ktype = 'D' AND change_pct IS NOT NULL AND isfinite(change_pct)
 ) WHERE _rn = 1
 """
 
@@ -169,161 +170,82 @@ def limit_pool_by_day(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[d
 
 def next_session(con: duckdb.DuckDBPyConnection, trade_date: str,
                  sessions: list[str] | None = None) -> str | None:
-    if sessions:
-        later = [d for d in sessions if d > trade_date]
-        return later[0] if later else None
-    rows = con.execute(
-        """
-        SELECT min(CAST(trade_date AS DATE)) FROM v_kline_daily
-        WHERE ktype='D' AND CAST(trade_date AS DATE) > ?
-        """,
-        [trade_date],
-    ).fetchone()
-    return str(rows[0]) if rows and rows[0] else None
+    """Use the exchange calendar; missing bars never move the target session."""
+    from trade_system.trading_calendar import open_session_dates
+    day = date.fromisoformat(trade_date).isoformat()
+    candidates = sessions if sessions is not None else open_session_dates(con, day, "9999-12-31")
+    later = sorted(d for d in candidates if d > day)
+    if not later:
+        return None
+    try:
+        verified = open_session_dates(con, day, later[0], strict=True)
+    except ValueError:
+        return None
+    return later[0] if verified == [day, later[0]] else None
 
 
-def _pool_with_fallback(con: duckdb.DuckDBPyConnection, trade_date: str,
-                        table_exists_fn) -> str:
-    """SQL fragment: real limit pool for the day, derived pool filling gaps.
-
-    Returns a ``pool(stock_code, board)`` select body; callers wrap it in a
-    CTE.  The derived table only contributes codes the real pool lacks.
-    """
-    has_derived = table_exists_fn(con, "derived_limit_up_daily")
-    if not has_derived:
-        return f"""
-            SELECT stock_code, max(board_level) AS board
-            FROM v_limit_pool
-            WHERE CAST(trade_date AS DATE) = {trade_date}
-            GROUP BY stock_code
-        """
+def _pool_sql(trade_date: str) -> str:
+    """Observed pool only; historical threshold estimates are not pool facts."""
+    day = date.fromisoformat(trade_date).isoformat()
     return f"""
-        WITH real_pool AS (
-            SELECT stock_code, max(board_level) AS board
-            FROM v_limit_pool
-            WHERE CAST(trade_date AS DATE) = {trade_date}
-            GROUP BY stock_code
-        ),
-        derived_only AS (
-            SELECT d.stock_code, d.board_level AS board
-            FROM derived_limit_up_daily d
-            WHERE d.trade_date = {trade_date}
-              AND d.stock_code NOT IN (SELECT stock_code FROM real_pool)
-        )
-        SELECT stock_code, board FROM real_pool
-        UNION ALL
-        SELECT stock_code, board FROM derived_only
+        SELECT stock_code, max(board_level) AS board
+        FROM v_limit_pool WHERE CAST(trade_date AS DATE) = DATE '{day}'
+        GROUP BY stock_code
+        HAVING max(board_level) >= 1
     """
 
 
 def compute_premium(con: duckdb.DuckDBPyConnection, prev_trade_date: str, *,
                     kline_src: str | None = None,
                     sessions: list[str] | None = None) -> list[dict]:
-    """Yesterday's limit-up cohort vs today's change_pct, bucketed by height."""
-    from trade_system.quality import table_exists as _te
-
+    """Exact next-session outcomes; incomplete cohorts keep unknown statistics."""
     nxt = next_session(con, prev_trade_date, sessions)
     if not nxt:
         return []
-    pool_body = _pool_with_fallback_quoted(con, prev_trade_date, _te)
     rows = con.execute(
         f"""
-        WITH pool AS ({pool_body}),
-        kline AS ({_kline_relation(kline_src)})
-        SELECT
-            CASE WHEN board >= 4 THEN '4+' ELSE CAST(board AS VARCHAR) END AS bucket,
-            count(*) AS n,
-            avg(k.change_pct) AS avg_pct,
-            median(k.change_pct) AS med_pct,
-            avg(CASE WHEN k.change_pct > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
-        FROM pool p JOIN kline k ON k.stock_code = p.stock_code
-                   AND k.trade_date = DATE '{nxt}'
-        GROUP BY 1
-        """,
-    ).fetchall()
-    out = []
-    for bucket, n, avg_pct, med_pct, win in rows:
-        out.append({
-            "prev_trade_date": prev_trade_date,
-            "board_bucket": bucket,
-            "sample_size": int(n),
-            "avg_pct": round(float(avg_pct), 4) if avg_pct is not None else None,
-            "median_pct": round(float(med_pct), 4) if med_pct is not None else None,
-            "win_rate": round(float(win), 4) if win is not None else None,
-        })
-    # overall row (all boards pooled)
-    overall = con.execute(
-        f"""
-        WITH pool AS ({pool_body}),
-        kline AS ({_kline_relation(kline_src)})
-        SELECT count(*), avg(k.change_pct), median(k.change_pct),
-               avg(CASE WHEN k.change_pct > 0 THEN 1.0 ELSE 0.0 END)
-        FROM pool p JOIN kline k ON k.stock_code = p.stock_code
-                   AND k.trade_date = DATE '{nxt}'
-        """,
-    ).fetchone()
-    if overall and overall[0]:
-        n, avg_pct, med_pct, win = overall
-        out.append({
-            "prev_trade_date": prev_trade_date,
-            "board_bucket": "_all",
-            "sample_size": int(n),
-            "avg_pct": round(float(avg_pct), 4) if avg_pct is not None else None,
-            "median_pct": round(float(med_pct), 4) if med_pct is not None else None,
-            "win_rate": round(float(win), 4) if win is not None else None,
-        })
-    return out
-
-
-def _pool_with_fallback_quoted(con: duckdb.DuckDBPyConnection, trade_date: str,
-                               table_exists_fn) -> str:
-    """Like :func:`_pool_with_fallback` but with the date inlined as a literal."""
-    has_derived = table_exists_fn(con, "derived_limit_up_daily")
-    lit = f"DATE '{trade_date}'"
-    if not has_derived:
-        return f"""
-            SELECT stock_code, max(board_level) AS board
-            FROM v_limit_pool
-            WHERE CAST(trade_date AS DATE) = {lit}
-            GROUP BY stock_code
-        """
-    return f"""
-        WITH real_pool AS (
-            SELECT stock_code, max(board_level) AS board
-            FROM v_limit_pool
-            WHERE CAST(trade_date AS DATE) = {lit}
-            GROUP BY stock_code
-        ),
-        derived_only AS (
-            SELECT d.stock_code, d.board_level AS board
-            FROM derived_limit_up_daily d
-            WHERE d.trade_date = {lit}
-              AND d.stock_code NOT IN (SELECT stock_code FROM real_pool)
+        WITH pool AS ({_pool_sql(prev_trade_date)}),
+        kline AS ({_kline_relation(kline_src)}),
+        cohort AS (
+            SELECT CASE WHEN board >= 4 THEN '4+' ELSE CAST(board AS VARCHAR) END AS bucket,
+                   k.change_pct
+            FROM pool p LEFT JOIN kline k ON k.stock_code = p.stock_code
+                       AND k.trade_date = DATE '{nxt}'
         )
-        SELECT stock_code, board FROM real_pool
-        UNION ALL
-        SELECT stock_code, board FROM derived_only
-    """
+        SELECT CASE WHEN grouping(bucket)=1 THEN '_all' ELSE bucket END,
+               count(*), count(change_pct), avg(change_pct), median(change_pct),
+               avg(CASE WHEN change_pct IS NULL THEN NULL
+                        WHEN change_pct > 0 THEN 1.0 ELSE 0.0 END)
+        FROM cohort GROUP BY GROUPING SETS ((bucket), ())
+        """
+    ).fetchall()
+    return [{"prev_trade_date": prev_trade_date, "board_bucket": bucket,
+             "sample_size": int(n), "observed_count": int(observed),
+             "missing_count": int(n-observed),
+             "avg_pct": round(float(avg_pct), 4) if observed == n else None,
+             "median_pct": round(float(med_pct), 4) if observed == n else None,
+             "win_rate": round(float(win), 4) if observed == n else None}
+            for bucket, n, observed, avg_pct, med_pct, win in rows if n]
 
 
 def compute_promotion(con: duckdb.DuckDBPyConnection, trade_date: str, *,
                       kline_src: str | None = None,
                       sessions: list[str] | None = None) -> list[dict]:
     """Of stocks at board b yesterday, how many reached b+1 today."""
-    from trade_system.quality import table_exists as _te
-
     nxt = next_session(con, trade_date, sessions)
     if not nxt:
         return []
-    y_pool = _pool_with_fallback_quoted(con, trade_date, _te)
-    t_pool = _pool_with_fallback_quoted(con, nxt, _te)
+    if not limit_pool_by_day(con, nxt):
+        return []  # Empty without coverage proof is unknown, not zero promotion.
+    y_pool = _pool_sql(trade_date)
+    t_pool = _pool_sql(nxt)
     rows = con.execute(
         f"""
         WITH y AS ({y_pool}),
         t AS ({t_pool})
         SELECT y.board, count(*) AS candidates,
                count(t.stock_code) AS promoted
-        FROM y LEFT JOIN t ON t.stock_code = y.stock_code
+        FROM y LEFT JOIN t ON t.stock_code = y.stock_code AND t.board = y.board + 1
         GROUP BY y.board ORDER BY y.board
         """
     ).fetchall()

@@ -1,11 +1,7 @@
-"""Bounded live executable quotes for candidate stocks.
+"""Bounded live quotes for explicit holdings and manual watchlists.
 
-Full-market Eastmoney clist often falls back to the delayed host during a live
-session.  When that happens, every stock is tagged
-``eastmoney_intraday_clist_delay`` and the strict tradability gate correctly
-refuses entry.  This module fills a **candidate-only** live quote table from
-Tencent ``qt.gtimg.cn`` (no token) so stage signals can attach a same-session
-reference price without waiting for a full-market live clist recovery.
+Provider timestamps and source identity remain attached to the observations.
+A quote is not an execution permission or a revival of historical stage scores.
 """
 
 from __future__ import annotations
@@ -22,7 +18,7 @@ from trade_system.quality import table_exists
 # Provider tag used in executable_quote_snapshot / stage evidence.
 TENCENT_SPOT_PROVIDER = "tencent_spot_quote"
 
-# Common qt.gtimg.cn field indices (price confirmed in stock_data_sources).
+# Common qt.gtimg.cn field indices (shared Tencent transport).
 _Q = {
     "name": 1,
     "code": 2,
@@ -125,7 +121,7 @@ def parse_tencent_parts(parts: list[str]) -> dict[str, Any] | None:
 
 def fetch_tencent_quotes(codes: Iterable[str]) -> dict[str, dict[str, Any]]:
     """Network call: batch Tencent spot quotes. Returns code -> parsed dict."""
-    from trade_system.stock_data_sources import _from_tencent_quote
+    from trade_system.quote_transport import fetch_parts as _from_tencent_quote
 
     codes_list = [str(c).zfill(6) if str(c).isdigit() else str(c) for c in codes]
     codes_list = [c for c in codes_list if c]
@@ -146,43 +142,22 @@ def candidate_codes_for_quotes(
     *,
     limit: int = 200,
 ) -> list[str]:
-    """Prefer same-day actionable universe: limit pool → stage → score."""
-    queries = (
-        """
-        SELECT stock_code FROM v_limit_pool
-        WHERE CAST(trade_date AS VARCHAR)=?
-        ORDER BY board_level DESC NULLS LAST, stock_code
-        LIMIT ?
-        """,
-        """
-        SELECT DISTINCT stock_code FROM stock_candidate_stage_signal
-        WHERE CAST(trade_date AS VARCHAR)=?
-        ORDER BY stock_code
-        LIMIT ?
-        """,
-        """
-        SELECT stock_code FROM stock_candidate_score
-        WHERE CAST(trade_date AS VARCHAR)=?
-        ORDER BY score DESC NULLS LAST, stock_code
-        LIMIT ?
-        """,
-        """
-        SELECT DISTINCT stock_code FROM multi_source_stock_flow
-        WHERE source_date=CAST(? AS DATE) AND main_net IS NOT NULL
-          AND main_net > 0
-        ORDER BY main_net DESC
-        LIMIT ?
-        """,
-    )
-    for sql in queries:
-        try:
-            rows = con.execute(sql, [trade_date, int(limit)]).fetchall()
-        except Exception:
-            continue
-        codes = [str(r[0]) for r in rows if r and r[0]]
-        if codes:
-            return codes
-    return []
+    """Quote explicit manual attention and open holdings; never infer a score universe."""
+    from trade_system.quality import table_exists
+    targets = []
+    if table_exists(con, "holdings"):
+        targets.extend(r[0] for r in con.execute(
+            "SELECT DISTINCT stock_code FROM holdings WHERE status='open' AND shares>0 "
+            "AND entry_date<=CAST(? AS DATE) AND (exit_date IS NULL OR exit_date>CAST(? AS DATE)) "
+            "ORDER BY stock_code", [trade_date, trade_date]).fetchall())
+    if table_exists(con, "watchlist"):
+        targets.extend(r[0] for r in con.execute(
+            "SELECT stock_code FROM (SELECT stock_code,status,priority, "
+            "row_number() OVER (PARTITION BY stock_code ORDER BY trade_date DESC,created_at DESC) AS rn "
+            "FROM watchlist WHERE CAST(trade_date AS DATE)<=CAST(? AS DATE)) "
+            "WHERE rn=1 AND status='active' ORDER BY priority DESC NULLS LAST,stock_code",
+            [trade_date]).fetchall())
+    return list(dict.fromkeys(str(code) for code in targets if code))[:max(0, int(limit))]
 
 
 def upsert_executable_quotes(

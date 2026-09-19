@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from datetime import datetime
@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import DB_PATH, TODAY
+from trade_system.config import DB_PATH, TODAY
 from trade_system.capital_flow_health import (
     assess_capital_flow_health,
     render_capital_flow_health_markdown,
