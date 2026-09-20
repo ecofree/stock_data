@@ -76,6 +76,15 @@ def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
 def test_profile_declares_full_market_flow_sources():
     names = {task.name for task in phase_tasks("intraday")}
     assert {"collect_intraday_stock_flow_market", "collect_intraday_sector_flow_full"} <= names
+    import pytest
+    from trade_system.collection_profiles import validate_plan
+    for phase in ('auction','intraday','close','supplemental','history'):
+        plan = command_plan('unused', '2026-09-18', include_collection=True, phase=phase)
+        assert [t.name for t in phase_tasks(phase)] == [n for n,_,_ in plan]
+    with pytest.raises(ValueError, match='unregistered'):
+        task_due('unused','2026-09-18','unknown',phase='close',force=True)
+    with pytest.raises(ValueError, match='unregistered'):
+        validate_plan([('unknown',[],False)])
 
 
 def test_fresh_intraday_snapshots_are_not_due(tmp_path):
@@ -205,7 +214,11 @@ def test_market_context_fallback_never_suppresses_real_retry(tmp_path):
         "2026-07-15",
         "collect_market_context",
         now=datetime(2026, 7, 15, 11, 0),
-    )[0] is False
+    )[0] is True
+    with duckdb.connect(str(db)) as con:
+        con.execute("INSERT INTO daily_summary VALUES ('2026-07-15','2026-07-15 10:59:30','real')")
+    assert not task_due(db, '2026-07-15', 'collect_market_context', now=datetime(2026,7,15,11))[0]
+
 
 
 def test_task_due_is_phase_aware_for_shared_tasks(tmp_path):
@@ -218,11 +231,14 @@ def test_task_due_is_phase_aware_for_shared_tasks(tmp_path):
     con = duckdb.connect(str(db))
     con.execute(
         "CREATE TABLE daily_summary (date DATE, source_kind VARCHAR, fetched_at TIMESTAMP)")
+    con.execute("CREATE TABLE market_rise_fall(date DATE,source_kind VARCHAR,updated_at TIMESTAMP)")
     fetched = datetime(2026, 7, 15, 17, 0, 0)
     con.execute(
         "INSERT INTO daily_summary VALUES (DATE '2026-07-15', 'real', ?)", [fetched])
     con.close()
 
+    with duckdb.connect(str(db)) as con:
+        con.execute("INSERT INTO market_rise_fall VALUES ('2026-07-15','real',?)", [fetched])
     now = fetched + timedelta(seconds=2000)  # 2000s old
     due_close, reason_close = task_due(
         str(db), "2026-07-15", "collect_market_context", phase="close", now=now)
@@ -232,7 +248,7 @@ def test_task_due_is_phase_aware_for_shared_tasks(tmp_path):
     assert due_auction is True, reason_auction  # 2000s > 300s auction TTL -> due
 
 
-def test_history_uses_single_plan_and_canaries_are_explicit_only():
+def test_history_uses_single_plan_and_canaries_are_explicit_only(monkeypatch):
     from trade_system.collection_profiles import HISTORY_SUPPLEMENT_TYPES
     for phase in ("auction", "intraday", "close", "history"):
         plan = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase=phase)
@@ -244,3 +260,12 @@ def test_history_uses_single_plan_and_canaries_are_explicit_only():
             assert command[1] == "scripts/collect_multisource.py"
             assert command[command.index("--types") + 1] == ",".join(HISTORY_SUPPLEMENT_TYPES)
             assert "--resume" in command
+
+    # Explicit historical samples cannot include future watchlist rows or repeat a code.
+    from scripts import collect_minute_snapshots as minute
+    monkeypatch.setattr(minute, '_market_of', lambda code: 'SZ')
+    with duckdb.connect(':memory:') as con:
+        con.execute('CREATE TABLE watchlist(trade_date DATE,stock_code VARCHAR)')
+        con.execute("INSERT INTO watchlist VALUES ('2026-09-17','000001'),('2026-09-18','000002'),('2026-09-19','000003')")
+        assert minute._universe(con,'2026-09-18','watchlist',10)==['000002']
+        assert minute._universe(con,'2026-09-18','000002,000002, 000001',10)==['000001','000002']

@@ -68,10 +68,13 @@ def project(con, day, as_of, research_codes):
     prior=sessions[1] if len(sessions)>1 else None
     limits=limit_facts(con,day,clock)
     boards={r['stock_code']:r['board_level'] for r in limits['rows']}
+    from trade_system.review_metrics import period_bounds, market_period_summary
+    week_start,week_end=period_bounds(day,'week')
+    price_start=min(week_start,prior or day)
     prices=con.execute("""SELECT trade_date,stock_code,change_pct,provider,adjustment,volume_unit,amount_unit,close
-        FROM v_kline_daily WHERE trade_date IN (?,?) AND fetched_at<=? AND close>0
-        ORDER BY trade_date,stock_code LIMIT 20001""",[day,prior or day,clock]).fetchall()
-    if len(prices)>20000:raise ValueError('market price budget exceeded')
+        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? AND close>0
+        ORDER BY trade_date,stock_code LIMIT 80001""",[price_start,day,clock]).fetchall()
+    if len(prices)>80000:raise ValueError('market price budget exceeded')
     keyed={}
     for d,code,pct,provider,adjustment,vol,amount,close in prices:
         d=str(d)[:10];code=str(code)
@@ -130,6 +133,17 @@ def project(con, day, as_of, research_codes):
         'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded,
         'account_state':'unknown','missing':['account_snapshot','verified_intraday_quotes','point_in_time_membership'],
         'execution_ready':False}
+    calendar={}
+    for exchange,opened,d in con.execute("""SELECT exchange,is_open,cal_date
+        FROM tushare_trade_cal WHERE exchange IN ('SSE','SZSE')
+        AND cal_date BETWEEN ? AND ? ORDER BY cal_date,exchange""",[week_start,week_end]).fetchall():
+        calendar.setdefault(str(d)[:10],[]).append((exchange,opened))
+    daily={}
+    for (d,code),r in keyed.items():
+        if d<week_start or r['pct'] is None or not math.isfinite(r['pct']) or not all(r['contract']):continue
+        counts=daily.setdefault(d,{'rise':0,'fall':0,'flat':0,'samples':0})
+        counts['samples']+=1;counts['rise' if r['pct']>0 else 'fall' if r['pct']<0 else 'flat']+=1
+    result['periods']={period:market_period_summary(day,period,daily,calendar) for period in ('day','week')}
     result['limit_pool']=limits
     result['breadth']['limit_up']=len(boards) if limits['status']=='available' else None
     result['highest_board']=max(boards.values(),default=None)

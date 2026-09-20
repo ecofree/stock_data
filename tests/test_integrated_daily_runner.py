@@ -191,7 +191,7 @@ def test_close_readiness_gate_is_tightened_to_2h():
     """Audit P2 #1: the close readiness/capital-flow acceptance window is 7200s (2h),
     not the loose 21600s (6h), so a degraded stale intraday snapshot is fail-closed;
     the close-decision SIGNAL evidence window stays at 6h (spans the trading day)."""
-    from scripts.run_integrated_daily import CLOSE_READINESS_MAX_AGE_SECONDS, command_plan
+    from trade_system.collection_profiles import CLOSE_READINESS_MAX_AGE_SECONDS, command_plan
 
     assert CLOSE_READINESS_MAX_AGE_SECONDS == 7200
     steps = command_plan("sample.duckdb", "2026-07-28", include_collection=True, phase="close")

@@ -18,17 +18,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from trade_system.hithink_client import HiThinkClient, HiThinkError  # noqa: E402
 from trade_system.logging_setup import configure, get_logger  # noqa: E402
 from trade_system.trading_calendar import open_session_dates  # noqa: E402
-from scripts.collect_hithink_limit_pool_daily import MIN_ROWS, _clean_items, _write_snapshot  # noqa: E402
+from scripts.collect_hithink_limit_pool_daily import _clean_items, _write_snapshot  # noqa: E402
 
 logger = get_logger("limit_history_backfill")
 
 def _missing_days(con, start: str, end: str) -> list[str]:
     sessions = open_session_dates(con, start, end, strict=True)
-    counts = dict(con.execute(
-        "SELECT CAST(trade_date AS VARCHAR), count(*) FROM official_limit_pool "
-        "WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date", [start, end]).fetchall())
-    # Existing row count is only a retry floor, not certification of coverage.
-    return [day for day in sessions if counts.get(day, 0) < MIN_ROWS]
+    from trade_system.collection_profiles import official_pool_checkpoint
+    return [day for day in sessions if official_pool_checkpoint(con, day) is None]
+
 
 
 def main() -> int:
@@ -52,8 +50,9 @@ def main() -> int:
         done = 0
         for day in todo:
             try:
-                items = _clean_items(client.limit_up_pool(day))
-                n = _write_snapshot(con, day, items)
+                raw, receipt = client.limit_up_pool(day, with_receipt=True)
+                items = _clean_items(raw)
+                n = _write_snapshot(con, day, items, receipt=receipt)
             except (HiThinkError, RuntimeError, ValueError) as exc:
                 if "5003" in str(exc):
                     print(f"{day}: outside authorized history window — stop.")

@@ -239,3 +239,48 @@ def validate_experimental_theme_scores(
         result["reason"] = "not_enough_validated_history"
     return result
 
+
+
+def period_bounds(day: str, period: str) -> tuple[str, str]:
+    """Natural periods; a week is Monday through Sunday, not five sessions."""
+    from datetime import date, timedelta
+    end = date.fromisoformat(day)
+    if period == 'day':
+        return day, day
+    if period != 'week':
+        raise ValueError('only delivered day/week contracts are supported')
+    start = end - timedelta(days=end.weekday())
+    return start.isoformat(), (start + timedelta(days=6)).isoformat()
+
+
+def market_period_summary(day, period, daily, calendar):
+    """Aggregate stored security-session observations, never account returns.
+
+    calendar maps dates to the exact SSE/SZSE flags. Missing calendar dates and
+    missing price sessions remain explicit; a source-sized market denominator
+    is not inferred from the rows that happened to arrive.
+    """
+    from datetime import date, timedelta
+    start, end = period_bounds(day, period)
+    days=[]; cursor=date.fromisoformat(start)
+    while cursor <= date.fromisoformat(day):
+        days.append(cursor.isoformat());cursor += timedelta(days=1)
+    unknown=[d for d in days if calendar.get(d) not in (
+        [('SSE',0),('SZSE',0)], [('SSE',1),('SZSE',1)])]
+    sessions=[d for d in days if calendar.get(d)==[('SSE',1),('SZSE',1)]]
+    rows=[dict(date=d, **daily[d]) for d in sessions if daily.get(d,{}).get('samples',0)>0]
+    missing=[d for d in sessions if not daily.get(d,{}).get('samples',0)]
+    for row in rows:
+        if any(type(row.get(k)) is not int or row[k]<0 for k in ('rise','fall','flat','samples')):
+            raise ValueError('nonnegative observed counts required')
+        if row['samples'] != row['rise']+row['fall']+row['flat']:
+            raise ValueError('breadth counts must reconcile')
+    total=sum(r['samples'] for r in rows)
+    return {'contract':'available-security-session-breadth-v1','period':period,
+        'start':start,'end':end,'through':day,'unfinished_period':day<end,
+        'status':'calendar_unverified' if unknown else 'missing_sessions' if missing else 'observed_sessions' if sessions else 'closed_period',
+        'calendar_missing':unknown,'expected_sessions':sessions,'missing_sessions':missing,
+        'rows':rows,'security_session_samples':total,
+        'rising_observation_ratio':sum(r['rise'] for r in rows)/total if total else None,
+        'scope':'available_observations_not_exchange_coverage_or_strategy_win_rate',
+        'point_in_time_qualified':False,'execution_ready':False}

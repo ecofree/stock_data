@@ -6,8 +6,6 @@ import time
 from datetime import datetime
 from typing import Any
 from trade_system.data_store import DuckDBStore
-from trade_system.limit_rules import limit_threshold
-from trade_system.trading_calendar import previous_open_session
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 def _iso_date(value) -> str | None:
     raw = "".join(ch for ch in str(value or "") if ch.isdigit())
@@ -160,61 +158,6 @@ def fetch_hk_hold(client: XiaodefaClient, trade_date: str) -> list[dict[str, Any
     return [r for r in rows if r["trade_date"]]
 
 
-def _enrich_limit_board_levels(store: DuckDBStore, rows: list[dict[str, Any]],
-                               trade_date: str) -> None:
-    """Derive consecutive limit-up board counts from local daily kline.
-
-    TuShare limit_list_d carries no board level; without this the ladder and
-    promotion-rate views would lose their height dimension on days where the
-    KPL pool is unavailable.
-    """
-    if not rows:
-        return
-    codes = [str(r.get("ts_code") or "").split(".")[0] for r in rows]
-    placeholders = ",".join("?" for _ in codes)
-    try:
-        hist = store.conn.execute(
-            f"""
-            SELECT regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') AS code,
-                   CAST(trade_date AS DATE) AS d, CAST(change_pct AS DOUBLE) AS pct
-            FROM v_kline_daily
-            WHERE regexp_replace(CAST(stock_code AS VARCHAR), '[.].*$', '') IN ({placeholders})
-              AND CAST(trade_date AS DATE) <= CAST(? AS DATE)
-            ORDER BY code, d DESC
-            """,
-            [*codes, trade_date],
-        ).fetchall()
-    except Exception:
-        return
-
-    streak_by_code: dict[str, dict[str, float]] = {}
-    for code, day, pct in hist:
-        streak_by_code.setdefault(code, {})[str(day)[:10]] = pct or 0.0
-
-    target = trade_date[:10]
-    for row in rows:
-        code = str(row.get("ts_code") or "").split(".")[0]
-        days_map = streak_by_code.get(code)
-        if not days_map:
-            row["board_level"] = None
-            continue
-        streak = 0
-        cursor = target
-        from datetime import date as _date
-
-        day = _date.fromisoformat(target)
-        for _ in range(40):
-            pct = days_map.get(cursor)
-            if pct is None or pct < limit_threshold(code, row.get("name")):
-                break
-            streak += 1
-            previous = previous_open_session(store.conn, cursor)
-            if previous is None:
-                break
-            cursor = previous
-        row["board_level"] = streak if streak > 0 else 1
-
-
 def fetch_limit_pool(client: XiaodefaClient, trade_date: str) -> list[dict[str, Any]]:
     """Exchange-grade limit-up list (TuShare limit_list_d, limit_type=U)."""
     rows = client.query_all(
@@ -225,6 +168,12 @@ def fetch_limit_pool(client: XiaodefaClient, trade_date: str) -> list[dict[str, 
         # `limit` is a reserved word in DuckDB DDL; rename before storage.
         if "limit" in row:
             row["limit_type"] = row.pop("limit")
+        height = row.get('limit_times')
+        try:
+            number = float(height) if not isinstance(height, bool) else float('nan')
+            row['board_level'] = int(number) if number >= 1 and number.is_integer() else None
+        except (TypeError, ValueError, OverflowError):
+            row['board_level'] = None
         row["fetched_at"] = datetime.now()
     return [r for r in rows if r["trade_date"]]
 
@@ -382,10 +331,6 @@ def collect(
                         f"{kind} returned only {len(rows)} rows for "
                         f"trade_date={trade_date}; source may be late or unavailable"
                     )
-                if kind == "limit_pool":
-                    _enrich_limit_board_levels(store, rows, trade_date)
-                    for r in rows:
-                        r.setdefault("board_level")
                 stored = store_rows(
                     store,
                     spec["table"],

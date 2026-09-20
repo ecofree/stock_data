@@ -1,7 +1,6 @@
 """Persist the same-day HiThink official limit-up pool.
 
-This is the close-stage producer for ``official_limit_pool``.  An empty or
-obviously partial response never deletes the last verified snapshot; the
+This is the close-stage producer for ``official_limit_pool``.  Only complete native pages and their declared total can replace a snapshot; the
 Eastmoney/KPL pool remains a separately marked fallback in ``v_limit_pool``.
 """
 
@@ -27,7 +26,7 @@ from trade_system.quality import table_exists  # noqa: E402
 
 
 logger = get_logger("hithink_limit_pool_daily")
-MIN_ROWS = 5
+
 
 
 def _number(value: Any) -> float | None:
@@ -71,17 +70,23 @@ def _clean_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _write_snapshot(con: duckdb.DuckDBPyConnection, trade_date: str,
-                    items: list[dict[str, Any]]) -> int:
+                    items: list[dict[str, Any]], *, receipt: dict) -> int:
     if not table_exists(con, "official_limit_pool"):
         raise RuntimeError(
             "official_limit_pool is missing; apply schema migrations before the close run"
         )
-    if len(items) < MIN_ROWS:
-        raise RuntimeError(
-            f"HiThink limit-up pool returned only {len(items)} valid rows; snapshot not replaced"
-        )
+    if (receipt.get('path') != '/api/a-share/special-data/limit-up-pool'
+            or receipt.get('params', {}).get('date_ms') != HiThinkClient._date_ms(trade_date)
+            or type(receipt.get('total')) is not int or receipt['total'] != len(items)
+            or type(receipt.get('pages')) is not int or receipt['pages'] < 1
+            or not receipt.get('items_sha256')):
+        raise ValueError('complete same-date native pool receipt required')
+    if not table_exists(con, 'history_fetch_checkpoint'):
+        raise RuntimeError('history_fetch_checkpoint missing; apply existing schema migration')
     con.execute("BEGIN TRANSACTION")
     try:
+        # Retire rows absent from the new complete source version, atomically.
+        con.execute("DELETE FROM official_limit_pool WHERE trade_date=? AND source='hithink'", [trade_date])
         for item in items:
             con.execute(
                 """
@@ -110,6 +115,13 @@ def _write_snapshot(con: duckdb.DuckDBPyConnection, trade_date: str,
                     item["max_seal_money"], item["is_st"],
                 ],
             )
+        con.execute("""INSERT INTO history_fetch_checkpoint
+            (dataset,trade_date,page_no,status,rows_written,last_error,updated_at)
+            VALUES ('hithink_limit_pool',?,0,'success',?,?,?)
+            ON CONFLICT(dataset,trade_date,page_no) DO UPDATE SET
+            status=excluded.status,rows_written=excluded.rows_written,
+            last_error=excluded.last_error,updated_at=excluded.updated_at""",
+            [trade_date,len(items),json.dumps(receipt,sort_keys=True),receipt['received_at']])
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -120,11 +132,12 @@ def _write_snapshot(con: duckdb.DuckDBPyConnection, trade_date: str,
 def collect(db_path: str | Path, trade_date: str) -> dict[str, Any]:
     datetime_date = date.fromisoformat(trade_date)
     client = HiThinkClient()
-    items = _clean_items(client.limit_up_pool(datetime_date.isoformat()))
+    raw, receipt = client.limit_up_pool(datetime_date.isoformat(), with_receipt=True)
+    items = _clean_items(raw)
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(db_path))
     try:
-        count = _write_snapshot(con, trade_date, items)
+        count = _write_snapshot(con, trade_date, items, receipt=receipt)
     finally:
         con.close()
     return {

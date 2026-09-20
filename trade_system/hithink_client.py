@@ -99,7 +99,7 @@ class HiThinkClient:
         return int(dt.timestamp() * 1000)
 
     def _paged(self, path: str, params: dict[str, Any],
-               item_key: str = "item", max_pages: int = 20) -> list[dict]:
+               item_key: str = "item", max_pages: int = 20, *, with_receipt: bool = False):
         """Fetch every page of a paginated endpoint; returns combined items."""
         if type(max_pages) is not int or not 1 <= max_pages <= 50:
             raise HiThinkError('page budget must be 1..50')
@@ -107,6 +107,7 @@ class HiThinkClient:
         out: list[dict] = []
         seen = set()
         expected_pages = None
+        expected_total = None
         for page in range(1, max_pages + 1):
             data = self._get(path, {**params, 'page': page}, _deadline=deadline)
             pagination = data.get('pagination')
@@ -114,6 +115,14 @@ class HiThinkClient:
             if not isinstance(pagination, dict) or not isinstance(items, list) or any(not isinstance(x, dict) for x in items):
                 raise HiThinkError('invalid pagination contract')
             pages = pagination.get('pages')
+            total = pagination.get('total')
+            if with_receipt and pagination.get('page') != page:
+                raise HiThinkError('native page number differs from request')
+            if with_receipt and (type(total) is not int or total < 0):
+                raise HiThinkError('native total required for certified coverage')
+            if expected_total is not None and total != expected_total:
+                raise HiThinkError('native total changed during collection')
+            expected_total = total
             if type(pages) is not int or not 1 <= pages <= max_pages:
                 raise HiThinkError('unknown or exhausted page budget')
             if expected_pages is not None and pages != expected_pages:
@@ -125,17 +134,23 @@ class HiThinkClient:
             seen.add(fingerprint)
             out.extend(items)
             if page == pages:
+                if total is not None and (type(total) is not int or total != len(out)):
+                    raise HiThinkError('native total differs from completed pages')
+                if with_receipt:
+                    return out, {'path': path, 'params': params, 'pages': pages, 'total': total,
+                        'received_at': datetime.now(CST).isoformat(),
+                        'items_sha256': hashlib.sha256(json.dumps(out, sort_keys=True, allow_nan=False).encode()).hexdigest()}
                 return out
         raise HiThinkError('page budget exhausted')
 
     # ------------------------------------------------------- special data
-    def limit_up_pool(self, date_str: str, max_pages: int = 20) -> list[dict]:
+    def limit_up_pool(self, date_str: str, max_pages: int = 20, *, with_receipt: bool = False):
         """涨停/连板股票池。date_str: YYYY-MM-DD 或 YYYYMMDD."""
         return self._paged(
             "/api/a-share/special-data/limit-up-pool",
             {"date_ms": self._date_ms(date_str), "size": 200,
              "sort_field": "limit_up_time", "sort_dir": "asc"},
-            max_pages=max_pages,
+            max_pages=max_pages, with_receipt=with_receipt,
         )
 
     def limit_down_pool(self, date_str: str, max_pages: int = 20) -> list[dict]:

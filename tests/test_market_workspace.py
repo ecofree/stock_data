@@ -31,6 +31,23 @@ def test_full_members_and_fixed_scope_previous_day(con):
     assert r['matched_previous']['previous']['fall']==1
     assert r['matched_previous']['current']['rise']==1
     assert r['account_state']=='unknown' and not r['execution_ready']
+    assert r['periods']['week']['start']=='2026-09-07'
+    assert r['periods']['week']['status']=='calendar_unverified'
+    con.execute("DELETE FROM tushare_trade_cal")
+    for d,opened in [('2026-09-07',0),('2026-09-08',0),('2026-09-09',0),('2026-09-10',1),('2026-09-11',1)]:
+        for exchange in ('SSE','SZSE'):
+            con.execute('INSERT INTO tushare_trade_cal VALUES (?,?,?)',[exchange,opened,d])
+    week=project(con)['periods']['week']
+    assert week['expected_sessions']==['2026-09-10','2026-09-11']
+    assert week['security_session_samples']==2 and week['rising_observation_ratio']==0.5
+    assert week['unfinished_period'] and not week['point_in_time_qualified']
+    from trade_system.review_metrics import market_period_summary
+    closed=market_period_summary('2026-09-09','week',{},
+        {d:[('SSE',0),('SZSE',0)] for d in ['2026-09-07','2026-09-08','2026-09-09']})
+    assert closed['status']=='closed_period' and closed['rising_observation_ratio'] is None
+    con.execute("DELETE FROM v_kline_daily WHERE trade_date='2026-09-10'")
+    assert project(con)['periods']['week']['missing_sessions']==['2026-09-10']
+
 
 
 def test_changed_provider_not_compared_and_partial_members_not_published(con):

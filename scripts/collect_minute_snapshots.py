@@ -1,9 +1,8 @@
-"""Store 1-minute intraday bars for the stocks that matter (replay axis).
+"""Explicit bounded historical price-point collection (not OHLCV).
 
-Universe defaults to the day's official limit-up pool — a few dozen names
-instead of the whole market, keeping the table at ~30k rows/day.  Data via
-easy-tdx (TDX protocol, free); servers only keep recent sessions, so this
-must run daily to accumulate history.
+The caller chooses the universe. Legacy watchlist dates do not prove original
+receipt time; these samples are retrospective observations, not a certified
+prospective cohort or executable prices. This maintenance tool is not scheduled.
 """
 from __future__ import annotations
 
@@ -42,6 +41,8 @@ def _market_of(code: str):
 
 def _universe(con: duckdb.DuckDBPyConnection, day: str, source: str,
               max_stocks: int) -> list[str]:
+    if not 1 <= max_stocks <= 200:
+        raise ValueError("explicit stock budget must be 1..200")
     if source == "limit-pool":
         # Use v_limit_pool (unified view) which falls back to derived pool
         # when official backfill hasn't run yet for today.
@@ -53,14 +54,14 @@ def _universe(con: duckdb.DuckDBPyConnection, day: str, source: str,
     elif source == "watchlist":
         rows = con.execute(
             """SELECT DISTINCT stock_code FROM watchlist
-               WHERE CAST(trade_date AS VARCHAR) >= (
+               WHERE CAST(trade_date AS VARCHAR) <= ? AND CAST(trade_date AS VARCHAR) = (
                    SELECT max(CAST(trade_date AS VARCHAR)) FROM watchlist
                    WHERE CAST(trade_date AS VARCHAR) <= ?)""",
-            [day],
+            [day, day],
         ).fetchall()
     else:
         rows = [(c,) for c in source.split(",") if c.strip()]
-    codes = [str(r[0]) for r in rows if str(r[0]).isdigit()]
+    codes = sorted({str(r[0]).strip() for r in rows if str(r[0]).strip().isascii() and str(r[0]).strip().isdigit() and len(str(r[0]).strip()) == 6})
     return [c for c in codes if _market_of(c)][:max_stocks]
 
 
@@ -68,7 +69,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(PROJECT_ROOT / "kpl_data.duckdb"))
     parser.add_argument("--date", default=str(date.today()).replace("-", ""))
-    parser.add_argument("--source", default="limit-pool",
+    parser.add_argument("--source", required=True,
                         help="limit-pool | watchlist | comma-separated codes")
     parser.add_argument("--max-stocks", type=int, default=150)
     args = parser.parse_args()
@@ -83,7 +84,9 @@ def main() -> int:
     con = legacy_connect(args.db)
     try:
         codes = _universe(con, day, args.source, args.max_stocks)
-        print(f"universe: {len(codes)} stocks for {day}")
+        print(f"universe: {len(codes)} stocks for {day}; retrospective_price_points_not_PIT")
+        if not codes:
+            return 2
         stored = failed = 0
         with TdxClient.from_best_host() as client:
             for code in codes:
@@ -91,6 +94,7 @@ def main() -> int:
                 try:
                     df = client.get_history_minute_time_data(market, code, int(ymd))
                     if df is None or df.empty:
+                        failed += 1
                         continue
                     con.execute("BEGIN TRANSACTION")
                     try:
@@ -113,7 +117,7 @@ def main() -> int:
             [day],
         ).fetchone()[0]
         print(f"stored={stored} failed={failed}; bars for {day}: {total}")
-        return 0 if stored else 1
+        return 0 if stored == len(codes) and not failed else 2
     finally:
         con.close()
 
