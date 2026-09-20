@@ -214,7 +214,7 @@ function drawPeriod(){
   box.append(el('p',a.start+' 至 '+a.end+' · 截至 '+a.through+'；'+(a.status==='declared_ledger_reconciled'?'已按导入声明对账':'资料不足，暂不计算收益')));
   const t=el('table',''),b=el('tbody','');t.append(b);table(b,[['期间净盈亏 / 元','现金流调整收益','已观测估值点回撤','已含费用 / 元'],
    [a.net_pnl_fen==null?'未知':fmt(a.net_pnl_fen/100),a.time_weighted_return==null?'未知':fmt(a.time_weighted_return*100)+'%',a.observed_drawdown==null?'未知':fmt(a.observed_drawdown*100)+'%',a.fees_fen==null?'未知':fmt(a.fees_fen/100)]]);box.append(t);
-  const gaps={opening_equity:'期初资产',closing_equity:'期末资产',cash_flows:'资金流水',fees:'成交费用',corporate_actions:'公司行动',valuation_path:'持仓估值路径',exact_period_coverage:'对应期间的完整性声明',events_complete:'完整事件账',fees_complete:'完整费用',corporate_actions_complete:'完整公司行动',valuation_path_complete:'完整估值路径',interval_reconciled:'期间对账',cash_flow_valuations:'资金进出前后估值',unresolved_event:'待核对事件',account_source_or_ledger_invalid:'可读取且有效的账户账本'};
+  const gaps={closing_valuation_after_last_event:'末笔事件之后的资产估值',opening_equity:'期初资产',closing_equity:'期末资产',cash_flows:'资金流水',fees:'成交费用',corporate_actions:'公司行动',valuation_path:'持仓估值路径',exact_period_coverage:'对应期间的完整性声明',events_complete:'完整事件账',fees_complete:'完整费用',corporate_actions_complete:'完整公司行动',valuation_path_complete:'完整估值路径',interval_reconciled:'期间对账',cash_flow_valuations:'资金进出前后估值',unresolved_event:'待核对事件',account_source_or_ledger_invalid:'可读取且有效的账户账本'};
   box.append(el('p','缺少：'+((a.missing||[]).map(k=>gaps[k]||'需核对的账项').join('、')||'期间基础账项无缺口')+'。期间盈亏含跨期持仓估值，费用不重复扣除；观测点回撤不是完整盘中回撤。'),el('p','平仓胜负、滑点和题材归因尚需完整成交及事前归因记录；不由行情或模型排名代替。'));return;
  }
  if(!p){box.append(el('p','此冻结版本未包含周期汇总；需要从本地合格事实重新发布。'));return}

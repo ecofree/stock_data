@@ -170,7 +170,8 @@ def period_performance(con, account_id, day, period):
         if not item.get('effective_at'):
             result['missing'].append('event_effective_time');continue
         effective=utc(item['effective_at'])
-        if not begin<effective<finish:continue
+        if not begin<=effective<finish:continue
+        if effective>last[1]:result['missing'].append('closing_valuation_after_last_event')
         if kind in ('correction','external_action_unknown'):
             result['missing'].append('unresolved_event');continue
         if item.get('reconciled') is not True:result['missing'].append('unreconciled_event')

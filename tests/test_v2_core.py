@@ -144,14 +144,15 @@ def test_unknown_live_and_unreconciled_accounts_never_approve(store):
         'valuation_path_complete':True,'interval_reconciled':True}
     import_snapshot(store,account_raw(account_id='period',asof='2026-09-30T15:00:00+08:00',
         valid_until='2026-10-02T00:00:00+08:00',positions=[],cash='1650',equity='1650',performance_coverage={'month':coverage}))
-    append_account_event(store,'deposit','period','cash_transfer',{'effective_at':'2026-09-10T10:00:00+08:00',
+    append_account_event(store,'deposit','period','cash_transfer',{'effective_at':'2026-09-01T00:00:00+08:00',
         'amount_fen':50000,'equity_before_fen':100000,'equity_after_fen':150000,'reconciled':True})
     value=period_performance(store.con,'period','2026-09-30','month')
     assert value['net_pnl_fen']==15000 and value['time_weighted_return']==pytest.approx(.1)
     assert value['observed_drawdown']==0 and value['net_external_flow_fen']==50000
     assert period_performance(store.con,'period','2026-09-30','quarter')['net_pnl_fen'] is None
-    append_account_event(store,'unknown','period','external_action_unknown',{'effective_at':'2026-09-11T10:00:00+08:00'})
-    assert period_performance(store.con,'period','2026-09-30','month')['time_weighted_return'] is None
+    append_account_event(store,'late-fee','period','fee',{'effective_at':'2026-09-30T18:00:00+08:00','amount_fen':100,'reconciled':True})
+    missing=period_performance(store.con,'period','2026-09-30','month')
+    assert missing['time_weighted_return'] is None and 'closing_valuation_after_last_event' in missing['missing']
 
 
 
