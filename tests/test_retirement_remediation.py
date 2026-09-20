@@ -107,25 +107,30 @@ def test_no_unguarded_legacy_duckdb_writer_calls():
 
 
 def test_current_application_and_tools_do_not_import_retired_implementations():
-    retired = ['base', 'config', 'schema', 'scripts.backfill_legacy_baostock',
+    retired = ['base', 'config', 'schema', 'fetch_all', 'scripts.backfill_2026_ytd',
+     'scripts.run_moneyflow_history_to_300', 'scripts.collect_auction_anomaly_daily',
+     'scripts.collect_auction_tick_daily', 'scripts.build_operator_views',
+     'trade_system.integration.operator_views', 'scripts.backfill_legacy_baostock',
      'scripts.backfill_legacy_baostock_parallel', 'scripts.build_derived_limit_pool',
      'scripts.build_qlib_candidate_pool', 'scripts.collect_tushare_basic_data',
      'scripts.generate_backtest_vs_actual', 'scripts.generate_professional_reports',
      'scripts.generate_review_report', 'scripts.generate_signals', 'scripts.generate_stage_signals',
-     'scripts.generate_stock_detail', 'scripts.generate_web_dashboard', 'scripts.paper_order',
-     'scripts.predict_qlib_daily', 'scripts.refresh_close_signals', 'scripts.run_backtest',
+     'scripts.generate_stock_detail', 'scripts.generate_web_dashboard', 'scripts.import_qlib_shadow_predictions', 'scripts.paper_order',
+     'scripts.predict_qlib_daily', 'scripts.push_stage_signals', 'scripts.refresh_close_signals', 'scripts.run_backtest',
      'scripts.run_daily_operator_loop', 'scripts.run_daily_screen', 'scripts.run_qlib_daily',
-     'scripts.run_stage_backtest', 'scripts.run_strategy_result_backtest', 'scripts.screen_with_qlib',
+     'scripts.run_stage_backtest', 'scripts.run_strategy_scan', 'scripts.run_strategy_result_backtest', 'scripts.screen_with_qlib',
      'scripts.sync_tushare_ohlc', 'scripts.train_qlib_shadow', 'staged_multisource', 'stock_data_sources',
      'tools.v2.verify_qlib', 'trade_system.akshare_guard', 'trade_system.backtest',
-     'trade_system.candidate_pool', 'trade_system.daily_loop', 'trade_system.ml.model_gate',
+     'trade_system.candidate_pool', 'trade_system.daily_loop', 'trade_system.ml.model_gate', 'trade_system.ml.qlib_shadow',
      'trade_system.operator_risk', 'trade_system.paper_execution', 'trade_system.risk',
      'trade_system.screening_funnel', 'trade_system.signals', 'trade_system.stage_signals',
      'trade_system.staged_multisource', 'trade_system.stock_data_sources',
-     'trade_system.strategy_stage_backtest', 'trade_system.trader_signals', 'trade_system.tushare_backfill',
+     'trade_system.strategy', 'trade_system.strategy_stage_backtest', 'trade_system.trader_signals', 'trade_system.tushare_backfill',
      'tushare_backfill']
     from importlib.util import find_spec
-    assert all(find_spec(name) is None for name in retired if name != "config")
+    # A removed package can leave an ignored bytecode-only namespace directory.
+    assert all((spec := find_spec(name)) is None or name == 'trade_system.strategy' and spec.origin is None
+               for name in retired if name != "config")
     import ast
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
@@ -145,7 +150,8 @@ def test_current_application_and_tools_do_not_import_retired_implementations():
                 fn = node.func
                 if (isinstance(fn, ast.Name) and fn.id == '__import__') or (isinstance(fn, ast.Attribute) and fn.attr == 'import_module'):
                     modules = [str(node.args[0].value)]
-            if any(m.startswith('collect_') or m == 'tools.incidents' or m.startswith('tools.incidents.') or m in retired for m in modules):
+            if any(m.startswith('collect_') or m == 'tools.incidents' or m.startswith('tools.incidents.')
+                   or any(m == r or m.startswith(r + '.') for r in retired) for m in modules):
                 offenders.append((name, node.lineno))
     assert not offenders, offenders
 

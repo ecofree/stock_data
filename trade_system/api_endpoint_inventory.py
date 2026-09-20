@@ -527,12 +527,8 @@ def merge_candidates(candidates: list[EndpointCandidate]) -> list[EndpointInvent
 def build_inventory_from_project(project_root: str | Path) -> list[EndpointInventoryItem]:
     root = Path(project_root)
     candidates: list[EndpointCandidate] = []
-    for path in sorted(root.glob("collect_*.py")):
-        candidates.extend(extract_python_candidates(path))
-    # ``fill_final.py`` was a hard-coded, exception-swallowing one-off runner
-    # and is intentionally retired.  The staged/backfill scripts own history
-    # now; inventory only needs to inspect the supported market entrypoint.
-    for path in [root / "fetch_all.py"]:
+    for path in [*sorted((root / 'collectors').glob('collect_*.py')),
+                 *sorted((root / 'scripts').glob('collect_*.py'))]:
         candidates.extend(extract_python_candidates(path))
     candidates.extend(extract_schema_candidates(root / "trade_system/schema.py"))
     for path in [root / "trading_data_application.md", *sorted((root / "docs").rglob("*.md"))]:

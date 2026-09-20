@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import duckdb
+import pytest
 
 from trade_system.tushare_history import TushareHistoryCollector
 from trade_system.xiaodefa_source import XiaodefaClient
@@ -67,7 +68,8 @@ def test_retained_xiaodefa_close_snapshot_is_certified(tmp_path):
     assert cert == ("xiaodefa", "certified", 1000)
 
 
-def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_path):
+@pytest.mark.parametrize('failure', ['empty_amounts', 'invalid_amount', 'publish_failure'])
+def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_path, monkeypatch, failure):
     class FlowFixture:
         def query_rows(self, api_name, params=None, fields=""):
             if api_name == "moneyflow_ind_dc":
@@ -81,6 +83,8 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
                      "buy_sm_amount": 1, "sell_sm_amount": 1,
                      "buy_md_amount": 1, "sell_md_amount": 1}]
     with TushareHistoryCollector(tmp_path / "flow.duckdb", client=FlowFixture()) as collector:
+        collector.store.conn.execute("INSERT INTO tushare_trade_cal(exchange,cal_date,is_open) "
+            "VALUES ('SSE','2026-07-14',true),('SZSE','2026-07-14',true)")
         collector._collect_industry_flow("20260714")
         collector.sync_sector_flow("20260714")
         assert collector.store.conn.execute(
@@ -91,6 +95,33 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
         assert collector.store.conn.execute(
             "SELECT main_net,super_net,large_net,mid_net,small_net,net_total FROM multi_source_stock_flow"
         ).fetchone() == (120000, 60000, 60000, 0, 0, None)
+        query = collector.client.query_rows
+        def refresh(api_name, params=None, fields=''):
+            rows = query(api_name, params, fields)
+            for row in rows:
+                if failure == 'empty_amounts':
+                    for field in list(row):
+                        if 'amount' in field:
+                            row[field] = None
+                else:
+                    row['buy_elg_amount'] = float('nan') if failure == 'invalid_amount' else 99
+            return rows
+        monkeypatch.setattr(collector.client, 'query_rows', refresh)
+        if failure == 'publish_failure':
+            original = collector._checkpoint
+            def checkpoint(dataset, day, status, **kwargs):
+                original(dataset, day, status, **kwargs)
+                if status == 'success':
+                    raise RuntimeError('failure after standard publication')
+            monkeypatch.setattr(collector, '_checkpoint', checkpoint)
+        tables = ['tushare_moneyflow', 'tushare_moneyflow_industry',
+                  'multi_source_stock_flow', 'multi_source_sector_flow']
+        before = {t: collector.store.conn.execute(f'SELECT * FROM {t}').fetchall() for t in tables}
+        receipts = collector.store.conn.execute('SELECT count(*) FROM multi_source_observation').fetchone()[0]
+        result = collector.run('20260714', '20260714', datasets=['moneyflow', 'industry_flow'], force=True)
+        assert {r['status'] for r in result['results']} == {'error'}
+        assert {t: collector.store.conn.execute(f'SELECT * FROM {t}').fetchall() for t in tables} == before
+        assert collector.store.conn.execute('SELECT count(*) FROM multi_source_observation').fetchone()[0] == receipts + 2
 
 
 class ScopedFixture:
@@ -157,6 +188,7 @@ def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tm
 
 
 def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
+    import json
     client = ScopedFixture()
     with TushareHistoryCollector(tmp_path / "plan.duckdb", client=client) as c:
         seed_calendar(c)
@@ -168,6 +200,24 @@ def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
         assert result["results"][0]["not_listed_codes"] == ["000002.SZ", "000003.SZ"]
         assert not client.calls
         assert c.store.conn.execute("SELECT count(*) FROM history_fetch_checkpoint").fetchone()[0] == 0
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code,list_date) "
+                             "SELECT '00000' || i || '.SZ','2020-01-01' FROM range(4,8) t(i)")
+        evidence = dict(params={'trade_date': '20260701'}, rows=[
+            dict(ts_code='000004.SZ', trade_date='20260701', suspend_type='S', suspend_timing=''),
+            dict(ts_code='000005.SZ', trade_date='20260701', suspend_type='S', suspend_timing='09:30-10:00'),
+            dict(ts_code='000006.SZ', trade_date='20260701', suspend_type='R', suspend_timing=''),
+        ])
+        c.store.conn.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json) "
+            "VALUES ('tushare_suspend_d_snapshot','custom','qualified',?)", [json.dumps(evidence)])
+        # No daily placeholder exists for the independently confirmed full-day suspension.
+        assert c._applicable_codes({'000004.SZ','000005.SZ','000006.SZ','000007.SZ'}, '20260701', 'daily') == {
+            '000005.SZ', '000006.SZ', '000007.SZ'}
+        assert '000004.SZ' in c._expected_stock_codes('20260701', 'adj_factor')
+        assert '000004.SZ' in c._expected_stock_codes('20260701', 'daily_basic')
+        assert '000004.SZ' not in c._expected_stock_codes('20260701', 'moneyflow')
+        c.store.conn.execute("INSERT INTO tushare_daily(ts_code,date,close,volume,turnover) "
+            "VALUES ('000004.SZ','2026-07-01',10,100,1000)")
+        assert '000004.SZ' in c._expected_stock_codes('20260701', 'daily')
 
 
 def test_wrong_session_is_rejected_with_raw_receipt_retained(tmp_path):
@@ -199,13 +249,16 @@ def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path
         def __init__(self):
             super().__init__(token="fixture")
         def query_rows(self, api, params=None, fields="", *, _deadline=None):
+            if api == 'stock_basic':
+                return [] if params['list_status'] == 'D' else [dict(
+                    ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L')]
             return [{"ts_code": "000001.SZ", "trade_date": "20260701", "close": 10}] * 100
     with TushareHistoryCollector(tmp_path / "pages.duckdb", client=Repeating(), batch_limit=100) as c:
         seed_calendar(c)
         result = c.run("20260701", "20260701", datasets=["daily"], stock_codes=["1"])
         assert result["results"][0]["status"] == "error"
         assert "repeated page" in result["results"][0]["error"]
-        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation").fetchone()[0] == 2
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_daily'").fetchone()[0] == 2
         assert c.store.conn.execute("SELECT count(*) FROM tushare_daily").fetchone()[0] == 0
 
 
@@ -214,6 +267,8 @@ def test_equal_count_with_wrong_instrument_cannot_certify_full_snapshot(tmp_path
     from trade_system.xiaodefa_source import XiaodefaError
     class WrongUniverse(XiaodefaDailyFixture):
         def query_rows(self, *args, **kwargs):
+            if args[0] == 'suspend_d':
+                return []
             rows = super().query_rows(*args, **kwargs)
             rows[-1]["ts_code"] = "600999.SH"
             return rows
@@ -224,26 +279,70 @@ def test_equal_count_with_wrong_instrument_cannot_certify_full_snapshot(tmp_path
         with pytest.raises(XiaodefaError, match="1 missing instruments"):
             c._collect_daily("20260714")
         assert c.store.conn.execute("SELECT count(*) FROM tushare_daily").fetchone()[0] == 0
-        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation").fetchone()[0] == 1
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_daily'").fetchone()[0] == 1
 
 
 def test_offline_plan_needs_no_provider_credential(tmp_path, monkeypatch):
+    import hashlib
     from trade_system import xiaodefa_source
     monkeypatch.setattr(xiaodefa_source, "SETTINGS", {})
-    with TushareHistoryCollector(tmp_path / "offline.duckdb", offline=True) as c:
+    missing = tmp_path / 'missing.duckdb'
+    with pytest.raises((ValueError, duckdb.Error)):
+        TushareHistoryCollector(missing, offline=True)
+    assert not missing.exists()
+    db = tmp_path / 'offline.duckdb'
+    with TushareHistoryCollector(db, client=ScopedFixture()) as c:
         seed_calendar(c)
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    with TushareHistoryCollector(db, offline=True) as c:
         result = c.run("20260701", "20260701", datasets=["daily"], stock_codes=["1"], plan_only=True)
         assert result["results"][0]["status"] == "planned"
+        with pytest.raises(duckdb.Error):
+            c.store.conn.execute('CREATE TABLE forbidden(i INT)')
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    empty = tmp_path / 'empty.duckdb'
+    duckdb.connect(str(empty)).close()
+    before = empty.read_bytes()
+    with pytest.raises((ValueError, duckdb.Error)):
+        TushareHistoryCollector(empty, offline=True)
+    assert empty.read_bytes() == before
 
 
 def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path):
+    import json
     class Empty:
+        rows = []
+        delisted = []
         def query_rows(self, *args, **kwargs):
-            return []
+            return self.delisted if args[1].get('list_status') == 'D' else self.rows
     with TushareHistoryCollector(tmp_path / "reference.duckdb", client=Empty()) as c:
         seed_calendar(c)
         result = c.run("20260701", "20260701", datasets=["stock_basic"])
         assert result["results"][0]["status"] == "error"
+        c.client.rows = [dict(ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L')]
+        assert c.collect_stock_basic() == 1
+        first = c._reference_version()
+        assert first and c.collect_stock_basic() == 0
+        c.store.conn.execute("UPDATE multi_source_observation SET observed_at=current_timestamp - INTERVAL 2 DAY "
+                             "WHERE data_type='tushare_stock_basic_snapshot'")
+        c.client.rows = []
+        result = c.run('20260701', '20260701', datasets=['stock_basic', 'daily'], gap_only=True)
+        assert all(r['status'] == 'error' for r in result['results'])
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 1
+        c.client.rows = [dict(ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L'),
+                         dict(ts_code='000002.SZ', symbol='000002', list_date='20260701', list_status='L')]
+        assert c.collect_stock_basic() == 2
+        assert c._reference_version()['version'] != first['version']
+        snapshots = c.store.conn.execute("SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='tushare_stock_basic_snapshot' ORDER BY observed_at").fetchall()
+        assert [len(json.loads(r[0])['rows']) for r in snapshots] == [1, 2]
+        c.client.delisted = [dict(c.client.rows[0], list_status='D', delist_date='20260701')]
+        c.client.rows = c.client.rows[1:]
+        assert c.collect_stock_basic(force=True) == 2
+        assert c._expected_stock_codes('20260701', 'daily') == {'000002.SZ'}
+        # A manually changed projection no longer matches its reference version.
+        c.store.conn.execute("UPDATE tushare_stock_basic SET list_date='1970-01-01' WHERE ts_code='000002.SZ'")
+        assert c._reference_version() is None
 
 
 def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):

@@ -1,6 +1,10 @@
 """Market sentiment and emotion data collectors."""
 import json
 from datetime import datetime
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 # After this many consecutive runs where KPL answers but returns no row for the
@@ -403,3 +407,29 @@ def collect_all_market(client: KPLClient, store: DuckDBStore, date: str) -> dict
     results["emotion_money_date"] = collect_emotion_money_date(client, store, date)
     results["emotion_money_detail"] = collect_emotion_money_detail(client, store, date)
     return results
+
+
+def main():
+    """Bounded market context only; other products use their existing phase tasks."""
+    import argparse
+    from trade_system.schema import init_schema
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--db', required=True)
+    parser.add_argument('--date', required=True)
+    args = parser.parse_args()
+    store = DuckDBStore(args.db)
+    try:
+        init_schema(store.conn)
+        client = KPLClient(max_attempts=2, total_budget_seconds=45)
+        result = collect_all_market(client, store, args.date)
+        qualified = all(store.fetchall(
+            f'SELECT count(*) FROM {table} WHERE CAST(date AS VARCHAR)=?', [args.date])[0][0]
+            for table in ('daily_summary', 'market_rise_fall'))
+        print(json.dumps({'rows': result, 'provider_stats': client.stats, 'qualified': qualified}))
+        return 0 if qualified and client.stats['success'] else 2
+    finally:
+        store.close()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -11,7 +11,7 @@
 | `kpl_qds.performance_tracker` | kpl_qds | review | `port` | `True` | `trade_system.review attribution` |  |
 | `kpl_qds.qmt_bridge` | kpl_qds | execution | `forbid` | `True` | `` | 自动交易/下单路径禁止进入 stock_data。 |
 | `kpl_qds.hardcoded_settings` | kpl_qds | secret | `forbid` | `True` | `` | 硬编码 key 或敏感配置禁止迁入，审计只记录文件存在，不读取内容。 |
-| `kpl_qds.qlib_shadow` | kpl_qds | ml_shadow | `reference` | `True` | `trade_system.ml.qlib_shadow` | 当前不迁移重型 qlib 训练/二进制数据。 |
+| `kpl_qds.qlib_shadow` | kpl_qds | ml_shadow | `reference` | `True` | `trade_system.ml.shadow_evaluator`（历史只读） | SQL 模型写入器已退出；不迁移重型 qlib 训练/二进制数据。 |
 | `tickflow.strategy_engine` | tickflow | strategy | `port` | `True` | `trade_system.strategy` |  |
 | `tickflow.indicator_pipeline` | tickflow | indicator | `port` | `True` | `trade_system.strategy.indicator_pipeline` |  |
 | `tickflow.backtest_engine` | tickflow | backtest | `port` | `True` | `trade_system.backtest.stage_backtest` |  |

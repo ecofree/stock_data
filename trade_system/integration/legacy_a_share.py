@@ -1,4 +1,4 @@
-"""Read-only audit and import helpers for the legacy A-share kpl-qds project."""
+"""Read-only legacy audit and one-time import into a separate empty archive."""
 
 from __future__ import annotations
 
@@ -107,8 +107,17 @@ def import_legacy_tables(
     root = Path(legacy_root)
     legacy_db = root / "db" / "kpl_qds.duckdb"
     selected_tables = selected_import_tables or IMPORT_TABLES
+    if set(selected_tables) - set(IMPORT_TABLES):
+        raise ValueError('only named historical tables may be archived')
     if not legacy_db.exists():
         raise FileNotFoundError(str(legacy_db))
+    target_path = Path(stock_db_path).resolve()
+    if target_path == legacy_db.resolve() or (target_path.exists() and target_path.samefile(legacy_db)):
+        raise ValueError('historical archive must not alias its source')
+    if target_path.exists():
+        with duckdb.connect(str(target_path), read_only=True) as check:
+            if check.execute('SHOW TABLES').fetchall():
+                raise ValueError('historical import requires an empty archive; existing records are protected')
 
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(stock_db_path))
@@ -123,12 +132,12 @@ def import_legacy_tables(
                 "SELECT table_name FROM duckdb_tables() WHERE database_name='legacy_db' AND schema_name='main'"
             ).fetchall()
         }
+        con.execute('BEGIN TRANSACTION')
         for table in selected_tables:
             target = f"legacy_qds_{table}"
             if table not in existing:
                 copied[target] = 0
                 continue
-            con.execute(f'DROP TABLE IF EXISTS "{target}"')
             con.execute(
                 f"""
                 CREATE TABLE "{target}" AS
@@ -137,6 +146,10 @@ def import_legacy_tables(
                 """
             )
             copied[target] = int(con.execute(f'SELECT count(*) FROM "{target}"').fetchone()[0])
+        con.execute('COMMIT')
+    except Exception:
+        con.rollback()
+        raise
     finally:
         if attached:
             try:

@@ -86,10 +86,22 @@ folder, without replacing live facts or orders.
 `collect_finance.py`, `collect_index.py`, `collect_news.py`, `collect_l2.py`,
 `collect_dingpan.py`, `collect_fengk.py`, `collect_misc.py`,
 `collect_advanced.py`, `collect_advanced_stock.py`, `collect_stock.py` —
-These modules live only in `collectors/` and are driven by `fetch_all.py`.
+These modules live only in `collectors/`; the existing phase runner selects narrow collectors.
+Market context calls `collectors/collect_market.py --db <db> --date <day>` directly; the broad `fetch_all.py` entry is retired.
 Configuration, schema and the existing store live in `trade_system/config.py`,
 `trade_system/schema.py` and `trade_system/data_store.py`; root import shims were removed.
 Production remains paused pending the separate handover.
+
+Auction acquisition uses `collect_auction_market_daily.py`: default `--product market` retains
+separate process ticks and final matched quotes; explicit `--product tick --codes 000001,600000`
+and `--product anomaly` preserve their distinct endpoints. One shared client enforces `--budget-seconds`;
+old candidate-signal selection and the two duplicate daily wrappers are removed.
+
+Historical TuShare collection uses `backfill_2026_tushare.py --start-date <start> --end-date <end>`.
+Use `--max-days 5 --gap-only --budget-seconds 600` for a bounded resumable batch;
+`--datasets moneyflow` limits the product. `--plan-only` needs a valid existing local calendar.
+The YTD and fixed 2024–2025 moneyflow wrappers no longer reset budgets, infer sessions from prices,
+wait on metadata lock files, or hide failed batches behind exit 0.
 
 ## Backfill / history
 

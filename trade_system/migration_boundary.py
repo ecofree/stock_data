@@ -32,7 +32,7 @@ def collection_source_files(root):
     import ast
 
     root = Path(root).resolve()
-    pending = [root / 'fetch_all.py']
+    pending = []
     runner = root / 'scripts/run_integrated_daily.py'
     if runner.is_file():
         pending.append(runner)
@@ -119,7 +119,7 @@ def collection_contract(source_root, database, reports, python):
             raise ValueError('transitional collection refuses V2/account databases')
         if not {'tushare_trade_cal', 'v_kline_daily'} <= names:
             raise ValueError('initialized market database and calendar required')
-    if not (root / 'fetch_all.py').is_file():
+    if not (root / 'scripts/run_integrated_daily.py').is_file():
         raise ValueError('canonical collector entry missing')
     files = collection_source_files(root)
     if any(p.is_symlink() or root not in p.resolve().parents for p in files):

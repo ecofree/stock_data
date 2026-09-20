@@ -45,6 +45,8 @@ def test_create_operator_outcome_template_uses_actionable_stage_signals(tmp_path
         "('2026-07-16','intraday_strength','000001','Ping An',71,true),"
         "('2026-07-16','intraday_strength','000002','Vanke',60,false)"
     )
+    con.execute("CREATE VIEW v_operator_candidates AS SELECT '2026-07-16' AS trade_date, "
+                "'999999' AS stock_code,'legacy mixed row' AS stock_name,999 AS score")
     con.close()
 
     out = tmp_path / "stage-outcomes.csv"

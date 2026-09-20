@@ -18,8 +18,8 @@ def render_markdown(result: dict[str, int]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Import legacy A-share kpl-qds tables into stock_data DuckDB.")
-    parser.add_argument("--db", default="kpl_data.duckdb")
+    parser = argparse.ArgumentParser(description="Import historical legacy tables into a new empty archive; never the current database.")
+    parser.add_argument("--db", required=True, help='New empty historical archive database')
     parser.add_argument("--legacy-root", default=r"D:\accio\A-share\kpl-qds")
     parser.add_argument("--out", default="reports/legacy_import_latest.md")
     args = parser.parse_args()

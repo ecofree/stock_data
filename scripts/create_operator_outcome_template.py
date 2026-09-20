@@ -41,12 +41,6 @@ def create_template(db_path: str | Path, output: str | Path, trade_date: str | N
                 "FROM trade_plan WHERE trade_date=? ORDER BY stock_code",
                 [selected_date],
             ).fetchall()
-        if not rows and table_exists(con, "v_operator_candidates"):
-            rows = con.execute(
-                "SELECT trade_date, stock_code, coalesce(stock_name, '') "
-                "FROM v_operator_candidates WHERE trade_date=? ORDER BY score DESC NULLS LAST, stock_code LIMIT 100",
-                [selected_date],
-            ).fetchall()
         if not rows and table_exists(con, "stock_candidate_score"):
             rows = con.execute(
                 "SELECT trade_date, stock_code, coalesce(stock_name, '') "

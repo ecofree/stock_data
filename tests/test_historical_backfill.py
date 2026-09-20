@@ -10,7 +10,7 @@ class FakeTushare:
         if api == "trade_cal":
             return [{"exchange": params["exchange"], "cal_date": "20260710", "is_open": 1, "pretrade_date": "20260709"}]
         if api == "stock_basic":
-            return [] if params["list_status"] == "D" else [{"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "industry": "银行", "list_status": "L"}]
+            return [] if params["list_status"] == "D" else [{"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "industry": "银行", "list_status": "L", "list_date": "19910403"}]
         if api == "daily":
             return [{"ts_code": "000001.SZ", "trade_date": "20260710", "open": 10, "high": 11,
                      "low": 9, "close": 10.5, "vol": 100, "amount": 1000, "pct_chg": 1}]

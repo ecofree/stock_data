@@ -352,7 +352,7 @@ def build_default_requirements(*, include_compatibility: bool = False) -> list[A
         ApiRequirement("research_layer", "news_radar_item", None, {}, "news_radar_item", "important", "local Vibe-style news radar import", "catalyst tagging and AI review context", source_type="local"),
         ApiRequirement("research_layer", "research_note", None, {}, "research_note", "important", "manual/local research-note table", "operator research notes and review memory", source_type="local"),
         ApiRequirement("research_layer", "research_report_file", None, {}, "research_report_file", "optional", "manual/local research-report registry", "report and announcement management", source_type="local"),
-        ApiRequirement("ml_shadow", "qlib_prediction", None, {}, "qlib_prediction", "optional", "external CSV via scripts/import_qlib_shadow_predictions.py", "shadow-mode factor/model validation", source_type="external_file", fallback="Do not use as direct trading signal until evaluated."),
+        ApiRequirement("ml_shadow", "qlib_prediction", None, {}, "qlib_prediction", "optional", "historical SQL archive; active importer retired", "read-only historical shadow diagnostics", source_type="local", fallback="Historical diagnostics never qualify a current model or trading signal."),
     ]
     if include_compatibility:
         return requirements

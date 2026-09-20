@@ -1,5 +1,4 @@
 from trade_system.data_store import DuckDBStore
-from fetch_all import should_collect_finance
 import pytest
 
 
@@ -42,10 +41,3 @@ def test_insert_rows_respects_caller_transaction(tmp_path):
     store.execute("COMMIT")
     assert store.fetchall("SELECT value FROM nested ORDER BY value") == [(1,), (2,)]
     store.close()
-
-
-def test_should_collect_finance_requires_collector_and_flag():
-    assert should_collect_finance(skip_finance=False, only_market=False, has_finance=True) is True
-    assert should_collect_finance(skip_finance=False, only_market=False, has_finance=False) is False
-    assert should_collect_finance(skip_finance=True, only_market=False, has_finance=True) is False
-    assert should_collect_finance(skip_finance=False, only_market=True, has_finance=True) is False

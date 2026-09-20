@@ -4,7 +4,7 @@ from trade_system.data_store import DuckDBStore
 from scripts.collect_professional_sources import select_stock_codes_for_professional_collection
 
 
-def test_select_stock_codes_prioritizes_candidates_limit_pool_then_sector_stocks(tmp_path):
+def test_select_stock_codes_uses_current_facts_not_historical_candidates(tmp_path):
     db_path = tmp_path / "select.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -29,6 +29,7 @@ def test_select_stock_codes_prioritizes_candidates_limit_pool_then_sector_stocks
     )
     con.execute("CREATE TABLE sector_stocks(date DATE, sector_code VARCHAR, stock_code VARCHAR)")
     con.execute("INSERT INTO sector_stocks VALUES ('2026-07-06','801001','000004')")
+    con.execute('CREATE VIEW v_operator_candidates AS SELECT * FROM stock_candidate_stage_signal')
     con.close()
 
     store = DuckDBStore(str(db_path))
@@ -37,4 +38,4 @@ def test_select_stock_codes_prioritizes_candidates_limit_pool_then_sector_stocks
     finally:
         store.close()
 
-    assert codes == ["000001", "000002", "000003", "000004"]
+    assert codes == ["000003", "000004"]

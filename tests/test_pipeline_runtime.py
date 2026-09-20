@@ -27,12 +27,12 @@ def test_runtime_fingerprint_tracks_consumers_and_actual_thresholds_not_git_fail
     from types import SimpleNamespace
     from trade_system import pipeline_runtime as runtime
 
-    for name in ("fetch_all.py", "trade_system/config.py", "trade_system/schema.py", "trade_system/consumer.py",
+    for name in ("scripts/run_integrated_daily.py", "trade_system/config.py", "trade_system/schema.py", "trade_system/consumer.py",
                  "config/phase_thresholds.json", "pyproject.toml"):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}" if path.suffix == ".json" else "# fixture", encoding="utf-8")
-    (tmp_path / "fetch_all.py").write_text("import trade_system.consumer", encoding="utf-8")
+    (tmp_path / "scripts/run_integrated_daily.py").write_text("import trade_system.consumer", encoding="utf-8")
     monkeypatch.setattr(runtime, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runtime.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=128, stdout="", stderr="synthetic Git failure"))
     first = runtime.runtime_fingerprint()

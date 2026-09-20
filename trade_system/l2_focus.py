@@ -1,7 +1,6 @@
 """Bounded L2 stock-curve collection for operator candidates.
 
-Production phase mode only runs ``fetch_all.py --only-market``, which never
-reaches ``collect_all_l2``.  That froze ``l2_stock_intraday`` at an old date.
+The narrow market task does not fan out into ``collect_all_l2``.
 This module collects a **small candidate universe** every intraday/close tick
 so stage signals can use L2 last prices as an executable-price fallback.
 """

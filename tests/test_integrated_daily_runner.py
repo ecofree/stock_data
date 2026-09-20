@@ -244,7 +244,8 @@ def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, m
     import subprocess
     from trade_system.migration_boundary import collection_contract, verify_collection_contract
     source=tmp_path/'source';source.mkdir()
-    (source/'fetch_all.py').write_text('from collectors import retained')
+    (source/'scripts').mkdir()
+    (source/'scripts/run_integrated_daily.py').write_text('from collectors import retained')
     adapters=source/'collectors';adapters.mkdir()
     (adapters/'__init__.py').write_text('')
     (adapters/'retained.py').write_text('THRESHOLD = 1')
@@ -285,7 +286,7 @@ def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, m
         verify_collection_contract(path,digest,db,tmp_path/'different')
     with pytest.raises(ValueError,match='supplied hash'):
         verify_collection_contract(path,'0'*64,db,output)
-    (source/'fetch_all.py').write_text('# changed fixture')
+    (source/'scripts/run_integrated_daily.py').write_text('# changed fixture')
     with pytest.raises(ValueError,match='source/runtime changed'):
         verify_collection_contract(path,digest,db,output)
     with duckdb.connect(str(db)) as con:

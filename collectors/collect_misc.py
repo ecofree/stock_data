@@ -14,7 +14,7 @@ def _parse_bidding_anomalies(data, fallback_date: str) -> list[tuple[str, str, s
     if not data:
         return []
     if isinstance(data, dict):
-        api_date = str(data.get("date") or fallback_date)
+        api_date = _normalize_kline_date(data.get("date") or fallback_date)
         items = data.get("anomalies")
         if items is None:
             items = data.get("data", [])
@@ -255,7 +255,8 @@ def collect_auction_market(client: KPLClient, store: DuckDBStore, date: str) -> 
     if not isinstance(payload, dict):
         return result
 
-    source_date = str(payload.get("date") or date)[:10]
+    store.insert_raw('/auction/market', payload)
+    source_date = _normalize_kline_date(payload.get('date'))
     result["source_date"] = source_date
     if source_date != str(date)[:10]:
         result["status"] = "source_date_mismatch"
@@ -366,6 +367,9 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
         data = client.get("/auction/tick", {"code": code, "date": date})
         if not data:
             continue
+        store.insert_raw('/auction/tick', data)
+        if not isinstance(data, dict) or _normalize_kline_date(data.get('date')) != date:
+            raise ValueError('auction tick requires explicit matching source date')
         # The endpoint nests ticks under "auction_ticks"; earlier parser
         # revisions looked at "data"/"ticks" and silently stored nothing
         # (auction_tick frozen at 2026-07-14 despite a healthy endpoint).
@@ -400,18 +404,17 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
 def collect_auction_bidding_anomaly(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
     if not stock_codes:
         return 0
+    # This route returns the global anomaly list, independently of market/ticks.
+    data = client.get('/auction/bidding-anomaly', {'date': date})
+    if not data:
+        return 0
+    store.insert_raw('/auction/bidding-anomaly', data)
+    if not isinstance(data, dict) or _normalize_kline_date(data.get('date')) != date:
+        raise ValueError('auction anomaly requires explicit matching source date')
+    rows = _parse_bidding_anomalies(data, date)
     total = 0
-    last_data = None
-    # The endpoint must be queried per stock; iterate all codes instead of
-    # only the first (the original single-code bug silently dropped the rest).
-    for code in stock_codes:
-        data = client.get("/auction/bidding-anomaly", {"code": code, "date": date})
-        if data:
-            last_data = data
-        rows = _parse_bidding_anomalies(data, date)
-        if not rows:
-            continue
-        total += store.insert_rows(
+    if rows:
+        total = store.insert_rows(
             "auction_bidding_anomaly",
             rows,
             ["date", "stock_code", "anomaly_type", "anomaly_value"],
@@ -419,8 +422,6 @@ def collect_auction_bidding_anomaly(client: KPLClient, store: DuckDBStore, date:
         )
     if total:
         store.log_collect("auction_bidding_anomaly", "/auction/bidding-anomaly", total, "ok")
-    elif last_data:
-        store.insert_raw("/auction/bidding-anomaly", last_data)
     return total
 
 

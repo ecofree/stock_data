@@ -56,27 +56,9 @@ def select_stock_codes_for_professional_collection(store: DuckDBStore, date: str
         (
             """
             SELECT DISTINCT stock_code
-            FROM stock_candidate_stage_signal
-            WHERE CAST(trade_date AS VARCHAR) = ? AND stock_code != ''
-            ORDER BY max(score) OVER (PARTITION BY stock_code) DESC NULLS LAST, stock_code
-            """,
-            [date],
-        ),
-        (
-            """
-            SELECT DISTINCT stock_code
             FROM v_limit_pool
             WHERE CAST(trade_date AS VARCHAR) = ? AND stock_code != ''
             ORDER BY stock_code
-            """,
-            [date],
-        ),
-        (
-            """
-            SELECT DISTINCT stock_code
-            FROM v_operator_candidates
-            WHERE CAST(trade_date AS VARCHAR) = ? AND stock_code != ''
-            ORDER BY score DESC NULLS LAST, stock_code
             """,
             [date],
         ),

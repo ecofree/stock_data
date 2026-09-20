@@ -116,14 +116,14 @@ def command_plan(
         # Phase mode is intentionally narrow and is the only collection path.
         if phase == "auction":
             collection_steps = [
-                ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_auction_evidence", [py, "scripts/collect_auction_evidence.py", "--db", db_path, "--date", selected_date, "--max-stocks", str(signal_limit), "--out", report("auction_collection_latest.json")], False),
                 ("build_auction_evidence", [py, "scripts/build_auction_evidence.py", "--db", db_path, "--trade-date", selected_date, "--out", report("auction_evidence_latest.md")], False),
             ]
         elif phase == "intraday":
             collection_steps = [
-                ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
                 # Phase mode never runs full L2; keep candidate stock curves fresh.
@@ -138,7 +138,7 @@ def command_plan(
             ]
         elif phase == "close":
             collection_steps = [
-                ("collect_market_context", [py, "fetch_all.py", "--db", db_path, "--date", selected_date, "--only-market"], False),
+                ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 # Daily ingestion writes raw facts; normalization projects them without copies.
                 ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
                  "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y%m%d"),

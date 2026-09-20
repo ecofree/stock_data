@@ -39,7 +39,7 @@ def build_retirement_checklist(
         {
             "project": "kpl_qds",
             "capability": "legacy_data_and_rules",
-            "migrated_to": "legacy_qds_* tables; trade_system.integration; operator views",
+            "migrated_to": "legacy_qds_* tables in separate historical archive; read-only audit",
             "verified": phase11_ready and _exists(stock, "reports/legacy_import_latest.md"),
             "remaining_dependency": "确认 stock_data 不再需要直接读取 kpl-qds 路径；删除前需备份 legacy DB。",
             "delete_safe": False,
@@ -48,10 +48,9 @@ def build_retirement_checklist(
         {
             "project": "tickflow",
             "capability": "strategy_backtest_monitor_reference",
-            "migrated_to": "trade_system.strategy; strategy_scan_result; strategy_backtest_result",
-            "verified": _exists(stock, "reports/strategy_scan_latest.md")
-            and _exists(stock, "reports/strategy_backtest_latest.md"),
-            "remaining_dependency": "确认策略协议、回测约束和监控思想已满足；React 工作台仅参考。",
+            "migrated_to": "historical strategy_scan_result / strategy_backtest_result (read-only)",
+            "verified": False,
+            "remaining_dependency": "旧扫描与写入者已退役；历史报告不证明当前策略或外部项目可删除。",
             "delete_safe": False,
             "notes": f"source_exists={tickflow.exists()}; 不迁移整套 FastAPI/React。",
         },

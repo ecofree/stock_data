@@ -194,7 +194,6 @@ def _codes(
         for relation, date_col, order_sql in (
             ("v_limit_pool", "trade_date", "board_level DESC NULLS LAST, stock_code"),
             ("l2_realtime_all_boards", "date", "stock_code"),
-            ("stock_candidate_stage_signal", "trade_date", "score DESC NULLS LAST, stock_code"),
         ):
             try:
                 rows = connection.execute(

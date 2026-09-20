@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from trade_system.integration.legacy_a_share import audit_legacy_project
 
@@ -47,3 +48,12 @@ def test_import_legacy_tables_copies_selected_tables_with_prefix(tmp_path):
     row = con.execute("SELECT stock_code, final_score, legacy_source_table FROM legacy_qds_daily_watchlist").fetchone()
     con.close()
     assert row == ("000001", 88.5, "daily_watchlist")
+    before = stock_db.read_bytes()
+    with pytest.raises(ValueError, match='empty archive'):
+        import_legacy_tables(stock_db, legacy_root)
+    assert stock_db.read_bytes() == before
+    with pytest.raises(ValueError, match='alias'):
+        import_legacy_tables(legacy_db, legacy_root)
+    with pytest.raises(ValueError, match='named historical'):
+        import_legacy_tables(tmp_path/'forbidden.duckdb', legacy_root, ['account_snapshot'])
+    assert not (tmp_path/'forbidden.duckdb').exists()

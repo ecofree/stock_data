@@ -54,10 +54,11 @@ def connect_duckdb(db_path=None, *, read_only=False):
     if not read_only:
         from trade_system.db_utils import refuse_v2_writes
         refuse_v2_writes(path)
-    try:
-        os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
-    except Exception:
-        pass
+    if not read_only:
+        try:
+            os.makedirs(DUCKDB_TEMP_DIR, exist_ok=True)
+        except Exception:
+            pass
     config = {
         "memory_limit": DUCKDB_MEMORY_LIMIT,
         "threads": DUCKDB_THREADS,
@@ -424,10 +425,11 @@ class KPLClient:
 class DuckDBStore:
     """DuckDB store with dynamic table creation."""
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, *, read_only=False):
         self.db_path = db_path or DB_PATH
-        self.conn = connect_duckdb(self.db_path)
-        self._init_meta()
+        self.conn = connect_duckdb(self.db_path, read_only=read_only)
+        if not read_only:
+            self._init_meta()
 
     def _init_meta(self):
         # The scheduled canonical path has already applied schema migrations

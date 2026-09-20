@@ -1,10 +1,8 @@
-"""Collect the full-market KPL auction payload after close.
+"""Bounded auction acquisition with distinct market, tick and anomaly products.
 
-The current KPL ``/auction/market`` route returns one mapping containing all
-stock-level auction sequences and final matched fields.  This replaces the
-retired per-stock ``/auction/tick`` and ``/auction/bidding-anomaly`` fan-out in
-the close path.  The normalized rows are idempotent and preserve the semantic
-distinction between auction ticks and the final matched snapshot.
+The close task uses the market sequence and final-match payload. Explicit
+maintenance may request scoped ticks or global anomalies; neither product is
+inferred from a final-match snapshot. All share the existing store and budget.
 """
 
 from __future__ import annotations
@@ -18,18 +16,24 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from trade_system.data_store import DuckDBStore, KPLClient
-from collectors.collect_misc import collect_auction_market
+from collectors.collect_misc import collect_auction_market, collect_auction_tick, collect_auction_bidding_anomaly
 from trade_system.config import API_KEY, DB_PATH, TODAY
 from trade_system.schema import init_schema
 from trade_system.api_health import require_api_key
 
 
-def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "") -> dict:
+def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
+            product: str = 'market', codes=(), budget_seconds: float = 60) -> dict:
+    # Distinct endpoints remain distinct products; no legacy signal-based fan-out.
+    if product not in {'market', 'tick', 'anomaly'} or (product == 'tick' and not codes):
+        raise ValueError('supported auction product and explicit codes for tick required')
     target = Path(out) if out else None
     result: dict = {
         "trade_date": trade_date,
         "status": "error",
-        "source": "/auction/market",
+        "source": {'market': '/auction/market', 'tick': '/auction/tick',
+                   'anomaly': '/auction/bidding-anomaly'}[product],
+        "product": product,
         "stock_rows": 0,
         "tick_rows": 0,
         "quote_rows": 0,
@@ -39,9 +43,15 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "") -> di
         store = DuckDBStore(str(db_path))
         try:
             init_schema(store.conn)
-            parsed = collect_auction_market(
-                KPLClient(request_timeout=30, max_attempts=2), store, trade_date
-            )
+            client = KPLClient(request_timeout=30, max_attempts=2, total_budget_seconds=budget_seconds)
+            if product == 'market':
+                parsed = collect_auction_market(client, store, trade_date)
+            else:
+                collector = collect_auction_tick if product == 'tick' else collect_auction_bidding_anomaly
+                rows = collector(client, store, trade_date, list(dict.fromkeys(codes)) or [''])
+                failures = sum(int(client.stats.get(k) or 0) for k in ('error', 'rate_limited', 'circuit_open'))
+                parsed = {product + '_rows': rows,
+                          'status': 'partial' if failures and rows else 'success' if rows else 'error'}
             result.update(parsed)
         finally:
             store.close()
@@ -59,9 +69,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--date", default=TODAY)
+    parser.add_argument('--product', choices=('market', 'tick', 'anomaly'), default='market',
+                        help='Distinct market sequence/final snapshot, scoped ticks or global anomalies; never interchangeable.')
+    parser.add_argument('--codes', default='', help='Explicit comma-separated codes for the tick product.')
+    parser.add_argument('--budget-seconds', type=float, default=60)
     parser.add_argument("--out", default="reports/auction_market_collection_latest.json")
     args = parser.parse_args()
-    result = collect(args.db, args.date, out=args.out)
+    result = collect(args.db, args.date, out=args.out, product=args.product,
+                     codes=[c.strip() for c in args.codes.split(',') if c.strip()], budget_seconds=args.budget_seconds)
     return 0 if result.get("status") == "success" else 2
 
 

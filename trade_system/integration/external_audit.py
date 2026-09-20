@@ -86,7 +86,7 @@ CAPABILITY_RULES: list[dict[str, str]] = [
         "module_path": "qlib_ext/inference_pipeline.py",
         "capability_type": "ml_shadow",
         "decision": "reference",
-        "target_adapter": "trade_system.ml.qlib_shadow",
+        "target_adapter": "trade_system.ml.shadow_evaluator (historical read-only)",
         "operator_value": "只允许作为旁路预测验证，不能直接参与交易信号。",
         "blocked_reason": "当前不迁移重型 qlib 训练/二进制数据。",
     },

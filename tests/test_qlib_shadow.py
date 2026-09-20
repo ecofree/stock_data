@@ -3,44 +3,24 @@ import hashlib
 import duckdb
 import pytest
 
-from trade_system.ml.qlib_shadow import ensure_qlib_shadow_tables, import_qlib_predictions
 from trade_system.ml.shadow_evaluator import evaluate_qlib_shadow
 
 
-def test_import_qlib_predictions_persists_model_and_scores(tmp_path):
-    db_path = tmp_path / "qlib.duckdb"
-    rows = [
-        {"trade_date": "2026-07-06", "symbol": "000001", "score": 0.91, "rank": 1, "horizon": "t1"},
-        {"trade_date": "2026-07-06", "symbol": "000002", "score": 0.12, "rank": 2, "horizon": "t1"},
-    ]
-
-    result = import_qlib_predictions(
-        db_path,
-        model_id="shadow.alstm",
-        model_name="ALSTM shadow",
-        factor_set="Alpha158",
-        rows=rows,
-    )
-
-    assert result["qlib_model_registry"] == 1
-    assert result["qlib_prediction"] == 2
-    con = duckdb.connect(str(db_path))
-    try:
-        assert con.execute("SELECT count(*) FROM qlib_model_registry").fetchone()[0] == 1
-        assert con.execute("SELECT count(*) FROM qlib_prediction").fetchone()[0] == 2
-        assert con.execute("SELECT count(*) FROM v_qlib_shadow_candidate_overlap").fetchone()[0] == 2
-    finally:
-        con.close()
+def seed_historical_predictions(db_path, model_id, rows):
+    """An archived SQL shape for reader tests, not an active model importer."""
+    with duckdb.connect(str(db_path)) as con:
+        con.execute('CREATE TABLE qlib_prediction(trade_date VARCHAR,symbol VARCHAR,model_id VARCHAR,'
+                    'score DOUBLE,rank INTEGER,horizon VARCHAR)')
+        con.execute('CREATE TABLE qlib_shadow_evaluation(model_id VARCHAR)')
+        con.executemany('INSERT INTO qlib_prediction VALUES (?,?,?,?,?,?)', [
+            (r['trade_date'], r['symbol'], model_id, r['score'], r['rank'], r['horizon']) for r in rows])
 
 
 def test_evaluate_qlib_shadow_uses_calendar_without_database_writes(tmp_path):
     db_path = tmp_path / "qlib_eval.duckdb"
-    ensure_qlib_shadow_tables(db_path)
-    import_qlib_predictions(
+    seed_historical_predictions(
         db_path,
         model_id="shadow.alstm",
-        model_name="ALSTM shadow",
-        factor_set="Alpha158",
         rows=[
             {"trade_date": "2026-07-06", "symbol": "000001", "score": 0.91, "rank": 1, "horizon": "t1"},
             {"trade_date": "2026-07-06", "symbol": "000002", "score": 0.12, "rank": 2, "horizon": "t1"},
@@ -94,7 +74,7 @@ def test_shared_rank_ic_keeps_ties_constants_and_small_samples():
 @pytest.mark.parametrize('problem', ['missing_entry', 'missing_exit', 'duplicate_entry', 'nan_price', 'bad_horizon'])
 def test_shadow_labels_never_skip_required_sessions(tmp_path, problem):
     db = tmp_path/'shadow.duckdb'
-    import_qlib_predictions(db, model_id='fixture', model_name='synthetic', factor_set='fixture',
+    seed_historical_predictions(db, model_id='fixture',
         rows=[{'trade_date':'2026-07-06','symbol':'000001','score':1,'rank':1,
                'horizon':'unknown' if problem=='bad_horizon' else 't1_exec'}])
     with duckdb.connect(str(db)) as con:
@@ -114,7 +94,7 @@ def test_shadow_labels_never_skip_required_sessions(tmp_path, problem):
 
 def test_shadow_execution_horizon_respects_closed_days_and_fails_unknown_calendar(tmp_path):
     db = tmp_path/'shadow.duckdb'
-    import_qlib_predictions(db, model_id='fixture', model_name='synthetic', factor_set='fixture',
+    seed_historical_predictions(db, model_id='fixture',
         rows=[{'trade_date':'2026-07-03','symbol':'000001','score':1,'rank':1,'horizon':'t1_exec'}])
     with duckdb.connect(str(db)) as con:
         con.execute('CREATE TABLE tushare_trade_cal(cal_date DATE, is_open BOOLEAN)')
