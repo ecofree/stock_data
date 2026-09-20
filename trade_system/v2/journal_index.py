@@ -167,6 +167,17 @@ def history(output, kind='note', before=None, limit=100):
             'next_before':rows[limit-1][1] if len(rows)>limit else None,'limit':limit}
 
 
+def between(output, kind, start, stop, limit=10000):
+    """Complete half-open receipt-time interval; overflow is never silently clipped."""
+    if kind not in FOLDERS or not 1 <= limit <= 10000 or utc(start)>=utc(stop):
+        raise ValueError('bounded ordered journal interval required')
+    with reader(output) as con:
+        rows=con.execute('SELECT path FROM events WHERE kind=? AND received>=? AND received<? ORDER BY received,id LIMIT ?',
+                         (kind,utc(start).isoformat(),utc(stop).isoformat(),limit+1)).fetchall()
+    if len(rows)>limit:raise ValueError('journal interval budget exceeded; narrow the period')
+    return [event(Path(output)/r[0],kind) for r in rows]
+
+
 def lookup(output, kind, column, value):
     if column not in ('request', 'parent'):
         raise ValueError('unsupported journal lookup')

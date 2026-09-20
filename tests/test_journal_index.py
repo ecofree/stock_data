@@ -55,6 +55,10 @@ def test_read_only_legacy_workspace_and_keyset_pagination(tmp_path):
         cursor=page['next_before']
         if cursor is None:break
     assert len(seen)==len(set(seen))==13
+    assert len(index.between(tmp_path,'note','2026-09-14T00:00:00+08:00','2026-09-16T00:00:00+08:00'))==13
+    assert not index.between(tmp_path,'note','2026-09-14T00:00:00+08:00','2026-09-15T08:00:00+08:00')
+    with pytest.raises(ValueError,match='budget'):
+        index.between(tmp_path,'note','2026-09-14T00:00:00+08:00','2026-09-16T00:00:00+08:00',12)
     with pytest.raises(ValueError):index.history(tmp_path,before='unknown')
 
 

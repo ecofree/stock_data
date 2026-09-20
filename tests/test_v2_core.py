@@ -134,6 +134,25 @@ def test_unknown_live_and_unreconciled_accounts_never_approve(store):
     imported = import_snapshot(store, account_raw(account_id='different', equity='11000'))
     assert not imported['reconciled']
     assert 'account_not_reconciled' in service.evaluate('different', sig, manifest, 'quote:v1')['blockers']
+    from trade_system.v2.accounts import period_performance
+    assert period_performance(store.con,'missing','2026-09-30','month')['net_pnl_fen'] is None
+    store.clock.value=utc('2026-10-01T00:00:00+08:00')
+    opening=import_snapshot(store,account_raw(account_id='period',asof='2026-08-31T15:00:00+08:00',
+        valid_until='2026-10-02T00:00:00+08:00',positions=[],cash='1000',equity='1000'))
+    coverage={'start':'2026-09-01','through':'2026-09-30','opening_snapshot_id':opening['snapshot_id'],
+        'events_complete':True,'fees_complete':True,'corporate_actions_complete':True,
+        'valuation_path_complete':True,'interval_reconciled':True}
+    import_snapshot(store,account_raw(account_id='period',asof='2026-09-30T15:00:00+08:00',
+        valid_until='2026-10-02T00:00:00+08:00',positions=[],cash='1650',equity='1650',performance_coverage={'month':coverage}))
+    append_account_event(store,'deposit','period','cash_transfer',{'effective_at':'2026-09-10T10:00:00+08:00',
+        'amount_fen':50000,'equity_before_fen':100000,'equity_after_fen':150000,'reconciled':True})
+    value=period_performance(store.con,'period','2026-09-30','month')
+    assert value['net_pnl_fen']==15000 and value['time_weighted_return']==pytest.approx(.1)
+    assert value['observed_drawdown']==0 and value['net_external_flow_fen']==50000
+    assert period_performance(store.con,'period','2026-09-30','quarter')['net_pnl_fen'] is None
+    append_account_event(store,'unknown','period','external_action_unknown',{'effective_at':'2026-09-11T10:00:00+08:00'})
+    assert period_performance(store.con,'period','2026-09-30','month')['time_weighted_return'] is None
+
 
 
 def test_old_quote_cannot_be_refreshed_by_downloading_again(store):

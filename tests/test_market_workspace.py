@@ -41,6 +41,13 @@ def test_full_members_and_fixed_scope_previous_day(con):
     assert week['expected_sessions']==['2026-09-10','2026-09-11']
     assert week['security_session_samples']==2 and week['rising_observation_ratio']==0.5
     assert week['unfinished_period'] and not week['point_in_time_qualified']
+    assert week['themes'][0]['membership_date'] is None
+    assert week['themes'][0]['rows']==[]  # later members never backfill Thursday
+    assert week['themes'][1]['rows'][0]['priced_members']==1
+    assert week['themes'][1]['rows'][0]['main_flow_cny'] is None
+    from trade_system.review_metrics import period_bounds
+    assert period_bounds('2026-12-31','quarter')==('2026-10-01','2026-12-31')
+    assert period_bounds('2024-02-20','month')==('2024-02-01','2024-02-29')
     from trade_system.review_metrics import market_period_summary
     closed=market_period_summary('2026-09-09','week',{},
         {d:[('SSE',0),('SZSE',0)] for d in ['2026-09-07','2026-09-08','2026-09-09']})

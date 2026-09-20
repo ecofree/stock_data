@@ -325,7 +325,8 @@ def test_real_transport_worker_preserves_http_and_size_boundaries(status, body):
             pass
     server = HTTPServer(('127.0.0.1', 0), Handler)
     server.timeout = 5
-    thread = threading.Thread(target=server.handle_request)
+    count=2 if status==200 and len(body)<=32 else 1
+    thread = threading.Thread(target=lambda:[server.handle_request() for _ in range(count)])
     thread.start()
     try:
         request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/fixture')
@@ -337,8 +338,13 @@ def test_real_transport_worker_preserves_http_and_size_boundaries(status, body):
             with pytest.raises(ValueError, match='byte budget'):
                 read_verified_once(request, timeout=4, max_bytes=32)
         else:
-            assert read_verified_once(request, timeout=4, max_bytes=32) == body
+            from trade_system.http_transport import measure_requests,summarize_requests
+            with measure_requests() as measured:
+                for _ in range(2):assert read_verified_once(request, timeout=4, max_bytes=32) == body
+            summary=summarize_requests(measured)
+            assert summary['transport_attempts']==summary['responses_received']==2
+            assert summary['same_request_same_response']==1 and summary['avoidable_duplicates'] is None
     finally:
         thread.join(5)
         server.server_close()
-    assert requests == ['/fixture'] and not thread.is_alive()
+    assert requests == ['/fixture']*count and not thread.is_alive()

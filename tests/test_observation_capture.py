@@ -93,10 +93,19 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     assert not first['qualified']  # old source date is never promoted by fresh fetch
 
 
-def test_quote_consumer_delegates_to_shared_transport(monkeypatch):
-    from trade_system import executable_quotes
-    calls=[]
-    monkeypatch.setattr(transport,'fetch_parts',lambda codes:calls.append(codes) or {'000001':['retained']})
-    monkeypatch.setattr(executable_quotes,'parse_tencent_parts',lambda parts:{'raw':parts})
-    assert executable_quotes.fetch_tencent_quotes(['000001']) == {'000001':{'raw':['retained']}}
-    assert calls==[['000001']]
+def test_pre_session_scope_keeps_holdings_rejections_and_controls(monkeypatch,tmp_path):
+
+    from trade_system.v2 import research_journal as journal,operator_workflow
+    from trade_system.v2.domain import identity,utc
+    def add(intent,code,at):
+        n={'instrument':code,'intent':intent,'received_at':at,'supersedes':None}
+        n['note_id']=identity(n);journal.durable_event(tmp_path/'notes',n['note_id'],n)
+    add('reject','000002','2026-09-10T08:00:00+08:00')
+    add('observe','000003','2026-09-12T08:00:00+08:00')
+    monkeypatch.setattr(operator_workflow,'configured_account_risk',lambda *a:{'status':'account_stale_or_future',
+        'snapshot_id':'synthetic','positions':[{'instrument':'SZ.000001','quantity':1}]})
+    reg=capture.register_sampling(tmp_path,'2026-09-11',['000004'],clock=lambda:utc('2026-09-11T08:00:00+08:00'))
+    assert reg['codes']==['000001','000002','000004'] and reg['account_status']=='account_stale_or_future'
+    assert capture.read_sampling(tmp_path/'sampling'/reg['sampling_id'],'2026-09-11')==reg
+    with pytest.raises(ValueError):capture.read_sampling(tmp_path/'sampling'/reg['sampling_id'],'2026-09-12')
+    with pytest.raises(ValueError):capture.register_sampling(tmp_path,'2026-09-11',clock=lambda:utc('2026-09-11T09:15:00+08:00'))

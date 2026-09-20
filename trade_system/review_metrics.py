@@ -247,10 +247,16 @@ def period_bounds(day: str, period: str) -> tuple[str, str]:
     end = date.fromisoformat(day)
     if period == 'day':
         return day, day
-    if period != 'week':
-        raise ValueError('only delivered day/week contracts are supported')
-    start = end - timedelta(days=end.weekday())
-    return start.isoformat(), (start + timedelta(days=6)).isoformat()
+    if period == 'week':
+        start = end - timedelta(days=end.weekday())
+        return start.isoformat(), (start + timedelta(days=6)).isoformat()
+    if period not in ('month', 'quarter'):
+        raise ValueError('unknown natural period')
+    month = end.month if period == 'month' else (end.month-1)//3*3+1
+    start = end.replace(month=month, day=1)
+    following = month + (1 if period == 'month' else 3)
+    stop = date(end.year + (following>12), (following-1)%12+1, 1) - timedelta(days=1)
+    return start.isoformat(), stop.isoformat()
 
 
 def market_period_summary(day, period, daily, calendar):

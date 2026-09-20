@@ -41,6 +41,88 @@ def request_budget(seconds):
         request_deadline.reset(token)
 
 
+
+request_observer = ContextVar('request_observer', default=None)
+
+
+@contextmanager
+def measure_requests():
+    """Observe the shared real transport in this context, without initiating I/O."""
+    records=[];token=request_observer.set(records)
+    try:yield records
+    finally:request_observer.reset(token)
+
+
+@contextmanager
+def request_receipt(request):
+    """Record bounded fingerprints, never URL arguments, bodies or credentials."""
+    import hashlib
+    import json
+    import uuid
+    from datetime import datetime,timezone
+    from urllib.parse import urlsplit
+    from trade_system.logging_setup import get_logger
+    body=request.data or b''
+    try:body=json.dumps(json.loads(body),sort_keys=True,separators=(',',':')).encode()
+    except (ValueError,UnicodeError):pass
+    key=hashlib.sha256(request.get_method().encode()+b'\0'+request.full_url.encode()+b'\0'+body+
+        json.dumps(sorted((k.lower(),v) for k,v in request.header_items())).encode()).hexdigest()
+    value={'attempt_id':uuid.uuid4().hex,'request_key':key,'host':urlsplit(request.full_url).hostname,
+           'started_at':datetime.now(timezone.utc).isoformat(),'status':'outcome_unknown'}
+    logger=get_logger('http_transport')
+    logger.info('request_receipt %s',json.dumps(dict(value,event='started'),sort_keys=True))
+    try:yield value
+    except Exception as exc:
+        value['error_type']=type(exc).__name__
+        if isinstance(exc,urllib.error.HTTPError):value.update(status='http_error',http_status=exc.code)
+        raise
+    finally:
+        value['finished_at']=datetime.now(timezone.utc).isoformat()
+        logger.info('request_receipt %s',json.dumps(dict(value,event='finished'),sort_keys=True))
+        if request_observer.get() is not None:request_observer.get().append(value)
+
+
+def summarize_requests(records):
+    """Same response bytes are repeat information, not proof of needless retries."""
+    attempts={};conflicts=set()
+    for item in records:
+        key=item['attempt_id'];previous=attempts.get(key)
+        if previous and previous.get('event')=='finished' and item.get('event')=='finished' and previous!=item:conflicts.add(key)
+        if previous is None or item.get('event')!='started':attempts[key]=item
+    seen=set();repeat=0
+    for r in sorted(attempts.values(),key=lambda v:v['started_at']):
+        if r.get('status')=='response_received':
+            key=(r['request_key'],r['response_sha256'])
+            repeat+=key in seen;seen.add(key)
+    return {'transport_attempts':len(attempts),'responses_received':sum(r['status']=='response_received' for r in attempts.values()),
+        'same_request_same_response':repeat,'unknown_outcomes':sum(r['status']=='outcome_unknown' for r in attempts.values()),
+        'conflicting_receipts':len(conflicts),'scope':'observed_shared_transport_only_not_all_providers_or_avoidable_cost',
+        'avoidable_duplicates':None,'missing':['request_reason_and_revision_policy_for_cost_attribution']}
+
+
+def request_metrics(log_paths):
+    """Read existing request logs only; absent instrumentation stays unmeasured."""
+    import json
+    import hashlib
+    records=[];sources=[]
+    if not 1<=len(log_paths)<=30:raise ValueError('one to thirty explicit logs required')
+    for name in log_paths:
+        path=Path(name).resolve(strict=True)
+        if path.stat().st_size>100_000_000:raise ValueError('request log exceeds read budget')
+        digest=hashlib.sha256()
+        with path.open('rb') as stream:
+            for line in stream:
+                digest.update(line)
+                if b'request_receipt ' not in line:continue
+                value=json.loads(line.split(b'request_receipt ',1)[1])
+                if value.get('event') not in ('started','finished'):raise ValueError('unknown request receipt event')
+                records.append(value)
+                if len(records)>100000:raise ValueError('request receipt budget exceeded')
+        sources.append({'name':path.name,'sha256':digest.hexdigest()})
+    return dict(summarize_requests(records),sources=sources,
+                status='observed_log_receipts' if records else 'unmeasured_no_request_receipts')
+
+
 def _setting(name: str, default: str = "") -> str:
     return str(SETTINGS.get(name) or os.environ.get(name) or default).strip()
 
@@ -212,28 +294,31 @@ def read_verified_once(request, *, timeout, max_bytes):
     command = [sys.executable, '-I', '-B', '-c',
         'import sys;sys.path.insert(0,sys.argv[1]);from trade_system.http_transport import _response_worker;_response_worker()',
         str(Path(__file__).resolve().parents[1])]
-    try:
-        result = subprocess.run(command, input=payload, capture_output=True, timeout=timeout,
-                                creationflags=0x08000000 if sys.platform == 'win32' else 0)
-    except subprocess.TimeoutExpired:
-        # run() kills and waits for its one child before raising; no background reader survives.
-        raise TimeoutError('transport deadline exhausted') from None
-    if result.returncode:
-        raise urllib.error.URLError('verified transport worker failed')
-    header, separator, raw = result.stdout.partition(b'\n')
-    try:
-        status = json.loads(header)
-    except ValueError:
-        raise urllib.error.URLError('invalid transport worker response') from None
-    if not separator:
-        raise urllib.error.URLError('incomplete transport worker response')
-    if 'http_status' in status:
-        raise urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed', None, None)
-    if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
-        raise ValueError('response byte budget exceeded')
-    if status.get('ok') is not True:
-        raise urllib.error.URLError('verified transport failed')
-    return raw
+    with request_receipt(request) as receipt:
+        try:
+            result = subprocess.run(command, input=payload, capture_output=True, timeout=timeout,
+                                    creationflags=0x08000000 if sys.platform == 'win32' else 0)
+        except subprocess.TimeoutExpired:
+            # run() kills and waits for its one child before raising; no background reader survives.
+            raise TimeoutError('transport deadline exhausted') from None
+        if result.returncode:
+            raise urllib.error.URLError('verified transport worker failed')
+        header, separator, raw = result.stdout.partition(b'\n')
+        try:
+            status = json.loads(header)
+        except ValueError:
+            raise urllib.error.URLError('invalid transport worker response') from None
+        if not separator:
+            raise urllib.error.URLError('incomplete transport worker response')
+        if 'http_status' in status:
+            raise urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed', None, None)
+        if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
+            raise ValueError('response byte budget exceeded')
+        if status.get('ok') is not True:
+            raise urllib.error.URLError('verified transport failed')
+        import hashlib
+        receipt.update(status='response_received',response_sha256=hashlib.sha256(raw).hexdigest(),response_bytes=len(raw))
+        return raw
 
 
 def read_public_pdf(url):

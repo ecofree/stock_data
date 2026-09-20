@@ -391,6 +391,20 @@ def journal_projection(output,data):
     review_paths,_=recent(output,'review')
     data['human_reviews']=[research_journal.read_review(output,p.stem) for p in reversed(review_paths)]
     data['note_scope']={'shown':len(notes),'total':note_total,'limit':100}
+    if data.get('market'):
+        from datetime import date,timedelta
+        from trade_system.review_metrics import period_bounds
+        from .journal_index import between
+        from .accounts import configured_performance
+        day=data['market']['trade_date'];start=period_bounds(day,'week')[0]
+        stop=(date.fromisoformat(day)+timedelta(days=1)).isoformat()
+        data['period_notes']=between(output,'note',start+'T00:00:00+08:00',stop+'T00:00:00+08:00')
+        data['period_note_scope']={'start':start,'through':day,'complete':True,'count':len(data['period_notes'])}
+        import duckdb
+        try:data['account_periods']=configured_performance(output,day)
+        except (OSError,ValueError,KeyError,duckdb.Error):
+            data['account_periods']={p:{'start':period_bounds(day,p)[0],'end':period_bounds(day,p)[1],'through':day,
+                'status':'insufficient_account_evidence','missing':['account_source_or_ledger_invalid']} for p in ('month','quarter')}
     reviews=data.setdefault('reviews',[])
     represented={r['prediction_id'] for r in reviews}
     for note in data['notes']:
@@ -450,7 +464,15 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
         if config.get('read_only') is not True:raise ValueError('explicit read-only market source required')
         data=saved_projection(output)
         codes={r['instrument'] for r in (data.get('prediction') or {}).get('rows',[])}
-        codes.update(n['instrument'] for n in data['notes'] if n['is_latest'] and n['intent']=='observe')
+        codes.update(n['instrument'] for n in data['notes'] if n['is_latest'])
+        codes.update(p['instrument'].split('.')[-1] for p in data.get('plans',{}).get('account',{}).get('positions',[]) if p['quantity']>0)
+        sampling=None
+        if (output/'sampling-current.json').exists():
+            pointer=read_json(output/'sampling-current.json')[0]
+            from .observation_workspace import local_clock
+            sampling=observation_capture.read_sampling(pointer['folder'],local_clock(now_utc()).date().isoformat())
+            if sampling['sampling_id']!=pointer['sampling_id']:raise ValueError('sampling pointer changed')
+            codes=set(sampling['codes'])
         clock=now_utc();rows=load_rows(config['market_database'],codes,clock.isoformat())
         value=project_rows(rows,codes,clock.isoformat());acquired=None;requests=0;reused=False
         missing=[r['instrument'] for r in value['rows'] if r['state']=='no_qualified_current_quote']
@@ -488,6 +510,10 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
             value['capture'].update(provider_requests_this_run=requests,reused=reused,
                                     received_rows=len(acquired['rows']))
             value['snapshot_id']=identity(value)
+        value.pop('snapshot_id')
+        value['sampling']={'sampling_id':sampling['sampling_id'],'rows':sampling['rows'],
+            'account_status':sampling['account_status']} if sampling else {'status':'no_pre_session_scope_current_observation_only'}
+        value['snapshot_id']=identity(value)
         destination=output/'observation-publication'
         generation=read_current(destination)[0]['generation']+1 if (destination/'current.json').exists() else 1
         publish(destination,uuid.uuid4().hex,{'observation.json':canonical(value).encode()},generation=generation)
@@ -581,7 +607,7 @@ def _save_note(output, values):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market','journal-index','journal-history'])
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market','register-sampling','request-metrics','journal-index','journal-history'])
     p.add_argument('--kind',choices=['note','review','plan'],default='note');p.add_argument('--before')
     p.add_argument('--ensure-index',action='store_true',help='Rebuild event cache only when missing or invalidated; creates no human events')
     p.add_argument('--config',default='config/research_delivery.json');p.add_argument('--output',default='reports/research-delivery')
@@ -593,6 +619,8 @@ def main():
     p.add_argument('--market-db',help='Explicit read-only canonical database for daily workspace')
     p.add_argument('--donor',help='Sealed receipt batch supplying exactly one failed factor request')
     p.add_argument('--capture-quotes',action='store_true',help='Explicit bounded Tencent fallback observation, not execution')
+    p.add_argument('--session',help='ISO prospective sampling session; registration must precede 09:15')
+    p.add_argument('--controls',default='',help='Explicit predeclared comma-separated comparison securities')
     p.add_argument('--quote-receipts',help='Replay a sealed real quote receipt folder without network')
     p.add_argument('--port',type=int,default=8766);p.add_argument('--open-browser',action='store_true')
     a=p.parse_args();root=Path(__file__).resolve().parents[2];output=(root/a.output).resolve()
@@ -614,12 +642,21 @@ def main():
         market=latest_snapshot(source,now_utc().isoformat())
         from trade_system.file_lock import FileLock
         with FileLock(output/'update.guard'):
-            write_pointer(output,'workspace-config.json',{'market_database':str(source),'read_only':True})
+            config=read_json(output/'workspace-config.json')[0] if (output/'workspace-config.json').exists() else {}
+            write_pointer(output,'workspace-config.json',dict(config,market_database=str(source),read_only=True))
             publish_desk(output,market=market)
         result={'configured':True,'snapshot_id':market['snapshot_id'],'production_cutover':False}
     elif a.command=='market-update':
         from .daily_workspace import update_market
         result=update_market(output,expected_date=a.expected_date)
+    elif a.command=='request-metrics':
+        if not a.receipts:p.error('--receipts must name an existing request log')
+        from trade_system.http_transport import request_metrics
+        result=request_metrics([root/a.receipts])
+    elif a.command=='register-sampling':
+        if not a.session:p.error('--session required')
+        from .observation_capture import register_sampling
+        result=register_sampling(output,a.session,[c for c in a.controls.split(',') if c])
     elif a.command=='observe':result=observe(output,capture_quotes=a.capture_quotes,quote_receipts=a.quote_receipts)
     elif a.command=='present':
         result=present(output,market_review=root/a.market_review if a.market_review else None)

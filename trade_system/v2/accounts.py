@@ -128,3 +128,91 @@ def append_account_event(store, event_id, account_id, kind, payload):
     store.con.execute('INSERT INTO account_event VALUES (?,?,?,?,?)',
                       [event_id, account_id, utc(store.clock()), kind, encoded])
     return True
+
+
+def period_performance(con, account_id, day, period):
+    """Recompute from imported equity and external flows; fees are already in NAV.
+
+    Snapshot performance_coverage is a source declaration, never inferred from
+    an empty event table. TWR requires valuations immediately before/after each
+    external transfer. Reported drawdown is only over retained valuation points.
+    """
+    from datetime import date, timedelta
+    from trade_system.review_metrics import period_bounds
+    start,end=period_bounds(day,period)
+    stop=(date.fromisoformat(day)+timedelta(days=1)).isoformat()
+    begin,finish=utc(start+'T00:00:00+08:00'),utc(stop+'T00:00:00+08:00')
+    result={'period':period,'start':start,'end':end,'through':day,'unfinished_period':day<end,
+        'status':'insufficient_account_evidence','mode':None,'net_pnl_fen':None,'net_external_flow_fen':None,
+        'time_weighted_return':None,'observed_drawdown':None,'fees_fen':None,'valuation_points':[],
+        'closed_trade_statistics':None,'attribution':None,'execution_ready':False,
+        'scope':'declared_imported_account_not_broker_certification_or_continuous_intraday_drawdown',
+        'missing':[]}
+    snapshots=con.execute('SELECT snapshot_id,asof_time,equity_fen,reconciled,payload FROM account_snapshot WHERE account_id=? AND asof_time<? ORDER BY asof_time,seq LIMIT 10001',[account_id,finish]).fetchall()
+    if len(snapshots)>10000:raise ValueError('account valuation budget exceeded')
+    opening=[r for r in snapshots if r[1]<=begin];closing=[r for r in snapshots if begin<r[1]<finish]
+    if not opening:result['missing'].append('opening_equity')
+    if not closing:result['missing'].append('closing_equity')
+    if not opening or not closing:return result
+    first,last=opening[-1],closing[-1];payload=json.loads(last[4]);coverage=payload.get('performance_coverage',{}).get(period,{})
+    result['mode']=payload['mode'];result['opening_snapshot_id']=first[0];result['closing_snapshot_id']=last[0]
+    if coverage.get('start')!=start or coverage.get('through')!=day or coverage.get('opening_snapshot_id')!=first[0]:
+        result['missing'].append('exact_period_coverage')
+    for key in ('events_complete','fees_complete','corporate_actions_complete','valuation_path_complete','interval_reconciled'):
+        if coverage.get(key) is not True:result['missing'].append(key)
+    if any(json.loads(r[4])['mode']!=payload['mode'] for r in [first,*closing]):result['missing'].append('mixed_account_modes')
+    if not all(r[3] for r in [first,*closing]):result['missing'].append('reconciled_equity_path')
+    events=con.execute('SELECT event_id,happened_at,kind,payload FROM account_event WHERE account_id=? ORDER BY happened_at,event_id LIMIT 20001',[account_id]).fetchall()
+    if len(events)>20000:raise ValueError('account event budget exceeded')
+    points=[(r[1],1,r[2],0) for r in closing];flows=fees=0
+    for event_id,received,kind,raw in events:
+        item=json.loads(raw)
+        if not item.get('effective_at'):
+            result['missing'].append('event_effective_time');continue
+        effective=utc(item['effective_at'])
+        if not begin<effective<finish:continue
+        if kind in ('correction','external_action_unknown'):
+            result['missing'].append('unresolved_event');continue
+        if item.get('reconciled') is not True:result['missing'].append('unreconciled_event')
+        if kind in ('cash_transfer','fee'):
+            amount=item.get('amount_fen')
+            if type(amount) is not int or abs(amount)>10**16 or (kind=='fee' and amount<0):
+                result['missing'].append('event_amount');continue
+            if kind=='fee':fees+=amount;continue
+            flows+=amount
+            before,after=item.get('equity_before_fen'),item.get('equity_after_fen')
+            if type(before) is not int or type(after) is not int or not 0<before<=10**16 or not 0<after<=10**16 or after-before!=amount:
+                result['missing'].append('cash_flow_valuations');continue
+            points.append((effective,0,before,after))
+    if result['missing']:
+        result['missing']=sorted(set(result['missing']));return result
+    nav=peak=1.;drawdown=0.;previous=first[2];last_at=first[1];last_flow=False
+    if previous<=0:raise ValueError('positive starting equity required')
+    for at,order,equity,after in sorted(points):
+        if equity<=0 or at<last_at:raise ValueError('invalid account valuation path')
+        if at==last_at and (not last_flow or order==0 or equity!=previous):
+            raise ValueError('ambiguous same-time account valuation')
+        nav*=equity/previous;peak=max(peak,nav);drawdown=max(drawdown,1-nav/peak)
+        result['valuation_points'].append({'as_of':at.isoformat(),'unit_nav':nav})
+        previous=after or equity;last_at=at;last_flow=(order==0)
+    result.update(status='declared_ledger_reconciled',net_pnl_fen=last[2]-first[2]-flows,
+        net_external_flow_fen=flows,time_weighted_return=nav-1,observed_drawdown=drawdown,fees_fen=fees)
+    return result
+
+
+def configured_performance(output, day):
+    """One read-only account projection for natural month and quarter."""
+    from pathlib import Path
+    import duckdb
+    from .gap_evidence import read_json
+    from trade_system.review_metrics import period_bounds
+    path=Path(output)/'workspace-config.json';config=read_json(path)[0] if path.exists() else {}
+    periods=('month','quarter')
+    if not config.get('account_database') or not config.get('account_id'):
+        return {p:{'period':p,'start':period_bounds(day,p)[0],'end':period_bounds(day,p)[1],'through':day,
+            'status':'insufficient_account_evidence','net_pnl_fen':None,'time_weighted_return':None,'observed_drawdown':None,
+            'fees_fen':None,'missing':['opening_equity','closing_equity','cash_flows','fees','corporate_actions','valuation_path'],
+            'execution_ready':False} for p in periods}
+    with duckdb.connect(str(Path(config['account_database']).resolve(strict=True)),read_only=True) as con:
+        con.execute('BEGIN TRANSACTION')
+        return {p:period_performance(con,config['account_id'],day,p) for p in periods}

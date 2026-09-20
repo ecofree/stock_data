@@ -64,3 +64,53 @@ def replay(folder):
     return {'rows':rows,'codes':[c for batch in plan for c in batch],'origin':reg['origin'],
         'requests':len(plan),'failures':failed,'manifest_id':identity(members),
         'folder':str(folder.resolve()),'fallback_reason':REASON}
+
+
+def register_sampling(output, session, controls=(), *, clock=now_utc):
+    """Seal the entire pre-session scope, including rejected and missing objects."""
+    from datetime import timedelta
+    from .domain import utc
+    from .journal_index import between
+    from .operator_workflow import configured_account_risk
+    from .research_product import write_pointer
+    from trade_system.file_lock import FileLock
+    output=Path(output);at=utc(clock());cutoff=utc(session+'T09:15:00+08:00')
+    if not at<cutoff or (cutoff-at)>timedelta(days=7):raise ValueError('sampling must be registered before session 09:15, within seven days')
+    with FileLock(output/'judgement.guard'):
+        notes=between(output,'note','1970-01-01T00:00:00+00:00',at.isoformat())
+        plans=between(output,'plan','1970-01-01T00:00:00+00:00',at.isoformat())
+        risk=configured_account_risk(output,at.isoformat());rows=[]
+        revised={n.get('supersedes') for n in notes}
+        for n in notes:
+            if n['note_id'] not in revised:
+                rows.append({'instrument':n['instrument'],'role':n['intent'],'evidence_id':n['note_id'],'included_at':n['received_at']})
+        for plan in plans:
+            if utc(plan['valid_until'])>cutoff:
+                rows.append({'instrument':plan['instrument'],'role':'plan','evidence_id':plan['plan_id'],'included_at':plan['received_at']})
+        for pos in risk.get('positions',[]):
+            if pos['quantity']>0:rows.append({'instrument':pos['instrument'].split('.')[-1],
+                'role':'holding','evidence_id':risk['snapshot_id'],'included_at':at.isoformat()})
+        from trade_system.quote_transport import canonical_codes
+        for code in canonical_codes(controls):
+            rows.append({'instrument':code,'role':'predeclared_control','evidence_id':None,'included_at':at.isoformat()})
+        codes=canonical_codes([r['instrument'] for r in rows])
+        if not codes:raise ValueError('no sampling subjects; provide existing attention or explicit controls')
+        value={'schema':1,'scope':'pre_session_observation_scope_not_full_market_PIT','session':session,
+            'registered_at':at.isoformat(),'cutoff':cutoff.isoformat(),'rows':rows,'codes':codes,
+            'account_status':risk['status'],'control_count':len(controls),'execution_ready':False}
+        value['sampling_id']=identity(value)
+        folder=output/'sampling'/value['sampling_id'];folder.mkdir(parents=True,exist_ok=False)
+        write_json(folder/'sampling.json',value);seal(folder)
+        write_pointer(output,'sampling-current.json',{'folder':str(folder.resolve()),'sampling_id':value['sampling_id']})
+        return value
+
+
+def read_sampling(folder,session):
+    members=sealed(folder)
+    if set(members)!={'sampling.json'}:raise ValueError('sampling membership changed')
+    value=read_json(Path(folder)/'sampling.json')[0]
+    from .domain import utc
+    if (value['sampling_id']!=identity({k:v for k,v in value.items() if k!='sampling_id'})
+        or value['session']!=session or not utc(value['registered_at'])<utc(session+'T09:15:00+08:00')):
+        raise ValueError('sampling identity/session/cutoff differs')
+    return value

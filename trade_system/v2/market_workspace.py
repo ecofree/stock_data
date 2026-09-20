@@ -56,6 +56,44 @@ def limit_facts(con, day, clock):
         'scope':'canonical_limit_pool_not_exchange_total'}
 
 
+def theme_facts(con,day,current,research_codes,limits):
+    boards={r['stock_code']:r['board_level'] for r in limits['rows']}
+    snap, membership_age=qualified_membership_snapshot(con,day)
+    themes=[];stocks={c:{'stock_code':c,'stock_name':'','research_covered':c in research_codes,
+        'change_pct':r['pct'],'close':r['close'],'price_contract':r['contract']} for c,r in current.items()}
+    excluded=[];membership_status='stale' if snap is not None else 'missing';catalog=[]
+    if snap is not None and membership_age<=THS_MEMBERSHIP_MAX_AGE_DAYS:
+        catalog=con.execute('SELECT concept_code,concept_name,stock_count FROM v_default_concept_daily WHERE trade_date=? ORDER BY concept_code LIMIT 10001',[snap]).fetchall()
+        members=con.execute('SELECT concept_code,stock_code,stock_name FROM v_default_concept_stock_history WHERE trade_date=? ORDER BY concept_code,stock_code LIMIT 500001',[snap]).fetchall()
+        if len(catalog)>10000 or len(members)>500000:raise ValueError('membership budget exceeded')
+        groups={}
+        for concept,code,name in members:
+            code=str(code).split('.')[0]
+            group=groups.setdefault(concept,[])
+            if code in group:raise ValueError('duplicate theme member')
+            group.append(code)
+            stocks[code]={'stock_code':code,'stock_name':name,'research_covered':code in research_codes,
+                'change_pct':current.get(code,{}).get('pct'),'close':current.get(code,{}).get('close'),
+                'price_contract':current.get(code,{}).get('contract')}
+        seen=set()
+        for code,name,count in catalog:
+            if code in seen:raise ValueError('duplicate theme identity')
+            seen.add(code);actual=groups.get(code,[])
+            valid=bool(count and len(actual)==count and all(len(c)==6 and c.isascii() and c.isdigit() for c in actual))
+            if not valid:
+                excluded.append({'concept_code':code,'reason':'declared_members_mismatch','expected':count,'actual':len(actual)})
+                continue
+            themes.append({'concept_code':code,'concept_name':name,'member_count':count,'member_codes':actual,
+                'research_covered':sum(c in research_codes for c in actual),'broad_classification':count>800,
+                'limit_up_count':sum(c in boards for c in actual) if limits['status']=='available' else None,
+                'max_board':max((boards.get(c,0) for c in actual),default=0) if limits['status']=='available' else None,
+                'limit_status':limits['status']})
+        membership_status='complete' if catalog and len(themes)==len(catalog) and set(groups)==seen else 'partial'
+    return {'themes':themes,'stocks':stocks,'membership_status':membership_status,
+        'membership_date':str(snap) if snap else None,'membership_age_days':membership_age,
+        'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded}
+
+
 def project(con, day, as_of, research_codes):
     clock=datetime.fromisoformat(as_of)
     if clock.tzinfo is not None:
@@ -92,45 +130,14 @@ def project(con, day, as_of, research_codes):
         'scope':'same_stock_provider_adjustment_units_retrospective_not_PIT',
         'current':breadth(current[c]['pct'] for c in common),
         'previous':breadth(keyed[prior,c]['pct'] for c in common)}
-    snap, membership_age=qualified_membership_snapshot(con,day)
-    themes=[];stocks={c:{'stock_code':c,'stock_name':'','research_covered':c in research_codes,
-        'change_pct':r['pct'],'close':r['close'],'price_contract':r['contract']} for c,r in current.items()}
-    excluded=[];membership_status='stale' if snap is not None else 'missing';catalog=[]
-    if snap is not None and membership_age<=THS_MEMBERSHIP_MAX_AGE_DAYS:
-        catalog=con.execute('SELECT concept_code,concept_name,stock_count FROM v_default_concept_daily WHERE trade_date=? ORDER BY concept_code LIMIT 10001',[snap]).fetchall()
-        members=con.execute('SELECT concept_code,stock_code,stock_name FROM v_default_concept_stock_history WHERE trade_date=? ORDER BY concept_code,stock_code LIMIT 500001',[snap]).fetchall()
-        if len(catalog)>10000 or len(members)>500000:raise ValueError('membership budget exceeded')
-        groups={}
-        for concept,code,name in members:
-            code=str(code).split('.')[0]
-            group=groups.setdefault(concept,[])
-            if code in group:raise ValueError('duplicate theme member')
-            group.append(code)
-            stocks[code]={'stock_code':code,'stock_name':name,'research_covered':code in research_codes,
-                'change_pct':current.get(code,{}).get('pct'),'close':current.get(code,{}).get('close'),
-                'price_contract':current.get(code,{}).get('contract')}
-        seen=set()
-        for code,name,count in catalog:
-            if code in seen:raise ValueError('duplicate theme identity')
-            seen.add(code);actual=groups.get(code,[])
-            valid=bool(count and len(actual)==count and all(len(c)==6 and c.isascii() and c.isdigit() for c in actual))
-            if not valid:
-                excluded.append({'concept_code':code,'reason':'declared_members_mismatch','expected':count,'actual':len(actual)})
-                continue
-            themes.append({'concept_code':code,'concept_name':name,'member_count':count,'member_codes':actual,
-                'research_covered':sum(c in research_codes for c in actual),'broad_classification':count>800,
-                'limit_up_count':sum(c in boards for c in actual) if limits['status']=='available' else None,
-                'max_board':max((boards.get(c,0) for c in actual),default=0) if limits['status']=='available' else None,
-                'limit_status':limits['status']})
-        membership_status='complete' if catalog and len(themes)==len(catalog) and set(groups)==seen else 'partial'
+    theme=theme_facts(con,day,current,research_codes,limits)
+    themes=theme['themes']
     result={'schema':2,'scope':'read_only_market_review_not_execution','trade_date':day,'as_of':as_of,
         'breadth':breadth(r['pct'] for r in current.values()),'regime':'未评级（价格广度不替代情绪模型）',
         'breadth_scope':'available_canonical_price_rows_not_exchange_total','matched_previous':matched,
-        'themes':themes,'stocks':stocks,'theme_scope':'all_quality_gated_declared_members_not_all_market_coverage',
-        'membership_status':membership_status,'membership_date':str(snap) if snap else None,
-        'membership_age_days':membership_age,'membership_max_age_days':THS_MEMBERSHIP_MAX_AGE_DAYS,
+        **theme,'theme_scope':'all_quality_gated_declared_members_not_all_market_coverage',
+        'membership_max_age_days':THS_MEMBERSHIP_MAX_AGE_DAYS,
         'membership_time_scope':'retained_quality_gated_snapshot_not_historical_arrival_certification',
-        'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded,
         'account_state':'unknown','missing':['account_snapshot','verified_intraday_quotes','point_in_time_membership'],
         'execution_ready':False}
     calendar={}
@@ -144,6 +151,28 @@ def project(con, day, as_of, research_codes):
         counts=daily.setdefault(d,{'rise':0,'fall':0,'flat':0,'samples':0})
         counts['samples']+=1;counts['rise' if r['pct']>0 else 'fall' if r['pct']<0 else 'flat']+=1
     result['periods']={period:market_period_summary(day,period,daily,calendar) for period in ('day','week')}
+    weekly=[]
+    for session in result['periods']['week']['expected_sessions']:
+        values={c:r for (d,c),r in keyed.items() if d==session and r['pct'] is not None and math.isfinite(r['pct'])}
+        pool=limits if session==day else limit_facts(con,session,clock)
+        item=theme if session==day else theme_facts(con,session,values,research_codes,pool)
+        flows={}
+        if 'multi_source_stock_flow' in {r[0] for r in con.execute('SHOW TABLES').fetchall()}:
+            from trade_system.concept_flow import qualified_concept_review
+            flows={r['sector_code']:r for r in qualified_concept_review(con,session,now=min(clock,datetime.fromisoformat(session+'T18:00:00')))['rows']}
+        rows=[]
+        for row in item['themes']:
+            members=row['member_codes'];valid=[values[c]['pct'] for c in members if c in values and all(values[c]['contract'])]
+            rows.append({k:row[k] for k in ('concept_code','concept_name','member_count','limit_up_count','max_board')} |
+                {'member_version':identity([item['membership_date'],members]),'priced_members':len(valid),
+                 'mean_change_pct':sum(valid)/len(valid) if valid else None,
+                 'main_flow_cny':flows.get(row['concept_code'],{}).get('main_net'),
+                 'flow_status':'qualified' if row['concept_code'] in flows else 'source_missing',
+                 'leaders':[r for r in pool['rows'] if r['stock_code'] in members]})
+        weekly.append({'date':session,'membership_date':item['membership_date'],'membership_status':item['membership_status'],
+                       'limit_status':pool['status'],'ladder':pool['ladder'],'rows':rows})
+    result['periods']['week']['themes']=weekly
+    result['periods']['week']['theme_scope']='per_session_retained_membership_versions_not_PIT_or_automatic_stage_labels'
     result['limit_pool']=limits
     result['breadth']['limit_up']=len(boards) if limits['status']=='available' else None
     result['highest_board']=max(boards.values(),default=None)

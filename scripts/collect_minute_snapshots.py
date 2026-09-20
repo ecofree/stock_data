@@ -69,7 +69,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(PROJECT_ROOT / "kpl_data.duckdb"))
     parser.add_argument("--date", default=str(date.today()).replace("-", ""))
-    parser.add_argument("--source", required=True,
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--sampling", help="Sealed pre-session sampling folder; retains missing and rejected subjects")
+    scope.add_argument("--source",
                         help="limit-pool | watchlist | comma-separated codes")
     parser.add_argument("--max-stocks", type=int, default=150)
     args = parser.parse_args()
@@ -83,11 +85,18 @@ def main() -> int:
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(args.db)
     try:
-        codes = _universe(con, day, args.source, args.max_stocks)
+        sampling=None
+        if args.sampling:
+            from trade_system.v2.observation_capture import read_sampling
+            sampling=read_sampling(args.sampling,day)
+            codes=sampling['codes']
+            if len(codes)>args.max_stocks:raise ValueError('sampling exceeds budget; never truncate the registered cohort')
+        else:codes = _universe(con, day, args.source, args.max_stocks)
         print(f"universe: {len(codes)} stocks for {day}; retrospective_price_points_not_PIT")
         if not codes:
             return 2
         stored = failed = 0
+        outcomes=[]
         with TdxClient.from_best_host() as client:
             for code in codes:
                 market = _market_of(code)
@@ -95,6 +104,7 @@ def main() -> int:
                     df = client.get_history_minute_time_data(market, code, int(ymd))
                     if df is None or df.empty:
                         failed += 1
+                        outcomes.append({'instrument':code,'status':'missing'})
                         continue
                     con.execute("BEGIN TRANSACTION")
                     try:
@@ -106,17 +116,25 @@ def main() -> int:
                             ])
                         con.execute("COMMIT")
                         stored += 1
+                        outcomes.append({'instrument':code,'status':'stored','points':len(df)})
                     except Exception:
                         con.execute("ROLLBACK")
                         raise
                 except Exception as exc:
                     failed += 1
+                    outcomes.append({'instrument':code,'status':'failed','error_type':type(exc).__name__})
                     logger.debug("minute fetch failed %s: %s", code, exc)
         total = con.execute(
             "SELECT count(*) FROM intraday_minute_bars WHERE trade_date = ?",
             [day],
         ).fetchone()[0]
         print(f"stored={stored} failed={failed}; bars for {day}: {total}")
+        if sampling:
+            from trade_system.v2.gap_evidence import write_json
+            from trade_system.v2.domain import now_utc
+            write_json(Path(args.sampling).parent/('collection-'+sampling['sampling_id']+'-'+now_utc().strftime('%Y%m%dT%H%M%S%f')+'.json'),
+                {'sampling_id':sampling['sampling_id'],'received_at':now_utc().isoformat(),'outcomes':outcomes,
+                 'scope':'historical_price_points_for_predeclared_scope_not_original_intraday_arrival'})
         return 0 if stored == len(codes) and not failed else 2
     finally:
         con.close()
