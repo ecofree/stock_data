@@ -34,20 +34,21 @@ if ($ReleaseDirectory) {
 if ($RefreshResearch) { $env:KPL_ENV_FILE=$EnvironmentFile }
 $env:PYTHONUTF8='1'
 . (Join-Path $PSScriptRoot 'native_process.ps1')
+$runLogDirectory=Join-Path $Workspace 'scheduled-logs'
+New-Item -ItemType Directory -Path $runLogDirectory -Force | Out-Null
+$runLog=Join-Path $runLogDirectory ((Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'.log')
 $dependency=Invoke-StockDataProcess -Executable $Python -Arguments @('-I','-B','-m','pip','check') -WorkingDirectory $projectPath
-if ($dependency.ExitCode -ne 0) { throw 'Research dependency check failed; no fallback runtime or publication permitted' }
+($dependency.Stdout+$dependency.Stderr) | Out-File -FilePath $runLog -Encoding utf8
+if ($dependency.ExitCode -ne 0) { throw "Research dependency check failed ($($dependency.ExitCode)); details: $runLog; no publication performed" }
 if (-not $ExpectedTradeDate) {
     $ExpectedTradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')
 }
 if ($ExpectedTradeDate -notmatch '^\d{4}-\d{2}-\d{2}$') { throw 'Expected ISO market date required' }
-$runLogDirectory=Join-Path $Workspace 'scheduled-logs'
-New-Item -ItemType Directory -Path $runLogDirectory -Force | Out-Null
-$runLog=Join-Path $runLogDirectory ((Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'.log')
 $prefix=if ($ReleaseDirectory) { @('-I','-X','utf8','-B',$launcher) } else { @('-X','utf8','-B','-m','trade_system.v2.research_product') }
 # Daily market publication is local-data-only. It never waits for provider
 # acquisition, retraining, or promotion of a research model.
 $market=Invoke-StockDataProcess -Executable $Python -Arguments ($prefix+@('market-update','--output',$Workspace,'--expected-date',$ExpectedTradeDate)) -WorkingDirectory $projectPath
-($market.Stdout+$market.Stderr) | Tee-Object -FilePath $runLog
+($market.Stdout+$market.Stderr) | Tee-Object -FilePath $runLog -Append
 if ($market.ExitCode -ne 0) { throw "Market publication failed ($($market.ExitCode)); prior verified page retained. Log: $runLog" }
 $marketReceipt=$market.Stdout.Trim() | ConvertFrom-Json
 if ($marketReceipt.status -eq 'market_closed') {

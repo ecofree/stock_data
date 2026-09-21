@@ -76,7 +76,26 @@ def register_sampling(output, session, controls=(), *, clock=now_utc):
     from trade_system.file_lock import FileLock
     output=Path(output);at=utc(clock());cutoff=utc(session+'T09:15:00+08:00')
     if not at<cutoff or (cutoff-at)>timedelta(days=7):raise ValueError('sampling must be registered before session 09:15, within seven days')
+    config=read_json(output/'workspace-config.json')[0]
+    if config.get('read_only') is not True or not config.get('market_database'):
+        raise ValueError('read-only market calendar required for sampling')
+    import duckdb
+    with duckdb.connect(str(Path(config['market_database']).resolve(strict=True)),read_only=True) as con:
+        flags=con.execute("SELECT exchange,is_open FROM tushare_trade_cal WHERE cal_date=? "
+            "AND exchange IN ('SSE','SZSE') ORDER BY exchange",[session]).fetchall()
+    if flags!=[('SSE',1),('SZSE',1)]:raise ValueError('verified open session required for sampling')
     with FileLock(output/'judgement.guard'):
+        pointer=output/'sampling-current.json'
+        if pointer.exists():
+            current=read_json(pointer)[0]
+            retained=read_json(Path(current['folder'])/'sampling.json')[0]
+            if retained.get('session')==session:
+                verified=read_sampling(current['folder'],session)
+                if verified['sampling_id']!=current['sampling_id']:raise ValueError('sampling pointer differs')
+                from trade_system.quote_transport import canonical_codes
+                if canonical_codes(controls)!=sorted({r['instrument'] for r in verified['rows'] if r['role']=='predeclared_control'}):
+                    raise ValueError('same-session controls already sealed; live scope may change separately')
+                return verified
         notes=between(output,'note','1970-01-01T00:00:00+00:00',at.isoformat())
         plans=between(output,'plan','1970-01-01T00:00:00+00:00',at.isoformat())
         risk=configured_account_risk(output,at.isoformat());rows=[]

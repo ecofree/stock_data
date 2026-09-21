@@ -30,7 +30,12 @@ def export_projection(data):
     result=deepcopy(data)
     if result.get('account_periods'):
         result['account_periods']={k:{key:v for key,v in value.items() if key in ('period','start','end','through','missing')} | {'status':'account_details_omitted_from_static_export'} for k,value in result['account_periods'].items()}
-    if result.get('observation'):result['observation'].pop('sampling',None)
+    if result.get('observation'):
+        result['observation'].pop('sampling',None)
+        # Export preserves quote coverage without disclosing private risk roles.
+        for row in result['observation'].get('live_scope',[]):
+            row.pop('risk_related',None)
+            row['roles']=['current_observation']
     if 'plans' in result:
         result['plans']['account']={'status':'account_details_omitted_from_static_export','execution_ready':False}
         for plan in result['plans'].get('rows',[]):
@@ -65,7 +70,7 @@ def render(data, *, include_account=False):
 <nav class="tabs" aria-label="工作区"><a href="#market">盘后复盘</a><a href="#observation">观察与计划</a><a href="#experiment">研究对照</a><a href="#operations">数据与运行</a></nav><section id="operations"><h2>数据与运行</h2><p id="runtime-state"></p><form method="post" action="/market-update"><input type="hidden" name="csrf" value="__CSRF__"><button>从本地合格数据刷新市场</button></form><p>行情采集与模型训练须分别明确触发。此按钮只读数据库，使用统一更新锁。</p></section>
 <p id="message" role="status" aria-live="polite"><!--SERVER_MESSAGE--></p>
 <section id="observation"><div class="toolbar"><h2>盘中观察</h2><form method="post" action="/observe"><input type="hidden" name="csrf" value="__CSRF__"><button>核对本地最新报价</button></form><form method="post" action="/capture-quotes"><input type="hidden" name="csrf" value="__CSRF__"><button>联网获取备用报价</button></form></div><p class="small">核对本地记录不联网；备用获取仅对缺失证券请求腾讯（最多200只、4次请求、零重试，同范围60秒内复用）。尚无已验证的原生/中继实时接口；合格高优先级留存来源优先。采集保留原始响应，不训练、不写现网主库、不推导仓位。过期报价不以昨日收盘价回填。</p><p id="observation-state" role="status"></p><p id="observation-capture" class="small"></p><label><input type="checkbox" id="observation-all"> 同时查看未加入人工关注的研究证券</label><div class="scroll"><table><thead><tr><th>证券 / 原判断</th><th>下一观察条件</th><th>人工核对</th><th>合格当前价</th><th>来源与状态</th></tr></thead><tbody id="observation-rows"></tbody></table></div></section>
-<section id="market"><div class="toolbar"><h2>市场与原判断复盘</h2><label>周期 <select id="review-period"><option value="day">日复盘</option><option value="week">自然周复盘</option><option value="month">月度账户</option><option value="quarter">季度账户</option></select></label></div><div id="period-summary"></div><p id="market-state" class="small"></p><div id="market-metrics" class="metrics"></div>
+<section id="market"><div class="toolbar"><h2>市场与原判断复盘</h2><label>周期 <select id="review-period"><option value="day">日复盘</option><option value="week">自然周复盘</option><option value="month">月度市场与账户</option><option value="quarter">季度市场与账户</option></select></label></div><div id="period-summary"></div><p id="market-state" class="small"></p><div id="market-metrics" class="metrics"></div>
 <details id="theme-workspace"><summary>题材与同日涨停证券</summary><label>搜索题材 <input id="theme-search" maxlength="40"></label><p id="theme-count" class="small"></p><div class="scroll" style="max-height:320px"><table><thead><tr><th>题材</th><th>涨停 / 成员</th><th>最高连板</th></tr></thead><tbody id="theme-rows"></tbody></table></div><div id="theme-detail"></div></details></section><section id="today"><div class="toolbar"><h2>候选比较</h2><form method="post" action="/update"><input type="hidden" name="csrf" value="__CSRF__"><button>更新真实数据与预测</button></form></div>
 <p id="session-date" class="small"></p><details class="small"><summary>数据与模型时点</summary><p id="freshness"></p></details><details class="warning"><summary>研究边界：价格目标不是收益或交易资格</summary><p>模型评分是下一交易日开盘至T+2收盘的价格变化估计，不是成交承诺或收益保证。当前历史对照未证明选股优势，以下是研究观察清单，不是买入推荐。缺失记录保留；当前模型预先指定为价格基线，不按测试赢家自动切换。</p></details>
 <div class="toolbar"><label>筛选证券 <input id="search" placeholder="输入代码或名称，点击行查看依据" maxlength="30"></label><label>排序依据 <select id="sort"><option value="code">证券代码（默认，不代表推荐顺序）</option><option value="model">QLib价格模型</option><option value="rule">20日动量规则（不训练）</option></select></label></div>
@@ -179,13 +184,13 @@ if(D.note_scope&&D.note_scope.total>D.note_scope.shown)$('notes').prepend(el('p'
 const online=location.protocol==='http:'&&!form.elements.csrf.value.startsWith('__');
 function staticMode(){if(!online){document.querySelectorAll('form button').forEach(b=>b.disabled=true);$('message').textContent='只读导出快照：这里不能更新或保存；填写/导出不代表已记录。请用 Start Research.cmd 打开在线工作台。'}}staticMode();window.addEventListener('pageshow',staticMode);
 const conditionNames={pending:'仍待观察',triggered:'失效条件已触发',not_triggered:'截至记录时未触发',unclear:'证据不足，无法判断'};
-const quoteStates={no_qualified_current_quote:'无合格当前报价',expired_after_publication:'已过期，不显示旧价格',conflicting_same_priority_quotes:'同优先级报价冲突',current_observation_not_executable:'时点合格，仅供观察'};
+const quoteStates={no_qualified_current_quote:'无合格当前报价',expired_after_publication:'已过期，不显示旧价格',conflicting_same_priority_quotes:'同优先级报价冲突',capacity_blocked:'本轮采集容量受限，尚未核对',current_observation_not_executable:'时点合格，仅供观察'};
 const obs=D.observation,watched=D.notes.filter(n=>n.is_latest&&n.intent==='observe');
 $('observation-state').textContent='人工关注 '+watched.length+' 条；'+(obs?'当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。':'尚未核对当前报价。')+' 账户未核对，不给可用仓位。';
 if(obs?.capture)$('observation-capture').textContent='备用来源：腾讯；留存 '+obs.capture.received_rows+' 条，采集批次失败 '+obs.capture.failures+' 次；本次请求 '+obs.capture.provider_requests_this_run+' 次'+(obs.capture.reused?'（复用封存响应，不延长行情时效）':'')+'。响应完整性编号 '+obs.capture.manifest_id.slice(0,12)+'。取得响应不等于当前价合格。';
 if(obs?.error)$('observation-state').textContent='报价快照校验失败或不可读取，当前报价关闭。日常工作台与判断记录仍可用；请核对来源后重新更新，不改用旧价。';
 $('market').after($('observation'));
-function drawObservation(){if(obs&&!obs.error){for(const q of obs.rows)if(q.price!=null){const deadline=Date.parse(q.valid_until+'+08:00');if(!Number.isFinite(deadline)||Date.now()>deadline){q.price=null;q.state='expired_after_publication'}}obs.qualified=obs.rows.filter(q=>q.price!=null).length;$('observation-state').textContent='人工关注 '+watched.length+' 条；当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。账户未核对，不给可用仓位。'}const items=watched.map(n=>({code:n.instrument,note:n}));if($('observation-all').checked)for(const r of forecastRows)if(!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});
+function drawObservation(){if(obs&&!obs.error){for(const q of obs.rows)if(q.price!=null){const deadline=Date.parse(q.valid_until+'+08:00');if(!Number.isFinite(deadline)||Date.now()>deadline){q.price=null;q.state='expired_after_publication'}}obs.qualified=obs.rows.filter(q=>q.price!=null).length;$('observation-state').textContent='人工关注 '+watched.length+' 条；当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。账户未核对，不给可用仓位。'}const items=watched.map(n=>({code:n.instrument,note:n}));for(const r of obs?.live_scope||[])if((r.roles||[]).some(role=>role!=='research_forecast')&&!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});if($('observation-all').checked)for(const r of forecastRows)if(!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});
  table($('observation-rows'),items.map(item=>{const q=obs?.rows.find(r=>r.instrument===item.code),n=item.note,review=n?(D.human_reviews||[]).filter(r=>r.note_id===n.note_id).sort((a,b)=>b.received_at.localeCompare(a.received_at))[0]:null;return [item.code+' / '+(n?(n.prediction_date||'独立关注'):'未人工关注'),n?n.invalidation:'先记录观察理由与失效条件',review?conditionNames[review.conclusion]+' · '+review.received_at:'尚未人工核对',q?.price==null?'—':fmt(q.price),q?(quoteStates[q.state]||q.state)+(q.provider?' / '+q.provider+' / '+q.source_event_time:''):'没有报价快照']}));
  for(const [i,item] of items.entries())if(item.note){const a=el('a','查看原判断与复盘');a.href='#note-'+item.note.note_id;$('observation-rows').rows[i].cells[0].append(el('br',''),a)}
  if(!items.length){const row=el('tr',''),cell=el('td','暂无人工关注。先在候选比较区保存一条“继续观察”，不会自动把模型排序变成关注清单。');cell.colSpan=5;row.append(cell);$('observation-rows').append(row)}
@@ -210,15 +215,18 @@ function drawPeriod(){
  const kind=$('review-period').value,p=D.market?.periods?.[kind],box=$('period-summary');box.replaceChildren();
  if(kind==='month'||kind==='quarter'){
   const a=D.account_periods?.[kind];box.append(el('h3',kind==='month'?'自然月账户复盘':'自然季度账户复盘'));
-  if(!a){box.append(el('p','没有导入账户绩效资料，或此静态导出已隐藏账户信息。收益未知。'));return}
+  if(!a){box.append(el('p','没有导入账户绩效资料。收益未知，市场汇总仍可查看。'))}
+  else if(a.status==='account_details_omitted_from_static_export'){box.append(el('p','此静态导出已隐藏账户详情；请在本地工作台查看。这不表示账户资料缺失。'))}
+  else{
   box.append(el('p',a.start+' 至 '+a.end+' · 截至 '+a.through+'；'+(a.status==='declared_ledger_reconciled'?'已按导入声明对账':'资料不足，暂不计算收益')));
   const t=el('table',''),b=el('tbody','');t.append(b);table(b,[['期间净盈亏 / 元','现金流调整收益','已观测估值点回撤','已含费用 / 元'],
    [a.net_pnl_fen==null?'未知':fmt(a.net_pnl_fen/100),a.time_weighted_return==null?'未知':fmt(a.time_weighted_return*100)+'%',a.observed_drawdown==null?'未知':fmt(a.observed_drawdown*100)+'%',a.fees_fen==null?'未知':fmt(a.fees_fen/100)]]);box.append(t);
   const gaps={closing_valuation_after_last_event:'末笔事件之后的资产估值',opening_equity:'期初资产',closing_equity:'期末资产',cash_flows:'资金流水',fees:'成交费用',corporate_actions:'公司行动',valuation_path:'持仓估值路径',exact_period_coverage:'对应期间的完整性声明',events_complete:'完整事件账',fees_complete:'完整费用',corporate_actions_complete:'完整公司行动',valuation_path_complete:'完整估值路径',interval_reconciled:'期间对账',cash_flow_valuations:'资金进出前后估值',unresolved_event:'待核对事件',account_source_or_ledger_invalid:'可读取且有效的账户账本'};
-  box.append(el('p','缺少：'+((a.missing||[]).map(k=>gaps[k]||'需核对的账项').join('、')||'期间基础账项无缺口')+'。期间盈亏含跨期持仓估值，费用不重复扣除；观测点回撤不是完整盘中回撤。'),el('p','平仓胜负、滑点和题材归因尚需完整成交及事前归因记录；不由行情或模型排名代替。'));return;
+  box.append(el('p','缺少：'+((a.missing||[]).map(k=>gaps[k]||'需核对的账项').join('、')||'期间基础账项无缺口')+'。期间盈亏含跨期持仓估值，费用不重复扣除；观测点回撤不是完整盘中回撤。'),el('p','平仓胜负、滑点和题材归因尚需完整成交及事前归因记录；不由行情或模型排名代替。'));
+  }
  }
  if(!p){box.append(el('p','此冻结版本未包含周期汇总；需要从本地合格事实重新发布。'));return}
- box.append(el('h3',(kind==='week'?'自然周':'当日')+' '+p.start+' 至 '+p.end+' · 截至 '+p.through),
+ box.append(el('h3',({day:'当日',week:'自然周',month:'自然月市场',quarter:'自然季度市场'}[kind])+' '+p.start+' 至 '+p.end+' · 截至 '+p.through),
  el('p','按已核验交易日历汇总。状态：'+({calendar_unverified:'日历不完整',missing_sessions:'行情会话缺失',observed_sessions:'已有会话观察',closed_period:'休市期间'}[p.status]||p.status)+(p.unfinished_period?'；期间尚未结束。':'。')));
  const t=el('table',''),body=el('tbody','');t.append(body);table(body,[['会话','有价样本','上涨','下跌','平盘'],...p.rows.map(r=>[r.date,r.samples,r.rise,r.fall,r.flat])]);box.append(t);
  box.append(el('p','合格证券×会话观察数：'+p.security_session_samples+'；上涨观察占比：'+(p.rising_observation_ratio==null?'不可计算':fmt(p.rising_observation_ratio*100)+'%')+'。不是全市场覆盖率、策略胜率或账户收益。'),

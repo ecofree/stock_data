@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date, datetime
 import os
 import subprocess
@@ -130,7 +131,9 @@ def main() -> int:
     if args.collector_contract:
         check = subprocess.run([python, "-I", "-B", "-m", "pip", "check"], capture_output=True, timeout=60)
         if check.returncode:
-            raise ValueError("collector environment dependency check failed; no collection performed")
+            dependency_log=artifact_dir/'dependency-check.log'
+            dependency_log.write_text((check.stdout+check.stderr).decode('utf-8','backslashreplace'),encoding='utf-8')
+            raise ValueError(f"collector dependency check failed ({check.returncode}); details: {dependency_log}; no collection performed")
     from trade_system.pipeline_runtime import PipelineLock, PipelineAlreadyRunning, RunManifest
     from trade_system.trading_calendar import trading_session_status
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
@@ -165,8 +168,14 @@ def main() -> int:
                 log = artifact_dir / (name+".log")
                 manifest.upsert_step(name, "running", command, started_at=started.isoformat(), log_path=str(log))
                 try:
+                    context={'demand_id':name, 'consumer':'market_review_and_observation',
+                        'phase':selected_phase,'session':args.trade_date,
+                        'refresh_reason':'supplemental_retry' if selected_phase=='supplemental' else 'profile_due',
+                        'coverage_before':reason}
+                    env=_utf8_subprocess_env()
+                    env['STOCKDATA_REQUEST_CONTEXT']=json.dumps(context,sort_keys=True)
                     process = subprocess.run(command, cwd=backend, capture_output=True,
-                        env=_utf8_subprocess_env(), timeout=args.step_timeout)
+                        env=env, timeout=args.step_timeout)
                     out, bad_out = _decode_process_bytes(process.stdout, "stdout")
                     err, bad_err = _decode_process_bytes(process.stderr, "stderr")
                     code = process.returncode or (-2 if bad_out or bad_err else 0)
@@ -178,6 +187,7 @@ def main() -> int:
                 log.write_text("[stdout]\n"+out+"\n[stderr]\n"+err, encoding="utf-8")
                 status = "completed" if code == 0 else "degraded"
                 manifest.upsert_step(name, status, command, return_code=code, log_path=str(log),
+                                     request_context=context,
                                      duration_seconds=round((datetime.now()-started).total_seconds(), 3))
                 if code:
                     failed.append(name)

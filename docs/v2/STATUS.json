@@ -1,17 +1,33 @@
 {
   "schema": 1,
   "as_of": "2026-09-21",
-  "status": "market_trial_active_five_session_acceptance_pending",
-  "baseline": "32126dc09d6e957afe16691828e0f6301aef1167",
-  "branch": "codex/cleanup-20260917",
-  "candidate_version": "0.3.29",
-  "code_cleanup": "existing_five_session_observer_uses_independent_versioned_publications",
-  "ledger": "reports/handover-20260917/completion.json#value_delivery_0_3_29",
+  "status": "isolated_delivery_remediation_live_trial_degraded",
+  "baseline": "229ecc8bd50055c99977193f230939f8315fef0b",
+  "branch": "codex/delivery-20260921",
+  "candidate_version": "0.3.30",
+  "code_cleanup": "candidate_fixes_reference_failure_receipts_native_catalogue_live_scope_publication_and_period_queries",
+  "ledger": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29",
   "remaining": "docs/v2/REMAINING_TASKS.md",
   "execution_ready": false,
   "production_cutover": false,
   "historical_records": "Git history and original handover artifacts; no historical result is current acceptance",
   "market_trial": true,
   "trial_approval": "2026-09-21 explicit user approval; five market tasks only",
-  "live_acceptance": "reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921"
+  "live_acceptance": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921",
+  "candidate_workspace": "D:/accio/stock_data-delivery",
+  "candidate_deployed": false,
+  "observed_runtime": {
+    "verified_at": "2026-09-21T18:06:00+08:00",
+    "release": "0.3.29",
+    "collector_contract_sha256": "a11bb950f565e0bd563b6c00f6f6fa147f2af46b7a242a5b45e4d38a34124b36",
+    "last_close": "completed_with_degradation",
+    "readiness": false,
+    "scope": "retained_admin_capture_and_close_receipts_not_continuous_live_probe"
+  },
+  "acceptance": {
+    "engineering": "candidate_validation_in_progress",
+    "market_trial": "five_complete_sessions_pending_20260921_excluded",
+    "research_value": "unproven_independent_experiments_required",
+    "real_account": "no_user_export_performance_unknown"
+  }
 }

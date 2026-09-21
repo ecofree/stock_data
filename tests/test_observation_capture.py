@@ -72,13 +72,14 @@ def test_current_native_source_beats_new_fallback_and_conflicts_are_not_hidden()
 
 def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monkeypatch):
     (tmp_path/'workspace-config.json').write_text(json.dumps({'read_only':True,'market_database':'synthetic'}))
-    monkeypatch.setattr(product,'saved_projection',lambda out:{'prediction':{'rows':[{'instrument':'000001'}]},'notes':[]})
+    desk={'prediction':{'rows':[{'instrument':'000001'}]},'notes':[]}
+    monkeypatch.setattr(product,'saved_projection',lambda out:desk)
     monkeypatch.setattr(watch,'load_rows',lambda *args:[])
     calls=[]
     original=capture.capture
     def fake(folder,codes):
         calls.append(codes)
-        result=original(folder,codes,fetch=lambda batch:raw())
+        result=original(folder,codes,fetch=lambda batch:b''.join(raw(c) for c in batch))
         # Product fixture explicitly emulates the network origin; never production output.
         return dict(result,origin='tencent_https')
     monkeypatch.setattr(capture,'capture',fake)
@@ -91,12 +92,43 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     assert second['provider_requests']==third['provider_requests']==0
     assert second['received_rows']==third['received_rows']==1 and len(calls)==1
     assert not first['qualified']  # old source date is never promoted by fresh fetch
+    # A new risk subject must not repeat the just-received (stale) old quote.
+    desk['plans']={'account':{'status':'risk_blocked','positions':[{'instrument':'SZ.000002','quantity':1}]}}
+    product.observe(tmp_path,capture_quotes=True)
+    assert calls==[['000001'],['000002']]
+    product.observe(tmp_path,capture_quotes=True)
+    assert calls==[['000001'],['000002']]  # overlapping cache segments survive expansion
+    (tmp_path/'sampling-current.json').write_text('{broken')
+    product.observe(tmp_path)
+    _,files=product.read_current(tmp_path/'observation-publication')
+    value=json.loads(files['observation.json'])
+    assert {r['instrument'] for r in value['rows']}=={'000001','000002'}
+    assert 'no_verified_pre_session_scope_for_today' in value['warnings']
+    desk['plans']={'account':{'status':'risk_unavailable'}}
+    desk['prediction']['rows']=[{'instrument':f'{i:06}'} for i in range(1,202)]
+    product.observe(tmp_path)
+    _,files=product.read_current(tmp_path/'observation-publication')
+    value=json.loads(files['observation.json'])
+    assert len(value['rows'])==201 and sum(r['state']=='capacity_blocked' for r in value['rows'])==1
+    assert any(r['instrument']=='000002' and r['risk_related'] for r in value['live_scope'])
+    # A damaged cache is optional evidence, not a failure of the whole view.
+    cache=json.loads((tmp_path/'quote-capture-current.json').read_text())
+    from pathlib import Path
+    (Path(cache['folder'])/'raw-0.bin').write_bytes(b'changed')
+    product.observe(tmp_path)
+    _,files=product.read_current(tmp_path/'observation-publication')
+    assert 'quote_cache_unusable' in json.loads(files['observation.json'])['warnings']
 
 
 def test_pre_session_scope_keeps_holdings_rejections_and_controls(monkeypatch,tmp_path):
 
     from trade_system.v2 import research_journal as journal,operator_workflow
     from trade_system.v2.domain import identity,utc
+    db=tmp_path/'calendar.duckdb'
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,is_open INTEGER,cal_date DATE)')
+        con.execute("INSERT INTO tushare_trade_cal VALUES ('SSE',1,'2026-09-11'),('SZSE',1,'2026-09-11')")
+    (tmp_path/'workspace-config.json').write_text(json.dumps({'read_only':True,'market_database':str(db)}))
     def add(intent,code,at):
         n={'instrument':code,'intent':intent,'received_at':at,'supersedes':None}
         n['note_id']=identity(n);journal.durable_event(tmp_path/'notes',n['note_id'],n)
@@ -106,6 +138,9 @@ def test_pre_session_scope_keeps_holdings_rejections_and_controls(monkeypatch,tm
         'snapshot_id':'synthetic','positions':[{'instrument':'SZ.000001','quantity':1}]})
     reg=capture.register_sampling(tmp_path,'2026-09-11',['000004'],clock=lambda:utc('2026-09-11T08:00:00+08:00'))
     assert reg['codes']==['000001','000002','000004'] and reg['account_status']=='account_stale_or_future'
+    assert capture.register_sampling(tmp_path,'2026-09-11',['000004'],clock=lambda:utc('2026-09-11T08:30:00+08:00'))==reg
     assert capture.read_sampling(tmp_path/'sampling'/reg['sampling_id'],'2026-09-11')==reg
     with pytest.raises(ValueError):capture.read_sampling(tmp_path/'sampling'/reg['sampling_id'],'2026-09-12')
     with pytest.raises(ValueError):capture.register_sampling(tmp_path,'2026-09-11',clock=lambda:utc('2026-09-11T09:15:00+08:00'))
+    with pytest.raises(ValueError,match='verified open session'):
+        capture.register_sampling(tmp_path,'2026-09-12',['000004'],clock=lambda:utc('2026-09-12T08:00:00+08:00'))

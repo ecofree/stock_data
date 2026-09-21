@@ -465,52 +465,120 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
         data=saved_projection(output)
         codes={r['instrument'] for r in (data.get('prediction') or {}).get('rows',[])}
         codes.update(n['instrument'] for n in data['notes'] if n['is_latest'])
-        codes.update(p['instrument'].split('.')[-1] for p in data.get('plans',{}).get('account',{}).get('positions',[]) if p['quantity']>0)
-        sampling=None
+        from .domain import utc
+        clock=now_utc();warnings=[];sampling=None
+        plans=data.get('plans') or {};account=plans.get('account') or {}
+        risk_entries=[*(p for p in account.get('positions',[]) if p.get('quantity',0)>0),
+                      *account.get('open_orders',[]),*account.get('internal_reservations',[])]
+        if account.get('status') in {'account_unknown','account_source_unavailable','risk_unavailable'} and (output/'publication/current.json').exists():
+            import json
+            try:
+                _,sealed_files=read_current(output/'publication')
+                last_account=(json.loads(sealed_files['desk.json']).get('plans') or {}).get('account') or {}
+                risk_entries.extend(p for p in last_account.get('positions',[]) if p.get('quantity',0)>0)
+                risk_entries.extend(last_account.get('open_orders',[]))
+                risk_entries.extend(last_account.get('internal_reservations',[]))
+                if risk_entries:warnings.append('account_unknown_retaining_last_published_risk_scope')
+            except (OSError,ValueError,KeyError,TypeError):
+                warnings.append('last_published_account_scope_unavailable')
+        priority=set()
+        for entry in risk_entries:
+            instrument=entry.get('instrument','')
+            code=instrument.split('.')[-1] if instrument.startswith(('SH.','SZ.','BJ.')) else instrument.split('.')[0]
+            if len(code)==6 and code.isdigit():priority.add(code)
+        for plan in plans.get('rows',[]):
+            if plan.get('is_latest') and utc(plan['valid_until'])>utc(clock):priority.add(plan['instrument'])
+        codes.update(priority)
+        previous_scope={}
+        if (output/'observation-publication/current.json').exists():
+            try:
+                import json
+                _,previous_files=read_current(output/'observation-publication')
+                previous=json.loads(previous_files['observation.json'])
+                previous_scope={r['instrument']:r for r in previous.get('live_scope',[])}
+                if account.get('status') in {'account_unknown','account_source_unavailable','risk_unavailable'}:
+                    priority.update(c for c,r in previous_scope.items() if r.get('risk_related'))
+                    codes.update(priority)
+                    warnings.append('account_unknown_retaining_last_known_risk_scope')
+            except (OSError,ValueError,KeyError,TypeError):
+                warnings.append('previous_observation_unavailable_risk_scope_unknown')
         if (output/'sampling-current.json').exists():
-            pointer=read_json(output/'sampling-current.json')[0]
-            from .observation_workspace import local_clock
-            sampling=observation_capture.read_sampling(pointer['folder'],local_clock(now_utc()).date().isoformat())
-            if sampling['sampling_id']!=pointer['sampling_id']:raise ValueError('sampling pointer changed')
-            codes=set(sampling['codes'])
-        clock=now_utc();rows=load_rows(config['market_database'],codes,clock.isoformat())
-        value=project_rows(rows,codes,clock.isoformat());acquired=None;requests=0;reused=False
+            try:
+                pointer=read_json(output/'sampling-current.json')[0]
+                from .observation_workspace import local_clock
+                sampling=observation_capture.read_sampling(pointer['folder'],local_clock(clock).date().isoformat())
+                if sampling['sampling_id']!=pointer['sampling_id']:raise ValueError('sampling pointer changed')
+                codes.update(sampling['codes'])
+            except (OSError,ValueError,KeyError,TypeError):
+                sampling=None;warnings.append('no_verified_pre_session_scope_for_today')
+        live_scope=[{'instrument':c,'included_at':previous_scope.get(c,{}).get('included_at',clock.isoformat()),
+                     'risk_related':c in priority,
+                     'roles':(['risk_or_active_plan'] if c in priority else [])+
+                         (['human_attention'] if any(n['instrument']==c and n['is_latest'] for n in data['notes']) else [])+
+                         (['pre_session_subject'] if sampling and c in sampling['codes'] else [])+
+                         (['research_forecast'] if any(r['instrument']==c for r in (data.get('prediction') or {}).get('rows',[])) else [])}
+                    for c in sorted(codes)]
+        selected=set((sorted(priority)+sorted(codes-priority))[:200]);deferred=sorted(codes-selected)
+        rows=load_rows(config['market_database'],selected,clock.isoformat())
+        value=project_rows(rows,selected,clock.isoformat());acquired=None;requests=0;reused=False
+        cached=None;cached_receipt=None;recent=[];recent_codes=set()
+        if (output/'quote-capture-current.json').exists():
+            try:
+                cached=read_json(output/'quote-capture-current.json')[0]
+                cached_receipt=observation_capture.replay(cached['folder'])
+                if cached_receipt['manifest_id']!=cached['manifest_id'] or cached_receipt['origin']!='tencent_https':
+                    raise ValueError('quote capture cache identity differs')
+            except (OSError,ValueError,KeyError,TypeError):
+                cached=None;cached_receipt=None;warnings.append('quote_cache_unusable')
+        if cached_receipt is not None:
+            entries=cached.get('recent',[])
+            if not isinstance(entries,list) or len(entries)>199:
+                entries=[];warnings.append('quote_cache_index_unusable')
+            entries=[*entries,{k:cached[k] for k in ('folder','captured_at','manifest_id')}]
+            for entry in entries:
+                try:
+                    if not 0<=(clock-utc(entry['captured_at'])).total_seconds()<60:continue
+                    receipt=cached_receipt if entry['folder']==cached['folder'] else observation_capture.replay(entry['folder'])
+                    if receipt['manifest_id']!=entry['manifest_id'] or receipt['origin']!='tencent_https':raise ValueError('cache identity')
+                    recent.append(entry);recent_codes.update(receipt['codes'])
+                    rows.extend(r for r in receipt['rows'] if r['asset_code'] in selected and r not in rows)
+                except (ValueError,TypeError,KeyError,OSError):
+                    warnings.append('quote_cache_part_unusable')
+            value=project_rows(rows,selected,clock.isoformat())
+            reused=bool(recent_codes & selected)
         missing=[r['instrument'] for r in value['rows'] if r['state']=='no_qualified_current_quote']
         if quote_receipts:
             acquired=observation_capture.replay(quote_receipts)
             if acquired['origin']!='tencent_https' or not set(acquired['codes'])<=codes:
                 raise ValueError('real same-universe quote replay required')
         elif capture_quotes and missing:
-            pointer=output/'quote-capture-current.json'
-            if pointer.exists():
-                cached=read_json(pointer)[0]
-                from .domain import utc
-                age=(clock-utc(cached['captured_at'])).total_seconds()
-                if cached['codes']==missing and 0<=age<60:
-                    acquired=observation_capture.replay(cached['folder'])
-                    if acquired['manifest_id']!=cached['manifest_id'] or acquired['origin']!='tencent_https':
-                        raise ValueError('quote capture cache identity differs')
-                    reused=True
-            if acquired is None:
+            pending=[c for c in missing if c not in recent_codes]
+            reused=reused or len(pending)<len(missing)
+            missing=pending
+            if not missing:acquired=cached_receipt
+            if acquired is None and missing:
                 acquired=observation_capture.capture(output/'quote-captures'/uuid.uuid4().hex,missing)
                 requests=acquired['requests']
                 write_pointer(output,'quote-capture-current.json',{'captured_at':now_utc().isoformat(),
-                    'codes':missing,'folder':acquired['folder'],'manifest_id':acquired['manifest_id']})
-        if acquired is None and not quote_receipts and (output/'quote-capture-current.json').exists():
-            cached=read_json(output/'quote-capture-current.json')[0]
-            acquired=observation_capture.replay(cached['folder'])
-            if (acquired['manifest_id']!=cached['manifest_id'] or acquired['origin']!='tencent_https'
-                or not set(acquired['codes'])<=codes):
-                raise ValueError('retained quote receipt identity/universe differs')
+                    'codes':missing,'folder':acquired['folder'],'manifest_id':acquired['manifest_id'],
+                    'recent':recent[-199:]})
+        if acquired is None and not quote_receipts and cached_receipt is not None:
+            acquired=cached_receipt
             reused=True
         if acquired:
-            value=project_rows([*rows,*acquired['rows']],codes,now_utc().isoformat())
+            retained=[r for r in acquired['rows'] if r['asset_code'] in selected and r not in rows]
+            value=project_rows([*rows,*retained],selected,now_utc().isoformat())
             value.pop('snapshot_id')
             value['capture']={k:v for k,v in acquired.items() if k not in ('rows','codes')}
             value['capture'].update(provider_requests_this_run=requests,reused=reused,
-                                    received_rows=len(acquired['rows']))
+                                    received_rows=len(acquired['rows']),reused_receipts=recent)
             value['snapshot_id']=identity(value)
         value.pop('snapshot_id')
+        value['rows'].extend({'instrument':c,'state':'capacity_blocked','price':None,'provider':None,
+            'source_event_time':None,'valid_until':None,'rejected_reasons':['observation_budget_exceeded'],
+            'retained_rows':0} for c in deferred)
+        value['live_scope']=live_scope;value['warnings']=warnings
+        value['account_status']=account.get('status','account_unknown')
         value['sampling']={'sampling_id':sampling['sampling_id'],'rows':sampling['rows'],
             'account_status':sampling['account_status']} if sampling else {'status':'no_pre_session_scope_current_observation_only'}
         value['snapshot_id']=identity(value)

@@ -313,7 +313,10 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path):
     class Empty:
         rows = []
         delisted = []
+        calls = []
         def query_rows(self, *args, **kwargs):
+            self.calls.append((args[0],dict(args[1])))
+            if args[0]=='daily':return [{'ts_code':'000001.SZ','trade_date':'20260701','close':10}]
             return self.delisted if args[1].get('list_status') == 'D' else self.rows
     with TushareHistoryCollector(tmp_path / "reference.duckdb", client=Empty()) as c:
         seed_calendar(c)
@@ -328,6 +331,10 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path):
         c.client.rows = []
         result = c.run('20260701', '20260701', datasets=['stock_basic', 'daily'], gap_only=True)
         assert all(r['status'] == 'error' for r in result['results'])
+        daily=next(r for r in result['results'] if r['dataset']=='daily')
+        assert daily['received_unverified_rows']==1 and daily['publication']=='raw_receipts_only_reference_unqualified'
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_daily').fetchone()[0]==0
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_daily'").fetchone()[0]==1
         assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 1
         c.client.rows = [dict(ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L'),
                          dict(ts_code='000002.SZ', symbol='000002', list_date='20260701', list_status='L')]

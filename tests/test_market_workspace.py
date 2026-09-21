@@ -45,6 +45,8 @@ def test_full_members_and_fixed_scope_previous_day(con):
     assert week['themes'][0]['rows']==[]  # later members never backfill Thursday
     assert week['themes'][1]['rows'][0]['priced_members']==1
     assert week['themes'][1]['rows'][0]['main_flow_cny'] is None
+    assert project(con)['periods']['month']['security_session_samples']==2
+    assert project(con)['periods']['quarter']['status']=='calendar_unverified'
     from trade_system.review_metrics import period_bounds
     assert period_bounds('2026-12-31','quarter')==('2026-10-01','2026-12-31')
     assert period_bounds('2024-02-20','month')==('2024-02-01','2024-02-29')
@@ -89,6 +91,21 @@ def test_empty_catalog_is_not_complete_membership(con):
     con.execute('DELETE FROM v_default_concept_daily')
     result=project(con)
     assert result['membership_status']=='partial' and result['themes']==[]
+    con.execute('CREATE TABLE v_limit_pool(trade_date DATE,stock_code VARCHAR,stock_name VARCHAR,board_level INTEGER,source VARCHAR,fetched_at TIMESTAMP)')
+    con.execute('CREATE TABLE history_fetch_checkpoint(dataset VARCHAR,trade_date DATE,page_no INTEGER,status VARCHAR,rows_written INTEGER,last_error VARCHAR,updated_at TIMESTAMP)')
+    from datetime import datetime
+    clock=datetime(2026,9,11,18)
+    assert market.limit_facts(con,'2026-09-11',clock)['status']=='source_missing'
+    import json,hashlib
+    from trade_system.hithink_client import HiThinkClient
+    receipt={'path':'/api/a-share/special-data/limit-up-pool','params':{'date_ms':HiThinkClient._date_ms('2026-09-11')},
+        'total':0,'pages':1,'items_sha256':hashlib.sha256(b'[]').hexdigest()}
+    con.execute("INSERT INTO history_fetch_checkpoint VALUES ('hithink_limit_pool','2026-09-11',0,'success',0,?,'2026-09-11 17:00')",[json.dumps(receipt)])
+    result=market.limit_facts(con,'2026-09-11',clock)
+    assert result['status']=='available' and result['complete_empty'] and result['rows']==[]
+    receipt['params']['date_ms']=HiThinkClient._date_ms('2026-09-10')
+    con.execute('UPDATE history_fetch_checkpoint SET last_error=?',[json.dumps(receipt)])
+    assert market.limit_facts(con,'2026-09-11',clock)['status']=='source_missing'
 
 
 def test_missing_price_date_and_duplicate_identity_refused(con):

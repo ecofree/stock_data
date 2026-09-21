@@ -69,11 +69,20 @@ def request_receipt(request):
         json.dumps(sorted((k.lower(),v) for k,v in request.header_items())).encode()).hexdigest()
     value={'attempt_id':uuid.uuid4().hex,'request_key':key,'host':urlsplit(request.full_url).hostname,
            'started_at':datetime.now(timezone.utc).isoformat(),'status':'outcome_unknown'}
+    # Scheduler-supplied attribution is constrained to non-secret identifiers.
+    # Standalone/SDK requests without this context remain explicitly unmeasured.
+    import re
+    try:context=json.loads(os.environ.get('STOCKDATA_REQUEST_CONTEXT','{}'))
+    except ValueError:context={}
+    allowed=('demand_id','consumer','refresh_reason','phase','session','revision_of','coverage_before')
+    value['attribution']={key:item for key,item in context.items() if key in allowed
+        and isinstance(item,str) and re.fullmatch(r'[A-Za-z0-9_.:/ -]{1,160}',item)} if isinstance(context,dict) else {}
     logger=get_logger('http_transport')
     logger.info('request_receipt %s',json.dumps(dict(value,event='started'),sort_keys=True))
     try:yield value
     except Exception as exc:
         value['error_type']=type(exc).__name__
+        value.setdefault('error_category',classify_transport_error(exc))
         if isinstance(exc,urllib.error.HTTPError):value.update(status='http_error',http_status=exc.code)
         raise
     finally:
@@ -94,10 +103,16 @@ def summarize_requests(records):
         if r.get('status')=='response_received':
             key=(r['request_key'],r['response_sha256'])
             repeat+=key in seen;seen.add(key)
+    reasons={}
+    for row in attempts.values():
+        reason=row.get('attribution',{}).get('refresh_reason','unattributed')
+        reasons[reason]=reasons.get(reason,0)+1
     return {'transport_attempts':len(attempts),'responses_received':sum(r['status']=='response_received' for r in attempts.values()),
         'same_request_same_response':repeat,'unknown_outcomes':sum(r['status']=='outcome_unknown' for r in attempts.values()),
         'conflicting_receipts':len(conflicts),'scope':'observed_shared_transport_only_not_all_providers_or_avoidable_cost',
-        'avoidable_duplicates':None,'missing':['request_reason_and_revision_policy_for_cost_attribution']}
+        'attempts_by_refresh_reason':reasons,
+        'attributed_attempts':sum(bool(r.get('attribution',{}).get('demand_id')) for r in attempts.values()),
+        'avoidable_duplicates':None,'missing':['verified_coverage_and_revision_policy_for_cost_attribution']}
 
 
 def request_metrics(log_paths):
@@ -193,10 +208,14 @@ def classify_transport_error(exc: BaseException) -> str:
         )
     ):
         return "tls_certificate_untrusted"
-    if isinstance(reason, TimeoutError) or "TIMED OUT" in text:
+    if isinstance(reason, TimeoutError) or "TIMED OUT" in text or "DEADLINE" in text:
         return "network_timeout"
     if "NAME OR SERVICE NOT KNOWN" in text or "GETADDRINFO FAILED" in text:
         return "dns_resolution_failed"
+    if "CONNECTIONREFUSED" in text or "REFUSED" in text or "10061" in text:
+        return "connection_refused"
+    if "RESET" in text or "10054" in text or "REMOTEDISCONNECTED" in text:
+        return "connection_interrupted"
     return "network_error"
 
 
@@ -265,8 +284,8 @@ def _response_worker():
         status = {'http_status': exc.code}
     except ValueError:
         status = {'error': 'response byte budget exceeded'}
-    except Exception:
-        status = {'error': 'verified transport failed'}
+    except Exception as exc:
+        status = {'error': classify_transport_error(exc)}
     sys.stdout.buffer.write(json.dumps(status).encode('ascii') + b'\n' + raw)
 
 
@@ -315,7 +334,12 @@ def read_verified_once(request, *, timeout, max_bytes):
         if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
             raise ValueError('response byte budget exceeded')
         if status.get('ok') is not True:
-            raise urllib.error.URLError('verified transport failed')
+            category = status.get('error')
+            if category not in {'tls_certificate_untrusted', 'network_timeout', 'dns_resolution_failed',
+                                'connection_refused', 'connection_interrupted', 'network_error'}:
+                category = 'network_error'
+            receipt['error_category'] = category
+            raise urllib.error.URLError(category)
         import hashlib
         receipt.update(status='response_received',response_sha256=hashlib.sha256(raw).hexdigest(),response_bytes=len(raw))
         return raw

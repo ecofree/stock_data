@@ -30,7 +30,7 @@ def _manifest(reports: Path, trade_date: str, phase: str, status: str = "complet
     )
 
 
-def test_two_strict_sessions_unlock_configured_observation_window(tmp_path):
+def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monkeypatch):
     db = tmp_path / "observation.duckdb"
     reports = tmp_path / "reports"
     workspace = tmp_path / 'workspace'
@@ -136,6 +136,23 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path):
     assert result["ready_for_p1"] is True
     assert result["consecutive_passes"] == 2
     assert 'dashboard' not in result['daily'][0]['checks']
+    # Historical verification binds the original sealed template, not today's.
+    from trade_system.v2 import research_product_view as view
+    from trade_system.p0_observation import _publications
+    with monkeypatch.context() as patch:
+        patch.setattr(view,'render',lambda data:'new renderer contract')
+        history,error=_publications(workspace,{'2026-07-23','2026-07-24'})
+    assert error is None and all(row['passed'] for row in history.values())
+    # Even an old-generation staged directory is not evidence of publication.
+    staged=workspace/'publication/runs/unpublished';staged.mkdir()
+    (staged/'manifest.json').write_text('{invalid unrelated history')
+    history,error=_publications(workspace,{'2026-07-23','2026-07-24'})
+    assert error is None and len(history)==2
+    historical=workspace/'publication/runs/2026-07-23/index.html'
+    saved=historical.read_bytes();historical.write_bytes(b'changed')
+    history,error=_publications(workspace,{'2026-07-23','2026-07-24'})
+    assert error is None and not history['2026-07-23']['passed'] and history['2026-07-24']['passed']
+    historical.write_bytes(saved)
 
     wrong_version = audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
                                                workspace=workspace,collector_contract_sha256='b'*64)

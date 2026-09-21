@@ -50,7 +50,27 @@ def limit_facts(con, day, clock):
     for code in conflicts:valid.pop(code,None)
     from collections import Counter
     counts=Counter(r['board_level'] for r in valid.values())
-    return {'status':'source_conflict' if conflicts else 'available' if rows else 'source_missing',
+    complete_empty=False
+    if not rows and 'history_fetch_checkpoint' in tables:
+        columns={r[0] for r in con.execute('DESCRIBE history_fetch_checkpoint').fetchall()}
+        if 'last_error' in columns:
+            receipt=con.execute("SELECT rows_written,last_error FROM history_fetch_checkpoint WHERE "
+                "dataset='hithink_limit_pool' AND trade_date=? AND page_no=0 AND status='success' AND updated_at<=?",
+                [day,clock]).fetchone()
+            if receipt and receipt[0]==0:
+                import json,hashlib
+                from zoneinfo import ZoneInfo
+                try:
+                    evidence=json.loads(receipt[1])
+                    complete_empty=(evidence.get('path')=='/api/a-share/special-data/limit-up-pool'
+                        and evidence.get('params',{}).get('date_ms')==int(datetime.fromisoformat(day).replace(tzinfo=ZoneInfo('Asia/Shanghai')).timestamp()*1000)
+                        and type(evidence.get('total')) is int and evidence['total']==0
+                        and type(evidence.get('pages')) is int and evidence['pages']>=1
+                        and evidence.get('items_sha256')==hashlib.sha256(b'[]').hexdigest())
+                except (ValueError,TypeError,AttributeError):
+                    complete_empty=False
+    return {'status':'source_conflict' if conflicts else 'available' if rows or complete_empty else 'source_missing',
+        'complete_empty':complete_empty,
         'rows':list(valid.values()),'conflicts':sorted(set(conflicts)),
         'ladder':[{'height':h,'count':n} for h,n in sorted(counts.items())],
         'scope':'canonical_limit_pool_not_exchange_total'}
@@ -108,6 +128,7 @@ def project(con, day, as_of, research_codes):
     boards={r['stock_code']:r['board_level'] for r in limits['rows']}
     from trade_system.review_metrics import period_bounds, market_period_summary
     week_start,week_end=period_bounds(day,'week')
+    quarter_start,_=period_bounds(day,'quarter')
     price_start=min(week_start,prior or day)
     prices=con.execute("""SELECT trade_date,stock_code,change_pct,provider,adjustment,volume_unit,amount_unit,close
         FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? AND close>0
@@ -143,7 +164,7 @@ def project(con, day, as_of, research_codes):
     calendar={}
     for exchange,opened,d in con.execute("""SELECT exchange,is_open,cal_date
         FROM tushare_trade_cal WHERE exchange IN ('SSE','SZSE')
-        AND cal_date BETWEEN ? AND ? ORDER BY cal_date,exchange""",[week_start,week_end]).fetchall():
+        AND cal_date BETWEEN ? AND ? ORDER BY cal_date,exchange""",[min(week_start,quarter_start),day]).fetchall():
         calendar.setdefault(str(d)[:10],[]).append((exchange,opened))
     daily={}
     for (d,code),r in keyed.items():
@@ -151,6 +172,19 @@ def project(con, day, as_of, research_codes):
         counts=daily.setdefault(d,{'rise':0,'fall':0,'flat':0,'samples':0})
         counts['samples']+=1;counts['rise' if r['pct']>0 else 'fall' if r['pct']<0 else 'flat']+=1
     result['periods']={period:market_period_summary(day,period,daily,calendar) for period in ('day','week')}
+    # Period breadth is a bounded SQL aggregation, not an expanded full-market
+    # Python row history or a substitute for returns/account performance.
+    period_daily={}
+    for d,total,distinct,rise,fall,flat in con.execute("""SELECT trade_date,count(*),count(DISTINCT stock_code),
+        count(*) FILTER (WHERE change_pct>0),count(*) FILTER (WHERE change_pct<0),count(*) FILTER (WHERE change_pct=0)
+        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? AND close>0
+        AND isfinite(change_pct) AND coalesce(provider,'')<>'' AND coalesce(adjustment,'')<>''
+        AND coalesce(volume_unit,'')<>'' AND coalesce(amount_unit,'')<>''
+        GROUP BY trade_date ORDER BY trade_date LIMIT 94""",[quarter_start,day,clock]).fetchall():
+        if total!=distinct:raise ValueError('duplicate canonical period identity')
+        period_daily[str(d)[:10]]={'samples':total,'rise':rise,'fall':fall,'flat':flat}
+    result['periods'].update({period:market_period_summary(day,period,period_daily,calendar)
+        for period in ('month','quarter')})
     weekly=[]
     for session in result['periods']['week']['expected_sessions']:
         values={c:r for (d,c),r in keyed.items() if d==session and r['pct'] is not None and math.isfinite(r['pct'])}

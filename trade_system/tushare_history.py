@@ -366,11 +366,18 @@ class TushareHistoryCollector:
         if not rows:
             raise XiaodefaError(f"empty {dataset} response")
         if dataset == 'stock_basic':
-            if (len({r.get('ts_code') for r in rows}) != len(rows) or any(
-                    not r.get('ts_code') or not r.get('list_date')
-                    or not '1990-01-01' <= _iso(r['list_date']) <= date.today().isoformat()
-                    for r in rows)):
-                raise XiaodefaError('invalid or unknown stock listing date/identity')
+            invalid = []
+            for row in rows:
+                try:
+                    listed = date.fromisoformat(_iso(row.get('list_date')))
+                    valid = bool(row.get('ts_code')) and date(1990, 1, 1) <= listed <= date.today()
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    invalid.append(str(row.get('ts_code') or '<missing>'))
+            if invalid or len({r.get('ts_code') for r in rows}) != len(rows):
+                raise XiaodefaError('invalid or unknown stock listing date/identity; '
+                                   f'count={len(invalid)} codes={",".join(invalid[:20])}')
             with self._transaction():
                 # Keep immutable old snapshots and raw receipts; replace only this projection.
                 self.store.conn.execute('DELETE FROM tushare_stock_basic')
@@ -765,8 +772,29 @@ class TushareHistoryCollector:
                     if retry_keys is not None and key not in retry_keys:
                         continue
                     if reference_error and dataset in STOCK_SNAPSHOT_DATASETS | {'moneyflow'}:
+                        # Acquire once for repair/replay, but never certify an unknown
+                        # universe or shrink its denominator to the rows that arrived.
+                        fields = (MARKET_FIELDS[dataset] if dataset in MARKET_FIELDS else
+                                  ','.join(dict.fromkeys((MONEYFLOW_MAIN_FIELDS+','+MONEYFLOW_SIZE_FIELDS).split(','))))
+                        error = 'reference prerequisite: ' + reference_error
+                        acquired = 0
+                        try:
+                            if not self._budget_left():
+                                raise XiaodefaError('request budget exhausted')
+                            for code in scopes.get(dataset) or [None]:
+                                if not self._budget_left():
+                                    raise XiaodefaError('request budget exhausted')
+                                params = {'trade_date': _ymd(trade_date)}
+                                if code is not None:
+                                    params['ts_code'] = code
+                                acquired += len(self._read_rows(dataset, params, fields))
+                        except Exception as exc:
+                            error += '; acquisition: ' + str(exc)[:180]
+                        self._checkpoint(checkpoint_key(dataset), trade_date, 'error',
+                                         attempts=self._next_attempt(checkpoint_key(dataset), trade_date), error=error)
                         results_by_key[key] = {'dataset': dataset, 'trade_date': trade_date,
-                            'status': 'error', 'error': 'reference prerequisite: ' + reference_error}
+                            'status': 'error', 'error': error, 'received_unverified_rows': acquired,
+                            'publication': 'raw_receipts_only_reference_unqualified'}
                         continue
                     if not self._budget_left():
                         results_by_key[key] = {
@@ -876,7 +904,11 @@ def render_report(db_path: str | Path, result: dict[str, Any], out_path: str | P
         con.close()
     lines = ["# Tushare 2026 历史回填", "", f"- 日期范围: `{result['start_date']}` ~ `{result['end_date']}`",
              f"- 本次交易日数: {len(result['dates'])}", f"- elapsed_seconds: {result['elapsed_seconds']}", "",
-             "## 检查点", "", "| dataset | status | dates/tasks | rows | last_updated |", "|---|---|---:|---:|"]
+             "## 本次结果", "", "| dataset | date | status | received unverified | reason |", "|---|---|---|---:|---|"]
+    for item in result['results']:
+        reason = str(item.get('error', '')).replace('|', '/').replace('\n', ' ')
+        lines.append(f"| {item['dataset']} | {item['trade_date']} | {item['status']} | {item.get('received_unverified_rows', 0)} | {reason} |")
+    lines.extend(["", "## 历史检查点汇总", "", "| dataset | status | dates/tasks | rows | last_updated |", "|---|---|---:|---:|---:|"])
     lines.extend(f"| {row[0]} | {row[1]} | {row[2]} | {row[3] or 0} | {row[4] or '-'} |" for row in counts)
     lines.extend(["", "## 表覆盖", "", "| table | rows | latest_date |", "|---|---:|---|"])
     lines.extend(f"| {table} | {rows} | {latest or '-'} |" for table, rows, latest in tables)

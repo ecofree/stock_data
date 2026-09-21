@@ -175,18 +175,28 @@ class HiThinkClient:
     # ------------------------------------------------------------- index
     def ths_concept_catalog(self, tag: str = "cn_concept",
                             max_pages: int = 50) -> list[dict]:
-        return self._paged(
+        return self._index_items(
             "/api/a-share-index/catalog/ths-index-list",
-            {"tag": tag, "size": 200},
-            max_pages=max_pages,
+            {"tag": tag},
         )
 
     def ths_index_constituents(self, thscode: str, max_pages: int = 50) -> list[dict]:
-        return self._paged(
+        return self._index_items(
             "/api/a-share-index/constituents/ths-stock-list",
-            {"thscode": thscode, "size": 200},
-            max_pages=max_pages,
+            {"thscode": thscode},
         )
+
+    def _index_items(self, path: str, params: dict) -> list[dict]:
+        """Native catalogue/constituents are complete lists, not paginated pools."""
+        data = self._get(path, params)
+        items = data.get('item')
+        if (not isinstance(items, list) or len(items) > 10000
+                or any(not isinstance(row, dict) or not isinstance(row.get('thscode'), str)
+                       or not row['thscode'].strip() for row in items)):
+            raise HiThinkError('invalid index list contract')
+        if len({row['thscode'].strip().upper() for row in items}) != len(items):
+            raise HiThinkError('duplicate index list identity')
+        return items
 
     # -------------------------------------------------------------- misc
     def trading_days(self) -> list[str]:

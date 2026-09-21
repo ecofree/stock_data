@@ -36,67 +36,68 @@ def _publications(workspace, dates):
     """Verify retained daily bundles, including the current published pointer."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    from trade_system.v2.domain import identity
-    from trade_system.v2.publisher import read_current, safe_child
+    from trade_system.v2.domain import identity, canonical
+    from trade_system.v2.publisher import read_current, read_bundle
     from trade_system.v2.research_product_view import render, export_projection
     root = Path(workspace) / 'publication'
     result = {}
     try:
-        current, _ = read_current(root)
-        paths = list((root / 'runs').glob('*/manifest.json'))
-        if len(paths) > 1000:
-            raise ValueError('publication history exceeds audit budget')
-        for path in paths:
-            if path.stat().st_size > 100_000:
-                raise ValueError('publication manifest exceeds audit budget')
-            manifest = json.loads(path.read_text(encoding='utf-8'))
-            desk = safe_child(root, 'runs/' + path.parent.name + '/desk.json')
-            if desk.stat().st_size > 20_000_000:
-                raise ValueError('publication artifact exceeds audit budget')
-            data = json.loads(desk.read_text(encoding='utf-8'))
-            if (data.get('market') or {}).get('trade_date') not in dates:
-                continue
-            if (manifest['run_id'] != path.parent.name or
-                    set(manifest['artifacts']) != {'index.html', 'desk.json'}):
+        current, current_files = read_current(root)
+        pointers = dict(current.get('published_days', {}))
+        if len(pointers) > 64:
+            raise ValueError('published day index exceeds audit budget')
+        current_day = (json.loads(current_files.get('desk.json', b'{}')).get('market') or {}).get('trade_date')
+        if current_day:
+            pointers[current_day] = {'run_id':current['run_id'],'generation':current['generation'],
+                'manifest_sha256':hashlib.sha256(canonical(current).encode()).hexdigest()}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {}, 'current_publication_' + type(exc).__name__
+    for day in dates:
+        if day not in pointers:
+            continue
+        try:
+            pointer = pointers[day]
+            manifest, files = read_bundle(root, pointer)
+            if set(manifest['artifacts']) != {'index.html', 'desk.json'}:
                 raise ValueError('publication identity or members differ')
             if manifest['generation'] > current['generation']:
-                continue  # A staged future bundle has not been published.
-            files = {}
-            for name, digest in manifest['artifacts'].items():
-                artifact = safe_child(path.parent, name)
-                if artifact.stat().st_size > 20_000_000:
-                    raise ValueError('publication artifact exceeds audit budget')
-                files[name] = artifact.read_bytes()
-                if hashlib.sha256(files[name]).hexdigest() != digest:
-                    raise ValueError('publication checksum differs')
+                raise ValueError('historical generation exceeds current')
             data = json.loads(files['desk.json'])
             market = data.get('market') or {}
             marker = '<script type="application/json" id="data">'
             head, body = files['index.html'].decode('utf-8').split(marker)
             payload, tail = body.split('</script>', 1)
-            expected_head, expected_body = render(data).split(marker)
-            _, expected_tail = expected_body.split('</script>', 1)
+            contract = manifest.get('content_contract')
+            if contract:
+                if (contract.get('name') != 'inline_research_desk' or contract.get('version') != 1
+                        or hashlib.sha256(canonical(json.loads(payload)).encode()).hexdigest() != contract.get('projection_sha256')):
+                    raise ValueError('unsupported or changed original publication contract')
+            else:
+                # Legacy bundles have no versioned contract. Only a current,
+                # byte-compatible renderer can verify them; do not invent proof.
+                expected_head, expected_body = render(data).split(marker)
+                _, expected_tail = expected_body.split('</script>', 1)
+                if head != expected_head or tail != expected_tail or json.loads(payload) != export_projection(data):
+                    raise ValueError('legacy publication contract unavailable')
             if (data.get('report_id') != identity({k:v for k,v in data.items() if k != 'report_id'})
                     or market.get('snapshot_id') != identity({k:v for k,v in market.items() if k != 'snapshot_id'})
                     or data.get('execution_ready') is not False
                     or market.get('scope') != 'read_only_market_review_not_execution'
                     or market.get('execution_ready') is not False
-                    or not market.get('stocks') or json.loads(payload) != export_projection(data)
-                    or head != expected_head or tail != expected_tail):
+                    or market.get('trade_date') != day or not market.get('stocks')):
                 raise ValueError('publication content contract differs')
             at = datetime.fromisoformat(market['as_of'])
             if at.tzinfo is None:
                 raise ValueError('publication timestamp must be aware')
             at = at.astimezone(ZoneInfo('Asia/Shanghai'))
-            day = market['trade_date']
             row = {'passed': at.date().isoformat() == day and at.hour >= 16,
                    'as_of': at.isoformat(), 'generation': manifest['generation'],
-                   'run_id': manifest['run_id'], 'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-            if day not in result or row['generation'] > result[day]['generation']:
-                result[day] = row
-        return result, None
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        return {}, type(exc).__name__
+                   'run_id': manifest['run_id'], 'manifest_sha256': pointer['manifest_sha256'],
+                   'published_at': manifest.get('published_at'), 'content_contract': contract}
+            result[day] = row
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result[day] = {'passed': False, 'error': 'publication_' + type(exc).__name__}
+    return result, None
 
 
 def _latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict[str, Any]]:

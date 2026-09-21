@@ -171,8 +171,19 @@ def test_native_incomplete_pagination_never_returns_partial(monkeypatch, payload
         return payloads[len(deadlines)-1]
     monkeypatch.setattr(client, '_get', get)
     with pytest.raises(native.HiThinkError):
-        client.ths_concept_catalog()
+        client.limit_up_pool('2026-09-21', max_pages=50)
     assert len(set(deadlines)) == 1
+    calls = []
+    def complete(path, params):
+        calls.append((path, params))
+        return {'timestamp': 1789920000000, 'item': [{'thscode': '886042.TI', 'name': 'example'}]}
+    monkeypatch.setattr(client, '_get', complete)
+    assert len(client.ths_concept_catalog()) == len(client.ths_index_constituents('886042.TI')) == 1
+    assert calls[0][1] == {'tag': 'cn_concept'}
+    assert calls[1][1] == {'thscode': '886042.TI'}
+    monkeypatch.setattr(client, '_get', lambda *a: {'item': [{'thscode': 'a'}, {'thscode': 'A'}]})
+    with pytest.raises(native.HiThinkError, match='duplicate'):
+        client.ths_concept_catalog()
 
 
 def test_strict_transport_refuses_redirects_and_propagates_failure(monkeypatch):

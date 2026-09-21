@@ -1,7 +1,7 @@
 """Explicit account imports and append-only operator/external facts."""
 import json
 
-from .domain import canonical, identity, instrument, money, quantity, utc
+from .domain import canonical, identity, instrument, money, quantity, utc, now_utc
 
 
 def import_snapshot(store, raw: bytes):
@@ -130,7 +130,7 @@ def append_account_event(store, event_id, account_id, kind, payload):
     return True
 
 
-def period_performance(con, account_id, day, period):
+def period_performance(con, account_id, day, period, *, report_as_of=None):
     """Recompute from imported equity and external flows; fees are already in NAV.
 
     Snapshot performance_coverage is a source declaration, never inferred from
@@ -142,15 +142,23 @@ def period_performance(con, account_id, day, period):
     start,end=period_bounds(day,period)
     stop=(date.fromisoformat(day)+timedelta(days=1)).isoformat()
     begin,finish=utc(start+'T00:00:00+08:00'),utc(stop+'T00:00:00+08:00')
+    known_at=utc(report_as_of or now_utc())
     result={'period':period,'start':start,'end':end,'through':day,'unfinished_period':day<end,
         'status':'insufficient_account_evidence','mode':None,'net_pnl_fen':None,'net_external_flow_fen':None,
         'time_weighted_return':None,'observed_drawdown':None,'fees_fen':None,'valuation_points':[],
         'closed_trade_statistics':None,'attribution':None,'execution_ready':False,
         'scope':'declared_imported_account_not_broker_certification_or_continuous_intraday_drawdown',
-        'missing':[]}
-    snapshots=con.execute('SELECT snapshot_id,asof_time,equity_fen,reconciled,payload FROM account_snapshot WHERE account_id=? AND asof_time<? ORDER BY asof_time,seq LIMIT 10001',[account_id,finish]).fetchall()
-    if len(snapshots)>10000:raise ValueError('account valuation budget exceeded')
-    opening=[r for r in snapshots if r[1]<=begin];closing=[r for r in snapshots if begin<r[1]<finish]
+        'report_as_of':known_at.isoformat(),'basis':'as_known_at_report_time','missing':[]}
+    fields='snapshot_id,asof_time,equity_fen,reconciled,payload,imported_at'
+    opening=con.execute(f'SELECT {fields} FROM account_snapshot WHERE account_id=? AND asof_time<=? '
+        'AND asof_time<=? AND imported_at<=? ORDER BY asof_time DESC,seq DESC LIMIT 1',
+        [account_id,begin,known_at,known_at]).fetchall()
+    closing=con.execute(f'SELECT {fields} FROM account_snapshot WHERE account_id=? AND asof_time>? '
+        'AND asof_time<? AND asof_time<=? AND imported_at<=? '
+        'QUALIFY row_number() OVER (PARTITION BY asof_time ORDER BY seq DESC)=1 '
+        'ORDER BY asof_time LIMIT 10001',[account_id,begin,finish,known_at,known_at]).fetchall()
+    if len(closing)>10000:raise ValueError('account period valuation budget exceeded')
+    result['valuation_evidence_id']=identity([r[0] for r in [*opening,*closing]])
     if not opening:result['missing'].append('opening_equity')
     if not closing:result['missing'].append('closing_equity')
     if not opening or not closing:return result
@@ -162,14 +170,23 @@ def period_performance(con, account_id, day, period):
         if coverage.get(key) is not True:result['missing'].append(key)
     if any(json.loads(r[4])['mode']!=payload['mode'] for r in [first,*closing]):result['missing'].append('mixed_account_modes')
     if not all(r[3] for r in [first,*closing]):result['missing'].append('reconciled_equity_path')
-    events=con.execute('SELECT event_id,happened_at,kind,payload FROM account_event WHERE account_id=? ORDER BY happened_at,event_id LIMIT 20001',[account_id]).fetchall()
+    events=con.execute("SELECT event_id,happened_at,kind,payload FROM account_event WHERE account_id=? "
+        "AND happened_at<=? AND (try_cast(json_extract_string(payload,'$.effective_at') AS TIMESTAMPTZ) IS NULL "
+        "OR try_cast(json_extract_string(payload,'$.effective_at') AS TIMESTAMPTZ)>=? "
+        "AND try_cast(json_extract_string(payload,'$.effective_at') AS TIMESTAMPTZ)<?) "
+        "ORDER BY happened_at,event_id LIMIT 20001",[account_id,known_at,begin,finish]).fetchall()
     if len(events)>20000:raise ValueError('account event budget exceeded')
+    result['event_evidence_id']=identity([r[0] for r in events])
+    result['late_received_inputs']={'snapshots':[r[0] for r in [first,*closing] if r[5]>=finish],
+        'events':[r[0] for r in events if r[1]>=finish]}
     points=[(r[1],1,r[2],0) for r in closing];flows=fees=0
     for event_id,received,kind,raw in events:
         item=json.loads(raw)
         if not item.get('effective_at'):
             result['missing'].append('event_effective_time');continue
-        effective=utc(item['effective_at'])
+        try:effective=utc(item['effective_at'])
+        except (ValueError,TypeError):
+            result['missing'].append('event_effective_time');continue
         if not begin<=effective<finish:continue
         if effective>last[1]:result['missing'].append('closing_valuation_after_last_event')
         if kind in ('correction','external_action_unknown'):
@@ -216,4 +233,5 @@ def configured_performance(output, day):
             'execution_ready':False} for p in periods}
     with duckdb.connect(str(Path(config['account_database']).resolve(strict=True)),read_only=True) as con:
         con.execute('BEGIN TRANSACTION')
-        return {p:period_performance(con,config['account_id'],day,p) for p in periods}
+        at=now_utc()
+        return {p:period_performance(con,config['account_id'],day,p,report_as_of=at) for p in periods}

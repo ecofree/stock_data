@@ -96,6 +96,12 @@ def test_market_date_mismatch_is_not_published(tmp_path):
             "2026-08-28",
         )
         assert result["status"] == "source_date_mismatch"
+        class MissingRoute(FakeAuctionClient):
+            def get(self,*args,**kwargs):
+                self.stats.update(error=1,route_error=1)
+                return None
+        failed=collect_auction_market(MissingRoute(None),store,'2026-08-28')
+        assert failed['status']=='route_unavailable' and failed['source_errors']['route_error']==1
         assert store.conn.execute(
             "SELECT count(*) FROM auction_tick"
         ).fetchone()[0] == 0

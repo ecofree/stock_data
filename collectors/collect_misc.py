@@ -243,6 +243,7 @@ def collect_auction_market(client: KPLClient, store: DuckDBStore, date: str) -> 
     parser deliberately ignores ``total_ticks`` because those are regular-day
     trade ticks, not auction evidence.
     """
+    before=dict(getattr(client,'stats',{}))
     payload = client.get("/auction/market", {"date": date}, critical=True)
     result = {
         "trade_date": date,
@@ -253,6 +254,11 @@ def collect_auction_market(client: KPLClient, store: DuckDBStore, date: str) -> 
         "status": "empty",
     }
     if not isinstance(payload, dict):
+        errors={key:max(0,int(value)-int(before.get(key,0))) for key,value in getattr(client,'stats',{}).items()}
+        result['source_errors']={key:count for key,count in errors.items() if count and key!='success'}
+        result['status']=('route_unavailable' if errors.get('route_error') else
+            'unauthorized' if errors.get('auth_error') else 'source_failed' if any(errors.get(k) for k in
+            ('error','rate_limited','circuit_open','semantic_error','skipped')) else 'empty_unverified')
         return result
 
     store.insert_raw('/auction/market', payload)

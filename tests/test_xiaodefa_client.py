@@ -1,4 +1,5 @@
 import urllib.error
+import json
 import threading
 
 import pytest
@@ -309,7 +310,7 @@ def test_blocked_transport_worker_is_reaped_at_deadline(monkeypatch):
 
 
 @pytest.mark.parametrize('status, body', [(200, b'complete'), (403, b'private'), (200, b'x'*33)])
-def test_real_transport_worker_preserves_http_and_size_boundaries(status, body):
+def test_real_transport_worker_preserves_http_and_size_boundaries(status, body,monkeypatch):
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import urllib.request
     from trade_system.http_transport import read_verified_once
@@ -340,10 +341,15 @@ def test_real_transport_worker_preserves_http_and_size_boundaries(status, body):
         else:
             from trade_system.http_transport import measure_requests,summarize_requests
             with measure_requests() as measured:
-                for _ in range(2):assert read_verified_once(request, timeout=4, max_bytes=32) == body
+                for reason in ('missing_range','approved_revision'):
+                    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT',json.dumps({'demand_id':'synthetic',
+                        'refresh_reason':reason,'credential':'must_not_be_logged'}))
+                    assert read_verified_once(request, timeout=4, max_bytes=32) == body
             summary=summarize_requests(measured)
             assert summary['transport_attempts']==summary['responses_received']==2
             assert summary['same_request_same_response']==1 and summary['avoidable_duplicates'] is None
+            assert summary['attempts_by_refresh_reason']=={'missing_range':1,'approved_revision':1}
+            assert summary['attributed_attempts']==2 and all('credential' not in r['attribution'] for r in measured)
     finally:
         thread.join(5)
         server.server_close()

@@ -191,7 +191,7 @@ def collect_review_supplement(
                 if name in selected:
                     result["rows"][name] = 0
                     result.setdefault("deferred", []).append(f"{name}:sector_universe_missing")
-        result["status"] = "completed" if any(int(value or 0) > 0 for value in result["rows"].values()) else "empty"
+        result['collector_rows']=dict(result['rows'])
         result["table_rows"] = {}
         for table_name in selected:
             try:
@@ -219,7 +219,10 @@ def collect_review_supplement(
             if count is not None:
                 result["rows"][table_name] = count
         result["api_success"] = client.stats.get("success", 0)
-        result["api_error"] = client.stats.get("error", 0)
+        result["api_error"] = sum(client.stats.get(k,0) for k in ('error','rate_limited','circuit_open','semantic_error'))
+        has_rows=any(int(value or 0)>0 for value in result['collector_rows'].values())
+        result['status']=('partial' if has_rows else 'failed') if result['api_error'] else (
+            'partial' if result.get('deferred') else 'completed' if has_rows else 'empty_unverified')
         total_rows = sum(int(value or 0) for value in result["rows"].values())
         store.conn.execute(
             """
@@ -268,7 +271,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] in {"planned", "completed", "empty"} else 2
+    return 0 if result["status"] in {"planned", "completed"} else 2
 
 
 if __name__ == "__main__":
