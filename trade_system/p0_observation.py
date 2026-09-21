@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -28,16 +29,74 @@ GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap", "partial"}
 
 def _infer_phase(manifest: dict[str, Any]) -> str | None:
     phase = str(manifest.get("phase") or "").lower()
-    if phase in PHASES:
-        return phase
-    names = {str(step.get("name") or "") for step in manifest.get("steps") or []}
-    if names & {"collect_auction_evidence", "generate_auction_stage_signals"}:
-        return "auction"
-    if names & {"collect_intraday_stock_flow_market", "generate_intraday_stage_signals"}:
-        return "intraday"
-    if names & {"sync_tushare_close", "generate_close_stage_signals", "generate_daily_review"}:
-        return "close"
-    return None
+    return phase if phase in PHASES else None
+
+
+def _publications(workspace, dates):
+    """Verify retained daily bundles, including the current published pointer."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trade_system.v2.domain import identity
+    from trade_system.v2.publisher import read_current, safe_child
+    from trade_system.v2.research_product_view import render, export_projection
+    root = Path(workspace) / 'publication'
+    result = {}
+    try:
+        current, _ = read_current(root)
+        paths = list((root / 'runs').glob('*/manifest.json'))
+        if len(paths) > 1000:
+            raise ValueError('publication history exceeds audit budget')
+        for path in paths:
+            if path.stat().st_size > 100_000:
+                raise ValueError('publication manifest exceeds audit budget')
+            manifest = json.loads(path.read_text(encoding='utf-8'))
+            desk = safe_child(root, 'runs/' + path.parent.name + '/desk.json')
+            if desk.stat().st_size > 20_000_000:
+                raise ValueError('publication artifact exceeds audit budget')
+            data = json.loads(desk.read_text(encoding='utf-8'))
+            if (data.get('market') or {}).get('trade_date') not in dates:
+                continue
+            if (manifest['run_id'] != path.parent.name or
+                    set(manifest['artifacts']) != {'index.html', 'desk.json'}):
+                raise ValueError('publication identity or members differ')
+            if manifest['generation'] > current['generation']:
+                continue  # A staged future bundle has not been published.
+            files = {}
+            for name, digest in manifest['artifacts'].items():
+                artifact = safe_child(path.parent, name)
+                if artifact.stat().st_size > 20_000_000:
+                    raise ValueError('publication artifact exceeds audit budget')
+                files[name] = artifact.read_bytes()
+                if hashlib.sha256(files[name]).hexdigest() != digest:
+                    raise ValueError('publication checksum differs')
+            data = json.loads(files['desk.json'])
+            market = data.get('market') or {}
+            marker = '<script type="application/json" id="data">'
+            head, body = files['index.html'].decode('utf-8').split(marker)
+            payload, tail = body.split('</script>', 1)
+            expected_head, expected_body = render(data).split(marker)
+            _, expected_tail = expected_body.split('</script>', 1)
+            if (data.get('report_id') != identity({k:v for k,v in data.items() if k != 'report_id'})
+                    or market.get('snapshot_id') != identity({k:v for k,v in market.items() if k != 'snapshot_id'})
+                    or data.get('execution_ready') is not False
+                    or market.get('scope') != 'read_only_market_review_not_execution'
+                    or market.get('execution_ready') is not False
+                    or not market.get('stocks') or json.loads(payload) != export_projection(data)
+                    or head != expected_head or tail != expected_tail):
+                raise ValueError('publication content contract differs')
+            at = datetime.fromisoformat(market['as_of'])
+            if at.tzinfo is None:
+                raise ValueError('publication timestamp must be aware')
+            at = at.astimezone(ZoneInfo('Asia/Shanghai'))
+            day = market['trade_date']
+            row = {'passed': at.date().isoformat() == day and at.hour >= 16,
+                   'as_of': at.isoformat(), 'generation': manifest['generation'],
+                   'run_id': manifest['run_id'], 'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            if day not in result or row['generation'] > result[day]['generation']:
+                result[day] = row
+        return result, None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {}, type(exc).__name__
 
 
 def _latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict[str, Any]]:
@@ -82,7 +141,9 @@ def _sessions(
     while len(sessions) < required_days and cursor >= target - timedelta(days=45):
         if cursor in calendar:
             if calendar[cursor]:
-                sessions.append({"trade_date": cursor.isoformat(), "calendar_verified": True})
+                flags = con.execute("SELECT exchange,is_open FROM tushare_trade_cal WHERE cal_date=? "
+                                    "AND exchange IN ('SSE','SZSE') ORDER BY exchange", [cursor]).fetchall()
+                sessions.append({"trade_date": cursor.isoformat(), "calendar_verified": flags == [('SSE',1),('SZSE',1)]})
         cursor -= timedelta(days=1)
     return list(reversed(sessions))
 
@@ -241,11 +302,16 @@ def audit_five_day_observation(
     *,
     required_days: int = 5,
     minimum_ths_concepts: int | None = None,
+    workspace: str | Path,
+    collector_contract_sha256: str,
 ) -> dict[str, Any]:
+    if len(collector_contract_sha256) != 64 or any(c not in '0123456789abcdef' for c in collector_contract_sha256.lower()):
+        raise ValueError('explicit collector contract SHA256 required')
     manifests = _latest_manifests(reports_dir)
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         sessions = _sessions(con, as_of, max(1, int(required_days)))
+        publications, publication_error = _publications(workspace, {s['trade_date'] for s in sessions})
         daily = []
         for session in sessions:
             trade_date = session["trade_date"]
@@ -261,14 +327,23 @@ def audit_five_day_observation(
                     # the day's core close run.  Only the explicit warning status
                     # is accepted here; degraded/blocked/chain-failure runs stay
                     # fail-closed.
-                    "passed": status in {"completed", "completed_with_warnings"},
+                    "passed": status in {"completed", "completed_with_warnings"}
+                    and (manifest or {}).get('scope') == 'transitional_market_collection_only'
+                    and str((manifest or {}).get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower(),
                     "run_dir": (manifest or {}).get("_run_dir"),
                 }
-            close_dir = Path(phases["close"]["run_dir"]) if phases["close"]["run_dir"] else None
-            artifacts = {
-                "daily_review": bool(close_dir and (close_dir / "daily_review_latest.md").exists()),
-                "dashboard": bool(close_dir and (close_dir / "trading_dashboard_latest.html").exists()),
-            }
+            publication = publications.get(trade_date, {'passed': False, 'error': publication_error or 'missing_same_day_publication'})
+            if publication['passed']:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                try:
+                    completed = datetime.fromisoformat(manifests[trade_date, 'close']['completed_at'])
+                    if completed.tzinfo is None:
+                        completed = completed.replace(tzinfo=ZoneInfo('Asia/Shanghai'))
+                    if datetime.fromisoformat(publication['as_of']) < completed:
+                        publication = dict(publication, passed=False, error='publication_precedes_close_completion')
+                except (KeyError, ValueError, TypeError):
+                    publication = dict(publication, passed=False, error='close_completion_unverified')
             stock = _batch_status(
                 con, "intraday_stock_flow_batch", trade_date, GOOD_STOCK_BATCH
             )
@@ -286,8 +361,7 @@ def audit_five_day_observation(
                 "sector_flow": sector["passed"],
                 "tushare_close": tushare["passed"],
                 "ths_weekly": ths["passed"],
-                "daily_review": artifacts["daily_review"],
-                "dashboard": artifacts["dashboard"],
+                "publication": publication['passed'],
             }
             daily.append(
                 {
@@ -299,7 +373,7 @@ def audit_five_day_observation(
                     "sector_flow": sector,
                     "tushare": tushare,
                     "ths": ths,
-                    "artifacts": artifacts,
+                    "publication": publication,
                 }
             )
     finally:
@@ -317,6 +391,8 @@ def audit_five_day_observation(
         "ready_for_p1": len(daily) >= int(required_days)
         and consecutive >= int(required_days),
         "daily": daily,
+        "collector_contract_sha256": collector_contract_sha256.lower(),
+        "scope": "market_collection_and_publication_not_account_performance_or_trading_permission",
     }
 
 
@@ -329,8 +405,8 @@ def render_observation(result: dict[str, Any]) -> str:
         f"- Consecutive strict passes: `{result['consecutive_passes']}`",
         f"- Ready to enter P1: `{str(result['ready_for_p1']).lower()}`",
         "",
-        "| trade date | calendar | auction | intraday | close | stock flow | sector flow | TuShare close | THS weekly | review | dashboard | pass |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| trade date | calendar | auction | intraday | close | stock flow | sector flow | TuShare close | THS weekly | publication | pass |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in result["daily"]:
         checks = item["checks"]
@@ -340,8 +416,7 @@ def render_observation(result: dict[str, Any]) -> str:
             f"{mark(checks['auction_run'])} | {mark(checks['intraday_run'])} | "
             f"{mark(checks['close_run'])} | {mark(checks['stock_flow'])} | "
             f"{mark(checks['sector_flow'])} | {mark(checks['tushare_close'])} | "
-            f"{mark(checks['ths_weekly'])} | {mark(checks['daily_review'])} | "
-            f"{mark(checks['dashboard'])} | {mark(item['passed'])} |"
+            f"{mark(checks['ths_weekly'])} | {mark(checks['publication'])} | {mark(item['passed'])} |"
         )
     lines.extend(
         [
