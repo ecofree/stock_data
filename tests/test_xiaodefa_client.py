@@ -42,15 +42,19 @@ def test_missing_retained_credential_never_opens_database(tmp_path, monkeypatch)
     envelope([['000001.SZ', '20260916', 12]], ('ts_code', 'ts_code', 'close')),
     envelope([['000001.SZ', '20260916', 12]], ('ts_code', 'date', 'close')),
 ])
-def test_invalid_envelope_has_one_attempt_and_no_fallback(payload):
+def test_invalid_envelope_has_one_attempt_and_no_fallback(payload, caplog):
     calls = []
     def request(*args):
         calls.append(args)
         return payload
     client = XiaodefaClient(token='fixture', runner=request)
-    with pytest.raises(XiaodefaError):
+    with pytest.raises(XiaodefaError) as failure:
         client.query_rows('daily', fields='ts_code,trade_date,close')
     assert len(calls) == 1
+    diagnostic = failure.value.diagnostic
+    assert diagnostic['api'] == 'daily'
+    assert 'data_type' in diagnostic and 'items_count' in diagnostic
+    assert 'fixture' not in caplog.text and '000001.SZ' not in caplog.text
 
 
 @pytest.mark.parametrize('code, attempts', [(301, 1), (403, 1), (429, 3), (503, 3)])

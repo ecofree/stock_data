@@ -184,6 +184,16 @@ def test_native_incomplete_pagination_never_returns_partial(monkeypatch, payload
     monkeypatch.setattr(client, '_get', lambda *a: {'item': [{'thscode': 'a'}, {'thscode': 'A'}]})
     with pytest.raises(native.HiThinkError, match='duplicate'):
         client.ths_concept_catalog()
+    import time
+    listing = {'timestamp':int(time.time()*1000), 'item':[{
+        'thscode':'000001.SZ','asset_type':'a-share','list_date':None}]}
+    monkeypatch.setattr(client, '_get', lambda *a: listing)
+    assert client.stock_listing('000001.SZ')['item'][0]['list_date'] is None
+    with pytest.raises(native.HiThinkError, match='ambiguous'):
+        client.stock_listing('600000.SH')
+    listing['timestamp'] -= 86400001
+    with pytest.raises(native.HiThinkError, match='stale'):
+        client.stock_listing('000001.SZ')
 
 
 def test_strict_transport_refuses_redirects_and_propagates_failure(monkeypatch):

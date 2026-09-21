@@ -81,6 +81,12 @@ def test_profile_declares_full_market_flow_sources():
     for phase in ('auction','intraday','close','supplemental','history'):
         plan = command_plan('unused', '2026-09-18', include_collection=True, phase=phase)
         assert [t.name for t in phase_tasks(phase)] == [n for n,_,_ in plan]
+    supplement = command_plan('unused', '2026-09-18', include_collection=True, phase='supplemental')
+    name, command, _ = supplement[0]
+    assert name == 'sync_tushare_close'
+    assert command[command.index('--start-date') + 1] == '20260918'
+    assert command[command.index('--end-date') + 1] == '20260918'
+    assert command[command.index('--retry-passes') + 1] == '0'
     with pytest.raises(ValueError, match='unregistered'):
         task_due('unused','2026-09-18','unknown',phase='close',force=True)
     with pytest.raises(ValueError, match='unregistered'):
@@ -160,6 +166,30 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
         db, "2026-07-15", "sync_tushare_close",
         now=datetime(2026, 7, 15, 18, 2),
     )[0] is True
+    # An unrelated successful supplement cannot satisfy publication inputs.
+    from trade_system.collection_profiles import publication_readiness
+    result = publication_readiness(db, '2026-07-15')
+    assert not result['passed'] and result['reason'] == 'publication_inputs_unavailable'
+    import hashlib
+    import json
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
+        con.execute('CREATE TABLE tushare_stock_basic(ts_code VARCHAR,stock_code VARCHAR,stock_name VARCHAR,area VARCHAR,industry VARCHAR,market VARCHAR,list_date DATE,delist_date DATE)')
+        con.execute("INSERT INTO tushare_stock_basic VALUES ('000001.SZ','000001','sample','','','','1991-04-03',NULL)")
+        con.execute('CREATE TABLE multi_source_observation(data_type VARCHAR,provider VARCHAR,status VARCHAR,payload_json VARCHAR,observed_at TIMESTAMP)')
+        ref = con.execute('SELECT * FROM tushare_stock_basic ORDER BY ts_code').fetchall()
+        version = hashlib.sha256(json.dumps(ref,ensure_ascii=False,default=str,separators=(',', ':')).encode()).hexdigest()
+        con.execute("INSERT INTO multi_source_observation VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,current_timestamp)",
+                    [json.dumps({'version':version,'scope':['L','D']})])
+        con.execute("CREATE TABLE v_kline_daily AS SELECT '2026-07-15' AS trade_date, '000001' AS stock_code, 10.0 AS close, 1.0 AS change_pct, 'xiaodefa' AS provider, 'none' AS adjustment, 'hands' AS volume_unit, 'thousand_yuan' AS amount_unit")
+        con.execute("UPDATE history_fetch_checkpoint SET rows_written=1 WHERE dataset='daily'")
+    assert publication_readiness(db, '2026-07-15')['passed']
+    with duckdb.connect(str(db)) as con:
+        con.execute('INSERT INTO v_kline_daily SELECT * FROM v_kline_daily')
+    assert publication_readiness(db, '2026-07-15')['reason'] == 'canonical_prices_incomplete'
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE tushare_stock_basic SET list_date='1970-01-01'")
+    assert publication_readiness(db, '2026-07-15')['reason'] == 'stock_reference_unqualified'
 
 
 def test_legacy_weekly_web_refresh_is_not_a_close_task():

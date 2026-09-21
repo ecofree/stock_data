@@ -193,6 +193,9 @@ def main() -> int:
                     failed.append(name)
                 # Independent data sources still run after one provider fails.
                 # No failed run is reported as a successful publication.
+            if selected_phase in ('close', 'supplemental'):
+                from trade_system.collection_profiles import publication_readiness
+                manifest.data['publication_readiness'] = publication_readiness(args.db, args.trade_date)
             manifest.finish("completed_with_degradation" if failed else "completed", ",".join(failed) or None)
             print(f"COLLECTION_COMPLETE date={args.trade_date} failed={len(failed)} user_pages_published=false manifest={manifest.path}")
             return 2 if failed else 0

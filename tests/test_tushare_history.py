@@ -308,7 +308,7 @@ def test_offline_plan_needs_no_provider_credential(tmp_path, monkeypatch):
     assert empty.read_bytes() == before
 
 
-def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path):
+def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeypatch):
     import json
     class Empty:
         rows = []
@@ -350,6 +350,39 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path):
         # A manually changed projection no longer matches its reference version.
         c.store.conn.execute("UPDATE tushare_stock_basic SET list_date='1970-01-01' WHERE ts_code='000002.SZ'")
         assert c._reference_version() is None
+        # Official repair is bounded, cached and retains unknown identities.
+        import time
+        from datetime import date, timedelta
+        from trade_system.hithink_client import HiThinkClient
+        calls = []
+        def official(_self, code):
+            calls.append(code)
+            return {'timestamp': int(time.time()*1000), 'item': [{'thscode': code,
+                'asset_type': 'a-share', 'list_date': None if code == '000003.SZ'
+                else (date.today()+timedelta(days=1)).isoformat()}]}
+        monkeypatch.setattr(HiThinkClient, '__init__', lambda *a, **k: None)
+        monkeypatch.setattr(HiThinkClient, 'stock_listing', official)
+        monkeypatch.setattr(c, '_is_production_source', lambda: True)
+        def query_all(api, *, on_page, **params):
+            rows = [dict(r) for r in (c.client.delisted if params.get('list_status') == 'D' else c.client.rows)]
+            on_page(0, rows)
+            return rows
+        monkeypatch.setattr(c.client, 'query_all', query_all, raising=False)
+        c.client.rows[0]['list_date'] = '19700101'
+        assert c.collect_stock_basic(force=True) == 2
+        assert c._expected_stock_codes(date.today().isoformat(), 'daily') == set()
+        assert calls == ['000002.SZ']
+        c.collect_stock_basic(force=True)
+        assert calls == ['000002.SZ']
+        c.client.rows.append(dict(ts_code='000003.SZ', list_status='L', list_date='19700101'))
+        with pytest.raises(Exception, match='000003.SZ'):
+            c.collect_stock_basic(force=True)
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 2
+        assert calls == ['000002.SZ', '000003.SZ']
+        c.store.conn.execute("UPDATE multi_source_observation SET observed_at=current_timestamp-INTERVAL 20 MINUTE WHERE data_type='stock_listing_reference' AND asset_code='000003.SZ'")
+        with pytest.raises(Exception, match='000003.SZ'):
+            c.collect_stock_basic(force=True)
+        assert calls == ['000002.SZ', '000003.SZ', '000003.SZ']
 
 
 def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):

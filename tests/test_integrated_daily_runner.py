@@ -224,17 +224,17 @@ def test_all_collection_phases_keep_data_and_retire_user_publications():
         command_plan("sample.duckdb", "2026-09-16", include_research=True)
 
 
-def test_supplemental_keeps_four_collectors_under_shared_plan():
+def test_supplemental_recovers_close_facts_under_shared_plan():
     from trade_system.collection_profiles import task_due, resolve_phase
     from trade_system.source_authority import validate_production_plan
     steps=command_plan('sample.duckdb','2026-09-17',include_collection=True,phase='supplemental')
     names=[n for n,_,_ in steps]
-    assert names==['collect_lhb_daily','collect_auction_market_daily','collect_index_kline_daily',
+    assert names==['sync_tushare_close','collect_lhb_daily','collect_auction_market_daily','collect_index_kline_daily',
                    'collect_xiaodefa_critical','build_normalized_views']
     validate_production_plan('supplemental',names)
     with pytest.raises(ValueError):validate_production_plan('supplemental',names[1:])
     assert resolve_phase('supplemental')=='supplemental'
-    for name in names[:4]:
+    for name in names[:5]:
         assert task_due('must-not-open.duckdb','2026-09-17',name,phase='supplemental')[0]
 
 

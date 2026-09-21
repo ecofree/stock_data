@@ -55,6 +55,7 @@ class XiaodefaClient:
             raw = read_verified_once(request, timeout=deadline-time.monotonic(), max_bytes=self.max_response_bytes)
         except ValueError as exc:
             raise XiaodefaError(str(exc)) from None
+        self._response_fingerprint = {'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)}
         try:
             return json.loads(raw)
         except (ValueError, UnicodeError) as exc:
@@ -68,6 +69,7 @@ class XiaodefaClient:
         if _deadline is not None:
             deadline = min(deadline, _deadline)
         payload = None
+        self._response_fingerprint = {}
         for attempt in range(self.max_retries):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -87,22 +89,42 @@ class XiaodefaClient:
             if delay >= deadline - time.monotonic():
                 raise XiaodefaError("request deadline exhausted")
             time.sleep(delay)
+        def fail(reason):
+            # Preserve safe structural evidence, never provider text, row values,
+            # request bodies or credentials. HTTP fingerprints bind exact bytes.
+            data = payload.get('data') if isinstance(payload, dict) else None
+            names = data.get('fields') if isinstance(data, dict) else None
+            items = data.get('items') if isinstance(data, dict) else None
+            diagnostic = dict(self._response_fingerprint, api=api_name,
+                envelope_type=type(payload).__name__, data_type=type(data).__name__,
+                fields_type=type(names).__name__, items_type=type(items).__name__,
+                fields_count=len(names) if isinstance(names, list) else None,
+                items_count=len(items) if isinstance(items, list) else None)
+            if isinstance(payload, dict) and type(payload.get('code')) is int:
+                diagnostic['provider_code'] = payload['code']
+            from trade_system.logging_setup import get_logger
+            get_logger(__name__).warning('response_contract %s', json.dumps(diagnostic, sort_keys=True))
+            error = XiaodefaError(reason)
+            error.diagnostic = diagnostic
+            raise error
         if not isinstance(payload, dict) or type(payload.get("code")) is not int or payload["code"] != 0:
-            raise XiaodefaError("provider rejected request; no semantic retry")
+            fail("provider rejected request; no semantic retry")
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise XiaodefaError("response data missing")
+            fail("response data missing")
         names, items = data.get("fields"), data.get("items")
+        if names == [] and items == []:
+            fail('empty response without fields; source data unavailable')
         if (not isinstance(names, list) or not names or any(not isinstance(n,str) or not n for n in names)
                 or len(names) != len(set(names)) or not isinstance(items,list)):
-            raise XiaodefaError("invalid fields/items contract")
+            fail("invalid fields/items contract")
         if fields and names != fields.split(","):
-            raise XiaodefaError("response fields differ from requested projection")
+            fail("response fields differ from requested projection")
         for row in items:
             if not isinstance(row,list) or len(row) != len(names):
-                raise XiaodefaError("response row width mismatch")
+                fail("response row width mismatch")
             if any(isinstance(v,float) and not math.isfinite(v) for v in row):
-                raise XiaodefaError("non-finite response value")
+                fail("non-finite response value")
         return data
 
     def query_rows(self, api_name, params=None, fields="", *, _deadline=None):

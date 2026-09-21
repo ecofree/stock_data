@@ -150,6 +150,7 @@ PROVIDER_ALIASES = {
 # optional research collectors remain outside the close contract.
 PHASE_REQUIRED_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
     "supplemental": {
+        "kline": ("sync_tushare_close",),
         "lhb": ("collect_lhb_daily",),
         "auction": ("collect_auction_market_daily",),
         "index": ("collect_index_kline_daily",),

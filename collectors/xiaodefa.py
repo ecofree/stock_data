@@ -304,13 +304,23 @@ def collect(
         for kind in kinds:
             spec = COLLECTORS[kind]
             started = time.time()
+            primary_error = None
             try:
-                rows = spec["fetch"](client, argparse.Namespace(
-                    trade_date=trade_date,
-                    start_date=start_date,
-                    end_date=end_date,
-                    ts_code=ts_code,
-                ))
+                try:
+                    rows = spec["fetch"](client, argparse.Namespace(
+                        trade_date=trade_date,
+                        start_date=start_date,
+                        end_date=end_date,
+                        ts_code=ts_code,
+                    ))
+                except XiaodefaError as exc:
+                    # Only the already-declared margin alternative is allowed.
+                    # A malformed successful envelope is not an auth fallback.
+                    evidence = getattr(exc, 'diagnostic', {})
+                    if kind != 'margin_detail' or evidence.get('provider_code') != 0:
+                        raise
+                    primary_error = {'message': str(exc), 'diagnostic': evidence}
+                    rows = []
                 fallback_used = False
                 if kind == "margin_detail" and len(rows) < int(spec.get("min_rows") or 1):
                     fallback_rows = fetch_margin_detail_fallback(trade_date)
@@ -344,6 +354,7 @@ def collect(
                     "rows": stored,
                     "provider": source_provider,
                     "elapsed_s": round(time.time() - started, 1),
+                    "primary_error": primary_error,
                 }
             except Exception as exc:
                 results[kind] = {
@@ -351,6 +362,8 @@ def collect(
                     "table": spec["table"],
                     "message": str(exc)[:200],
                     "elapsed_s": round(time.time() - started, 1),
+                    "primary_error": primary_error,
+                    "diagnostic": getattr(exc, 'diagnostic', None),
                 }
     finally:
         store.conn.close()

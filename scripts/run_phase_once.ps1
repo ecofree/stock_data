@@ -63,8 +63,9 @@ if ($PublicationTask -and $code -in @(0,2)) {
         $receipt.scope -ne 'transitional_market_collection_only' -or
         $receipt.collector_contract_sha256 -ne $CollectorContractSha256) { throw 'Collection receipt binding mismatch; no publication requested' }
     $normalized=@($receipt.steps | Where-Object { $_.name -eq 'build_normalized_views' -and $_.status -eq 'completed' -and $_.return_code -eq 0 })
-    $collected=@($receipt.steps | Where-Object { $_.name -in @('collect_lhb_daily','collect_auction_market_daily','collect_index_kline_daily','collect_xiaodefa_critical') -and $_.status -eq 'completed' -and $_.return_code -eq 0 })
-    if ($receipt.status -in @('completed','completed_with_degradation') -and $normalized.Count -eq 1 -and $collected.Count -gt 0) {
+    $ready=$receipt.publication_readiness
+    if ($receipt.status -in @('completed','completed_with_degradation') -and $normalized.Count -eq 1 -and
+        $ready.passed -eq $true -and $ready.trade_date -eq $TradeDate) {
         $task=Get-ScheduledTask -TaskName $PublicationTask -TaskPath '\' -ErrorAction Stop
         if ($task.State -eq 'Running') { throw 'Publication task already running; request not queued. Retry publication after completion.' }
         $action=@($task.Actions)
@@ -76,7 +77,7 @@ if ($PublicationTask -and $code -in @(0,2)) {
         Start-ScheduledTask -TaskName $PublicationTask -TaskPath '\' -ErrorAction Stop
         "PUBLICATION_REQUESTED task=$PublicationTask run_id=$runId; publication_verified=false" | Tee-Object -FilePath $Log -Append
     } else {
-        "PUBLICATION_NOT_REQUESTED run_id=$runId status=$($receipt.status)" | Tee-Object -FilePath $Log -Append
+        "PUBLICATION_NOT_REQUESTED run_id=$runId status=$($receipt.status) reason=$($ready.reason)" | Tee-Object -FilePath $Log -Append
     }
 }
 Write-Output "PHASE_RUN phase=$Phase code=$code log=$Log"

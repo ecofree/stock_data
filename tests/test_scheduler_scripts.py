@@ -202,7 +202,9 @@ function Invoke-StockDataProcess {
  $status=switch ('__CASE__') {'closed' {'skipped_market_closed'} 'unknown_calendar' {'blocked_calendar_unverified'} 'degraded' {'completed_with_degradation'} default {'completed'}}
  $normal=if ('__CASE__' -eq 'normalize_failed') {'degraded'} else {'completed'}
  $receipt=@{run_id=$id;trade_date='2026-09-17';phase='supplemental';scope='transitional_market_collection_only';
- collector_contract_sha256=('a'*64);status=$status;steps=@(@{name='build_normalized_views';status=$normal;return_code=0},@{name='collect_lhb_daily';status='completed';return_code=0})}
+ collector_contract_sha256=('a'*64);status=$status;
+ publication_readiness=@{passed=$true;trade_date='2026-09-17';reason='current_qualified_prices_available'};
+ steps=@(@{name='build_normalized_views';status=$normal;return_code=0},@{name='collect_lhb_daily';status='completed';return_code=0})}
  if ('__CASE__' -eq 'wrong_receipt') {$receipt.trade_date='2026-09-16'}
  $receipt | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path
  [pscustomobject]@{ExitCode=__EXIT__;Stdout='fixture';Stderr=''}
@@ -221,6 +223,15 @@ function Start-ScheduledTask {Write-Output 'MOCK_REQUEST_ONLY'}
     assert result.returncode==code,result.stdout+result.stderr
     assert ('MOCK_REQUEST_ONLY' in result.stdout)==requested
     assert ('publication_verified=false' in result.stdout)==requested
+    if case in ('success','degraded'):
+        blocked = native.replace('passed=$true;', 'passed=$false;').replace(
+            "reason='current_qualified_prices_available'", "reason='stock_reference_unqualified'")
+        (scripts/'native_process.ps1').write_text(blocked)
+        result=_ps(scripts/'run_phase_once.ps1','-Python',sys.executable,'-Phase','supplemental',
+            '-TradeDate','2026-09-17','-CollectorContract','fixture','-CollectorContractSha256','a'*64,
+            '-ReportsDirectory',tmp_path/'reports','-PublicationTask','StockData-ResearchDaily')
+        assert result.returncode == code and 'MOCK_REQUEST_ONLY' not in result.stdout
+        assert 'reason=stock_reference_unqualified' in result.stdout
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows research adapter')

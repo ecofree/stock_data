@@ -366,11 +366,67 @@ class TushareHistoryCollector:
         if not rows:
             raise XiaodefaError(f"empty {dataset} response")
         if dataset == 'stock_basic':
+            # Resolve only malformed dates, with retained official evidence.
+            # Unknown dates are never replaced by subscription dates or dropped.
+            corrections = []
+            native = None
+            for row in rows:
+                try:
+                    listed = date.fromisoformat(_iso(row.get('list_date')))
+                    invalid_date = listed < date(1990, 1, 1) or listed > date.today()
+                except (TypeError, ValueError):
+                    invalid_date = True
+                if not invalid_date or row.get('list_status') != 'L' or not self._is_production_source():
+                    continue
+                if len(corrections) >= 20 or not self._budget_left():
+                    raise XiaodefaError('native listing repair budget exhausted')
+                code = row.get('ts_code')
+                receipt = self.store.conn.execute(
+                    "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+                    "WHERE data_type='stock_listing_reference' AND provider='hithink' AND asset_code=? "
+                    "AND observed_at>=current_timestamp-INTERVAL 1 DAY ORDER BY observed_at DESC LIMIT 1",
+                    [code]).fetchone()
+                evidence = None
+                if receipt and hashlib.sha256(receipt[0].encode()).hexdigest() == receipt[1]:
+                    cached = json.loads(receipt[0])
+                    items = cached.get('item', [])
+                    stamp = cached.get('timestamp')
+                    age = (datetime.now() - receipt[2]).total_seconds()
+                    ttl = 86400 if len(items) == 1 and items[0].get('list_date') else 900
+                    if (type(stamp) in (int, float) and 0 <= time.time()-stamp/1000 <= 86400
+                            and 0 <= age < ttl):
+                        evidence = cached
+                if evidence is None:
+                    from trade_system.hithink_client import HiThinkClient
+                    native = native or HiThinkClient(timeout=10)
+                    evidence = native.stock_listing(code)
+                    encoded = _json(evidence)
+                    self.store.conn.execute(
+                        "INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
+                        "VALUES ('stock_listing_reference','reference',?,'hithink','received_unverified',?,?)",
+                        [code, encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+                items = evidence.get('item', [])
+                stamp = evidence.get('timestamp')
+                if (len(items) != 1 or items[0].get('thscode') != code
+                        or items[0].get('asset_type') != 'a-share'
+                        or type(stamp) not in (int, float)
+                        or not 0 <= time.time() - stamp / 1000 <= 86400):
+                    raise XiaodefaError('native listing receipt identity mismatch')
+                replacement = items[0].get('list_date')
+                corrections.append({'ts_code': code, 'original': row.get('list_date'),
+                                    'list_date': replacement, 'provider': 'hithink'})
+                if replacement is not None:
+                    # A confirmed future listing is retained, but not yet in the
+                    # applicable universe (_expected_stock_codes applies dates).
+                    date.fromisoformat(replacement)
+                    row['list_date'] = replacement
             invalid = []
             for row in rows:
                 try:
                     listed = date.fromisoformat(_iso(row.get('list_date')))
-                    valid = bool(row.get('ts_code')) and date(1990, 1, 1) <= listed <= date.today()
+                    valid = bool(row.get('ts_code')) and date(1990, 1, 1) <= listed
+                    if listed > date.today():
+                        valid = valid and any(c['ts_code'] == row['ts_code'] and c['list_date'] == row['list_date'] for c in corrections)
                 except (TypeError, ValueError):
                     valid = False
                 if not valid:
@@ -384,7 +440,8 @@ class TushareHistoryCollector:
                 count = store_reference(self.store, dataset, rows)
                 snapshot = self._reference_rows()
                 self._record_snapshot(dataset, {'rows': snapshot, 'scope': ['L', 'D'],
-                    'version': hashlib.sha256(_json(snapshot).encode()).hexdigest()})
+                    'version': hashlib.sha256(_json(snapshot).encode()).hexdigest(),
+                    'listing_corrections': corrections})
                 self._checkpoint(dataset, CHECKPOINT_DATE, 'success', rows=count, attempts=1)
             return count
         return store_reference(self.store, dataset, rows)

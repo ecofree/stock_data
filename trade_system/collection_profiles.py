@@ -112,6 +112,13 @@ def command_plan(
     if include_research:
         raise ValueError("automatic legacy research retired; use the independent research product")
     report = lambda name: str(Path(reports_dir) / name)
+    close_facts = ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
+        "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)
+                         if phase == 'close' else date.fromisoformat(selected_date)).strftime('%Y%m%d'),
+        "--end-date", selected_date.replace('-', ''),
+        "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--gap-only", "--max-days", "1",
+        "--retry-passes", "0" if phase == 'supplemental' else "1", "--retry-delay-seconds", "2.0",
+        "--report", report("tushare_close_latest.md")], False)
     steps: list[CommandStep] = []
     if include_collection and phase is not None:
         # Phase mode is intentionally narrow and is the only collection path.
@@ -141,12 +148,7 @@ def command_plan(
             collection_steps = [
                 ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 # Daily ingestion writes raw facts; normalization projects them without copies.
-                ("sync_tushare_close", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
-                 "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)).strftime("%Y%m%d"),
-                 "--end-date", selected_date.replace("-", ""),
-                 "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--gap-only", "--max-days", "1",
-                 "--retry-passes", "1", "--retry-delay-seconds", "2.0",
-                 "--report", report("tushare_close_latest.md")], False),
+                close_facts,
                 # The official same-day THS snapshot must exist before the
                 # stock-flow aggregate is grouped into concepts.  Running this
                 # after sector flow created same-date rows based on a prior
@@ -205,6 +207,7 @@ def command_plan(
             ]
         elif phase == "supplemental":
             collection_steps = [
+                close_facts,
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
                 ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_market_collection_latest.json")], False),
                 ("collect_index_kline_daily", [py, "scripts/collect_index_kline_daily.py", "--db", db_path, "--date", selected_date, "--out", report("index_kline_collection_latest.md")], False),
@@ -339,6 +342,32 @@ def official_pool_checkpoint(con, trade_date):
         AND status='success' AND last_error IS NOT NULL
         AND rows_written=(SELECT count(*) FROM official_limit_pool p
             WHERE p.trade_date=c.trade_date AND p.source='hithink')""", [trade_date])
+
+
+def publication_readiness(db_path: str | Path, trade_date: str) -> dict:
+    """Read-only publication prerequisites, independent of optional supplements."""
+    from trade_system.tushare_history import TushareHistoryCollector
+    result = {'passed': False, 'trade_date': trade_date, 'price_rows': 0,
+              'scope': 'market_page_prerequisites_not_full_data_or_account_acceptance'}
+    try:
+        with TushareHistoryCollector(db_path, offline=True) as collector:
+            if not collector._reference_version():
+                return dict(result, reason='stock_reference_unqualified')
+            con = collector.store.conn
+            checkpoint = con.execute("SELECT status,rows_written FROM history_fetch_checkpoint "
+                "WHERE dataset='daily' AND trade_date=? AND page_no=0", [trade_date]).fetchone()
+            if not checkpoint or checkpoint[0] != 'success' or checkpoint[1] <= 0:
+                return dict(result, reason='daily_snapshot_unqualified')
+            rows, identities = con.execute("SELECT count(*),count(DISTINCT stock_code) FROM v_kline_daily WHERE trade_date=? AND close>0 "
+                "AND isfinite(close) AND isfinite(change_pct) AND provider IS NOT NULL "
+                "AND adjustment IS NOT NULL AND volume_unit IS NOT NULL AND amount_unit IS NOT NULL",
+                [trade_date]).fetchone()
+            result['price_rows'] = rows
+            if rows != checkpoint[1] or identities != rows:
+                return dict(result, reason='canonical_prices_incomplete')
+            return dict(result, passed=True, reason='current_qualified_prices_available')
+    except (ValueError, duckdb.Error) as exc:
+        return dict(result, reason='publication_inputs_unavailable', error_type=type(exc).__name__)
 
 
 def task_due(db_path: str | Path, trade_date: str, task_name: str,
