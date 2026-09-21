@@ -17,6 +17,15 @@ from trade_system.units import _number as number, normalize_amount
 FLOW_MAPPING_VERSION = "stock_flow_v3_explicit_units"
 DEFAULT_AMOUNT_UNIT = "yuan"
 
+# Transport identity is not a new flow definition. Relay rows qualify only
+# with their explicit native API, origin, units and main-order definition.
+NATIVE_MAIN_FLOW_SQL = """(
+    (provider IN ('eastmoney_market','eastmoney_intraday_clist','eastmoney_intraday_clist_delay')
+     OR (provider='xiaodefa_moneyflow_dc' AND origin_provider='eastmoney' AND source_api='moneyflow_dc'))
+    AND amount_unit='yuan' AND isfinite(main_net)
+    AND flow_definition IN ('provider_main_net','provider_main_orders_net','main_orders_net')
+)"""
+
 SECTOR_TAXONOMIES = {
     'em_industry': ('eastmoney.industry', 'provider_reported', 'main_orders_net'),
     'ths_industry': ('ths.industry', 'provider_reported', 'sector_total_net'),

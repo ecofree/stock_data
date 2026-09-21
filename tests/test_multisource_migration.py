@@ -95,6 +95,17 @@ def test_store_is_idempotent_and_stale_does_not_overwrite(tmp_path):
         assert store.con.execute("select main_net from multi_source_stock_flow").fetchone()[0] == 100
         assert store.con.execute("select count(*) from multi_source_sector_flow").fetchone()[0] == 1
         assert store.con.execute("select count(*) from multi_source_kline").fetchone()[0] == 1
+        from trade_system.data_store import DuckDBStore
+        writer= DuckDBStore(connection=store.con)
+        writer.close()  # Borrowed store must not close the owner's connection.
+        before=store.con.execute('SELECT * FROM multi_source_stock_flow').fetchall()
+        store.con.execute('BEGIN TRANSACTION')
+        store.store('stock_flow','000001',[{'date':'2026-07-10','main_net':101},
+            {'date':'2026-07-10','main_net':102}],{'source':'eastmoney','status':'live'},commit=False)
+        assert store.con.execute('SELECT main_net FROM multi_source_stock_flow').fetchone()[0]==102
+        store.con.execute('ROLLBACK')
+        assert store.con.execute('SELECT * FROM multi_source_stock_flow').fetchall()==before
+
 
 
 def test_store_skips_preopen_flow_placeholders(tmp_path):

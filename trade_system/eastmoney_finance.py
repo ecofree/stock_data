@@ -11,6 +11,7 @@ import json, sys, urllib.parse, urllib.request
 from trade_system.http_transport import read_verified_once, request_budget, request_deadline
 
 from trade_system.host_limiter import shared_host_limiter
+from trade_system.units import _number
 from trade_system.eastmoney_clist_guard import (
     DELAY_CLIST_GUARD,
     DEFAULT_CLIST_GUARD,
@@ -57,6 +58,70 @@ def _query(reportName: str, code: str, pageSize: int = 10,
     if payload and payload.get("success") and payload.get("result"):
         return payload["result"].get("data") or []
     return []
+
+
+def normalize_fund_flow_page(rows: list[dict], trade_date: str) -> list[dict]:
+    target = str(trade_date or "").replace("-", "")[:8]
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_date = str(row.get("TRADE_DATE") or "")[:10]
+        if target and raw_date.replace("-", "") != target:
+            continue
+        code = str(row.get("SECURITY_CODE") or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            continue
+        super_in = _number(row.get("SUPERDEAL_INFLOW"))
+        super_out = _number(row.get("SUPERDEAL_OUTFLOW"))
+        big_in = _number(row.get("BIGDEAL_INFLOW"))
+        big_out = _number(row.get("BIGDEAL_OUTFLOW"))
+        out.append({
+            "code": code,
+            "date": raw_date[:10],
+            # Eastmoney's PRIME_INFLOW is its main-money net estimate.
+            "main_net": _number(row.get("PRIME_INFLOW")),
+            "super_net": super_in - super_out if super_in is not None and super_out is not None else None,
+            "large_net": big_in - big_out if big_in is not None and big_out is not None else None,
+            "mid_net": None,
+            "small_net": None,
+            "close": _number(row.get("CLOSE_PRICE")),
+            "change_pct": _number(row.get("CHANGE_RATE")),
+            "turnover": _number(row.get("TURNOVERRATE")),
+            "name": row.get("SECURITY_NAME_ABBR") or "",
+            "raw": row,
+            "amount_unit": "yuan", "origin_provider": "eastmoney",
+            "source_api": "RPT_DMSK_TS_STOCKNEW", "flow_definition": "provider_main_orders_net",
+        })
+    return list({row["code"]: row for row in out}.values())
+
+
+def normalize_realtime_flow_page(rows: list[dict], trade_date: str) -> list[dict]:
+    """Normalize Eastmoney push2 ``diff`` rows without trusting a date field."""
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("f12") or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            continue
+        out.append({
+            "code": code,
+            "date": trade_date,
+            "main_net": _number(row.get("f62")),
+            "super_net": _number(row.get("f66")),
+            "large_net": _number(row.get("f72")),
+            "mid_net": _number(row.get("f78")),
+            "small_net": _number(row.get("f84")),
+            "close": _number(row.get("f2")),
+            "change_pct": _number(row.get("f3")),
+            "turnover": None, "main_ratio": _number(row.get("f184")),
+            "name": row.get("f14") or "",
+            "raw": row,
+            "amount_unit": "yuan", "origin_provider": "eastmoney",
+            "source_api": "push2_clist", "flow_definition": "provider_main_orders_net",
+        })
+    return list({row["code"]: row for row in out}.values())
 
 
 @request_budget(60)
@@ -118,42 +183,7 @@ def get_fund_flow_market(trade_date: str | None = None, *, page_size: int = 500,
         if max_pages is not None and page >= int(max_pages):
             break
 
-    normalized: list[dict] = []
-    for row in rows:
-        raw_date = str(row.get("TRADE_DATE") or "")[:10]
-        compact = "".join(ch for ch in raw_date if ch.isdigit())[:8]
-        if target and compact != target:
-            continue
-        code = str(row.get("SECURITY_CODE") or "").strip()
-        if len(code) != 6 or not code.isdigit():
-            continue
-        def number(value):
-            try:
-                return float(value) if value not in (None, "", "-") else None
-            except (TypeError, ValueError):
-                return None
-        super_net = None
-        if number(row.get("SUPERDEAL_INFLOW")) is not None and number(row.get("SUPERDEAL_OUTFLOW")) is not None:
-            super_net = number(row.get("SUPERDEAL_INFLOW")) - number(row.get("SUPERDEAL_OUTFLOW"))
-        large_net = None
-        if number(row.get("BIGDEAL_INFLOW")) is not None and number(row.get("BIGDEAL_OUTFLOW")) is not None:
-            large_net = number(row.get("BIGDEAL_INFLOW")) - number(row.get("BIGDEAL_OUTFLOW"))
-        normalized.append({
-            "code": code,
-            "date": raw_date[:10],
-            "main_net": number(row.get("PRIME_INFLOW")),
-            "super_net": super_net,
-            "large_net": large_net,
-            "mid_net": None,
-            "small_net": None,
-            "close": number(row.get("CLOSE_PRICE")),
-            "change_pct": number(row.get("CHANGE_RATE")),
-            "turnover": number(row.get("TURNOVERRATE")),
-            "name": row.get("SECURITY_NAME_ABBR") or "",
-            "raw": row,
-        })
-    # A market query can contain duplicate code rows if the source rolls over
-    # while pages are being fetched.  Keep the latest row per code.
+    normalized = normalize_fund_flow_page(rows, trade_date)
     deduped = {row["code"]: row for row in normalized}
     return list(deduped.values()), {
         "source": "eastmoney_market",
@@ -234,12 +264,6 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
     last_endpoint = guard_state.get("last_endpoint")
     endpoint_start = endpoints.index(last_endpoint) if last_endpoint in endpoints else 0
     probe_endpoints = [endpoints[(endpoint_start + index) % len(endpoints)] for index in range(front_door_count)]
-    def number(value):
-        try:
-            return float(value) if value not in (None, "", "-") else None
-        except (TypeError, ValueError):
-            return None
-
     for page in range(start_page, limit + 1):
         params = {
             "pn": page, "pz": page_size, "po": 1, "np": 1,
@@ -314,28 +338,8 @@ def get_fund_flow_market_realtime(trade_date: str, *, page_size: int = 100,
             total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
         if not page_rows:
             break
-        for item in page_rows:
-            if not isinstance(item, dict):
-                continue
-            code = str(item.get("f12") or "").strip()
-            if len(code) != 6 or not code.isdigit():
-                continue
-            rows.append({
-                "code": code,
-                # This route is a live snapshot; the script has already
-                # rejected historical dates before persisting it.
-                "date": _dt.datetime.strptime(target, "%Y%m%d").date().isoformat(),
-                "main_net": number(item.get("f62")),
-                "super_net": number(item.get("f66")),
-                "large_net": number(item.get("f72")),
-                "mid_net": number(item.get("f78")),
-                "small_net": number(item.get("f84")),
-                "close": number(item.get("f2")),
-                "change_pct": number(item.get("f3")),
-                "main_ratio": number(item.get("f184")),
-                "name": item.get("f14") or "",
-                "raw": item,
-            })
+        rows.extend(normalize_realtime_flow_page(page_rows,
+            _dt.datetime.strptime(target, "%Y%m%d").date().isoformat()))
         fetched_pages = page
         if on_page is not None:
             on_page(page, page_rows, total_pages, {

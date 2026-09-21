@@ -30,6 +30,12 @@ def test_ths_complete_aggregate_replaces_slice_and_preserves_unknown_buckets(tmp
         assert result['promoted'] and result['status']=='success'
         assert store.con.execute('SELECT sector_code,main_net,large_net FROM multi_source_sector_flow').fetchall() == [('THS-A',30,None)]
         assert result['membership_pairs']==2 and result['missing_stock_count']==0
+        store.con.execute("UPDATE multi_source_stock_flow SET provider='xiaodefa_moneyflow_dc',origin_provider='eastmoney',source_api='moneyflow_dc'")
+        assert collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))['promoted']
+        store.con.execute("UPDATE multi_source_stock_flow SET origin_provider='unknown'")
+        invalid=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert invalid['status']=='partial_stock_flow' and not invalid['promoted']
+
 
 
 @pytest.mark.parametrize('fault,status',[

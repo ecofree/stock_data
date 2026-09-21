@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,61 @@ EVIDENCE_COLUMNS = [
     "missing_reason",
     "evidence_json",
 ]
+
+
+def observed_auction_rows(payload, trade_date, provider, received_at, payload_hash):
+    """Native final snapshots and historical opening bars never qualify as ticks."""
+    from trade_system.units import _number
+    final = provider == 'hithink'
+    if final:
+        from trade_system.hithink_client import CST
+        timestamp = _number(payload.get('timestamp'))
+        if (timestamp is None or datetime.fromtimestamp(timestamp/1000, CST).date().isoformat() != trade_date
+                or received_at.date().isoformat() != trade_date
+                or abs(received_at.replace(tzinfo=CST).timestamp()-timestamp/1000)>60
+                or payload.get('data_status') != 'final' or payload.get('auction_phase') != 'closed'):
+            raise ValueError('undated or unfinished native final auction snapshot')
+        items = payload.get('item')
+        if type(payload.get('total')) is not int or not isinstance(items,list) or len(items) != payload['total'] or len(items)>100:
+            raise ValueError('incomplete scoped final snapshot')
+    else:
+        if (provider != 'xiaodefa' or payload.get('api') != 'stk_auction_o'
+                or payload.get('params',{}).get('trade_date') != trade_date.replace('-','')):
+            raise ValueError('wrong historical opening product or request date')
+        items = payload.get('rows')
+        if not isinstance(items,list) or len(items)>=10000:
+            raise ValueError('opening snapshot page completeness unknown')
+    output, seen = [], set()
+    for item in items:
+        ts_code = item.get('thscode' if final else 'ts_code', '')
+        if (not isinstance(ts_code,str) or len(ts_code)!=9 or not ts_code[:6].isascii()
+                or not ts_code[:6].isdigit() or ts_code[-3:] not in ('.SH','.SZ','.BJ') or ts_code in seen
+                or (not final and item.get('trade_date') != trade_date.replace('-',''))):
+            raise ValueError('invalid, repeated or wrong-date auction identity')
+        if final and item.get('ticker', ts_code[:6]) != ts_code[:6]:
+            raise ValueError('native final ticker and exchange identity disagree')
+        seen.add(ts_code)
+        reason = 'final_snapshot_not_tick_or_order_book_or_preopen_capture' if final else 'historical_bar_not_tick_or_order_book_or_preopen_capture'
+        price = _number(item.get('auction_price' if final else 'close'))
+        volume = _number(item.get('auction_volume' if final else 'vol'))
+        amount = _number(item.get('auction_amount' if final else 'amount'))
+        if any(v is None or v <= 0 for v in (price,volume,amount)):
+            reason += ';no_positive_price_volume_amount'
+        if not final:
+            opening, high, low = map(_number, (item.get('open'),item.get('high'),item.get('low')))
+            if any(v is None or v<=0 for v in (opening,high,low,price)) or not low<=min(opening,price)<=max(opening,price)<=high:
+                reason += ';invalid_native_ohlc'
+        output.append(dict(trade_date=trade_date,stock_code=ts_code[:6],
+            source_table='hithink_auction_final' if final else 'multi_source_observation',
+            confirmation='final_snapshot_observed' if final else 'historical_opening_bar_observed',
+            auction_strength=None,auction_amount=amount if amount is not None and amount>=0 else None,
+            tick_rows=0,is_fallback=True,missing_reason=reason,
+            evidence_json=json.dumps(dict(native=item,provider=provider,
+                api='/api/a-share/auction/snapshot' if final else 'stk_auction_o',
+                received_at=received_at.isoformat(),raw_payload_hash=payload_hash,
+                qualified_tick=False,qualified_order_book=False,predeclared_observation=False,
+                volume_unit='native_undocumented'),ensure_ascii=False,sort_keys=True)))
+    return output
 
 
 def resolve_auction_trade_date(db_path: str | Path, requested: str | None = None) -> str:
@@ -54,9 +111,9 @@ def _relation_count(con: duckdb.DuckDBPyConnection, relation: str, trade_date: s
     return int(con.execute(f'SELECT count(*) FROM "{relation}"').fetchone()[0])
 
 
-def ensure_auction_evidence_tables(db_path: str | Path) -> None:
+def ensure_auction_evidence_tables(db_path: str | Path, *, connection=None) -> None:
     from trade_system.db_utils import legacy_connect
-    con = legacy_connect(str(db_path))
+    con = connection if connection is not None else legacy_connect(str(db_path))
     try:
         con.execute(
             """
@@ -94,7 +151,8 @@ def ensure_auction_evidence_tables(db_path: str | Path) -> None:
             """
         )
     finally:
-        con.close()
+        if connection is None:
+            con.close()
 
 
 

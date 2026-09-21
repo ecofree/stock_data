@@ -425,10 +425,11 @@ class KPLClient:
 class DuckDBStore:
     """DuckDB store with dynamic table creation."""
 
-    def __init__(self, db_path=None, *, read_only=False):
+    def __init__(self, db_path=None, *, read_only=False, connection=None):
         self.db_path = db_path or DB_PATH
-        self.conn = connect_duckdb(self.db_path, read_only=read_only)
-        if not read_only:
+        self._owns_connection = connection is None
+        self.conn = connection if connection is not None else connect_duckdb(self.db_path, read_only=read_only)
+        if self._owns_connection and not read_only:
             self._init_meta()
 
     def _init_meta(self):
@@ -632,4 +633,5 @@ class DuckDBStore:
             self.conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({col_defs})")
 
     def close(self):
-        self.conn.close()
+        if self._owns_connection:
+            self.conn.close()

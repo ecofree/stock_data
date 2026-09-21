@@ -65,13 +65,13 @@ class TushareHistoryCollector:
     def __init__(self, db_path: str | Path, *, client: XiaodefaClient | None = None,
                  request_timeout: int = 20, retries: int = 3,
                  batch_limit: int = 5000, moneyflow_page_size: int = 1000,
-                 budget_seconds: float = 300.0, offline: bool = False):
+                 budget_seconds: float = 300.0, offline: bool = False, connection=None):
         # Validate the only approved client before opening a business database.
         self.client = client if client is not None else (None if offline else XiaodefaClient(
             timeout=request_timeout, max_retries=retries))
         self.db_path = str(db_path)
         self.offline = offline
-        self.store = DuckDBStore(self.db_path, read_only=offline)
+        self.store = DuckDBStore(self.db_path, read_only=offline, connection=connection)
         try:
             if offline:
                 # Bind the planning queries without initializing or migrating tables.

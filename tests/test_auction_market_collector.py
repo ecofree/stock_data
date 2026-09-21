@@ -105,5 +105,28 @@ def test_market_date_mismatch_is_not_published(tmp_path):
         assert store.conn.execute(
             "SELECT count(*) FROM auction_tick"
         ).fetchone()[0] == 0
+        from datetime import datetime
+        from trade_system.auction_evidence import observed_auction_rows
+        from trade_system.hithink_client import CST
+        import pytest
+        now=datetime.now(); day=now.date().isoformat()
+        snapshot=dict(timestamp=int(now.replace(tzinfo=CST).timestamp()*1000),
+            auction_phase='closed',data_status='final',total=1,
+            item=[dict(thscode='000001.SZ',auction_price=10,auction_volume=2,auction_amount=2000)])
+        evidence=observed_auction_rows(snapshot,day,'hithink',now,'raw-hash')
+        assert evidence[0]['confirmation']=='final_snapshot_observed'
+        assert evidence[0]['tick_rows']==0 and evidence[0]['auction_strength'] is None
+        snapshot['data_status']='live'
+        with pytest.raises(ValueError,match='unfinished'):
+            observed_auction_rows(snapshot,day,'hithink',now,'raw-hash')
+        bar=dict(api='stk_auction_o',params={'trade_date':'20260828'},rows=[
+            dict(ts_code='920978.BJ',trade_date='20260828',open=11.94,high=18,low=0,
+                 close=17.11,vol=3400,amount=58174)])
+        evidence=observed_auction_rows(bar,'2026-08-28','xiaodefa',now,'raw-hash')
+        assert evidence[0]['confirmation']=='historical_opening_bar_observed'
+        assert 'invalid_native_ohlc' in evidence[0]['missing_reason'] and evidence[0]['tick_rows']==0
+        bar['rows'][0]['trade_date']='20260827'
+        with pytest.raises(ValueError,match='wrong-date'):
+            observed_auction_rows(bar,'2026-08-28','xiaodefa',now,'raw-hash')
     finally:
         store.close()

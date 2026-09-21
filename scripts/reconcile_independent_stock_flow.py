@@ -68,13 +68,18 @@ def reconcile(
     db_path: str | Path,
     trade_date: str,
     *,
-    primary_provider: str = "eastmoney_intraday_clist_delay",
+    primary_provider: str | None = None,
     reference_provider: str = "tushare",
 ) -> dict:
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(db_path))
     try:
         _ensure_table(con)
+        if primary_provider is None:
+            from trade_system.quality import table_exists
+            batch = con.execute('SELECT provider FROM intraday_stock_flow_batch WHERE trade_date=?',
+                [trade_date]).fetchone() if table_exists(con,'intraday_stock_flow_batch') else None
+            primary_provider = batch[0] if batch else 'eastmoney_intraday_clist_delay'
         primary = _rows(con, trade_date, primary_provider)
         reference = _rows(con, trade_date, reference_provider)
         overlap_codes = sorted(set(primary) & set(reference))
@@ -103,6 +108,7 @@ def reconcile(
             and (sign_agreement or 0.0) >= 90.0
         ) else ("empty" if not reference else "warning")
         result = {
+            "scope": "declared_data_origin_comparison_not_independent_transport_attestation",
             "trade_date": trade_date,
             "primary_provider": primary_provider,
             "reference_provider": reference_provider,

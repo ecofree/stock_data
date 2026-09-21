@@ -122,9 +122,9 @@ def test_second_atomic_refresh_updates_same_unique_keys_without_conflict(tmp_pat
     )
     db = tmp_path / "second-atomic-refresh.duckdb"
     con = duckdb.connect(str(db))
-    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)")
+    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR,list_date DATE DEFAULT '2000-01-01',delist_date DATE)")
     con.execute(
-        "INSERT INTO tushare_stock_basic VALUES "
+        "INSERT INTO tushare_stock_basic(stock_code,ts_code) VALUES "
         "('000001','000001.SZ'),('920992','920992.BJ')"
     )
     con.close()
@@ -166,10 +166,10 @@ def test_market_flow_filters_b_shares_and_cross_page_duplicates(tmp_path, monkey
     db = tmp_path / "canonical_market.duckdb"
     con = duckdb.connect(str(db))
     con.execute(
-        "CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)"
+        "CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR,list_date DATE DEFAULT '2000-01-01',delist_date DATE)"
     )
     con.execute(
-        "INSERT INTO tushare_stock_basic VALUES ('000001','000001.SZ'),('600000','600000.SH'),('900948','900948.SH')"
+        "INSERT INTO tushare_stock_basic(stock_code,ts_code) VALUES ('000001','000001.SZ'),('600000','600000.SH'),('900948','900948.SH')"
     )
     con.close()
 
@@ -190,18 +190,26 @@ def test_market_flow_filters_b_shares_and_cross_page_duplicates(tmp_path, monkey
 def test_a_share_universe_keeps_beijing_but_excludes_exchange_specific_b_shares(tmp_path):
     db = tmp_path / "universe.duckdb"
     con = duckdb.connect(str(db))
-    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)")
+    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR,list_date DATE DEFAULT '2000-01-01',delist_date DATE)")
     con.execute(
-        "INSERT INTO tushare_stock_basic VALUES "
+        "INSERT INTO tushare_stock_basic(stock_code,ts_code) VALUES "
         "('000001','000001.SZ'),('600000','600000.SH'),"
         "('920001','920001.BJ'),('900948','900948.SH'),('200012','200012.SZ')"
     )
+    from trade_system.schema import init_schema
+    init_schema(con)
     try:
         assert _a_share_universe_by_exchange(con) == {
             "000001": "SZ",
             "600000": "SH",
             "920001": "BJ",
         }
+        con.execute("UPDATE tushare_stock_basic SET delist_date='2026-09-20' WHERE stock_code='000001'")
+        con.execute("UPDATE tushare_stock_basic SET list_date='2026-09-22' WHERE stock_code='600000'")
+        assert _a_share_universe_by_exchange(con,'2026-09-21') == {'920001':'BJ'}
+        con.execute("UPDATE tushare_stock_basic SET list_date=NULL WHERE stock_code='920001'")
+        assert _a_share_universe_by_exchange(con,'2026-09-21') == {}
+
     finally:
         con.close()
 
@@ -218,9 +226,9 @@ def test_market_flow_persists_beijing_exchange_coverage(tmp_path, monkeypatch):
     )
     db = tmp_path / "bj-coverage.duckdb"
     con = duckdb.connect(str(db))
-    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)")
+    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR,list_date DATE DEFAULT '2000-01-01',delist_date DATE)")
     con.execute(
-        "INSERT INTO tushare_stock_basic VALUES "
+        "INSERT INTO tushare_stock_basic(stock_code,ts_code) VALUES "
         "('000001','000001.SZ'),('600000','600000.SH'),('920001','920001.BJ')"
     )
     con.close()
@@ -250,37 +258,15 @@ def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
                 system_date.today(), system_datetime.strptime("17:45", "%H:%M").time()
             )
 
-    def fake_live(trade_date, *, page_size, max_pages, pause_seconds, on_page, start_page):
-        rows = [
-            {
-                "f12": code, "f14": "Test", "f2": 10.0, "f3": 2.0,
-                "f62": 100.0, "f66": 50.0, "f72": 40.0,
-                "f78": 10.0, "f84": 0.0,
-            }
-            for code in ("000001", "600000")
-        ]
-        on_page(
-            1, rows, 1,
-            {"count": 2, "source": "eastmoney_intraday_clist", "status": "live"},
-        )
-        return [], {
-            "pages": 1, "expected_rows": 2, "rows": 2,
-            "source": "eastmoney_intraday_clist",
-        }
+    calls = []
+    def fake_live(*args, **kwargs):
+        raise AssertionError('after-close must not request realtime snapshot')
 
-    def fake_reference(trade_date, *, page_size, pause_seconds):
-        return [
-            {
-                "code": code,
-                "date": trade_date,
-                "main_net": 100.0,
-                "super_net": 50.0,
-                "large_net": 40.0,
-                "mid_net": 10.0,
-                "small_net": 0.0,
-            }
-            for code in ("000001", "600000")
-        ], {"source": "eastmoney_market"}
+    def fake_reference(trade_date, *, page_size, max_pages, pause_seconds, on_page):
+        calls.append('dated')
+        rows = [_market_row(code, trade_date) for code in ('000001','600000')]
+        on_page(1, rows, 1, {'count':2})
+        return [], {'source':'eastmoney_market','pages':1,'expected_rows':2}
 
     monkeypatch.setattr(
         "scripts.collect_intraday_stock_flow_market.datetime",
@@ -296,9 +282,9 @@ def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
     )
     db = tmp_path / "after-close-reconciliation.duckdb"
     con = duckdb.connect(str(db))
-    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR)")
+    con.execute("CREATE TABLE tushare_stock_basic(stock_code VARCHAR, ts_code VARCHAR,list_date DATE DEFAULT '2000-01-01',delist_date DATE)")
     con.execute(
-        "INSERT INTO tushare_stock_basic VALUES "
+        "INSERT INTO tushare_stock_basic(stock_code,ts_code) VALUES "
         "('000001','000001.SZ'),('600000','600000.SH')"
     )
     con.close()
@@ -306,7 +292,8 @@ def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
     result = collect_market_stock_flow(db, trade_date, pause_seconds=0)
 
     assert result["status"] == "success", result.get("error")
-    assert result["reconciliation"]["status"] == "pass"
+    assert result["reconciliation"]["status"] == "not_run"
+    assert calls == ["dated"]
     con = duckdb.connect(str(db), read_only=True)
     try:
         assert con.execute(
@@ -317,9 +304,39 @@ def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
             "SELECT count(*) FROM multi_source_stock_flow "
             "WHERE source_date=? AND provider='eastmoney_market'",
             [trade_date],
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 2
     finally:
         con.close()
+
+    from scripts import collect_intraday_stock_flow_market as entry
+    from trade_system.multi_source_store import MultiSourceStore
+    import trade_system.xiaodefa_source as relay
+    import pytest
+    relay_rows=[dict(ts_code=code,trade_date=trade_date.replace('-',''),net_amount=3,
+        buy_elg_amount=1,buy_lg_amount=2,buy_md_amount=-1,buy_sm_amount=-2)
+        for code in ('000001.SZ','600000.SH')]
+    class NativeRelay:
+        def query_all(self, api, **kwargs):
+            assert api=='moneyflow_dc' and kwargs['page_size']==6000 and kwargs['max_rows']==18000
+            kwargs['on_page'](0,relay_rows)
+            return relay_rows
+    monkeypatch.setattr(relay,'XiaodefaClient',lambda **kwargs: NativeRelay())
+    monkeypatch.setattr(entry,'datetime',system_datetime)
+    with MultiSourceStore(db) as store:
+        pages=[]
+        entry._collect_dc_snapshot(store.con,trade_date,{'000001':'SZ','600000':'SH'},lambda *a:pages.append(a))
+        _,rows,_,meta=pages[0]
+        store.store('stock_flow',None,rows,{'source':'xiaodefa_moneyflow_dc','status':'live',
+            'received_at':meta['received_at']},trade_date=trade_date)
+        assert store.con.execute("SELECT DISTINCT main_net,super_net,large_net,amount_unit,origin_provider FROM multi_source_stock_flow WHERE provider='xiaodefa_moneyflow_dc'").fetchall()==[(30000,10000,20000,'yuan','eastmoney')]
+        pages.clear()
+        _,meta=entry._collect_dc_snapshot(store.con,trade_date,{'000001':'SZ','600000':'SH'},lambda *a:pages.append(a))
+        assert meta['receipt_reused'] and pages[0][3]['receipt_reused']
+        store.con.execute("DELETE FROM multi_source_stock_flow WHERE provider='xiaodefa_moneyflow_dc'")
+        relay_rows[0]['trade_date']='19990101'
+        with pytest.raises(ValueError,match='wrong-date'):
+            entry._collect_dc_snapshot(store.con,trade_date,{'000001':'SZ','600000':'SH'},lambda *a:pages.append(a))
+        assert store.con.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_moneyflow_dc'").fetchone()[0]==2
 
 
 def test_realtime_market_flow_normalizes_push2_rows(monkeypatch, tmp_path):

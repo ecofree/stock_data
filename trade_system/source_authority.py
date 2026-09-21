@@ -61,11 +61,11 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
         "HiThink official is the primary concept catalogue. A partial snapshot must never replace a complete snapshot.",
     ),
     "stock_flow": SourcePolicy(
-        "stock_flow", "multi_source_stock_flow", ("eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"),
+        "stock_flow", "multi_source_stock_flow", ("xiaodefa_moneyflow_dc", "eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"),
         ("tushare", "tushare_relay", "kpl", "sina", "eastmoney_market", "eastmoney", "resilient", "cache"),
         "collect_intraday_stock_flow_market.py",
         ("collect_capital_flow_focus.py", "collect_multisource.py"),
-        "TuShare is independent certification evidence, not additive flow.",
+        "Official flow API is not externally open. Dated DC relay is preferred after close; native realtime is intraday. Different origins may be compared, never summed; a shared relay is not independent transport.",
     ),
     "sector_flow": SourcePolicy(
         "sector_flow", "multi_source_sector_flow", ("eastmoney_sector_full",),

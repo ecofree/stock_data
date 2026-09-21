@@ -277,9 +277,14 @@ class MultiSourceStore:
         return count
 
     def _store_stock_flow(self, code, data, provider, stale, received_at=None):
+        from trade_system.data_store import DuckDBStore
         rows = data if isinstance(data, list) else []
         received_at = received_at or datetime.now()
-        count = 0
+        batch = []
+        columns = ("source_date", "stock_code", "provider", "main_net", "net_total", "super_net",
+                   "large_net", "mid_net", "small_net", "close", "change_pct", "turnover",
+                   "amount_unit", "flow_unit", "turnover_unit", "flow_definition", "source_api",
+                   "origin_provider", "field_mapping_version", "is_stale", "raw_json", "fetched_at")
         for row in rows:
             if not isinstance(row, dict) or not (row.get("date") or row.get("trade_date")):
                 continue
@@ -292,29 +297,18 @@ class MultiSourceStore:
                 continue
             d = _date(row.get("date") or row.get("trade_date"))
             stock = str(code or row.get("code") or "")
-            columns = ("source_date", "stock_code", "provider", "main_net", "net_total", "super_net",
-                       "large_net", "mid_net", "small_net", "close", "change_pct", "turnover",
-                       "amount_unit", "flow_unit", "turnover_unit", "flow_definition", "source_api",
-                       "origin_provider", "field_mapping_version", "is_stale", "raw_json", "fetched_at")
             values = [d, stock, provider, canonical["main_net"], canonical["net_total"],
                       canonical["super_net"], canonical["large_net"], canonical["mid_net"], canonical["small_net"],
                       _number(row.get("close")), _number(row.get("change_pct") if row.get("change_pct") is not None else row.get("pct")),
                       _number(row.get("turnover")), canonical["amount_unit"], canonical["flow_unit"], canonical["turnover_unit"],
                       canonical["flow_definition"], canonical["source_api"], canonical["origin_provider"],
                       canonical["field_mapping_version"], stale, _json(row), received_at]
-            # One atomic statement works before and after the business-key index exists.
-            # No delete/reinsert cycle; raw receipt and original receive time remain paired.
-            names = ",".join(columns)
-            self.con.execute(
-                f"MERGE INTO multi_source_stock_flow AS target USING (VALUES ({','.join('?' for _ in columns)})) "
-                f"AS source({names}) ON target.source_date=CAST(source.source_date AS DATE) "
-                "AND target.stock_code=source.stock_code AND target.provider=source.provider "
-                f"WHEN MATCHED THEN UPDATE SET {','.join(f'{c}=source.{c}' for c in columns[3:])} "
-                f"WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({','.join('source.'+c for c in columns)})",
-                values,
-            )
-            count += 1
-        return count
+            batch.append(values)
+        # Borrow the existing writer and transaction; one MERGE for the whole
+        # batch keeps the receipt atomic without thousands of query plans.
+        return DuckDBStore(connection=self.con).insert_rows(
+            'multi_source_stock_flow', batch, columns,
+            replace_on=['source_date', 'stock_code', 'provider'])
 
     def _store_sector_flow(self, data, provider, trade_date, stale, received_at=None):
         rows = data if isinstance(data, list) else []

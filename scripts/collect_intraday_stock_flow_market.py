@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from datetime import date, datetime
 import os
 from pathlib import Path
@@ -13,9 +15,11 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trade_system.config import DB_PATH, TODAY
+from trade_system.config import DB_PATH, TODAY, SETTINGS
+from trade_system.tushare_history import TushareHistoryCollector
 from trade_system.schema import init_schema
-from trade_system.eastmoney_finance import get_fund_flow_market, get_fund_flow_market_realtime
+from trade_system.eastmoney_finance import (get_fund_flow_market, get_fund_flow_market_realtime,
+    normalize_fund_flow_page as _normalize_page, normalize_realtime_flow_page as _normalize_realtime_page)
 from trade_system.multi_source_store import MultiSourceStore
 
 
@@ -24,70 +28,54 @@ def _compact(value) -> str:
 
 
 def _number(value):
-    try:
-        return float(value) if value not in (None, "", "-") else None
-    except (TypeError, ValueError):
-        return None
+    from trade_system.units import _number as finite_number
+    return finite_number(value)
 
 
-def _normalize_page(rows: list[dict], trade_date: str) -> list[dict]:
-    target = _compact(trade_date)
-    out = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        raw_date = str(row.get("TRADE_DATE") or "")[:10]
-        if target and _compact(raw_date) != target:
-            continue
-        code = str(row.get("SECURITY_CODE") or "").strip()
-        if len(code) != 6 or not code.isdigit():
-            continue
-        super_in = _number(row.get("SUPERDEAL_INFLOW"))
-        super_out = _number(row.get("SUPERDEAL_OUTFLOW"))
-        big_in = _number(row.get("BIGDEAL_INFLOW"))
-        big_out = _number(row.get("BIGDEAL_OUTFLOW"))
-        out.append({
-            "code": code,
-            "date": raw_date[:10],
-            # Eastmoney's PRIME_INFLOW is its main-money net estimate.
-            "main_net": _number(row.get("PRIME_INFLOW")),
-            "super_net": super_in - super_out if super_in is not None and super_out is not None else None,
-            "large_net": big_in - big_out if big_in is not None and big_out is not None else None,
-            "mid_net": None,
-            "small_net": None,
-            "close": _number(row.get("CLOSE_PRICE")),
-            "change_pct": _number(row.get("CHANGE_RATE")),
-            "turnover": _number(row.get("TURNOVERRATE")),
-            "name": row.get("SECURITY_NAME_ABBR") or "",
-            "raw": row,
-        })
-    return list({row["code"]: row for row in out}.values())
-
-
-def _normalize_realtime_page(rows: list[dict], trade_date: str) -> list[dict]:
-    """Normalize Eastmoney push2 ``diff`` rows without trusting a date field."""
-    out = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        code = str(row.get("f12") or "").strip()
-        if len(code) != 6 or not code.isdigit():
-            continue
-        out.append({
-            "code": code,
-            "date": trade_date,
-            "main_net": _number(row.get("f62")),
-            "super_net": _number(row.get("f66")),
-            "large_net": _number(row.get("f72")),
-            "mid_net": _number(row.get("f78")),
-            "small_net": _number(row.get("f84")),
-            "close": _number(row.get("f2")),
-            "change_pct": _number(row.get("f3")),
-            "turnover": None,
-            "name": row.get("f14") or "",
-            "raw": row,
-        })
-    return list({row["code"]: row for row in out}.values())
+def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
+    """Dated relay snapshot; reuse a complete canonical receipt without refreshing it."""
+    from trade_system.xiaodefa_source import XiaodefaClient
+    if not universe:
+        raise ValueError('dated A-share reference unavailable')
+    cached = con.execute("SELECT stock_code,fetched_at FROM multi_source_stock_flow "
+        "WHERE source_date=? AND provider='xiaodefa_moneyflow_dc' AND is_stale=FALSE "
+        "AND origin_provider='eastmoney' AND source_api='moneyflow_dc' "
+        "AND amount_unit='yuan' AND flow_definition='provider_main_orders_net' AND isfinite(main_net) "
+        "AND fetched_at BETWEEN current_timestamp-INTERVAL 3 HOUR AND current_timestamp", [trade_date]).fetchall()
+    if {r[0] for r in cached} == set(universe):
+        on_page(1, [], 1, {'count':len(universe), 'receipt_reused':True})
+        return [], dict(source='xiaodefa_moneyflow_dc',pages=1,expected_rows=len(universe),receipt_reused=True)
+    # API limit is 6000; one full page alone cannot prove completeness.
+    pages = []
+    def retain(offset, rows):
+        received = datetime.now()
+        payload = json.dumps(dict(api='moneyflow_dc',params={'trade_date':_compact(trade_date)},
+                                  offset=offset,rows=rows), ensure_ascii=False,sort_keys=True,allow_nan=False)
+        con.execute("INSERT INTO multi_source_observation "
+            "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash,observed_at) "
+            "VALUES (?,'tushare_moneyflow_dc','receipt','xiaodefa','received_unverified',?,?,?)",
+            [trade_date,payload,hashlib.sha256(payload.encode()).hexdigest(),received])
+        pages.append((rows, received.timestamp()))
+    limit = min(3, int(max_pages)) if max_pages is not None else 3
+    if limit < 1:
+        raise ValueError('positive relay page budget required')
+    rows = XiaodefaClient(timeout=60,max_retries=1).query_all('moneyflow_dc',
+        trade_date=_compact(trade_date),page_size=6000,max_rows=6000*limit,on_page=retain)
+    identities = [r.get('ts_code') for r in rows]
+    if (not rows or len(set(identities)) != len(rows) or any(
+            r.get('trade_date') != _compact(trade_date) or not isinstance(r.get('ts_code'), str)
+            or len(r['ts_code']) != 9 or r['ts_code'][-3:] not in ('.SH','.SZ','.BJ') for r in rows)):
+        raise ValueError('duplicate identity or wrong-date relay stock flow')
+    for index, (batch, received_at) in enumerate(pages, 1):
+        normalized = [dict(code=r['ts_code'][:6],date=trade_date,main_net=r.get('net_amount'),
+            super_net=r.get('buy_elg_amount'),large_net=r.get('buy_lg_amount'),
+            mid_net=r.get('buy_md_amount'),small_net=r.get('buy_sm_amount'),
+            close=r.get('close'),change_pct=r.get('pct_change'),raw=r,
+            amount_unit='10000_yuan',flow_definition='provider_main_orders_net',
+            source_api='moneyflow_dc',origin_provider='eastmoney') for r in batch
+            if r['ts_code'] == f"{r['ts_code'][:6]}.{universe.get(r['ts_code'][:6])}"]
+        on_page(index,normalized,len(pages),dict(count=len(rows),received_at=received_at))
+    return rows, dict(source='xiaodefa_moneyflow_dc',pages=len(pages),expected_rows=len(universe))
 
 
 def _ensure_checkpoint_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -187,7 +175,7 @@ def _ensure_checkpoint_table(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def _a_share_universe_by_exchange(con: duckdb.DuckDBPyConnection) -> dict[str, str]:
+def _a_share_universe_by_exchange(con: duckdb.DuckDBPyConnection, trade_date=None) -> dict[str, str]:
     """Return the current point-in-time A-share universe used as denominator.
 
     B shares are exchange-specific: Shanghai B shares start with 9 and
@@ -195,6 +183,16 @@ def _a_share_universe_by_exchange(con: duckdb.DuckDBPyConnection) -> dict[str, s
     prefix-only exclusion incorrectly removes the whole Beijing market.
     """
     try:
+        day = trade_date or date.today().isoformat()
+        with TushareHistoryCollector(':memory:', offline=True, connection=con) as reference:
+            qualified = reference._reference_version()
+            if os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and not qualified:
+                return {}
+            # A missing native listing date needs current official membership,
+            # never an invented IPO date or an all-time instrument denominator.
+            if not qualified and con.execute('SELECT 1 FROM tushare_stock_basic WHERE list_date IS NULL LIMIT 1').fetchone():
+                return {}
+            expected = reference._expected_stock_codes(day)
         rows = con.execute(
             """
             SELECT DISTINCT stock_code,
@@ -219,13 +217,10 @@ def _a_share_universe_by_exchange(con: duckdb.DuckDBPyConnection) -> dict[str, s
               )
             """
         ).fetchall()
-        return {str(row[0]): str(row[1]) for row in rows if row[0] and row[1]}
+        return {str(code): str(exchange) for code, exchange in rows
+                if code and exchange and f'{code}.{exchange}' in expected}
     except Exception:
         return {}
-
-
-def _a_share_universe(con: duckdb.DuckDBPyConnection) -> set[str]:
-    return set(_a_share_universe_by_exchange(con))
 
 
 def _write_exchange_coverage(
@@ -240,7 +235,7 @@ def _write_exchange_coverage(
         for row in con.execute(
             "SELECT DISTINCT stock_code FROM multi_source_stock_flow "
             "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE "
-            "AND main_net IS NOT NULL",
+            "AND isfinite(main_net)",
             [trade_date, provider],
         ).fetchall()
     }
@@ -284,14 +279,30 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
     con = multi_store.con
     init_schema(con)
     _ensure_checkpoint_table(con)
-    universe_by_exchange = _a_share_universe_by_exchange(con)
+    universe_by_exchange = _a_share_universe_by_exchange(con, trade_date)
+    reference_error = ''
+    if not universe_by_exchange and os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and trade_date == date.today().isoformat():
+        try:
+            # Refresh reference identity once it expires, through the existing
+            # owner. Intraday never backfills prices, flows or historical facts.
+            from trade_system.http_transport import request_budget
+            with request_budget(60), TushareHistoryCollector(db_path,connection=con,
+                    request_timeout=20,retries=1,budget_seconds=60) as reference:
+                reference._collect_reference('stock_basic')
+            universe_by_exchange = _a_share_universe_by_exchange(con, trade_date)
+        except Exception as exc:
+            reference_error = f'{type(exc).__name__}: {str(exc)[:250]}'
     expected_universe = set(universe_by_exchange)
     previous_batch = con.execute(
         "SELECT expected_rows,expected_pages,fetched_rows,fetched_pages,provider,coverage_pct "
         "FROM intraday_stock_flow_batch WHERE trade_date=?",
         [trade_date],
     ).fetchone()
-    source_provider = "eastmoney_intraday_clist" if trade_date == date.today().isoformat() else "eastmoney_market"
+    now = datetime.now()
+    after_close = trade_date < date.today().isoformat() or (now.hour, now.minute) >= (15, 5)
+    source_provider = "eastmoney_market" if after_close else "eastmoney_intraday_clist"
+    if after_close and (SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')):
+        source_provider = 'xiaodefa_moneyflow_dc'
     completed_resume = False
     skip_pages = set()
     resume_start_page = 1
@@ -312,7 +323,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             prior_coverage = float(previous_batch[5] or 0)
             completed_resume = (
                 prior_pages >= int(previous_batch[1] or 0) > 0
-                and prior_coverage >= 99.5
+                and prior_coverage >= 99.5 and previous_batch[4] == source_provider
             )
             if prior_fetched < int(previous_batch[0]) and not completed_resume:
                 skip_pages = set()
@@ -387,13 +398,14 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         if page_no in skip_pages:
             written_pages.add(page_no)
             return
-        rows = (_normalize_realtime_page(raw_rows, trade_date)
+        rows = (raw_rows if source_provider == 'xiaodefa_moneyflow_dc' else _normalize_realtime_page(raw_rows, trade_date)
                 if source_provider in {"eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"}
                 else _normalize_page(raw_rows, trade_date))
         # The live clist contains B shares and can repeat rows at page
         # boundaries while its sort order moves.  The project contract is the
         # canonical A-share universe; filter before persistence and suppress
         # cross-page duplicates so the unique business key remains meaningful.
+        rows = [row for row in rows if _number(row.get("main_net")) is not None]
         if expected_universe:
             rows = [row for row in rows if str(row.get("code") or "") in expected_universe]
         if not resume and not refresh_cleared and rows:
@@ -411,10 +423,10 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             rows = [row for row in rows if str(row.get("code") or "") not in accepted_codes]
             accepted_codes.update(str(row.get("code") or "") for row in rows if row.get("code"))
         page_rows_seen += len(rows)
-        stored = multi_store.store(
+        stored = {'rows_written':len(expected_universe)} if result.get('receipt_reused') else multi_store.store(
             "stock_flow", None, rows,
             {"source": source_provider, "status": page_status, "trade_date": trade_date,
-             "page_no": page_no, "pages": pages},
+             "page_no": page_no, "pages": pages, **({'received_at': result['received_at']} if 'received_at' in result else {})},
             asset_type="stock", trade_date=trade_date, commit=not atomic_refresh,
         )
         con.execute(
@@ -428,6 +440,14 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         written_pages.add(page_no)
 
     try:
+        if os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and not expected_universe:
+            raise ValueError('qualified dated A-share reference unavailable; collection not started; '+reference_error)
+        dc_pages = []
+        if source_provider == 'xiaodefa_moneyflow_dc' and not completed_resume:
+            # Retain raw pages before canonical transaction, including failed
+            # pagination. No second connection and no receipt timestamp rewrite.
+            rows, meta = _collect_dc_snapshot(con, trade_date, universe_by_exchange,
+                lambda *args: dc_pages.append(args), max_pages=max_pages)
         if atomic_refresh:
             con.execute("BEGIN TRANSACTION")
         if completed_resume:
@@ -438,11 +458,13 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 "rows": int(previous_batch[2] or 0),
                 "status": "existing_complete_pages",
             }
+        elif source_provider == 'xiaodefa_moneyflow_dc':
+            for page in dc_pages:
+                on_page(*page)
         elif source_provider in {"eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"}:
             # During the session the datacenter/report endpoint is commonly
             # one session behind.  Use Eastmoney's live clist route directly
-            # for today's snapshot; the historical route remains available
-            # for backfills and unit-testable historical runs.
+            # until 15:05; close runs use dated provider responses.
             rows, meta = get_fund_flow_market_realtime(
                 trade_date, page_size=min(page_size, 100), max_pages=max_pages,
                 pause_seconds=pause_seconds, on_page=on_page,
@@ -456,6 +478,11 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         expected_pages = int(meta.get("pages") or expected_pages or 0)
         expected_rows = len(expected_universe) or int(meta.get("expected_rows") or expected_rows or 0)
         source_provider = str(meta.get("source") or source_provider)
+        if atomic_refresh and expected_pages > len(written_pages):
+            raise ValueError('incomplete pagination; previous canonical snapshot retained')
+        if (atomic_refresh and accepted_codes and previous_batch
+                and len(accepted_codes) < int(previous_batch[2] or 0)):
+            raise ValueError('shorter refresh; previous canonical snapshot retained')
         if atomic_refresh and accepted_codes:
             accepted_list = sorted(accepted_codes)
             # Publish exactly one provider snapshot.  Incoming keys have
@@ -481,7 +508,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         # Rows may have been skipped only in resume mode; the database is the
         # authoritative coverage count, not the in-memory response length.
         fetched_rows = int(con.execute(
-            "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+            "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
             [trade_date, source_provider],
         ).fetchone()[0])
         fetched_pages = int(con.execute(
@@ -503,7 +530,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         missing_codes = sorted(expected_universe - {
             str(row[0]) for row in con.execute(
                 "SELECT DISTINCT stock_code FROM multi_source_stock_flow "
-                "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+                "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
                 [trade_date, source_provider],
             ).fetchall()
         }) if expected_universe else []
@@ -521,7 +548,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 pass
         error = str(exc)[:500]
         fetched_rows = int(con.execute(
-            "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+            "SELECT count(DISTINCT stock_code) FROM multi_source_stock_flow WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
             [trade_date, source_provider],
         ).fetchone()[0])
         fetched_pages = int(con.execute(
@@ -533,7 +560,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         missing_codes = sorted(expected_universe - {
             str(row[0]) for row in con.execute(
                 "SELECT DISTINCT stock_code FROM multi_source_stock_flow "
-                "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+                "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
                 [trade_date, source_provider],
             ).fetchall()
         }) if expected_universe else []
@@ -598,11 +625,19 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             pass
     is_after_close = datetime.now().hour > 15 or (datetime.now().hour == 15 and datetime.now().minute >= 5)
     if (checkpoint_ok and status.startswith("success") and trade_date == date.today().isoformat()
+            and source_provider in {'xiaodefa_moneyflow_dc','eastmoney_intraday_clist','eastmoney_intraday_clist_delay'}
             and crosscheck_after_close and is_after_close and max_pages is None):
         try:
-            reference_rows, reference_meta = get_fund_flow_market(
-                trade_date, page_size=500, pause_seconds=max(float(pause_seconds), 0.5),
-            )
+            reference_rows = [dict(code=code,main_net=value) for code,value in con.execute(
+                "SELECT stock_code,main_net FROM multi_source_stock_flow WHERE source_date=? "
+                "AND provider='eastmoney_market' AND is_stale=FALSE AND amount_unit='yuan' "
+                "AND flow_definition IN ('provider_main_net','provider_main_orders_net','main_orders_net') "
+                "AND isfinite(main_net) AND fetched_at BETWEEN current_timestamp-INTERVAL 3 HOUR AND current_timestamp",
+                [trade_date]).fetchall()]
+            reference_meta={'source':'eastmoney_market','receipt_reused':bool(reference_rows)}
+            if not reference_rows:
+                reference_rows, reference_meta = get_fund_flow_market(
+                    trade_date, page_size=500, max_pages=20, pause_seconds=max(float(pause_seconds), 0.5))
             reference_provider = str(reference_meta.get("source") or "eastmoney_market")
             reference_rows = [row for row in reference_rows if row.get("code")]
             if expected_universe:
@@ -617,7 +652,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             primary_codes = {
                 str(row[0]) for row in con.execute(
                     "SELECT DISTINCT stock_code FROM multi_source_stock_flow "
-                    "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+                    "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
                     [trade_date, source_provider],
                 ).fetchall()
             }
@@ -628,7 +663,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 str(row[0]): row[1]
                 for row in con.execute(
                     "SELECT stock_code, main_net FROM multi_source_stock_flow "
-                    "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE",
+                    "WHERE source_date=CAST(? AS DATE) AND provider=? AND is_stale=FALSE AND isfinite(main_net)",
                     [trade_date, source_provider],
                 ).fetchall()
             }
@@ -665,6 +700,8 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             )
             reconciliation = {
                 "status": recon_status,
+                "scope": "matched_native_subset_not_independent_transport",
+                "receipt_reused": bool(reference_meta.get('receipt_reused')),
                 "reference_provider": reference_provider,
                 "reference_rows": len(reference_codes),
                 "overlap_rows": len(overlap),

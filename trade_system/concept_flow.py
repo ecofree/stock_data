@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from trade_system.source_authority import provider_rank_sql
+from trade_system.flow_contract import NATIVE_MAIN_FLOW_SQL
 from trade_system.units import _number
 
 from trade_system.ths_quality import (
@@ -80,9 +81,7 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
             ORDER BY {provider_order} ASC, fetched_at DESC, provider ASC) AS rn
           FROM multi_source_stock_flow
           WHERE source_date=CAST(? AS DATE) AND is_stale=FALSE
-            AND provider IN ('eastmoney_market','eastmoney_intraday_clist','eastmoney_intraday_clist_delay')
-            AND amount_unit='yuan' AND isfinite(main_net)
-            AND flow_definition IN ('provider_main_net','provider_main_orders_net','main_orders_net')
+            AND {NATIVE_MAIN_FLOW_SQL}
             AND fetched_at BETWEEN ? AND ?
         ) WHERE rn=1 ORDER BY stock_code LIMIT 10001
     """, [trade_date, now-timedelta(seconds=max_age_seconds), now]).fetchall()
@@ -175,10 +174,9 @@ def concept_source_evidence(con, trade_date):
             'SELECT provider,status,expected_concepts FROM ths_concept_snapshot_expectation WHERE trade_date=CAST(? AS DATE)',
             [trade_date]).fetchall()]
         result['sources'] = [dict(provider=p,definition=d,amount_unit=u,rows=n,
-            role='native_main_flow_candidate' if p in ('eastmoney_market','eastmoney_intraday_clist','eastmoney_intraday_clist_delay')
-                and d in ('provider_main_net','provider_main_orders_net','main_orders_net') and u=='yuan'
+            role='native_main_flow_candidate' if eligible
                 else 'separate_semantics_not_automatically_interchangeable')
-            for p,d,u,n in con.execute('SELECT provider,flow_definition,amount_unit,count(*) FROM multi_source_stock_flow '
+            for p,d,u,eligible,n in con.execute(f'SELECT provider,flow_definition,amount_unit,coalesce({NATIVE_MAIN_FLOW_SQL},FALSE),count(*) FROM multi_source_stock_flow '
                 'WHERE source_date=CAST(? AS DATE) GROUP BY ALL ORDER BY provider,flow_definition,amount_unit',[trade_date]).fetchall()]
     except Exception as exc:
         result['error'] = str(exc)[:200]
