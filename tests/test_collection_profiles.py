@@ -176,11 +176,12 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
         con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
         con.execute('CREATE TABLE tushare_stock_basic(ts_code VARCHAR,stock_code VARCHAR,stock_name VARCHAR,area VARCHAR,industry VARCHAR,market VARCHAR,list_date DATE,delist_date DATE)')
         con.execute("INSERT INTO tushare_stock_basic VALUES ('000001.SZ','000001','sample','','','','1991-04-03',NULL)")
-        con.execute('CREATE TABLE multi_source_observation(data_type VARCHAR,provider VARCHAR,status VARCHAR,payload_json VARCHAR,observed_at TIMESTAMP)')
+        con.execute('CREATE TABLE multi_source_observation(data_type VARCHAR,provider VARCHAR,status VARCHAR,payload_json VARCHAR,observed_at TIMESTAMP,payload_hash VARCHAR)')
         ref = con.execute('SELECT * FROM tushare_stock_basic ORDER BY ts_code').fetchall()
         version = hashlib.sha256(json.dumps(ref,ensure_ascii=False,default=str,separators=(',', ':')).encode()).hexdigest()
-        con.execute("INSERT INTO multi_source_observation VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,current_timestamp)",
-                    [json.dumps({'version':version,'scope':['L','D']})])
+        payload = json.dumps({'version':version,'scope':['L','D']})
+        con.execute("INSERT INTO multi_source_observation VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,current_timestamp,?)",
+                    [payload,hashlib.sha256(payload.encode()).hexdigest()])
         con.execute("CREATE TABLE v_kline_daily AS SELECT '2026-07-15' AS trade_date, '000001' AS stock_code, 10.0 AS close, 1.0 AS change_pct, 'xiaodefa' AS provider, 'none' AS adjustment, 'hands' AS volume_unit, 'thousand_yuan' AS amount_unit")
         con.execute("UPDATE history_fetch_checkpoint SET rows_written=1 WHERE dataset='daily'")
     assert publication_readiness(db, '2026-07-15')['passed']

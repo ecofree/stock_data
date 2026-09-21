@@ -127,6 +127,9 @@ class TushareHistoryCollector:
             raise XiaodefaError(f"empty {dataset} response for {_iso(trade_date)}")
         expected = self._expected_stock_codes(trade_date, dataset)
         observed = {r["ts_code"] if isinstance(r, dict) else r[0] for r in rows}
+        reference = self._reference_version() or {}
+        if reference.get('membership_date') == _iso(trade_date) and observed & set(reference.get('not_listed', [])):
+            raise XiaodefaError('price response conflicts with official listing membership')
         if dataset in {'daily', 'moneyflow'} and expected - observed:
             self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                             'ts_code,trade_date,suspend_timing,suspend_type')
@@ -140,6 +143,9 @@ class TushareHistoryCollector:
             "SELECT DISTINCT ts_code FROM tushare_stock_basic WHERE ts_code IS NOT NULL "
             "AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
             "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [_iso(trade_date)] * 2).fetchall()}
+        reference = self._reference_version() or {}
+        if reference.get('membership_date') == _iso(trade_date):
+            expected -= set(reference.get('not_listed', []))
         if dataset in {'daily', 'moneyflow'}:
             receipts = self.store.conn.execute(
                 "SELECT payload_json FROM multi_source_observation WHERE data_type='tushare_suspend_d_snapshot' "
@@ -327,17 +333,88 @@ class TushareHistoryCollector:
 
     def _reference_version(self):
         receipt = self.store.conn.execute(
-            "SELECT observed_at,payload_json FROM multi_source_observation "
+            "SELECT observed_at,payload_json,payload_hash FROM multi_source_observation "
             "WHERE data_type='tushare_stock_basic_snapshot' AND status='qualified' AND provider=? "
             "ORDER BY observed_at DESC LIMIT 1", [
                 'xiaodefa' if self.offline else self._provider_name(self.client)]).fetchone()
         if not receipt or not 0 <= (datetime.now() - receipt[0]).total_seconds() < 86400:
             return None
+        if hashlib.sha256(receipt[1].encode()).hexdigest() != receipt[2]:
+            return None
         payload = json.loads(receipt[1])
         version = hashlib.sha256(_json(self._reference_rows()).encode()).hexdigest()
         if payload.get('version') != version or payload.get('scope') != ['L', 'D']:
             return None
-        return {'version': version, 'known_at': receipt[0].isoformat(), 'max_age_seconds': 86400}
+        membership = payload.get('listing_membership', {})
+        if membership and membership.get('as_of') != date.today().isoformat():
+            return None  # Negative membership never rolls into the next session.
+        return {'version': version, 'known_at': receipt[0].isoformat(), 'max_age_seconds': 86400,
+                'membership_date': membership.get('as_of'), 'not_listed': membership.get('not_listed', [])}
+
+    def _szse_listing_membership(self):
+        """Dated complete exchange inventory, only for unresolved native dates."""
+        import io
+        import re
+        import urllib.request
+        import zipfile
+        from xml.etree import ElementTree as ET
+        from trade_system.http_transport import read_verified_once, request_budget
+        today = date.today().isoformat()
+        cached = self.store.conn.execute(
+            "SELECT payload_json,payload_hash FROM multi_source_observation "
+            "WHERE data_type='szse_listing_membership' AND provider='szse' "
+            "AND observed_at>=current_timestamp-INTERVAL 15 MINUTE ORDER BY observed_at DESC LIMIT 1").fetchone()
+        if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1]:
+            value = json.loads(cached[0])
+            if value.get('as_of') == today:
+                return value
+        base = 'https://www.szse.cn/api/report/ShowReport'
+        with request_budget(min(30, self.budget_seconds - (time.monotonic()-self.started))):
+            meta_raw = read_verified_once(urllib.request.Request(
+                base+'/data?SHOWTYPE=JSON&CATALOGID=1110&TABKEY=tab1&PAGENO=1'), timeout=15, max_bytes=500_000)
+            tab = json.loads(meta_raw.decode('utf-8'))[0]
+            meta = tab['metadata']
+            count = meta['recordcount']
+            if (meta.get('subname', '').strip() != today or type(count) is not int or not 1000 <= count <= 10000
+                    or meta.get('pageno') != 1 or len(tab['data']) != meta.get('pagesize')):
+                raise XiaodefaError('undated or incomplete exchange listing metadata')
+            raw = read_verified_once(urllib.request.Request(
+                base+'?SHOWTYPE=xlsx&CATALOGID=1110&TABKEY=tab1'), timeout=15, max_bytes=3_000_000)
+        ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            if sum(info.file_size for info in archive.infolist()) > 30_000_000:
+                raise XiaodefaError('exchange listing archive exceeds budget')
+            strings = [''.join(x.itertext()) for x in ET.fromstring(archive.read('xl/sharedStrings.xml')).findall('s:si', ns)]
+            sheet = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
+        rows = []
+        for row in sheet.findall('s:sheetData/s:row', ns):
+            cells = {}
+            for cell in row.findall('s:c', ns):
+                text = cell.findtext('s:v', '', ns)
+                if cell.get('t') == 's':
+                    text = strings[int(text)]
+                elif cell.get('t') == 'inlineStr':
+                    text = ''.join(cell.find('s:is', ns).itertext())
+                cells[re.sub(r'\d', '', cell.attrib['r'])] = text
+            rows.append(cells)
+        if not rows or rows[0].get('E') != 'A股代码' or rows[0].get('G') != 'A股上市日期':
+            raise XiaodefaError('exchange listing schema changed')
+        listings = {r.get('E'): r.get('G') for r in rows[1:]}
+        if (len(rows)-1 != count or len(listings) != count
+                or any(not re.fullmatch(r'\d{6}', code or '') or not listed
+                       or not date(1990, 1, 1) <= date.fromisoformat(listed) <= date.today()
+                       for code, listed in listings.items())
+                or any(listings.get(r['agdm']) != r['agssrq'] for r in tab['data'])):
+            raise XiaodefaError('incomplete or conflicting exchange listing inventory')
+        value = {'as_of': today, 'recordcount': count, 'listings': listings,
+                 'metadata_sha256': hashlib.sha256(meta_raw).hexdigest(),
+                 'xlsx_sha256': hashlib.sha256(raw).hexdigest(), 'source': base}
+        encoded = _json(value)
+        self.store.conn.execute(
+            "INSERT INTO multi_source_observation(data_type,asset_type,provider,status,payload_json,payload_hash) "
+            "VALUES ('szse_listing_membership','reference','szse','qualified',?,?)",
+            [encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+        return value
 
     def _collect_reference(self, dataset, start=None, end=None):
         if dataset == "trade_cal":
@@ -369,6 +446,8 @@ class TushareHistoryCollector:
             # Resolve only malformed dates, with retained official evidence.
             # Unknown dates are never replaced by subscription dates or dropped.
             corrections = []
+            membership = None
+            not_listed = []
             native = None
             for row in rows:
                 try:
@@ -420,8 +499,15 @@ class TushareHistoryCollector:
                     # applicable universe (_expected_stock_codes applies dates).
                     date.fromisoformat(replacement)
                     row['list_date'] = replacement
+                elif code.endswith('.SZ'):
+                    membership = membership or self._szse_listing_membership()
+                    if code[:6] not in membership['listings']:
+                        not_listed.append(code)
+                        row['list_date'] = None
             invalid = []
             for row in rows:
+                if row.get('ts_code') in not_listed:
+                    continue
                 try:
                     listed = date.fromisoformat(_iso(row.get('list_date')))
                     valid = bool(row.get('ts_code')) and date(1990, 1, 1) <= listed
@@ -441,7 +527,10 @@ class TushareHistoryCollector:
                 snapshot = self._reference_rows()
                 self._record_snapshot(dataset, {'rows': snapshot, 'scope': ['L', 'D'],
                     'version': hashlib.sha256(_json(snapshot).encode()).hexdigest(),
-                    'listing_corrections': corrections})
+                    'listing_corrections': corrections,
+                    'listing_membership': {'as_of': membership['as_of'], 'not_listed': not_listed,
+                        'recordcount': membership['recordcount'], 'xlsx_sha256': membership['xlsx_sha256']}
+                        if not_listed else {}})
                 self._checkpoint(dataset, CHECKPOINT_DATE, 'success', rows=count, attempts=1)
             return count
         return store_reference(self.store, dataset, rows)

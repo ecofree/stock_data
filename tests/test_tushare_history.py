@@ -375,6 +375,9 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         c.collect_stock_basic(force=True)
         assert calls == ['000002.SZ']
         c.client.rows.append(dict(ts_code='000003.SZ', list_status='L', list_date='19700101'))
+        membership = {'as_of': date.today().isoformat(), 'recordcount': 2901,
+                      'listings': {'000003': '1991-01-01'}, 'xlsx_sha256': 'fixture'}
+        monkeypatch.setattr(c, '_szse_listing_membership', lambda: membership)
         with pytest.raises(Exception, match='000003.SZ'):
             c.collect_stock_basic(force=True)
         assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 2
@@ -383,6 +386,48 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         with pytest.raises(Exception, match='000003.SZ'):
             c.collect_stock_basic(force=True)
         assert calls == ['000002.SZ', '000003.SZ', '000003.SZ']
+        membership['listings'] = {'000001': '1991-01-01'}
+        assert c.collect_stock_basic(force=True) == 3
+        assert c.store.conn.execute("SELECT list_date FROM tushare_stock_basic WHERE ts_code='000003.SZ'").fetchone() == (None,)
+        assert '000003.SZ' not in c._expected_stock_codes(date.today().isoformat(), 'daily')
+        assert '000003.SZ' in c._expected_stock_codes((date.today()-timedelta(days=1)).isoformat(), 'daily')
+        with pytest.raises(Exception, match='conflicts with official listing membership'):
+            c._validate_stock_snapshot('daily', [{'ts_code': '000003.SZ'}], date.today().isoformat())
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_json=json_merge_patch(payload_json,?) "
+            "WHERE data_type='tushare_stock_basic_snapshot' AND json_extract(payload_json,'$.listing_membership') IS NOT NULL",
+            [json.dumps({'listing_membership': {'as_of': (date.today()-timedelta(days=1)).isoformat(), 'not_listed': ['000003.SZ']}})])
+        assert c._reference_version() is None
+        assert '000003.SZ' in c._expected_stock_codes(date.today().isoformat(), 'daily')
+
+    # Exercise the exchange parser and cache without network or new test cases.
+    import io
+    import zipfile
+    from trade_system import http_transport
+    ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    header = '<row><c r="E1" t="s"><v>0</v></c><c r="G1" t="s"><v>1</v></c></row>'
+    body = ''.join(f'<row><c r="E{i+2}" t="inlineStr"><is><t>{i:06}</t></is></c>'
+                   f'<c r="G{i+2}" t="inlineStr"><is><t>1991-01-01</t></is></c></row>' for i in range(1000))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        archive.writestr('xl/sharedStrings.xml', f'<sst xmlns="{ns}"><si><t>A股代码</t></si><si><t>A股上市日期</t></si></sst>')
+        archive.writestr('xl/worksheets/sheet1.xml', f'<worksheet xmlns="{ns}"><sheetData>{header}{body}</sheetData></worksheet>')
+    tab = {'metadata': {'subname': date.today().isoformat(), 'recordcount': 1000, 'pageno': 1, 'pagesize': 1},
+           'data': [{'agdm': '000000', 'agssrq': '1991-01-01'}]}
+    reads = []
+    def transport(request, **kwargs):
+        reads.append(request.full_url)
+        return json.dumps([tab]).encode() if '/data?' in request.full_url else buffer.getvalue()
+    monkeypatch.setattr(http_transport, 'read_verified_once', transport)
+    with TushareHistoryCollector(tmp_path / 'membership.duckdb', client=Empty()) as c:
+        assert len(c._szse_listing_membership()['listings']) == 1000
+        assert len(c._szse_listing_membership()['listings']) == 1000 and len(reads) == 2
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='corrupted' WHERE data_type='szse_listing_membership'")
+        tab['metadata']['recordcount'] = 1001
+        with pytest.raises(Exception, match='incomplete or conflicting'):
+            c._szse_listing_membership()
+        tab['metadata']['subname'] = (date.today()-timedelta(days=1)).isoformat()
+        with pytest.raises(Exception, match='undated or incomplete'):
+            c._szse_listing_membership()
 
 
 def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
