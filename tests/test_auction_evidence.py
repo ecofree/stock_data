@@ -29,9 +29,16 @@ def test_auction_evidence_prefers_tick_over_fallback_sources(tmp_path):
 
     assert rows[0]["stock_code"] == "000001"
     assert rows[0]["source_table"] == "auction_tick"
-    assert rows[0]["confirmation"] == "tick_confirmed"
+    assert rows[0]["confirmation"] == "tick_observed_unit_unknown"
+    assert rows[0]['auction_strength'] is None and rows[0]['auction_amount'] is None
+    assert rows[0]['missing_reason'] == 'auction_tick_volume_unit_unknown'
     assert rows[0]["is_fallback"] is False
     assert rows[0]["tick_rows"] == 1
+    con = duckdb.connect(str(db_path))
+    con.execute("ALTER TABLE auction_tick ADD COLUMN volume_unit VARCHAR")
+    con.execute("UPDATE auction_tick SET volume_unit='shares'")
+    con.close()
+    assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['confirmation'] == 'tick_confirmed'
 
 
 def test_auction_evidence_uses_anomaly_when_tick_is_empty(tmp_path):

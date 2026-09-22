@@ -242,8 +242,8 @@ def collect_market_rise_fall(client: KPLClient, store: DuckDBStore, date: str) -
                     logger.warning(
                         f"KPL_STALE_ALERT date={date} consecutive_stale={stale_count}: "
                         "KPL has returned no same-date market/rise-fall row for "
-                        f"{stale_count} consecutive runs; market state is relying on the "
-                        "Eastmoney-derived fallback. Check the KPL upstream feed."
+                        f"{stale_count} consecutive runs; current market context is "
+                        "unavailable unless an independent source passes its own checks."
                     )
                     # Surface the alert in alert_events so the dashboard,
                     # daily review and trading terminal show it, not just the
@@ -261,7 +261,7 @@ def collect_market_rise_fall(client: KPLClient, store: DuckDBStore, date: str) -
                             [
                                 str(date)[:10],
                                 f"KPL market/rise-fall stale for {stale_count} consecutive runs; "
-                                "market state relies on the Eastmoney-derived fallback",
+                                "current market context remains unverified",
                             ],
                         )
                     except Exception as exc:
@@ -284,7 +284,9 @@ def collect_market_limit_up_down(client: KPLClient, store: DuckDBStore, date: st
         if not isinstance(item, dict):
             continue
         code = str(item.get("stock_code", item.get("code", "")) or "").strip()
-        item_date = str(item.get("date") or date)[:10]
+        item_date = str(item.get("date") or item.get("日期") or '')[:10]
+        if not item_date:
+            continue
         # The current response is a dated aggregate.  Do not store it as a
         # stock row with an empty code.
         if not code and any(key in item for key in ("limit_up", "limit_down", "actual_limit_up", "actual_limit_down")):
@@ -422,10 +424,14 @@ def main():
         init_schema(store.conn)
         client = KPLClient(max_attempts=2, total_budget_seconds=45)
         result = collect_all_market(client, store, args.date)
-        qualified = all(store.fetchall(
+        current = {table: store.fetchall(
             f'SELECT count(*) FROM {table} WHERE CAST(date AS VARCHAR)=?', [args.date])[0][0]
-            for table in ('daily_summary', 'market_rise_fall'))
-        print(json.dumps({'rows': result, 'provider_stats': client.stats, 'qualified': qualified}))
+            for table in ('daily_summary', 'market_rise_fall')}
+        dates = {table: str(store.fetchall(f'SELECT max(date) FROM {table}')[0][0]) for table in current}
+        qualified = all(current.values())
+        print(json.dumps({'rows': result, 'provider_stats': client.stats, 'qualified': qualified,
+                          'requested_date': args.date, 'latest_source_dates': dates,
+                          'missing_current': [table for table, count in current.items() if not count]}))
         return 0 if qualified and client.stats['success'] else 2
     finally:
         store.close()

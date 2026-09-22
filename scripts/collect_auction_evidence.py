@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from trade_system.data_store import DuckDBStore, KPLClient
-from collectors.collect_misc import collect_auction_market
+from collectors.collect_misc import collect_auction_tick
 from trade_system.config import API_KEY, TODAY
 from trade_system.schema import init_schema
 from trade_system.api_health import require_api_key
@@ -241,7 +241,7 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
                 [trade_date, "outside_window", "auction collection is restricted to 08:25-09:35 local time"],
             )
             return emit()
-        codes = _codes(db_path, trade_date, max_stocks, con=con)
+        codes = _codes(db_path, trade_date, min(20, max(1, max_stocks)), con=con)
         result["stock_codes"] = len(codes)
         if not codes:
             result["status"] = "no_candidates"
@@ -259,28 +259,35 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
             return emit()
     finally:
         con.close()
+    store = None
     try:
         require_api_key(API_KEY)
-        client = KPLClient()
+        client = KPLClient(request_timeout=7, max_attempts=1, total_budget_seconds=45)
         store = DuckDBStore(db_path)
         init_schema(store.conn)
-        market = collect_auction_market(client, store, trade_date)
-        tick_rows = int(market.get("tick_rows") or 0)
-        quote_rows = int(market.get("quote_rows") or 0)
-        # Anomaly collection moved out of the auction window: the old route
-        # is a latest-session snapshot and is not a reliable same-date source.
-        # The full-market route above is the authoritative auction input.
+        tick_rows = collect_auction_tick(client, store, trade_date, codes)
+        unknown = store.conn.execute("SELECT count(*) FROM auction_tick WHERE date=? "
+            "AND stock_code IN (SELECT unnest(?)) AND lower(coalesce(volume_unit,'unknown')) NOT IN ('hands','shares')", [trade_date, codes]).fetchone()[0]
+        observed = store.conn.execute("SELECT count(DISTINCT stock_code) FROM auction_tick WHERE date=? "
+            "AND stock_code IN (SELECT unnest(?))", [trade_date, codes]).fetchone()[0]
+        failures = {k: v for k, v in client.stats.items() if k != 'success' and v}
+        qualified_tick = bool(tick_rows) and observed == len(codes) and not unknown and not failures
+        quote_rows = 0
+        # Scoped ticks are not full-market coverage; anomalies remain separate.
         anomaly_rows = 0
-        if not tick_rows and not quote_rows:
-            # Tencent remains a bounded order-book fallback for the rare case
-            # where the full KPL route is temporarily empty.  It is written to
-            # the separate quote table and never relabelled as trade ticks.
+        if not qualified_tick:
+            # The bounded fallback stays in the quote table and never supplies
+            # missing tick units or sequence completeness.
             quote_rows = _collect_tencent_auction_quotes(store.conn, trade_date, codes)
         store.close()
+        store = None
         result.update({
-            "status": "success" if tick_rows or anomaly_rows or quote_rows else "empty",
+            "status": "success" if qualified_tick else "partial" if tick_rows or quote_rows else "empty",
             "tick_rows": tick_rows, "anomaly_rows": anomaly_rows,
             "quote_rows": quote_rows,
+            "qualified_tick": qualified_tick, "unknown_unit_rows": unknown,
+            "scope": "bounded_current_candidate_pool_not_full_market", "observed_codes": observed,
+            "source_errors": failures,
         })
         from trade_system.db_utils import legacy_connect
         con = legacy_connect(db_path)
@@ -304,6 +311,9 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
         finally:
             con.close()
     except Exception as exc:
+        if store is not None:
+            store.close()
+            store = None
         result.update({"status": "error", "error": str(exc)})
         from trade_system.db_utils import legacy_connect
         con = legacy_connect(db_path)
@@ -334,7 +344,7 @@ def main() -> int:
     parser.add_argument("--out", default=str(ROOT / "reports" / "auction_collection_latest.json"))
     args = parser.parse_args()
     result = collect(args.db, args.date, max_stocks=args.max_stocks, out=args.out)
-    return 0 if result["status"] not in {"error"} else 2
+    return 0 if result["status"] == "success" else 2
 
 
 if __name__ == "__main__":

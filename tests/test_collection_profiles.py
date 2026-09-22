@@ -71,6 +71,10 @@ def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
     for phase in ('auction', 'intraday', 'close', 'history'):
         steps = command_plan("sample.duckdb", "2026-07-15", include_collection=True, phase=phase)
         assert not {arg.removeprefix('scripts/') for _, command, _ in steps for arg in command} & retired
+    for phase in ('close', 'supplemental'):
+        steps = command_plan('sample.duckdb', '2026-09-22', include_collection=True, phase=phase)
+        command = next(command for name, command, _ in steps if name == 'collect_auction_market_daily')
+        assert command[command.index('--product') + 1] == 'tick'
 
 
 def test_profile_declares_full_market_flow_sources():

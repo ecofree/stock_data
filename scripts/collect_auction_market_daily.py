@@ -1,8 +1,8 @@
 """Bounded auction acquisition with distinct market, tick, anomaly, final and opening products.
 
-The close task uses the market sequence and final-match payload. Explicit
-maintenance may request scoped ticks or global anomalies; neither product is
-inferred from a final-match snapshot. Official final snapshots and relay opening
+The close task explicitly selects bounded candidate ticks and reuses final
+receipts. Maintenance may request market payloads or global anomalies; neither
+product is inferred from a final-match snapshot. Official final snapshots and relay opening
 bars retain receipt times and quality gaps, never tick or pre-open qualification.
 All share the existing store and budget.
 """
@@ -31,7 +31,7 @@ from trade_system.auction_evidence import observed_auction_rows, EVIDENCE_COLUMN
 def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
             product: str = 'market', codes=(), budget_seconds: float = 60) -> dict:
     # Distinct endpoints remain distinct products; no legacy signal-based fan-out.
-    if product not in {'market', 'tick', 'anomaly', 'final', 'opening'} or (product in {'tick','final'} and not codes):
+    if product not in {'market', 'tick', 'anomaly', 'final', 'opening'} or (product == 'final' and not codes):
         raise ValueError('supported auction product and explicit codes for tick required')
     if not math.isfinite(budget_seconds) or not 0 < budget_seconds <= 60:
         raise ValueError('auction budget must be finite within 60 seconds')
@@ -109,15 +109,30 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                     invalid_rows=sum(';invalid_native_ohlc' in r['missing_reason'] or ';no_positive_' in r['missing_reason'] for r in evidence),
                     qualified_tick=False,qualified_order_book=False,predeclared_observation=False)
             else:
-                client = KPLClient(request_timeout=30, max_attempts=2, total_budget_seconds=budget_seconds)
+                client = KPLClient(request_timeout=7, max_attempts=1, total_budget_seconds=budget_seconds)
                 if product == 'market':
                     parsed = collect_auction_market(client, store, trade_date)
                 else:
+                    if product == 'tick' and not codes:
+                        from scripts.collect_auction_evidence import _codes
+                        codes = _codes(db_path, trade_date, 20, con=store.conn)
+                    if product == 'tick' and not codes:
+                        raise ValueError('no same-date candidate pool for bounded auction ticks')
                     collector = collect_auction_tick if product == 'tick' else collect_auction_bidding_anomaly
                     rows = collector(client, store, trade_date, list(dict.fromkeys(codes)) or [''])
-                    failures = sum(int(client.stats.get(k) or 0) for k in ('error', 'rate_limited', 'circuit_open'))
+                    failures = sum(int(v or 0) for k, v in client.stats.items() if k != 'success')
                     parsed = {product + '_rows': rows,
                               'status': 'partial' if failures and rows else 'success' if rows else 'error'}
+                    if product == 'tick':
+                        from trade_system.quote_transport import canonical_codes
+                        selected = canonical_codes(codes)
+                        observed, unknown = store.conn.execute("SELECT count(DISTINCT stock_code), "
+                            "count(*) FILTER (WHERE lower(coalesce(volume_unit,'unknown')) NOT IN ('hands','shares')) "
+                            "FROM auction_tick WHERE date=? AND stock_code IN (SELECT unnest(?))", [trade_date, selected]).fetchone()
+                        qualified = bool(rows) and observed == len(selected) and not unknown and not failures
+                        parsed.update(status='success' if qualified else 'partial' if rows else 'error',
+                            stock_rows=observed, requested_codes=len(selected), unknown_unit_rows=unknown,
+                            qualified_tick=qualified, scope='bounded_candidate_ticks_not_full_market_or_preopen_capture')
                 result.update(parsed)
         finally:
             store.close()

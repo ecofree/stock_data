@@ -72,7 +72,7 @@ def test_full_market_payload_writes_ticks_and_final_match(tmp_path, monkeypatch)
         assert len(client.calls) == 1 and client.calls[0][0] == '/auction/bidding-anomaly'
         assert store.conn.execute('SELECT anomaly_type FROM auction_bidding_anomaly').fetchall() == [('cancel_buy',)]
         assert store.conn.execute('SELECT count(*) FROM auction_tick').fetchone()[0] == 2
-        client = FakeAuctionClient({'date': '2026-08-28', 'auction_ticks': [
+        client = FakeAuctionClient({'date': '2026-08-28', 'stock_code': '000002', 'auction_ticks': [
             {'time': '09:20:00', 'price': 8, 'volume': 5, 'volume_unit': 'hands'}]})
         store.close()
         assert entry.collect(db, '2026-08-28', product='tick', codes=['000002', '000002'])['status'] == 'success'
@@ -81,6 +81,19 @@ def test_full_market_payload_writes_ticks_and_final_match(tmp_path, monkeypatch)
         assert store.conn.execute('SELECT count(*) FROM auction_tick').fetchone()[0] == 3
         assert store.conn.execute('SELECT count(*) FROM auction_quote_snapshot').fetchone()[0] == 1
         assert writes == ['auction_tick', 'auction_quote_snapshot', 'auction_bidding_anomaly', 'auction_tick']
+        count = store.conn.execute("SELECT count(*) FROM raw_api_data WHERE endpoint='/auction/tick'").fetchone()[0]
+        store.close()
+        # A recent identical receipt is reused without another request/raw write.
+        assert entry.collect(db, '2026-08-28', product='tick', codes=['000002'])['status'] == 'success'
+        store = DuckDBStore(str(db))
+        assert len(client.calls) == 1
+        assert store.conn.execute("SELECT count(*) FROM raw_api_data WHERE endpoint='/auction/tick'").fetchone()[0] == count
+        import pytest
+        from collectors.collect_misc import collect_auction_tick
+        wrong = FakeAuctionClient(dict(client.payload, stock_code='600000'))
+        with pytest.raises(ValueError, match='identity mismatch'):
+            collect_auction_tick(wrong, store, '2026-08-28', ['000003'])
+        assert store.conn.execute("SELECT count(*) FROM auction_tick WHERE stock_code='000003'").fetchone()[0] == 0
     finally:
         store.close()
 

@@ -22,6 +22,20 @@ def test_rise_fall_previous_day_is_rejected():
     )
     assert not result.ok
     assert "2026-07-15" in result.reason
+    for endpoint in ('/daily', '/ladder/market', '/auction/bidding-anomaly'):
+        assert not validate_kpl(endpoint, {'date': '2026-09-22'}, {'日期': '2026-09-21', 'value': 3}).ok
+    assert validate_kpl('/kline', {'date': '2026-09-22'},
+                        {'data': [{'date': '2026-09-21'}] * 201 + [{'date': '2026-09-22'}]}).ok
+    assert not validate_kpl('/daily', {'date': '2026-09-22'},
+                            {'date': '2026-09-21', 'data': [{'date': '2026-09-22'}]}).ok
+    valid = {'date': '2026-09-22', 'stock_code': '600000', 'auction_ticks': [
+        {'time': '09:15:00', 'price': 10, 'volume': 100}, {'time': '09:25:00', 'price': 10.1, 'volume': 200}]}
+    params = {'code': '600000', 'date': '2026-09-22'}
+    assert validate_kpl('/auction/tick', params, valid).ok
+    assert not validate_kpl('/auction/tick', dict(params, code='000001'), valid).ok
+    for field, value in [('time', '09:30:00'), ('time', '09:15:00'), ('price', float('nan')), ('volume', -1)]:
+        broken = dict(valid, auction_ticks=[valid['auction_ticks'][0], dict(valid['auction_ticks'][1], **{field: value})])
+        assert not validate_kpl('/auction/tick', params, broken).ok
 
 
 def test_realtime_board_payload_requires_rows():

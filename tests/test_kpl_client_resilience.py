@@ -36,6 +36,13 @@ def test_expired_total_budget_skips_request(monkeypatch):
     assert client.get("/l2/stock-intraday") is None
     assert client.stats["circuit_open"] == 1
     assert client.stats["skipped"] == 1
+    def exhausted(*args, **kwargs):
+        assert kwargs['deadline'] > 0
+        raise TimeoutError('shared rate limit deadline exhausted')
+    monkeypatch.setattr(base.shared_host_limiter, 'acquire', exhausted)
+    bounded = base.KPLClient(request_timeout=1, total_budget_seconds=3)
+    assert bounded.get('/auction/tick', {'code': '000001', 'date': '2026-09-22'}) is None
+    assert bounded.stats['rate_limited'] == 1
 
 
 def test_dated_semantic_mismatch_does_not_retry(monkeypatch):

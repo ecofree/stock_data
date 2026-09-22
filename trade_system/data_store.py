@@ -207,7 +207,9 @@ class KPLClient:
                 delay = max(delay, RATE_LIMIT_DELAY)
 
             if elapsed < delay:
-                time.sleep(delay - elapsed)
+                if not self._sleep_retry(delay - elapsed):
+                    self.stats['skipped'] += 1
+                    return None
 
             # KPLClient is used by separate scripts from the resilient source
             # layer; share the same host lease so those scripts cannot burst
@@ -215,8 +217,15 @@ class KPLClient:
             # Keep the global host lease for rate limiting, but isolate empty
             # endpoint backoff so one optional/unsupported route cannot pause
             # healthy KPL routes for the whole host.
-            shared_host_limiter.acquire(f"kpl_endpoint:{endpoint}", 0.001)
-            shared_host_limiter.acquire("kpl", delay)
+            remaining = self._remaining_budget()
+            deadline = time.monotonic() + min(self.request_timeout, remaining if remaining is not None else self.request_timeout)
+            try:
+                shared_host_limiter.acquire(f"kpl_endpoint:{endpoint}", 0.001, deadline=deadline)
+                shared_host_limiter.acquire("kpl", delay, deadline=deadline)
+            except TimeoutError:
+                self.stats['rate_limited'] += 1
+                logger.warning('KPL shared rate-limit deadline exhausted for %s', endpoint)
+                return None
 
             headers = {"accept": "application/json"}
             if API_KEY:

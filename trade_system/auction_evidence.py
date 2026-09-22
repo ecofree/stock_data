@@ -177,6 +177,7 @@ def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
             CAST(date AS VARCHAR) AS trade_date,
             stock_code,
             count(*) AS tick_rows,
+            count(*) FILTER (WHERE {normalized_volume} IS NULL) AS unknown_unit_rows,
             sum({amount_expr}) AS auction_amount,
             sum({normalized_volume}) AS tick_volume,
             max({unit_expr}) AS tick_volume_unit,
@@ -280,19 +281,20 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
         tick_codes: set[str] = set()
         for row in _tick_rows(con, trade_date):
             tick_codes.add(str(row["stock_code"]))
-            strength = float(row.get("tick_volume") or 0) / 1000000.0
+            qualified = not row.get('unknown_unit_rows')
+            strength = float(row.get("tick_volume") or 0) / 1000000.0 if qualified else None
             evidence = {**row, "source_priority": 1, "counts": counts}
             output.append(
                 {
                     "trade_date": row["trade_date"],
                     "stock_code": row["stock_code"],
                     "source_table": "auction_tick",
-                    "confirmation": "tick_confirmed",
-                    "auction_strength": round(strength, 4),
-                    "auction_amount": row.get("auction_amount"),
+                    "confirmation": "tick_confirmed" if qualified else "tick_observed_unit_unknown",
+                    "auction_strength": round(strength, 4) if qualified else None,
+                    "auction_amount": row.get("auction_amount") if qualified else None,
                     "tick_rows": int(row.get("tick_rows") or 0),
                     "is_fallback": False,
-                    "missing_reason": "",
+                    "missing_reason": "" if qualified else "auction_tick_volume_unit_unknown",
                     "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
                 }
             )

@@ -44,7 +44,7 @@ _TASKS = {
     "build_auction_evidence": ProfileTask("build_auction_evidence", "local auction snapshots", None, "normalize retained auction observations", network=False),
     'collect_market_context': ProfileTask('collect_market_context', 'KPL market/rise-fall', 300, 'market regime and auction context', network=True),
     'collect_realtime_limit_pool': ProfileTask('collect_realtime_limit_pool', 'KPL L2 realtime/ladder', 180, 'same-day executable limit-up pool', network=True),
-    'collect_auction_evidence': ProfileTask('collect_auction_evidence', 'KPL /auction/market + Tencent fallback', 180, 'full-market auction sequence and final match evidence', network=True),
+    'collect_auction_evidence': ProfileTask('collect_auction_evidence', 'KPL scoped /auction/tick + Tencent snapshot', 180, 'bounded candidate auction observations with explicit unit gaps', network=True),
     'collect_intraday_stock_flow_market': ProfileTask('collect_intraday_stock_flow_market', 'Eastmoney push2 clist', 300, 'full-market stock capital flow', network=True),
     'collect_executable_quotes': ProfileTask('collect_executable_quotes', 'Tencent qt.gtimg.cn spot', 180, 'candidate-only live prices for entry-executable signals when clist is delayed-only', network=True),
     'collect_l2_focus': ProfileTask('collect_l2_focus', 'KPL /l2/stock-intraday (candidates)', 300, 'bounded L2 price curves; phase mode never runs full L2', network=True),
@@ -53,7 +53,7 @@ _TASKS = {
     'collect_hithink_limit_pool_daily': ProfileTask('collect_hithink_limit_pool_daily', 'HiThink official limit-up pool', 3600, 'same-day close limit-up facts and reasons', network=True),
     'collect_kpl_stock_flow_focus': ProfileTask('collect_kpl_stock_flow_focus', 'KPL advanced/zjmm-min', 3600, 'bounded independent money-flow confirmation for candidate stocks', network=True),
     'collect_review_supplement': ProfileTask('collect_review_supplement', 'KPL bounded P1 review supplement', 86400, 'daily review enhancement; never a close gate', network=True),
-    'collect_auction_market_daily': ProfileTask('collect_auction_market_daily', 'KPL /auction/market', 3600, 'full-market after-close auction evidence', network=True),
+    'collect_auction_market_daily': ProfileTask('collect_auction_market_daily', 'KPL scoped /auction/tick', 3600, 'reuse bounded candidate final tick receipts after close', network=True),
     'collect_lhb_daily': ProfileTask('collect_lhb_daily', 'KPL LHB', None, 'explicit late disclosure; collector coverage cache', network=True),
     'collect_index_kline_daily': ProfileTask('collect_index_kline_daily', 'KPL index', None, 'bounded index history; collector coverage cache', network=True),
     'collect_xiaodefa_critical': ProfileTask('collect_xiaodefa_critical', 'TuShare relay', None, 'late chips and margin evidence', network=True),
@@ -170,10 +170,9 @@ def command_plan(
                 # imports collect_all_lhb but the --only-market path returns
                 # before any call), leaving lhb_* frozen at 2026-07-08.
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
-                # One full-market request replaces the retired per-stock
-                # auction/tick and bidding-anomaly fan-out.  It writes both
-                # the normalized auction sequence and final matched snapshot.
-                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_market_collection_latest.json")], False),
+                # Bounded current-pool ticks reuse final receipts; a 404 market
+                # route and latest-session anomalies are not implicit fallbacks.
+                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--product", "tick", "--out", report("auction_market_collection_latest.json")], False),
                 # On-the-LHB probability predictions (previously unreachable:
                 # only wired behind fetch_all.py's non --only-market path).
                 ("collect_advanced_lhb_daily", [py, "scripts/collect_advanced_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("advanced_lhb_collection_latest.md")], False),
@@ -209,7 +208,7 @@ def command_plan(
             collection_steps = [
                 close_facts,
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
-                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--out", report("auction_market_collection_latest.json")], False),
+                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--product", "tick", "--out", report("auction_market_collection_latest.json")], False),
                 ("collect_index_kline_daily", [py, "scripts/collect_index_kline_daily.py", "--db", db_path, "--date", selected_date, "--out", report("index_kline_collection_latest.md")], False),
                 ("collect_xiaodefa_critical", [py, "scripts/collect_xiaodefa.py", "--db", db_path, "--trade-date", selected_date,
                  "--start-date", selected_date, "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail"], False),
