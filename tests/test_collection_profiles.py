@@ -74,7 +74,7 @@ def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
     for phase in ('close', 'supplemental'):
         steps = command_plan('sample.duckdb', '2026-09-22', include_collection=True, phase=phase)
         command = next(command for name, command, _ in steps if name == 'collect_auction_market_daily')
-        assert command[command.index('--product') + 1] == 'tick'
+        assert command[command.index('--product') + 1] == 'match'
 
 
 def test_profile_declares_full_market_flow_sources():
@@ -86,7 +86,7 @@ def test_profile_declares_full_market_flow_sources():
         plan = command_plan('unused', '2026-09-18', include_collection=True, phase=phase)
         assert [t.name for t in phase_tasks(phase)] == [n for n,_,_ in plan]
     supplement = command_plan('unused', '2026-09-18', include_collection=True, phase='supplemental')
-    name, command, _ = supplement[0]
+    name, command, _ = next(step for step in supplement if step[0]=='sync_tushare_close')
     assert name == 'sync_tushare_close'
     assert command[command.index('--start-date') + 1] == '20260918'
     assert command[command.index('--end-date') + 1] == '20260918'

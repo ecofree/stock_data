@@ -175,6 +175,33 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     assert not corrupt['ready_for_p1'] and not corrupt['daily'][-1]['checks']['publication']
     page.write_bytes(original)
 
+    # Recovery is a new linked receipt, not a rewrite of a failed close or
+    # permission to recover missed auction/intraday stages after the fact.
+    import hashlib
+    _manifest(reports,'2026-07-24','close','completed_with_degradation')
+    close_bytes=close_path.read_bytes();close=json.loads(close_bytes)
+    _manifest(reports,'2026-07-24','supplemental','completed_with_warnings')
+    recovery_path=reports/'runs/2026-07-24-supplemental/run.json'
+    recovery=json.loads(recovery_path.read_text())
+    recovery.update(started_at='2026-07-24T18:10:00',completed_at='2026-07-24T18:20:00',
+        recovery_of={'phase':'close','run_id':close['run_id'],'completed_at':close['completed_at'],
+                     'manifest_sha256':hashlib.sha256(close_bytes).hexdigest(),
+                     'scope':'same_day_close_recovery_not_auction_or_intraday_replay'})
+    recovery_path.write_text(json.dumps(recovery))
+    recovered=audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
+                                         workspace=workspace,collector_contract_sha256='a'*64)
+    assert recovered['consecutive_passes']==2
+    assert recovered['daily'][-1]['phases']['close']['recovered_by_supplemental']
+    assert recovered['daily'][-1]['phases']['close']['original_status']=='completed_with_degradation'
+    assert close_path.read_bytes()==close_bytes
+    recovery['recovery_of']['manifest_sha256']='b'*64
+    recovery_path.write_text(json.dumps(recovery))
+    invalid=audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
+                                      workspace=workspace,collector_contract_sha256='a'*64)
+    assert not invalid['daily'][-1]['checks']['close_run']
+    recovery['recovery_of']['manifest_sha256']=hashlib.sha256(close_bytes).hexdigest()
+    recovery_path.write_text(json.dumps(recovery))
+
     _manifest(reports, "2026-07-24", "auction", "completed_with_degradation")
     result = audit_five_day_observation(
         db, reports, "2026-07-24", required_days=2, workspace=workspace, collector_contract_sha256='a'*64

@@ -1,7 +1,7 @@
 """Bounded auction acquisition with distinct market, tick, anomaly, final and opening products.
 
-The close task explicitly selects bounded candidate ticks and reuses final
-receipts. Maintenance may request market payloads or global anomalies; neither
+The close task explicitly selects dated matched results for bounded candidates.
+Maintenance may request ticks, market payloads or global anomalies; no such
 product is inferred from a final-match snapshot. Official final snapshots and relay opening
 bars retain receipt times and quality gaps, never tick or pre-open qualification.
 All share the existing store and budget.
@@ -58,6 +58,11 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
         store = DuckDBStore(str(db_path))
         try:
             init_schema(store.conn)
+            if product == 'match' and not codes:
+                from scripts.collect_auction_evidence import _codes
+                codes = _codes(str(db_path), trade_date, 20, con=store.conn)
+                if not codes:
+                    raise ValueError('no same-date candidates for bounded matched auction results')
             if product in {'final','opening','match'}:
                 provider = 'hithink' if product=='final' else 'xiaodefa'
                 asset = 'hithink_auction_final' if product=='final' else result['source']
@@ -99,6 +104,8 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                             raise ValueError('matched auction trades are published from 09:26')
                         params={'trade_date':trade_date.replace('-',''),'limit':8000 if product=='match' else 10000}
                         rows=XiaodefaClient(timeout=budget_seconds,max_retries=1).query_rows(asset,params)
+                        if len(rows) >= params['limit']:
+                            raise ValueError('auction response hit page limit; completeness unverified')
                         payload=dict(api=asset,params=params,rows=rows)
                     received=datetime.now()
                     encoded=json.dumps(payload,ensure_ascii=False,sort_keys=True,allow_nan=False)
@@ -124,6 +131,7 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                 result.update(status='partial' if invalid else 'success' if count else 'empty',stock_rows=count,
                     evidence_rows=count,receipt_reused=reused,scope='observed_native_product_not_market_phase_acceptance',
                     invalid_rows=invalid, qualified_match=product=='match' and bool(count) and not invalid,
+                    requested_codes=len(set(c[:6] for c in codes)),
                     qualified_tick=False,qualified_order_book=False,predeclared_observation=False)
             else:
                 client = KPLClient(request_timeout=7, max_attempts=1, total_budget_seconds=budget_seconds)
@@ -153,13 +161,6 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                 result.update(parsed)
         finally:
             store.close()
-        if product=='tick' and (trade_date<datetime.now().date().isoformat() or datetime.now().strftime('%H:%M')>='09:26'):
-            # Supplement the current entry with a separate documented matched
-            # result. Unknown tick units still prevent tick qualification.
-            remaining=budget_seconds-(time.monotonic()-started)
-            result['matched_result'] = (collect(db_path,trade_date,product='match',codes=codes,
-                                               budget_seconds=min(remaining,15)) if remaining>0 else
-                                        dict(status='budget_exhausted',qualified_match=False))
     except Exception as exc:
         result.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
 

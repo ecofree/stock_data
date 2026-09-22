@@ -13,6 +13,7 @@ import duckdb
 from trade_system.quality import table_exists
 from trade_system.ths_quality import canonical_ths_snapshot
 from trade_system.trading_calendar import open_session_dates
+from trade_system.pipeline_runtime import latest_manifests
 
 
 PHASES = ("auction", "intraday", "close")
@@ -26,10 +27,6 @@ TUSHARE_CLOSE_DATASETS = (
 GOOD_STOCK_BATCH = {"success", "success_with_unavailable", "partial"}
 GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap", "partial"}
 
-
-def _infer_phase(manifest: dict[str, Any]) -> str | None:
-    phase = str(manifest.get("phase") or "").lower()
-    return phase if phase in PHASES else None
 
 
 def _publications(workspace, dates):
@@ -99,32 +96,6 @@ def _publications(workspace, dates):
             result[day] = {'passed': False, 'error': 'publication_' + type(exc).__name__}
     return result, None
 
-
-def _latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict[str, Any]]:
-    root = Path(reports_dir).resolve() / "runs"
-    out: dict[tuple[str, str], dict[str, Any]] = {}
-    if not root.exists():
-        return out
-    for path in root.glob("*/run.json"):
-        try:
-            item = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        trade_date = str(item.get("trade_date") or "")[:10]
-        phase = _infer_phase(item)
-        if not trade_date or phase not in PHASES:
-            continue
-        item["_run_dir"] = str(path.parent)
-        key = (trade_date, phase)
-        stamp = str(item.get("completed_at") or item.get("started_at") or "")
-        old_stamp = str(
-            out.get(key, {}).get("completed_at")
-            or out.get(key, {}).get("started_at")
-            or ""
-        )
-        if key not in out or stamp >= old_stamp:
-            out[key] = item
-    return out
 
 
 def _sessions(
@@ -308,7 +279,7 @@ def audit_five_day_observation(
 ) -> dict[str, Any]:
     if len(collector_contract_sha256) != 64 or any(c not in '0123456789abcdef' for c in collector_contract_sha256.lower()):
         raise ValueError('explicit collector contract SHA256 required')
-    manifests = _latest_manifests(reports_dir)
+    manifests = latest_manifests(reports_dir)
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         sessions = _sessions(con, as_of, max(1, int(required_days)))
@@ -319,6 +290,20 @@ def audit_five_day_observation(
             phases = {}
             for phase in PHASES:
                 manifest = manifests.get((trade_date, phase))
+                original = manifest
+                if phase == 'close' and manifest:
+                    recovery = manifests.get((trade_date, 'supplemental')) or {}
+                    bound = recovery.get('recovery_of') or {}
+                    if (recovery.get('status') in {'completed', 'completed_with_warnings'}
+                            and recovery.get('scope') == 'transitional_market_collection_only'
+                            and str(recovery.get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower()
+                            and str(manifest.get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower()
+                            and bound.get('phase') == 'close' and bound.get('run_id') == manifest.get('run_id')
+                            and bound.get('completed_at') == manifest.get('completed_at')
+                            and bound.get('manifest_sha256') == manifest['_manifest_sha256']
+                            and bound.get('scope') == 'same_day_close_recovery_not_auction_or_intraday_replay'
+                            and str(recovery.get('started_at', '')) > str(manifest.get('completed_at') or '9999')):
+                        manifest = recovery
                 status = str((manifest or {}).get("status") or "missing")
                 phases[phase] = {
                     "run_id": (manifest or {}).get("run_id"),
@@ -332,13 +317,17 @@ def audit_five_day_observation(
                     and (manifest or {}).get('scope') == 'transitional_market_collection_only'
                     and str((manifest or {}).get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower(),
                     "run_dir": (manifest or {}).get("_run_dir"),
+                    "completed_at": (manifest or {}).get('completed_at'),
+                    "original_run_id": (original or {}).get('run_id'),
+                    "original_status": (original or {}).get('status'),
+                    "recovered_by_supplemental": bool(original and manifest is not original),
                 }
             publication = publications.get(trade_date, {'passed': False, 'error': publication_error or 'missing_same_day_publication'})
             if publication['passed']:
                 from datetime import datetime
                 from zoneinfo import ZoneInfo
                 try:
-                    completed = datetime.fromisoformat(manifests[trade_date, 'close']['completed_at'])
+                    completed = datetime.fromisoformat(phases['close']['completed_at'])
                     if completed.tzinfo is None:
                         completed = completed.replace(tzinfo=ZoneInfo('Asia/Shanghai'))
                     if datetime.fromisoformat(publication['as_of']) < completed:

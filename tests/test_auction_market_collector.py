@@ -98,7 +98,7 @@ def test_full_market_payload_writes_ticks_and_final_match(tmp_path, monkeypatch)
         store.close()
 
 
-def test_market_date_mismatch_is_not_published(tmp_path):
+def test_market_date_mismatch_is_not_published(tmp_path, monkeypatch):
     db = tmp_path / "auction-mismatch.duckdb"
     store = DuckDBStore(str(db))
     init_schema(store.conn)
@@ -157,5 +157,22 @@ def test_market_date_mismatch_is_not_published(tmp_path):
         invalid=observed_auction_rows(match,'2026-08-28','xiaodefa',now,'bad-hash')
         assert invalid[0]['confirmation']=='matched_trade_invalid'
         assert not json.loads(invalid[0]['evidence_json'])['qualified_match']
+        import hashlib
+        from scripts import collect_auction_market_daily as entry
+        from trade_system.xiaodefa_source import XiaodefaClient
+        match['rows'][0]['amount']=7105410
+        encoded=json.dumps(match,ensure_ascii=False,sort_keys=True)
+        store.conn.execute("INSERT INTO multi_source_observation "
+            "(source_date,data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) "
+            "VALUES ('2026-08-28','auction_native_snapshot','receipt','stk_auction','xiaodefa','received_unverified',?,?,?)",
+            [encoded,hashlib.sha256(encoded.encode()).hexdigest(),now])
+        store.close()
+        def no_http(*a,**k):
+            raise AssertionError('valid matching receipt must be reused')
+        monkeypatch.setattr(XiaodefaClient,'query_rows',no_http)
+        cached=entry.collect(db,'2026-08-28',product='match',codes=['000001.SZ'])
+        assert cached['status']=='success' and cached['qualified_match'] and cached['receipt_reused']
+        assert not cached['qualified_tick'] and not cached['predeclared_observation']
+        store=DuckDBStore(str(db))
     finally:
         store.close()

@@ -157,6 +157,12 @@ def test_review_consumes_only_complete_subset_and_never_old_extreme_rank(tmp_pat
         expired=_apply_qualified_concept_flow(result,store.con,'2026-09-11',now=datetime(2026,9,11,21))
         assert expired['sector_inflow']==expired['sector_outflow']==[]
         assert len(expired['qualified_concept_flow']['contract']['excluded_concepts'])==3
+        published=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert published['status']=='qualified_subset' and published['subset_published']
+        assert not published['promoted'] and published['coverage_pct']==66.67
+        assert store.con.execute('SELECT sector_code,main_net FROM multi_source_sector_flow ORDER BY sector_code').fetchall()==[('THS-B',10),('THS-C',-8)]
+        again=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert again['rows_written']==2 and again['missing_stock_reasons']['000002']=='native_flow_unavailable'
 
 
 def test_subset_missing_catalogue_cannot_fall_back_to_retained_rank(tmp_path):

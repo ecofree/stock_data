@@ -233,16 +233,40 @@ def _publish_ths_aggregate(store, trade_date, *, now=None, max_age_seconds=10800
     con.execute("BEGIN TRANSACTION")
     try:
         rows, report = _prepare_ths_aggregate(
-            con, trade_date, now=now, max_age_seconds=max_age_seconds)
-        if report["status"] == "complete":
-            con.execute("DELETE FROM multi_source_sector_flow WHERE source_date=CAST(? AS DATE) "
-                        "AND provider='derived_ths_stock_aggregate'", [trade_date])
+            con, trade_date, now=now, max_age_seconds=max_age_seconds, allow_subset=True)
+        missing = sorted({code for item in report.get('excluded_concepts', [])
+                          for code in item.get('missing_members', [])})
+        report['missing_stock_reasons'] = {code: 'native_flow_unavailable' for code in missing}
+        # Classification belongs to collection. The read-only research package
+        # must not import the history collector or acquire its write authority.
+        if missing:
+            try:
+                from trade_system.tushare_history import TushareHistoryCollector
+                with TushareHistoryCollector(':memory:', offline=True, connection=con) as reference:
+                    if reference._reference_version():
+                        listed = {c[:6] for c in reference._expected_stock_codes(trade_date)}
+                        trading = {c[:6] for c in reference._expected_stock_codes(trade_date, 'moneyflow')}
+                        report['missing_stock_reasons'] = {code:
+                            'outside_verified_listing_universe' if code not in listed else
+                            'verified_full_day_suspension' if code not in trading else 'native_flow_unavailable'
+                            for code in missing}
+            except (ValueError, RuntimeError, duckdb.Error):
+                pass
+        if report["status"] in {"complete", "qualified_subset"} and rows:
+            complete = report['status'] == 'complete'
             stored = store.store("sector_flow", None, rows,
                                  {"source":"derived_ths_stock_aggregate", "status":"live"},
                                  trade_date=trade_date, commit=False)
-            if stored["rows_written"] != report["expected_rows"]:
+            if stored["rows_written"] != len(rows):
                 raise ValueError("THS aggregate write count mismatch")
-            report.update(status="success", promoted=True, rows_written=stored["rows_written"])
+            # Keep the same atomic slice; obsolete/excluded concepts cannot
+            # survive a newer qualified subset as apparently current totals.
+            con.execute("DELETE FROM multi_source_sector_flow WHERE source_date=? "
+                        "AND provider='derived_ths_stock_aggregate' AND sector_code NOT IN (SELECT unnest(?))",
+                        [trade_date, [r['sector_code'] for r in rows]])
+            report.update(status="success" if complete else "qualified_subset",
+                          promoted=complete, subset_published=not complete,
+                          rows_written=stored["rows_written"])
         con.commit()
     except Exception as exc:
         con.rollback()

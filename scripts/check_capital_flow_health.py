@@ -22,6 +22,8 @@ def main() -> int:
     parser.add_argument("--expected-sectors", type=int, default=0)
     parser.add_argument("--out", default="reports/capital_flow_freshness_latest.md")
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument("--stage", choices=("intraday", "close"), default="close",
+                        help="Intraday checks current coverage; close also requires reconciliation.")
     parser.add_argument("--min-coverage-pct", type=float, default=99.5)
     parser.add_argument("--collected-after", default=None)
     parser.add_argument("--max-age-seconds", type=int, default=None)
@@ -57,7 +59,10 @@ def main() -> int:
     # independent flow certification is the actual downstream gate; returning
     # zero for source-only data made the close runner treat an uncertified flow
     # snapshot as successful.
-    return 0 if result.get("flow_certified_ready", False) or args.report_only else 2
+    gate_ok = bool(result.get("data_certified_ready", False))
+    if args.stage == "close":
+        gate_ok = gate_ok and bool(result.get("flow_certified_ready", False))
+    return 0 if gate_ok or args.report_only else 2
 
 
 if __name__ == "__main__":

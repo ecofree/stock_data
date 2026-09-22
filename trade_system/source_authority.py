@@ -151,6 +151,12 @@ PROVIDER_ALIASES = {
 PHASE_REQUIRED_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
     "supplemental": {
         "kline": ("sync_tushare_close",),
+        "ths_concept": ("collect_ths_concepts_api",),
+        "limit_pool": ("collect_hithink_limit_pool_daily", "collect_realtime_limit_pool"),
+        "stock_flow": ("collect_intraday_stock_flow_market",),
+        "sector_flow": ("collect_intraday_sector_flow_full",),
+        "quality": ("derive_market_context", "reconcile_independent_stock_flow",
+                    "check_capital_flow_health", "check_data_readiness"),
         "lhb": ("collect_lhb_daily",),
         "auction": ("collect_auction_market_daily",),
         "index": ("collect_index_kline_daily",),

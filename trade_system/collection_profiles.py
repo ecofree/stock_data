@@ -31,6 +31,7 @@ class ProfileTask:
     cadence_seconds: int | None
     purpose: str
     network: bool = True
+    required: bool = True
 
 
 HISTORY_SUPPLEMENT_TYPES = ("financials", "statements", "margin_trading", "dragon_tiger_daily", "northbound_hist")
@@ -42,7 +43,7 @@ CLOSE_READINESS_MAX_AGE_SECONDS = 7200
 
 _TASKS = {
     "build_auction_evidence": ProfileTask("build_auction_evidence", "local auction snapshots", None, "normalize retained auction observations", network=False),
-    'collect_market_context': ProfileTask('collect_market_context', 'KPL market/rise-fall', 300, 'market regime and auction context', network=True),
+    'collect_market_context': ProfileTask('collect_market_context', 'KPL market/rise-fall', 300, 'native context; final data gate still requires qualified market context', network=True, required=False),
     'collect_realtime_limit_pool': ProfileTask('collect_realtime_limit_pool', 'KPL L2 realtime/ladder', 180, 'same-day executable limit-up pool', network=True),
     'collect_auction_evidence': ProfileTask('collect_auction_evidence', 'KPL scoped /auction/tick + Tencent snapshot', 180, 'bounded candidate auction observations with explicit unit gaps', network=True),
     'collect_intraday_stock_flow_market': ProfileTask('collect_intraday_stock_flow_market', 'Eastmoney push2 clist', 300, 'full-market stock capital flow', network=True),
@@ -51,9 +52,9 @@ _TASKS = {
     'collect_intraday_sector_flow_full': ProfileTask('collect_intraday_sector_flow_full', 'Eastmoney sector pages + TuShare/THS aggregate', 300, 'full-sector capital flow refreshed after L2', network=True),
     'sync_tushare_close': ProfileTask('sync_tushare_close', 'TuShare relay date batches', 3600, 'same-day daily/basic/adjustment/money-flow facts', network=True),
     'collect_hithink_limit_pool_daily': ProfileTask('collect_hithink_limit_pool_daily', 'HiThink official limit-up pool', 3600, 'same-day close limit-up facts and reasons', network=True),
-    'collect_kpl_stock_flow_focus': ProfileTask('collect_kpl_stock_flow_focus', 'KPL advanced/zjmm-min', 3600, 'bounded independent money-flow confirmation for candidate stocks', network=True),
-    'collect_review_supplement': ProfileTask('collect_review_supplement', 'KPL bounded P1 review supplement', 86400, 'daily review enhancement; never a close gate', network=True),
-    'collect_auction_market_daily': ProfileTask('collect_auction_market_daily', 'KPL scoped /auction/tick', 3600, 'reuse bounded candidate final tick receipts after close', network=True),
+    'collect_kpl_stock_flow_focus': ProfileTask('collect_kpl_stock_flow_focus', 'KPL advanced/zjmm-min', 3600, 'bounded candidate supplement; full-market reconciliation remains mandatory', network=True, required=False),
+    'collect_review_supplement': ProfileTask('collect_review_supplement', 'KPL bounded P1 review supplement', 86400, 'daily review enhancement; never a close gate', network=True, required=False),
+    'collect_auction_market_daily': ProfileTask('collect_auction_market_daily', 'TuShare stk_auction matched trades', None, 'dated matched results with declared units; cached native receipts, never preopen ticks', network=True),
     'collect_lhb_daily': ProfileTask('collect_lhb_daily', 'KPL LHB', None, 'explicit late disclosure; collector coverage cache', network=True),
     'collect_index_kline_daily': ProfileTask('collect_index_kline_daily', 'KPL index', None, 'bounded index history; collector coverage cache', network=True),
     'collect_xiaodefa_critical': ProfileTask('collect_xiaodefa_critical', 'TuShare relay', None, 'late chips and margin evidence', network=True),
@@ -61,8 +62,8 @@ _TASKS = {
     'backfill_2026_ths_concepts': ProfileTask('backfill_2026_ths_concepts', 'THS web pages', 604800, 'weekly concept catalogue and constituents snapshot', network=True),
     'collect_history_supplement': ProfileTask('collect_history_supplement', 'provider fallback graph', None, 'financials, statements, margin and historical northbound', network=True),
     'collect_ths_concepts_api': ProfileTask('collect_ths_concepts_api', 'HiThink official concept catalogue', 86400, 'qualified same-date catalogue and members', network=True),
-    'collect_advanced_lhb_daily': ProfileTask('collect_advanced_lhb_daily', 'KPL advanced LHB', None, 'bounded disclosed LHB supplement', network=True),
-    'collect_northbound_daily': ProfileTask('collect_northbound_daily', 'provider-defined northbound', None, 'unverified product; explicit bounded collection only', network=True),
+    'collect_advanced_lhb_daily': ProfileTask('collect_advanced_lhb_daily', 'KPL advanced LHB', None, 'bounded disclosed LHB supplement', network=True, required=False),
+    'collect_northbound_daily': ProfileTask('collect_northbound_daily', 'provider-defined northbound', None, 'unverified product; explicit bounded collection only', network=True, required=False),
     'collect_xiaodefa': ProfileTask('collect_xiaodefa', 'TuShare via xiaodefa', None, 'declared date/range kinds; bounded collector budget', network=True),
     'derive_market_context': ProfileTask('derive_market_context', 'local stored facts', None, 'local projection or quality check', network=False),
     'build_normalized_views': ProfileTask('build_normalized_views', 'local stored facts', None, 'local projection or quality check', network=False),
@@ -144,7 +145,7 @@ def command_plan(
                 ("collect_intraday_sector_flow_full", [py, "scripts/collect_intraday_sector_flow_full.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_sector_flow_latest.md")], False),
                 ("derive_market_context", [py, "scripts/derive_market_context.py", "--db", db_path, "--date", selected_date, "--out", report("market_context_latest.json")], False),
             ]
-        elif phase == "close":
+        elif phase in ("close", "supplemental"):
             collection_steps = [
                 ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 # Daily ingestion writes raw facts; normalization projects them without copies.
@@ -170,9 +171,9 @@ def command_plan(
                 # imports collect_all_lhb but the --only-market path returns
                 # before any call), leaving lhb_* frozen at 2026-07-08.
                 ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
-                # Bounded current-pool ticks reuse final receipts; a 404 market
-                # route and latest-session anomalies are not implicit fallbacks.
-                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--product", "tick", "--out", report("auction_market_collection_latest.json")], False),
+                # Matched results reuse dated native receipts for the bounded
+                # current pool; tick and pre-open products remain separate.
+                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--product", "match", "--out", report("auction_market_collection_latest.json")], False),
                 # On-the-LHB probability predictions (previously unreachable:
                 # only wired behind fetch_all.py's non --only-market path).
                 ("collect_advanced_lhb_daily", [py, "scripts/collect_advanced_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("advanced_lhb_collection_latest.md")], False),
@@ -204,15 +205,18 @@ def command_plan(
                  "--date", selected_date, "--max-sectors", "20", "--assume-pipeline-lock",
                  "--out", report("review_supplement_latest.json")], False),
             ]
-        elif phase == "supplemental":
-            collection_steps = [
-                close_facts,
-                ("collect_lhb_daily", [py, "scripts/collect_lhb_daily.py", "--db", db_path, "--date", selected_date, "--out", report("lhb_collection_latest.md")], False),
-                ("collect_auction_market_daily", [py, "scripts/collect_auction_market_daily.py", "--db", db_path, "--date", selected_date, "--product", "tick", "--out", report("auction_market_collection_latest.json")], False),
-                ("collect_index_kline_daily", [py, "scripts/collect_index_kline_daily.py", "--db", db_path, "--date", selected_date, "--out", report("index_kline_collection_latest.md")], False),
-                ("collect_xiaodefa_critical", [py, "scripts/collect_xiaodefa.py", "--db", db_path, "--trade-date", selected_date,
-                 "--start-date", selected_date, "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail"], False),
-            ]
+            if phase == "supplemental":
+                # Reuse the close dependency order; retry only its essential
+                # producers and the existing late-disclosure entry.
+                retained = {'collect_market_context', 'sync_tushare_close', 'collect_ths_concepts_api',
+                            'collect_hithink_limit_pool_daily', 'collect_realtime_limit_pool',
+                            'collect_intraday_stock_flow_market', 'collect_intraday_sector_flow_full',
+                            'derive_market_context', 'collect_lhb_daily', 'collect_auction_market_daily',
+                            'collect_index_kline_daily'}
+                collection_steps = [step for step in collection_steps if step[0] in retained]
+                collection_steps.append(("collect_xiaodefa_critical", [py, "scripts/collect_xiaodefa.py",
+                    "--db", db_path, "--trade-date", selected_date, "--start-date", selected_date,
+                    "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail"], False))
         elif phase == "history":
             start = history_start or "20260101"
             end = history_end or selected_date.replace("-", "")
@@ -235,10 +239,7 @@ def command_plan(
             ("audit_data_quality", [py, "scripts/audit_data_quality.py", "--db", db_path, "--schema", "trade_system/schema.py", "--out", report("data_quality_history_latest.md")], False),
         ])
         return validate_plan(steps)
-    if phase == "supplemental":
-        steps.append(("build_normalized_views", [py, "scripts/build_normalized_views.py", "--db", db_path], False))
-        return validate_plan(steps)
-    selected_phase = phase or "close"
+    selected_phase = "close" if phase == "supplemental" else phase or "close"
     age = {"auction": 300, "intraday": 600, "close": CLOSE_READINESS_MAX_AGE_SECONDS}[selected_phase]
     steps.append(("build_normalized_views", [py, "scripts/build_normalized_views.py", "--db", db_path], False))
     if selected_phase == "intraday" and include_collection:
@@ -252,6 +253,7 @@ def command_plan(
             ("audit_multisource_readiness", [py, "scripts/audit_multisource_readiness.py", "--db", db_path,
              "--as-of", selected_date, "--out", report("multisource_readiness_latest.md")], False),
             ("check_capital_flow_health", [py, "scripts/check_capital_flow_health.py", "--db", db_path,
+             "--stage", selected_phase,
              "--date", selected_date, "--max-age-seconds", str(age), "--min-coverage-pct", "99.5",
              "--out", report("capital_flow_freshness_latest.md"),
              *(["--as-of", as_of_time] if as_of_time else [])], False),

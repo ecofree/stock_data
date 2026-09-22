@@ -147,6 +147,37 @@ class PipelineLock:
             self._guard.__exit__(exc_type, exc, tb)
 
 
+def latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict]:
+    root = Path(reports_dir).resolve() / "runs"
+    out: dict[tuple[str, str], dict] = {}
+    if not root.exists():
+        return out
+    for path in root.glob("*/run.json"):
+        try:
+            raw = path.read_bytes()
+            item = json.loads(raw.decode("utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        trade_date = str(item.get("trade_date") or "")[:10]
+        phase = str(item.get("phase") or "").lower()
+        if not trade_date or phase not in ("auction", "intraday", "close", "supplemental"):
+            continue
+        item["_run_dir"] = str(path.parent)
+        item["_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+        key = (trade_date, phase)
+        stamp = str(item.get("completed_at") or item.get("started_at") or "")
+        old_stamp = str(
+            out.get(key, {}).get("completed_at")
+            or out.get(key, {}).get("started_at")
+            or ""
+        )
+        if key not in out or stamp >= old_stamp:
+            out[key] = item
+    return out
+
+
 class RunManifest:
     def __init__(
         self,

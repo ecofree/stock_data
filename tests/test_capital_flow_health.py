@@ -155,7 +155,7 @@ def test_capital_flow_health_enforces_expected_coverage(tmp_path):
     assert result["ready"] is False
 
 
-def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path):
+def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path, monkeypatch):
     db_path = tmp_path / "migrated-flow.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -183,6 +183,18 @@ def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path):
     assert result["stock_flow"]["ready"] is True
     assert result["sector_flow"]["ready"] is True
     assert result["ready"] is True
+
+    from scripts import check_capital_flow_health as entry
+    import sys
+    monkeypatch.setattr(entry,'assess_capital_flow_health',lambda *a,**k:result)
+    args=['check_capital_flow_health.py','--date','2026-07-14','--out',str(tmp_path/'health.md')]
+    monkeypatch.setattr(sys,'argv',args+['--stage','intraday'])
+    assert entry.main()==0
+    monkeypatch.setattr(sys,'argv',args+['--stage','close'])
+    assert entry.main()==2  # Coverage is not after-close reconciliation.
+    result['data_certified_ready']=False
+    monkeypatch.setattr(sys,'argv',args+['--stage','intraday'])
+    assert entry.main()==2
 
 
 def test_capital_flow_health_rejects_count_complete_partial_sector_batch(tmp_path):

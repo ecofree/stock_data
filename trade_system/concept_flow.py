@@ -145,7 +145,9 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
                                       [(row[0],row[7],row[9]) for row in inputs]).encode()).hexdigest(),
                                   membership_sha256=report["membership_sha256"],
                                   flow_input_sha256=report["flow_input_sha256"])))
-    report.update(status="qualified_subset" if excluded else "complete",
+    report.update(status="qualified_subset" if rows and excluded else
+                  "invalid_aggregate" if not rows and report['status']=='invalid_aggregate' else
+                  "partial_stock_flow" if excluded else "complete",
                   eligible_concepts=len(rows), excluded_concepts=excluded,
                   fetched_rows=len(rows), coverage_pct=round(100*len(rows)/len(expected),2))
     return rows, report

@@ -53,6 +53,9 @@ def test_intraday_plan_collects_executable_quotes_before_signals():
     assert "--auto-boost-if-kpl-stale" in quote_cmd
     assert "--auto-boost-if-kpl-stale" in by_name["collect_l2_focus"]
     assert "generate_trading_terminal" not in by_name
+    health = by_name['check_capital_flow_health']
+    assert health[health.index('--stage') + 1] == 'intraday'
+    assert 'reconcile_independent_stock_flow' not in by_name
 
 
 def test_close_plan_reuses_intraday_l2_instead_of_fetching_after_hours():
@@ -161,7 +164,7 @@ def test_manifest_upsert_step_transitions_running_to_completed(tmp_path):
     assert data["steps"][0]["duration_seconds"] == 1.5
 
 
-def test_manifest_finish_persists_informational_warnings(tmp_path):
+def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
     import json
     from trade_system.pipeline_runtime import RunManifest
 
@@ -170,6 +173,41 @@ def test_manifest_finish_persists_informational_warnings(tmp_path):
     data = json.loads(m.path.read_text(encoding="utf-8"))
     assert data["status"] == "completed"
     assert data["warnings"] == ["operator_readiness_gate_not_passed"]
+
+    # Drive the actual runner and receipt state transitions. Only transport
+    # children are replaced; data failures and cooldowns must remain failures.
+    from types import SimpleNamespace
+    from scripts import run_integrated_daily as runner
+    from trade_system import collection_profiles, pipeline_runtime
+    from tools.v2.backup_verify import backup_verify
+    source=tmp_path/'source.duckdb'
+    with duckdb.connect(str(source)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
+        con.executemany('INSERT INTO tushare_trade_cal VALUES (?,?,true)',
+                        [(x,date.today().isoformat()) for x in ('SSE','SZSE')])
+    migration=tmp_path/'migration'
+    verified=backup_verify(source,migration)
+    fail_core=False;cooldown=False
+    def child(command,**kwargs):
+        code=2 if command[1]=='collectors/collect_market.py' or (
+            fail_core and command[1]=='scripts/check_data_readiness.py') else 0
+        return SimpleNamespace(returncode=code,stdout=b'',stderr=b'')
+    monkeypatch.setattr(runner.subprocess,'run',child)
+    monkeypatch.setattr(pipeline_runtime,'runtime_fingerprint',lambda:{'scope':'test_fixture'})
+    monkeypatch.setattr(collection_profiles,'task_due',lambda db,day,name,**k:
+        (False,'retry cooldown age=0s ttl=150s status=error') if cooldown and name=='collect_intraday_stock_flow_market'
+        else (True,'fixture_due'))
+    for case,expected in [('optional',0),('core',2),('cooldown',2)]:
+        fail_core=case=='core';cooldown=case=='cooldown'
+        monkeypatch.setattr(sys,'argv',['run_integrated_daily.py','--migration-root',str(migration),
+            '--db',str(verified['backup']),'--reports-dir',str(migration/'reports'),
+            '--phase','intraday','--run-id',case,'--trade-date',date.today().isoformat()])
+        assert main()==expected
+        receipt=json.loads((migration/'reports'/'runs'/case/'run.json').read_text())
+        assert receipt['status']==('completed_with_warnings' if expected==0 else 'completed_with_degradation')
+        assert receipt['warnings']==['collect_market_context']
+        if cooldown:
+            assert next(x for x in receipt['steps'] if x['name']=='collect_intraday_stock_flow_market')['status']=='degraded'
 
 
 def test_close_tushare_sync_uses_gapfill_lookback():
@@ -229,13 +267,21 @@ def test_supplemental_recovers_close_facts_under_shared_plan():
     from trade_system.source_authority import validate_production_plan
     steps=command_plan('sample.duckdb','2026-09-17',include_collection=True,phase='supplemental')
     names=[n for n,_,_ in steps]
-    assert names==['sync_tushare_close','collect_lhb_daily','collect_auction_market_daily','collect_index_kline_daily',
-                   'collect_xiaodefa_critical','build_normalized_views']
+    assert names==['collect_market_context','sync_tushare_close','collect_ths_concepts_api',
+                   'collect_hithink_limit_pool_daily','collect_realtime_limit_pool',
+                   'collect_intraday_stock_flow_market','collect_intraday_sector_flow_full',
+                   'derive_market_context','collect_lhb_daily','collect_auction_market_daily',
+                   'collect_index_kline_daily','collect_xiaodefa_critical','build_normalized_views',
+                   'reconcile_independent_stock_flow','audit_multisource_readiness',
+                   'check_capital_flow_health','check_data_readiness']
     validate_production_plan('supplemental',names)
-    with pytest.raises(ValueError):validate_production_plan('supplemental',names[1:])
+    with pytest.raises(ValueError):
+        validate_production_plan('supplemental',[n for n in names if n!='collect_intraday_stock_flow_market'])
     assert resolve_phase('supplemental')=='supplemental'
-    for name in names[:5]:
+    for name in names:
         assert task_due('must-not-open.duckdb','2026-09-17',name,phase='supplemental')[0]
+    health=next(cmd for name,cmd,_ in steps if name=='check_capital_flow_health')
+    assert health[health.index('--stage')+1]=='close'
 
 
 def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, monkeypatch):
