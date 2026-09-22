@@ -62,20 +62,23 @@ def test_probe_inspection_checks_actual_database_and_frozen_pointer_without_writ
     import json
     from tools.v2.deployment_probe import inspect_product
     from trade_system.v2 import market_workspace, research_product
-    database=tmp_path/'source.duckdb';database.write_bytes(b'synthetic read-only database')
+    import duckdb
+    database=tmp_path/'source.duckdb'
+    duckdb.connect(str(database)).close()
     (tmp_path/'workspace-config.json').write_text(json.dumps({'read_only':True,'market_database':str(database)}))
     data=daily_probe_fixture('2026-09-15');calls=[]
-    def latest(path,as_of):
-        calls.append((path,as_of));return {'trade_date':'2026-09-16'}
-    monkeypatch.setattr(market_workspace,'latest_snapshot',latest)
+    def project(con,day,as_of,research_codes):
+        assert con.execute('SELECT 1').fetchone()==(1,)
+        calls.append((day,as_of));return {'trade_date':'2026-09-16'}
+    monkeypatch.setattr(market_workspace,'project',project)
     monkeypatch.setattr(research_product,'saved_projection',lambda p:data)
     monkeypatch.setattr(research_product,'read_prediction',lambda p:data['prediction'])
     before={p.name:p.read_bytes() for p in tmp_path.iterdir()}
     assert inspect_product(tmp_path,database,'2026-09-16')[1]['historical_prediction']
-    assert calls[0][0]==database
+    assert calls[0][0]=='2026-09-16'
     monkeypatch.setattr(research_product,'read_prediction',lambda p:{'prediction_id':'changed'})
     with pytest.raises(ValueError,match='frozen pointer'):inspect_product(tmp_path,database,'2026-09-16')
-    monkeypatch.setattr(market_workspace,'latest_snapshot',lambda *a:{'trade_date':'2026-09-15'})
+    monkeypatch.setattr(market_workspace,'project',lambda *a:{'trade_date':'2026-09-15'})
     with pytest.raises(ValueError,match='source database'):inspect_product(tmp_path,database,'2026-09-16')
     assert before=={p.name:p.read_bytes() for p in tmp_path.iterdir()}
 

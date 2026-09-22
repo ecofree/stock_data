@@ -70,12 +70,18 @@ def product_contract(data, expected_date):
 
 def inspect_product(workspace, database, expected_date):
     """Read only. No inference, model refresh, journal rebuild or publication."""
-    from trade_system.v2.market_workspace import latest_snapshot
+    from trade_system.v2.market_workspace import project
     from trade_system.v2.research_product import saved_projection, read_prediction
     config = json.loads((Path(workspace)/'workspace-config.json').read_text(encoding='utf-8'))
     if config.get('read_only') is not True or Path(config['market_database']).resolve() != Path(database).resolve():
         raise ValueError('workspace must bind the same read-only source database')
-    current = latest_snapshot(database, datetime.now(timezone.utc).isoformat())
+    # Handover verifies the explicitly named saved session, even after today's
+    # market close but before its scheduled collector has published new prices.
+    # Keep the real observation clock; this does not certify today's market.
+    import duckdb
+    observed_at = datetime.now(timezone.utc).isoformat()
+    with duckdb.connect(str(Path(database).resolve(strict=True)), read_only=True) as con:
+        current = project(con, expected_date, observed_at, set())
     if current['trade_date'] != expected_date:
         raise ValueError('source database has no expected market session')
     data = saved_projection(workspace)
