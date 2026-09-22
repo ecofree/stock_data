@@ -13,6 +13,7 @@ import argparse
 import json
 import hashlib
 import math
+import time
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -30,8 +31,9 @@ from trade_system.auction_evidence import observed_auction_rows, EVIDENCE_COLUMN
 
 def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
             product: str = 'market', codes=(), budget_seconds: float = 60) -> dict:
+    started=time.monotonic()
     # Distinct endpoints remain distinct products; no legacy signal-based fan-out.
-    if product not in {'market', 'tick', 'anomaly', 'final', 'opening'} or (product == 'final' and not codes):
+    if product not in {'market', 'tick', 'anomaly', 'final', 'opening', 'match'} or (product == 'final' and not codes):
         raise ValueError('supported auction product and explicit codes for tick required')
     if not math.isfinite(budget_seconds) or not 0 < budget_seconds <= 60:
         raise ValueError('auction budget must be finite within 60 seconds')
@@ -44,31 +46,43 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
         "status": "error",
         "source": {'market': '/auction/market', 'tick': '/auction/tick',
                    'anomaly': '/auction/bidding-anomaly', 'final':'/api/a-share/auction/snapshot',
-                   'opening':'stk_auction_o'}[product],
+                   'opening':'stk_auction_o', 'match':'stk_auction'}[product],
         "product": product,
         "stock_rows": 0,
         "tick_rows": 0,
         "quote_rows": 0,
     }
     try:
-        if product not in {'final','opening'}:
+        if product not in {'final','opening','match'}:
             require_api_key(API_KEY)
         store = DuckDBStore(str(db_path))
         try:
             init_schema(store.conn)
-            if product in {'final','opening'}:
+            if product in {'final','opening','match'}:
                 provider = 'hithink' if product=='final' else 'xiaodefa'
-                asset = 'hithink_auction_final' if product=='final' else 'stk_auction_o'
-                cached = store.conn.execute("SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+                asset = 'hithink_auction_final' if product=='final' else result['source']
+                receipts = store.conn.execute("SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
                     "WHERE source_date=? AND asset_code=? AND provider=? "
                     "AND data_type IN ('provider_gap_probe','auction_native_snapshot') "
-                    "ORDER BY observed_at DESC LIMIT 1",[trade_date,asset,provider]).fetchone()
+                    "ORDER BY observed_at DESC LIMIT 32",[trade_date,asset,provider]).fetchall()
                 evidence = None
-                if cached and hashlib.sha256(cached[0].encode()).hexdigest()==cached[1]:
-                    payload=json.loads(cached[0])
-                    evidence=observed_auction_rows(payload,trade_date,provider,cached[2],cached[1])
+                for cached in receipts:
+                    if hashlib.sha256(cached[0].encode()).hexdigest()!=cached[1]:
+                        continue
+                    try:
+                        payload=json.loads(cached[0])
+                        evidence=observed_auction_rows(payload,trade_date,provider,cached[2],cached[1])
+                    except (ValueError,TypeError,KeyError):
+                        evidence=None
+                        continue
                     if product=='final' and not set(codes)<= {r['thscode'] for r in payload['item']}:
                         evidence=None
+                    if product=='match' and codes and not {c[:6] for c in codes} <= {r['stock_code'] for r in evidence or []}:
+                        evidence=None
+                    if product=='match' and not codes and payload.get('params',{}).get('ts_code'):
+                        evidence=None
+                    if evidence is not None:
+                        break
                 reused = evidence is not None
                 if evidence is None:
                     if product=='final':
@@ -79,11 +93,13 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                             {'thscodes':','.join(dict.fromkeys(codes)),'stage':'final'})
                     else:
                         from trade_system.xiaodefa_source import XiaodefaClient
-                        if trade_date==datetime.now().date().isoformat() and datetime.now().hour<20:
+                        if product=='opening' and trade_date==datetime.now().date().isoformat() and datetime.now().hour<20:
                             raise ValueError('historical opening API is published after 20:00')
-                        params={'trade_date':trade_date.replace('-',''),'limit':10000}
-                        rows=XiaodefaClient(timeout=budget_seconds,max_retries=1).query_rows('stk_auction_o',params)
-                        payload=dict(api='stk_auction_o',params=params,rows=rows)
+                        if product=='match' and trade_date==datetime.now().date().isoformat() and datetime.now().strftime('%H:%M')<'09:26':
+                            raise ValueError('matched auction trades are published from 09:26')
+                        params={'trade_date':trade_date.replace('-',''),'limit':8000 if product=='match' else 10000}
+                        rows=XiaodefaClient(timeout=budget_seconds,max_retries=1).query_rows(asset,params)
+                        payload=dict(api=asset,params=params,rows=rows)
                     received=datetime.now()
                     encoded=json.dumps(payload,ensure_ascii=False,sort_keys=True,allow_nan=False)
                     fingerprint=hashlib.sha256(encoded.encode()).hexdigest()
@@ -92,11 +108,11 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                         "VALUES (?,'auction_native_snapshot','receipt',?,?,'received_unverified',?,?,?)",
                         [trade_date,asset,provider,encoded,fingerprint,received])
                     evidence=observed_auction_rows(payload,trade_date,provider,received,fingerprint)
-                if product=='final':
+                if product=='final' or (product=='match' and codes):
                     wanted={c[:6] for c in codes}
                     evidence=[r for r in evidence if r['stock_code'] in wanted]
                     if len(evidence)!=len(wanted):
-                        raise ValueError('native final snapshot missing requested codes')
+                        raise ValueError('auction snapshot missing requested codes')
                 # Use the existing evidence table and bulk writer. No tick,
                 # quote-window or phase-success checkpoint is manufactured.
                 columns=EVIDENCE_COLUMNS+['generated_at']
@@ -104,9 +120,10 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                 count=store.insert_rows('auction_evidence_snapshot',
                     [[r.get(c) for c in EVIDENCE_COLUMNS]+[datetime.now()] for r in evidence],
                     columns,replace_on=['trade_date','stock_code','source_table'])
-                result.update(status='success' if count else 'empty',stock_rows=count,
+                invalid=sum(';invalid_' in r['missing_reason'] or ';no_positive_' in r['missing_reason'] for r in evidence)
+                result.update(status='partial' if invalid else 'success' if count else 'empty',stock_rows=count,
                     evidence_rows=count,receipt_reused=reused,scope='observed_native_product_not_market_phase_acceptance',
-                    invalid_rows=sum(';invalid_native_ohlc' in r['missing_reason'] or ';no_positive_' in r['missing_reason'] for r in evidence),
+                    invalid_rows=invalid, qualified_match=product=='match' and bool(count) and not invalid,
                     qualified_tick=False,qualified_order_book=False,predeclared_observation=False)
             else:
                 client = KPLClient(request_timeout=7, max_attempts=1, total_budget_seconds=budget_seconds)
@@ -136,6 +153,13 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                 result.update(parsed)
         finally:
             store.close()
+        if product=='tick' and (trade_date<datetime.now().date().isoformat() or datetime.now().strftime('%H:%M')>='09:26'):
+            # Supplement the current entry with a separate documented matched
+            # result. Unknown tick units still prevent tick qualification.
+            remaining=budget_seconds-(time.monotonic()-started)
+            result['matched_result'] = (collect(db_path,trade_date,product='match',codes=codes,
+                                               budget_seconds=min(remaining,15)) if remaining>0 else
+                                        dict(status='budget_exhausted',qualified_match=False))
     except Exception as exc:
         result.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -150,7 +174,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--date", default=TODAY)
-    parser.add_argument('--product', choices=('market', 'tick', 'anomaly','final','opening'), default='market',
+    parser.add_argument('--product', choices=('market', 'tick', 'anomaly','final','opening','match'), default='market',
                         help='Distinct market sequence/final snapshot, scoped ticks or global anomalies; never interchangeable.')
     parser.add_argument('--codes', default='', help='Explicit codes; final requires exchange-qualified codes such as 000001.SZ (max 100).')
     parser.add_argument('--budget-seconds', type=float, default=60)

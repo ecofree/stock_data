@@ -29,27 +29,31 @@ EVIDENCE_COLUMNS = [
 
 
 def observed_auction_rows(payload, trade_date, provider, received_at, payload_hash):
-    """Native final snapshots and historical opening bars never qualify as ticks."""
+    """Keep matched trades, native finals and historical bars distinct from ticks."""
     from trade_system.units import _number
     final = provider == 'hithink'
+    matched = provider == 'xiaodefa' and payload.get('api') == 'stk_auction'
     if final:
         from trade_system.hithink_client import CST
         timestamp = _number(payload.get('timestamp'))
         if (timestamp is None or datetime.fromtimestamp(timestamp/1000, CST).date().isoformat() != trade_date
                 or received_at.date().isoformat() != trade_date
                 or abs(received_at.replace(tzinfo=CST).timestamp()-timestamp/1000)>60
-                or payload.get('data_status') != 'final' or payload.get('auction_phase') != 'closed'):
+                or (payload.get('auction_phase'),payload.get('data_status')) not in {('closed','final'),('final','ready')}):
             raise ValueError('undated or unfinished native final auction snapshot')
         items = payload.get('item')
         if type(payload.get('total')) is not int or not isinstance(items,list) or len(items) != payload['total'] or len(items)>100:
             raise ValueError('incomplete scoped final snapshot')
     else:
-        if (provider != 'xiaodefa' or payload.get('api') != 'stk_auction_o'
+        if (provider != 'xiaodefa' or payload.get('api') not in {'stk_auction_o', 'stk_auction'}
                 or payload.get('params',{}).get('trade_date') != trade_date.replace('-','')):
             raise ValueError('wrong historical opening product or request date')
         items = payload.get('rows')
-        if not isinstance(items,list) or len(items)>=10000:
+        if not isinstance(items,list) or len(items)>=(8000 if matched else 10000):
             raise ValueError('opening snapshot page completeness unknown')
+        if matched and (received_at.date().isoformat()<trade_date or
+                (received_at.date().isoformat()==trade_date and received_at.strftime('%H:%M')<'09:26')):
+            raise ValueError('matched trade receipt precedes product availability')
     output, seen = [], set()
     for item in items:
         ts_code = item.get('thscode' if final else 'ts_code', '')
@@ -61,25 +65,33 @@ def observed_auction_rows(payload, trade_date, provider, received_at, payload_ha
             raise ValueError('native final ticker and exchange identity disagree')
         seen.add(ts_code)
         reason = 'final_snapshot_not_tick_or_order_book_or_preopen_capture' if final else 'historical_bar_not_tick_or_order_book_or_preopen_capture'
-        price = _number(item.get('auction_price' if final else 'close'))
+        if matched:
+            reason = 'matched_trade_not_tick_or_order_book_or_preopen_capture'
+        price = _number(item.get('auction_price' if final else 'price' if matched else 'close'))
         volume = _number(item.get('auction_volume' if final else 'vol'))
         amount = _number(item.get('auction_amount' if final else 'amount'))
         if any(v is None or v <= 0 for v in (price,volume,amount)):
             reason += ';no_positive_price_volume_amount'
-        if not final:
+        if matched and (volume is None or volume != int(volume)
+                or any(v is None or v <= 0 for v in (price,volume,amount))
+                or abs(price * volume - amount) > max(0.01, abs(amount) * 1e-8)):
+            reason += ';invalid_matched_price_volume_amount'
+        if not final and not matched:
             opening, high, low = map(_number, (item.get('open'),item.get('high'),item.get('low')))
             if any(v is None or v<=0 for v in (opening,high,low,price)) or not low<=min(opening,price)<=max(opening,price)<=high:
                 reason += ';invalid_native_ohlc'
         output.append(dict(trade_date=trade_date,stock_code=ts_code[:6],
-            source_table='hithink_auction_final' if final else 'multi_source_observation',
-            confirmation='final_snapshot_observed' if final else 'historical_opening_bar_observed',
+            source_table='hithink_auction_final' if final else 'xiaodefa_auction_match' if matched else 'multi_source_observation',
+            confirmation='final_snapshot_observed' if final else ('matched_trade_confirmed' if ';' not in reason else 'matched_trade_invalid') if matched else 'historical_opening_bar_observed',
             auction_strength=None,auction_amount=amount if amount is not None and amount>=0 else None,
             tick_rows=0,is_fallback=True,missing_reason=reason,
             evidence_json=json.dumps(dict(native=item,provider=provider,
-                api='/api/a-share/auction/snapshot' if final else 'stk_auction_o',
+                api='/api/a-share/auction/snapshot' if final else payload['api'],
                 received_at=received_at.isoformat(),raw_payload_hash=payload_hash,
                 qualified_tick=False,qualified_order_book=False,predeclared_observation=False,
-                volume_unit='native_undocumented'),ensure_ascii=False,sort_keys=True)))
+                qualified_match=matched and ';' not in reason,
+                amount_unit='CNY' if matched else 'native_undocumented',
+                volume_unit='shares' if matched else 'native_undocumented'),ensure_ascii=False,sort_keys=True)))
     return output
 
 
@@ -278,6 +290,12 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
             "advanced_morning_bidding_summary": _relation_count(con, "advanced_morning_bidding_summary", trade_date),
         }
         output: list[dict[str, Any]] = []
+        if table_exists(con, 'auction_evidence_snapshot'):
+            # These products own their persisted receipts; the tick projection
+            # must expose them without interpreting them as a tick sequence.
+            output.extend(_fetch_dicts(con, "SELECT " + ','.join(EVIDENCE_COLUMNS) +
+                " FROM auction_evidence_snapshot WHERE trade_date=? AND source_table IN "
+                "('hithink_auction_final','xiaodefa_auction_match','multi_source_observation')", [trade_date]))
         tick_codes: set[str] = set()
         for row in _tick_rows(con, trade_date):
             tick_codes.add(str(row["stock_code"]))

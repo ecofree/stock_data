@@ -24,7 +24,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trade_system.config import DB_PATH, TODAY
+from trade_system.config import DB_PATH, TODAY, SETTINGS
 from trade_system.schema import init_schema
 from trade_system.multi_source_store import MultiSourceStore
 from trade_system.adapters.eastmoney_dc import _from_em_sector_flow_page
@@ -167,12 +167,16 @@ def _replace_sector_snapshot(store, trade_date, rows, pagination):
     con = store.con
     con.execute('BEGIN TRANSACTION')
     try:
-        con.execute("DELETE FROM multi_source_sector_flow WHERE source_date=CAST(? AS DATE) AND provider='eastmoney_sector_full'", [trade_date])
         qualified = [dict(row, catalogue_version=pagination['catalogue_version']) for row in rows]
         result = store.store('sector_flow', None, qualified,
             {'source':'eastmoney_sector_full','status':'live'}, trade_date=trade_date, commit=False)
         if result['rows_written'] != pagination['expected_total']:
             raise ValueError('qualified page rows changed before publication')
+        # Upsert retained keys first. DuckDB cannot delete then reinsert the
+        # same unique key in one transaction on a repeated daily snapshot.
+        con.execute("DELETE FROM multi_source_sector_flow WHERE source_date=CAST(? AS DATE) "
+            "AND provider='eastmoney_sector_full' AND sector_code NOT IN (SELECT unnest(?))",
+            [trade_date,[row['sector_code'] for row in qualified]])
         con.commit()
     except Exception:
         con.rollback()
@@ -371,6 +375,45 @@ def collect_full_sector_flow(
         con.commit()
 
         try:
+            catalogue_error = ''
+            if expected_codes is None and (SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')):
+                # The flow response cannot certify its own membership. Fetch a
+                # dated independent catalogue and retain its original receipt.
+                try:
+                    from trade_system.xiaodefa_source import XiaodefaClient
+                    cached = con.execute("SELECT payload_json,payload_hash FROM multi_source_observation "
+                        "WHERE data_type='em_industry_catalogue' AND source_date=? AND provider='xiaodefa' "
+                        "AND (status='qualified' OR observed_at>=current_timestamp-INTERVAL 15 MINUTE) "
+                        "ORDER BY observed_at DESC LIMIT 1", [trade_date]).fetchone()
+                    payload = None
+                    if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1]:
+                        payload = json.loads(cached[0])
+                    if payload is None:
+                        params = dict(trade_date=trade_date.replace('-',''),idx_type='行业板块',limit=5000)
+                        rows = XiaodefaClient(timeout=15,max_retries=1).query_rows('dc_index',params,
+                            'ts_code,trade_date,name,idx_type,level')
+                        payload = dict(api='dc_index',params=params,rows=rows)
+                        encoded = json.dumps(payload,ensure_ascii=False,sort_keys=True,allow_nan=False)
+                        fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+                        con.execute("INSERT INTO multi_source_observation "
+                            "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash) "
+                            "VALUES (?,'em_industry_catalogue','reference','xiaodefa','received_unverified',?,?)",
+                            [trade_date,encoded,fingerprint])
+                    rows = payload['rows']
+                    codes = [r.get('ts_code','') for r in rows]
+                    if (payload.get('api')!='dc_index' or payload.get('params',{}).get('trade_date')!=trade_date.replace('-','')
+                            or not 0<len(rows)<5000 or len(set(codes))!=len(codes)
+                            or any(r.get('trade_date')!=trade_date.replace('-','') or r.get('idx_type')!='行业板块'
+                                or not c.startswith('BK') or not c.endswith('.DC') or not c[2:-3].isdigit()
+                                for r,c in zip(rows,codes))):
+                        raise ValueError('dated industry catalogue incomplete or namespace mismatch')
+                    expected_codes = [c.removesuffix('.DC') for c in codes]
+                    catalogue_version = hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+                    con.execute("UPDATE multi_source_observation SET status='qualified' "
+                        "WHERE data_type='em_industry_catalogue' AND source_date=? AND payload_hash=?",
+                        [trade_date,catalogue_version])
+                except Exception as exc:
+                    catalogue_error = 'independent_catalogue: ' + str(exc)[:200]
             staged_rows, pagination = _collect_sector_pages(
                 store, trade_date, page_size, max_pages, pause_seconds,
                 expected_codes, catalogue_version)
@@ -379,6 +422,8 @@ def collect_full_sector_flow(
             expected_pages = pagination['expected_pages']
             fetched_pages = pagination['primary_pages']
             reconciliation_pages = pagination['reconciliation_pages']
+            if catalogue_error:
+                pagination['errors'].append(catalogue_error)
             error = '; '.join(pagination['errors'])[:500]
             if _replace_sector_snapshot(store, trade_date, staged_rows, pagination):
                 provider_used = 'eastmoney_sector_full'

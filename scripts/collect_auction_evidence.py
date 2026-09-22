@@ -289,6 +289,10 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
             "scope": "bounded_current_candidate_pool_not_full_market", "observed_codes": observed,
             "source_errors": failures,
         })
+        if now >= time(9,26):
+            from scripts.collect_auction_market_daily import collect as collect_product
+            result['matched_result'] = collect_product(db_path,trade_date,product='match',
+                                                       codes=codes,budget_seconds=15)
         from trade_system.db_utils import legacy_connect
         con = legacy_connect(db_path)
         try:

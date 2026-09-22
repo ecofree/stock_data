@@ -254,6 +254,13 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
 
     monkeypatch.setattr(collector, "_from_em_sector_flow_page", fake_page)
     monkeypatch.setattr(collector.shared_host_limiter, "acquire", lambda *args, **kwargs: None)
+    catalogue_calls=[]
+    from trade_system.xiaodefa_source import XiaodefaClient
+    def catalogue(self,api,params,fields):
+        catalogue_calls.append((api,params))
+        return [dict(ts_code=f'BK000{i}.DC',trade_date='20260724',idx_type='行业板块',level='1') for i in range(1,5)]
+    monkeypatch.setitem(collector.SETTINGS,'XIAODEFA_TOKEN','fixture')
+    monkeypatch.setattr(XiaodefaClient,'query_rows',catalogue)
 
     result = collector.collect_full_sector_flow(
         db,
@@ -261,7 +268,6 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         page_size=500,
         max_pages=2,
         pause_seconds=0,
-        expected_codes=['BK0001','BK0002','BK0003','BK0004'], catalogue_version='fixture-v1',
     )
 
     assert result["status"] == "success_with_optional_gap"
@@ -272,6 +278,9 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         (2, "f12", "0"),
         (1, "f12", "1"),
     ]
+    reused=collector.collect_full_sector_flow(db,'2026-07-24',max_pages=2,pause_seconds=0)
+    assert reused['status']=='success_with_optional_gap', reused
+    assert len(catalogue_calls)==1, 'qualified dated catalogue must be reused'
     con = duckdb.connect(str(db), read_only=True)
     try:
         assert con.execute(

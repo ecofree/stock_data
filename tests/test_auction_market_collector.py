@@ -119,6 +119,7 @@ def test_market_date_mismatch_is_not_published(tmp_path):
             "SELECT count(*) FROM auction_tick"
         ).fetchone()[0] == 0
         from datetime import datetime
+        import json
         from trade_system.auction_evidence import observed_auction_rows
         from trade_system.hithink_client import CST
         import pytest
@@ -141,5 +142,20 @@ def test_market_date_mismatch_is_not_published(tmp_path):
         bar['rows'][0]['trade_date']='20260827'
         with pytest.raises(ValueError,match='wrong-date'):
             observed_auction_rows(bar,'2026-08-28','xiaodefa',now,'raw-hash')
+        match=dict(api='stk_auction',params={'trade_date':'20260828'},rows=[
+            dict(ts_code='000001.SZ',trade_date='20260828',price=11.7,vol=607300,amount=7105410)])
+        evidence=observed_auction_rows(match,'2026-08-28','xiaodefa',now,'match-hash')
+        assert evidence[0]['confirmation']=='matched_trade_confirmed'
+        detail=json.loads(evidence[0]['evidence_json'])
+        assert detail['volume_unit']=='shares' and detail['qualified_match']
+        assert not detail['qualified_tick'] and not detail['predeclared_observation']
+        from trade_system.auction_evidence import ensure_auction_evidence_tables, EVIDENCE_COLUMNS
+        ensure_auction_evidence_tables(db,connection=store.conn)
+        store.conn.execute('INSERT INTO auction_evidence_snapshot ('+','.join(EVIDENCE_COLUMNS)+') VALUES ('+
+            ','.join('?' for _ in EVIDENCE_COLUMNS)+')',[evidence[0][k] for k in EVIDENCE_COLUMNS])
+        match['rows'][0]['amount']=71054.10
+        invalid=observed_auction_rows(match,'2026-08-28','xiaodefa',now,'bad-hash')
+        assert invalid[0]['confirmation']=='matched_trade_invalid'
+        assert not json.loads(invalid[0]['evidence_json'])['qualified_match']
     finally:
         store.close()

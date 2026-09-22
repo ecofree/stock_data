@@ -62,7 +62,9 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
     rows = XiaodefaClient(timeout=60,max_retries=1).query_all('moneyflow_dc',
         trade_date=_compact(trade_date),page_size=6000,max_rows=6000*limit,on_page=retain)
     identities = [r.get('ts_code') for r in rows]
-    if (not rows or len(set(identities)) != len(rows) or any(
+    if not rows:
+        raise ValueError('dated relay stock flow unavailable: empty response')
+    if (len(set(identities)) != len(rows) or any(
             r.get('trade_date') != _compact(trade_date) or not isinstance(r.get('ts_code'), str)
             or len(r['ts_code']) != 9 or r['ts_code'][-3:] not in ('.SH','.SZ','.BJ') for r in rows)):
         raise ValueError('duplicate identity or wrong-date relay stock flow')
@@ -439,6 +441,14 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             con.commit()
         written_pages.add(page_no)
 
+    buffered_pages = []
+
+    def buffer_page(page_no, raw_rows, pages, result):
+        # Network budgets cover acquisition; canonical writes run afterwards.
+        # Keep actual page arrival, never the later transaction time.
+        buffered_pages.append((page_no, raw_rows, pages,
+                               dict(result, received_at=result.get('received_at', datetime.now().timestamp()))))
+
     try:
         if os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and not expected_universe:
             raise ValueError('qualified dated A-share reference unavailable; collection not started; '+reference_error)
@@ -467,16 +477,18 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             # until 15:05; close runs use dated provider responses.
             rows, meta = get_fund_flow_market_realtime(
                 trade_date, page_size=min(page_size, 100), max_pages=max_pages,
-                pause_seconds=pause_seconds, on_page=on_page,
+                pause_seconds=pause_seconds, on_page=on_page if resume else buffer_page,
                 start_page=resume_start_page,
             )
         else:
             rows, meta = get_fund_flow_market(
                 trade_date, page_size=page_size, max_pages=max_pages,
-                pause_seconds=pause_seconds, on_page=on_page,
+                pause_seconds=pause_seconds, on_page=on_page if resume else buffer_page,
             )
         expected_pages = int(meta.get("pages") or expected_pages or 0)
         expected_rows = len(expected_universe) or int(meta.get("expected_rows") or expected_rows or 0)
+        for page in buffered_pages:
+            on_page(*page)
         source_provider = str(meta.get("source") or source_provider)
         if atomic_refresh and expected_pages > len(written_pages):
             raise ValueError('incomplete pagination; previous canonical snapshot retained')
@@ -822,4 +834,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     raise SystemExit(main())

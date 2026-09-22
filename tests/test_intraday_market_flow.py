@@ -45,11 +45,21 @@ def test_market_flow_fetcher_paginates_and_normalizes(monkeypatch):
 
 
 def test_market_flow_batch_persists_each_page_and_coverage(tmp_path, monkeypatch):
+    inside_fetch = False
+    from trade_system.multi_source_store import MultiSourceStore
+    original_store = MultiSourceStore.store
+    def checked_store(self,*args,**kwargs):
+        assert not inside_fetch, 'canonical writes must not consume the network deadline'
+        return original_store(self,*args,**kwargs)
+    monkeypatch.setattr(MultiSourceStore,'store',checked_store)
     def fake_fetch(trade_date, *, page_size, max_pages, pause_seconds, on_page):
+        nonlocal inside_fetch
+        inside_fetch = True
         page1 = [_market_row("000001")]
         page2 = [_market_row("600000")]
         on_page(1, page1, 2, {"count": 2})
         on_page(2, page2, 2, {"count": 2})
+        inside_fetch = False
         return [], {"pages": 2, "expected_rows": 2, "rows": 2}
 
     monkeypatch.setattr(

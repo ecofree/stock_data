@@ -10,6 +10,14 @@ def test_market_context_fallback_uses_same_date_stock_flow(tmp_path):
     db = tmp_path / "fallback.duckdb"
     con = duckdb.connect(str(db))
     init_schema(con)
+    from scripts.derive_market_context import _limit_pct
+    con.execute("INSERT INTO tushare_stock_basic(ts_code,stock_code,stock_name) VALUES "
+                "('920992.BJ','920992','Example'),('300001.SZ','300001','*ST Example'),"
+                "('000009.SZ','000009','*ST Main')")
+    assert _limit_pct(con,'920992')==30
+    assert _limit_pct(con,'300001')==20
+    assert _limit_pct(con,'000009','2026-07-03')==5
+    assert _limit_pct(con,'000009','2026-07-06')==10
     con.executemany(
         """
         INSERT INTO multi_source_stock_flow

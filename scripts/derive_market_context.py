@@ -49,22 +49,26 @@ def _table_columns(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:
     return {row[1] for row in con.execute(f'PRAGMA table_info("{table}")').fetchall()}
 
 
-def _limit_pct(con: duckdb.DuckDBPyConnection, stock_code: str) -> float:
+def _limit_pct(con: duckdb.DuckDBPyConnection, stock_code: str, trade_date: str | None = None) -> float:
     """Return the board/ST price-limit rule used for breadth counting."""
     code = "".join(ch for ch in str(stock_code or "") if ch.isdigit())[-6:]
     name = ""
+    exchange = ""
     if code and _table_columns(con, "tushare_stock_basic"):
         row = con.execute(
-            "SELECT stock_name FROM tushare_stock_basic WHERE stock_code=? LIMIT 1",
+            "SELECT stock_name,ts_code FROM tushare_stock_basic WHERE stock_code=? LIMIT 1",
             [code],
         ).fetchone()
         name = str(row[0] or "") if row else ""
-    if "ST" in name.upper().replace("*", ""):
-        return 5.0
+        exchange = str(row[1] or '').rsplit('.',1)[-1] if row else ''
+    if exchange == 'BJ' or code.startswith(('4','8','920')):
+        return 30.0
     if code.startswith(("30", "68")):
         return 20.0
-    if code.startswith(("4", "8")):
-        return 30.0
+    if "ST" in name.upper().replace("*", ""):
+        # 2026 exchange trading rules took effect on July 6. Historical
+        # projections must not apply the new main-board band retroactively.
+        return 10.0 if (trade_date or datetime.now().date().isoformat()) >= '2026-07-06' else 5.0
     return 10.0
 
 
@@ -170,7 +174,7 @@ def derive_market_context(
                 change = float(row[1])
             except (TypeError, ValueError):
                 continue
-            rule = _limit_pct(con, str(row[0]))
+            rule = _limit_pct(con, str(row[0]), trade_date)
             limit_rules[str(rule)] = limit_rules.get(str(rule), 0) + 1
             if change >= rule - 0.15:
                 limit_up += 1
