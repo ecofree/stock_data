@@ -43,10 +43,15 @@ def rehearse(previous,candidate,output,runtime,workspace):
     for name,archive in [('previous',previous),('candidate',candidate)]:
         info=stage(archive,output/name)
         entry=Path(info['directory'])/'run_research.py'
-        result=subprocess.run([str(runtime),'-I',str(entry),'status','--output',str(workspace)],capture_output=True,text=True,encoding='utf-8',timeout=90)
-        (output/(name+'-status.log')).write_text(result.stdout+result.stderr,encoding='utf-8')
-        if result.returncode:raise ValueError(name+' release status failed')
-        rendered=subprocess.run([str(runtime),'-I',str(entry),'render','--output',str(workspace),
+        if (workspace/'research-current.json').exists():
+            result=subprocess.run([str(runtime),'-I','-X','utf8',str(entry),'status','--output',str(workspace)],capture_output=True,text=True,encoding='utf-8',timeout=90)
+            (output/(name+'-status.log')).write_text(result.stdout+result.stderr,encoding='utf-8')
+            if result.returncode:raise ValueError(name+' release status failed')
+        elif not (workspace/'workspace-config.json').is_file():
+            raise ValueError('configured daily workspace or frozen research build required')
+        # Daily publication does not depend on a QLib model. The same sealed
+        # projection renderer validates either product below.
+        rendered=subprocess.run([str(runtime),'-I','-X','utf8',str(entry),'render','--output',str(workspace),
             '--destination',str(output/(name+'-render'))],capture_output=True,text=True,encoding='utf-8',timeout=90)
         (output/(name+'-render.log')).write_text(rendered.stdout+rendered.stderr,encoding='utf-8')
         if rendered.returncode:raise ValueError(name+' release render failed')
