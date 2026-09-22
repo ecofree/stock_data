@@ -196,15 +196,17 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_runtime,'runtime_fingerprint',lambda:{'scope':'test_fixture'})
     monkeypatch.setattr(collection_profiles,'task_due',lambda db,day,name,**k:
         (False,'retry cooldown age=0s ttl=150s status=error') if cooldown and name=='collect_intraday_stock_flow_market'
+        else (False,'publication pending: fixture') if case=='pending' and name=='reconcile_independent_stock_flow'
         else (True,'fixture_due'))
-    for case,expected in [('optional',0),('core',2),('cooldown',2)]:
+    for case,expected in [('optional',0),('core',2),('cooldown',2),('pending',0)]:
         fail_core=case=='core';cooldown=case=='cooldown'
         monkeypatch.setattr(sys,'argv',['run_integrated_daily.py','--migration-root',str(migration),
             '--db',str(verified['backup']),'--reports-dir',str(migration/'reports'),
-            '--phase','intraday','--run-id',case,'--trade-date',date.today().isoformat()])
+            '--phase','close' if case=='pending' else 'intraday','--run-id',case,'--trade-date',date.today().isoformat()])
         assert main()==expected
         receipt=json.loads((migration/'reports'/'runs'/case/'run.json').read_text())
-        assert receipt['status']==('completed_with_warnings' if expected==0 else 'completed_with_degradation')
+        assert receipt['status']==('awaiting_publication' if case=='pending' else 'completed_with_warnings' if expected==0 else 'completed_with_degradation')
+        assert receipt['pending']==(['reconcile_independent_stock_flow'] if case=='pending' else [])
         assert receipt['warnings']==['collect_market_context']
         if cooldown:
             assert next(x for x in receipt['steps'] if x['name']=='collect_intraday_stock_flow_market')['status']=='degraded'

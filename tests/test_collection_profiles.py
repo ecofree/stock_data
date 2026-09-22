@@ -138,7 +138,7 @@ def test_close_priority_plan_keeps_incremental_tushare_and_official_ths():
     ]
 
 
-def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path):
+def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path, monkeypatch):
     db = tmp_path / "tushare-close.duckdb"
     con = duckdb.connect(str(db))
     con.execute(
@@ -148,12 +148,12 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
     )
     for dataset in ("daily", "daily_basic", "adj_factor", "moneyflow", "industry_flow"):
         con.execute(
-            "INSERT INTO history_fetch_checkpoint VALUES (?, '2026-07-15', 0, 'success', 10, '2026-07-15 17:31:00')",
+            "INSERT INTO history_fetch_checkpoint VALUES (?, '2026-07-15', 0, 'success', 10, '2026-07-15 19:01:00')",
             [dataset],
         )
     con.close()
 
-    now = datetime(2026, 7, 15, 17, 40)
+    now = datetime(2026, 7, 15, 19, 10)
     assert task_due(db, "2026-07-15", "sync_tushare_close", now=now)[0] is False
 
     con = duckdb.connect(str(db))
@@ -168,8 +168,40 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
     # Failed/partial checkpoints use a shorter 30-minute TTL.
     assert task_due(
         db, "2026-07-15", "sync_tushare_close",
-        now=datetime(2026, 7, 15, 18, 2),
+        now=datetime(2026, 7, 15, 19, 32),
     )[0] is True
+    from trade_system.collection_profiles import close_datasets
+    assert close_datasets('2026-07-15', '2026-07-15T17:30:00+08:00') == ('daily','daily_basic','adj_factor')
+    assert len(close_datasets('2026-07-15', '2026-07-15T11:00:00+00:00')) == 5
+    assert task_due(db, '2026-07-15', 'reconcile_independent_stock_flow', phase='close',
+                    now=datetime(2026,7,15,17,30))[1].startswith('publication pending:')
+    early = dict((name, command) for name,command,_ in command_plan(str(db),'2026-07-15',
+                 phase='close',include_collection=True,as_of_time='2026-07-15T17:30:00'))
+    assert early['sync_tushare_close'][early['sync_tushare_close'].index('--datasets')+1] == 'daily,daily_basic,adj_factor'
+    assert early['check_capital_flow_health'][early['check_capital_flow_health'].index('--stage')+1] == 'intraday'
+    from collectors import xiaodefa
+    with duckdb.connect(str(db)) as con:
+        con.execute("CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)")
+        con.execute("INSERT INTO tushare_trade_cal VALUES ('SSE','2026-07-14',true),('SSE','2026-07-15',true)")
+    class Clock(datetime):
+        @classmethod
+        def now(cls): return cls(2026,7,15,20)
+    monkeypatch.setattr(xiaodefa,'datetime',Clock)
+    monkeypatch.setattr(xiaodefa,'XiaodefaClient',lambda:object())
+    calls=[]
+    monkeypatch.setitem(xiaodefa.COLLECTORS,'margin',dict(table='fixture',replace_on=(),
+        fetch=lambda client,args:calls.append(args.trade_date) or [{'trade_date':args.trade_date}]))
+    monkeypatch.setattr(xiaodefa,'store_rows',lambda store,table,rows,keys,**k:len(rows))
+    args=dict(db_path=str(db),trade_date='2026-07-15',start_date='2026-07-15',end_date='2026-07-15')
+    waiting=xiaodefa.collect(['margin'],**args)
+    assert waiting['margin']['status']=='awaiting_publication' and not calls
+    disclosed=xiaodefa.collect(['margin'],latest_disclosed=True,**args)
+    assert calls==['2026-07-14']
+    assert disclosed['margin']['requested_date']=='2026-07-15' and disclosed['margin']['source_date']=='2026-07-14'
+    monkeypatch.setitem(xiaodefa.COLLECTORS['margin'],'fetch',lambda *a:[{'trade_date':'2026-07-15'}])
+    assert xiaodefa.collect(['margin'],latest_disclosed=True,**args)['margin']['status']=='error'
+    with duckdb.connect(str(db)) as con:
+        con.execute('DROP TABLE tushare_trade_cal')
     # An unrelated successful supplement cannot satisfy publication inputs.
     from trade_system.collection_profiles import publication_readiness
     result = publication_readiness(db, '2026-07-15')

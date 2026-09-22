@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+import hashlib
+import json
 from typing import Any
 
 
@@ -10,6 +12,32 @@ from typing import Any
 # floor would silently accept a truncated catalogue after the source changed.
 THS_MIN_CONCEPTS: int | None = None
 THS_MEMBERSHIP_MAX_AGE_DAYS = 7
+
+
+def qualified_stock_reference(con, *, provider='xiaodefa', now=None):
+    """Read the collector's sealed L/D reference; never acquire or repair it."""
+    now = now or datetime.now()
+    if not _table_exists(con, 'multi_source_observation') or not _table_exists(con, 'tushare_stock_basic'):
+        return None
+    receipt = con.execute("SELECT observed_at,payload_json,payload_hash FROM multi_source_observation "
+        "WHERE data_type='tushare_stock_basic_snapshot' AND status='qualified' AND provider=? "
+        "ORDER BY observed_at DESC LIMIT 1", [provider]).fetchone()
+    if not receipt or not 0 <= (now - receipt[0]).total_seconds() < 86400:
+        return None
+    if hashlib.sha256(receipt[1].encode()).hexdigest() != receipt[2]:
+        return None
+    payload = json.loads(receipt[1])
+    rows = con.execute('SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date '
+                       'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
+    version = hashlib.sha256(json.dumps(rows, ensure_ascii=False, default=str,
+                                       separators=(',', ':')).encode()).hexdigest()
+    if payload.get('version') != version or payload.get('scope') != ['L', 'D']:
+        return None
+    membership = payload.get('listing_membership', {})
+    if membership and membership.get('as_of') != now.date().isoformat():
+        return None
+    return dict(version=version, known_at=receipt[0].isoformat(), max_age_seconds=86400,
+                membership_date=membership.get('as_of'), not_listed=membership.get('not_listed', []))
 
 
 def _table_exists(con: Any, name: str) -> bool:

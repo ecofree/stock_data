@@ -130,10 +130,20 @@ class TushareHistoryCollector:
         reference = self._reference_version() or {}
         if reference.get('membership_date') == _iso(trade_date) and observed & set(reference.get('not_listed', [])):
             raise XiaodefaError('price response conflicts with official listing membership')
-        if dataset in {'daily', 'moneyflow'} and expected - observed:
+        if dataset in {'daily', 'daily_basic', 'moneyflow'} and expected - observed and self._suspension_rows(trade_date) is None:
             self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                             'ts_code,trade_date,suspend_timing,suspend_type')
             expected = self._expected_stock_codes(trade_date, dataset)
+        if dataset == 'daily_basic' and expected and expected - observed:
+            # Retain valid rows without exempting missing valuation/share fields.
+            self._record_snapshot('daily_basic_gaps', {
+                'trade_date': _iso(trade_date), 'missing_codes': sorted(expected - observed),
+                'full_day_suspended': sorted((expected - observed) - self._expected_stock_codes(trade_date, 'daily')),
+                'field_status': {'turnover_rate': 'not_applicable_only_if_full_day_suspended',
+                    'volume_ratio': 'unknown', 'pe': 'unknown', 'pb': 'unknown',
+                    'total_mv': 'unknown', 'circ_mv': 'unknown'},
+                'acceptance': 'incomplete_not_certified'})
+            return
         if not expected or expected - observed:
             raise XiaodefaError(f"incomplete {dataset} response: "
                                f"{len(expected - observed)} missing instruments; expected universe={len(expected)}")
@@ -147,20 +157,8 @@ class TushareHistoryCollector:
         if reference.get('membership_date') == _iso(trade_date):
             expected -= set(reference.get('not_listed', []))
         if dataset in {'daily', 'moneyflow'}:
-            receipts = self.store.conn.execute(
-                "SELECT payload_json FROM multi_source_observation WHERE data_type='tushare_suspend_d_snapshot' "
-                "AND status='qualified' AND provider=? "
-                "AND json_extract_string(payload_json,'$.params.trade_date')=? "
-                "ORDER BY observed_at DESC LIMIT 1", [
-                    'xiaodefa' if self.offline else self._provider_name(self.client), _ymd(trade_date)]).fetchall()
-            for (payload,) in receipts:
-                receipt = json.loads(payload)
-                if receipt.get('params', {}).get('trade_date') != _ymd(trade_date):
-                    continue
-                rows = receipt['rows']
-                if (len({r.get('ts_code') for r in rows}) != len(rows)
-                        or any(r.get('trade_date') != _ymd(trade_date) for r in rows)):
-                    break  # Ambiguous suspension evidence cannot shrink the universe.
+            rows = self._suspension_rows(trade_date)
+            if rows is not None:
                 suspended = {r['ts_code'] for r in rows if r.get('trade_date') == _ymd(trade_date)
                              and r.get('suspend_type') == 'S' and r.get('suspend_timing') in (None, '')}
                 traded = {r[0] for r in self.store.conn.execute(
@@ -169,8 +167,23 @@ class TushareHistoryCollector:
                 # Independent full-day evidence needs no invented zero-price row.
                 # Conflicting traded evidence keeps the instrument required.
                 expected -= suspended - traded
-                break
         return expected
+
+    def _suspension_rows(self, trade_date):
+        receipt = self.store.conn.execute(
+            "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_suspend_d_snapshot' "
+            "AND status='qualified' AND provider=? AND json_extract_string(payload_json,'$.params.trade_date')=? "
+            "ORDER BY observed_at DESC LIMIT 1",
+            ['xiaodefa' if self.offline else self._provider_name(self.client), _ymd(trade_date)]).fetchone()
+        if not receipt or hashlib.sha256(receipt[0].encode()).hexdigest() != receipt[1]:
+            return None
+        payload = json.loads(receipt[0])
+        rows = payload.get('rows')
+        if not isinstance(rows, list) or len({r.get('ts_code') for r in rows}) != len(rows) or any(
+                not r.get('ts_code') or r.get('trade_date') != _ymd(trade_date)
+                or r.get('suspend_type') not in {'S', 'R'} for r in rows):
+            return None
+        return rows
 
     def _is_production_source(self) -> bool:
         return isinstance(self.client, XiaodefaClient)
@@ -332,24 +345,9 @@ class TushareHistoryCollector:
             'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
 
     def _reference_version(self):
-        receipt = self.store.conn.execute(
-            "SELECT observed_at,payload_json,payload_hash FROM multi_source_observation "
-            "WHERE data_type='tushare_stock_basic_snapshot' AND status='qualified' AND provider=? "
-            "ORDER BY observed_at DESC LIMIT 1", [
-                'xiaodefa' if self.offline else self._provider_name(self.client)]).fetchone()
-        if not receipt or not 0 <= (datetime.now() - receipt[0]).total_seconds() < 86400:
-            return None
-        if hashlib.sha256(receipt[1].encode()).hexdigest() != receipt[2]:
-            return None
-        payload = json.loads(receipt[1])
-        version = hashlib.sha256(_json(self._reference_rows()).encode()).hexdigest()
-        if payload.get('version') != version or payload.get('scope') != ['L', 'D']:
-            return None
-        membership = payload.get('listing_membership', {})
-        if membership and membership.get('as_of') != date.today().isoformat():
-            return None  # Negative membership never rolls into the next session.
-        return {'version': version, 'known_at': receipt[0].isoformat(), 'max_age_seconds': 86400,
-                'membership_date': membership.get('as_of'), 'not_listed': membership.get('not_listed', [])}
+        from trade_system.ths_quality import qualified_stock_reference
+        return qualified_stock_reference(self.store.conn,
+            provider='xiaodefa' if self.offline else self._provider_name(self.client))
 
     def _szse_listing_membership(self):
         """Dated complete exchange inventory, only for unresolved native dates."""
@@ -416,6 +414,45 @@ class TushareHistoryCollector:
             [encoded, hashlib.sha256(encoded.encode()).hexdigest()])
         return value
 
+    @staticmethod
+    def stock_listing_evidence(con, code):
+        receipt = con.execute(
+            "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+            "WHERE data_type='stock_listing_reference' AND provider='hithink' AND asset_code=? "
+            "AND observed_at>=current_timestamp-INTERVAL 1 DAY ORDER BY observed_at DESC LIMIT 1",
+            [code]).fetchone()
+        evidence = None
+        if receipt and hashlib.sha256(receipt[0].encode()).hexdigest() == receipt[1]:
+            cached = json.loads(receipt[0])
+            items = cached.get('item', [])
+            stamp = cached.get('timestamp')
+            age = (datetime.now() - receipt[2]).total_seconds()
+            if cached.get('error_type') and 0 <= age < 900:
+                raise XiaodefaError('native listing reference retry cooldown')
+            ttl = 86400 if len(items) == 1 and items[0].get('list_date') else 900
+            if (type(stamp) in (int, float) and 0 <= time.time()-stamp/1000 <= 86400
+                    and 0 <= age < ttl):
+                evidence = cached
+        if evidence is None:
+            from trade_system.hithink_client import HiThinkClient
+            native = HiThinkClient(timeout=10)
+            try:
+                evidence = native.stock_listing(code)
+            except Exception as exc:
+                evidence = {'error_type': type(exc).__name__, 'thscode': code}
+                encoded = _json(evidence)
+                con.execute("INSERT INTO multi_source_observation "
+                    "(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
+                    "VALUES ('stock_listing_reference','reference',?,'hithink','error',?,?)",
+                    [code, encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+                raise
+            encoded = _json(evidence)
+            con.execute(
+                "INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
+                "VALUES ('stock_listing_reference','reference',?,'hithink','received_unverified',?,?)",
+                [code, encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+        return evidence
+
     def _collect_reference(self, dataset, start=None, end=None):
         if dataset == "trade_cal":
             params = {"start_date": start, "end_date": end}
@@ -448,7 +485,6 @@ class TushareHistoryCollector:
             corrections = []
             membership = None
             not_listed = []
-            native = None
             for row in rows:
                 try:
                     listed = date.fromisoformat(_iso(row.get('list_date')))
@@ -460,30 +496,7 @@ class TushareHistoryCollector:
                 if len(corrections) >= 20 or not self._budget_left():
                     raise XiaodefaError('native listing repair budget exhausted')
                 code = row.get('ts_code')
-                receipt = self.store.conn.execute(
-                    "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
-                    "WHERE data_type='stock_listing_reference' AND provider='hithink' AND asset_code=? "
-                    "AND observed_at>=current_timestamp-INTERVAL 1 DAY ORDER BY observed_at DESC LIMIT 1",
-                    [code]).fetchone()
-                evidence = None
-                if receipt and hashlib.sha256(receipt[0].encode()).hexdigest() == receipt[1]:
-                    cached = json.loads(receipt[0])
-                    items = cached.get('item', [])
-                    stamp = cached.get('timestamp')
-                    age = (datetime.now() - receipt[2]).total_seconds()
-                    ttl = 86400 if len(items) == 1 and items[0].get('list_date') else 900
-                    if (type(stamp) in (int, float) and 0 <= time.time()-stamp/1000 <= 86400
-                            and 0 <= age < ttl):
-                        evidence = cached
-                if evidence is None:
-                    from trade_system.hithink_client import HiThinkClient
-                    native = native or HiThinkClient(timeout=10)
-                    evidence = native.stock_listing(code)
-                    encoded = _json(evidence)
-                    self.store.conn.execute(
-                        "INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
-                        "VALUES ('stock_listing_reference','reference',?,'hithink','received_unverified',?,?)",
-                        [code, encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+                evidence = self.stock_listing_evidence(self.store.conn, code)
                 items = evidence.get('item', [])
                 stamp = evidence.get('timestamp')
                 if (len(items) != 1 or items[0].get('thscode') != code

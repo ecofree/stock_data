@@ -295,6 +295,7 @@ def collect(
     start_date: str,
     end_date: str,
     ts_code: str | None = None,
+    latest_disclosed: bool = False,
 ) -> dict[str, Any]:
     client = XiaodefaClient()
     from trade_system.data_store import DuckDBStore
@@ -306,9 +307,32 @@ def collect(
             started = time.time()
             primary_error = None
             try:
+                source_date = trade_date
+                current = datetime.now()
+                day = datetime.fromisoformat(trade_date).date()
+                # Preserve the requested date; yesterday's margin is not today's.
+                pending = (kind == 'cyq' and current < datetime.combine(day, datetime.min.time()).replace(hour=19))
+                if kind in {'margin', 'margin_detail'}:
+                    from trade_system.trading_calendar import open_session_dates
+                    days = open_session_dates(store.conn, day.isoformat(), current.date().isoformat(), strict=True)
+                    pending = not any(d > day.isoformat() and
+                        (d < current.date().isoformat() or (current.hour, current.minute) >= (9, 5)) for d in days)
+                    if pending and latest_disclosed:
+                        from trade_system.trading_calendar import previous_open_session
+                        candidate = previous_open_session(store.conn, day.isoformat())
+                        if candidate:
+                            verified = open_session_dates(store.conn, candidate, current.date().isoformat(), strict=True)
+                            if any(d > candidate and (d < current.date().isoformat() or
+                                    (current.hour, current.minute) >= (9, 5)) for d in verified):
+                                source_date, pending = candidate, False
+                if pending:
+                    results[kind] = dict(status='awaiting_publication', table=spec['table'],
+                        source_date=trade_date, rows=0, elapsed_s=0,
+                        message='cyq: 19:00 same session; margin: next verified open session 09:05; no request sent')
+                    continue
                 try:
                     rows = spec["fetch"](client, argparse.Namespace(
-                        trade_date=trade_date,
+                        trade_date=source_date,
                         start_date=start_date,
                         end_date=end_date,
                         ts_code=ts_code,
@@ -323,11 +347,14 @@ def collect(
                     rows = []
                 fallback_used = False
                 if kind == "margin_detail" and len(rows) < int(spec.get("min_rows") or 1):
-                    fallback_rows = fetch_margin_detail_fallback(trade_date)
+                    fallback_rows = fetch_margin_detail_fallback(source_date)
                     if len(fallback_rows) >= int(spec.get("min_rows") or 1):
                         rows = fallback_rows
                         fallback_used = True
                 source_provider = "eastmoney_datacenter" if fallback_used else "xiaodefa"
+                if kind in {'cyq', 'margin', 'margin_detail'} and any(
+                        _iso_date(row.get('trade_date')) != source_date for row in rows):
+                    raise XiaodefaError('disclosed source date mismatch; rows not published')
                 if kind == "margin_detail":
                     if os.environ.get("KPL_RUNTIME_SCHEMA_READY", "").strip() != "1":
                         store.execute(
@@ -353,6 +380,8 @@ def collect(
                     "table": spec["table"],
                     "rows": stored,
                     "provider": source_provider,
+                    "requested_date": trade_date,
+                    "source_date": source_date,
                     "elapsed_s": round(time.time() - started, 1),
                     "primary_error": primary_error,
                 }
@@ -377,6 +406,7 @@ def main() -> int:
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--ts-code", default=None)
+    parser.add_argument('--latest-disclosed', action='store_true', help='Use a verified prior margin session before T+1 disclosure; preserve its date')
     parser.add_argument(
         "--kinds",
         default="cyq,hsgt,ggt,margin,margin_detail,float",
@@ -398,19 +428,20 @@ def main() -> int:
         start_date=start,
         end_date=end,
         ts_code=args.ts_code,
+        latest_disclosed=args.latest_disclosed,
     )
     failed = False
     for kind, info in outcomes.items():
-        mark = "OK " if info["status"] == "ok" else "ERR"
+        mark = "OK " if info["status"] == "ok" else "WAIT" if info['status'] == 'awaiting_publication' else "ERR"
         detail = (
-            f"rows={info['rows']}"
+            f"rows={info['rows']} source_date={info['source_date']} requested_date={info['requested_date']}"
             if info["status"] == "ok"
             else f"msg={info['message']}"
         )
         print(f"[{mark}] {kind:14s} -> {info['table']} ({detail}, {info['elapsed_s']}s)")
-        if info["status"] != "ok":
+        if info["status"] == "error":
             failed = True
-    return 1 if failed else 0
+    return 1 if failed else 4 if any(i['status'] == 'awaiting_publication' for i in outcomes.values()) else 0
 
 
 if __name__ == "__main__":

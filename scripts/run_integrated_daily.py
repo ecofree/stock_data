@@ -115,6 +115,7 @@ def main() -> int:
     if not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in run_id):
         parser.error("safe run id required")
     artifact_dir = Path(args.reports_dir).resolve() / "runs" / run_id
+    plan_as_of = args.as_of or datetime.now().isoformat()
     plan = command_plan(args.db, args.trade_date, include_collection=not args.skip_collect,
         signal_limit=args.signal_limit, reports_dir=str(artifact_dir), phase=selected_phase,
         as_of_time=args.as_of or None, collection_profile=args.collection_profile,
@@ -157,18 +158,22 @@ def main() -> int:
                 cwd=backend, capture_output=True, timeout=args.step_timeout, env=_utf8_subprocess_env())
             if initialization.returncode:
                 raise ValueError("collector schema initialization failed: "+initialization.stderr.decode("utf-8", "backslashreplace")[-500:])
-            failed, warnings = [], []
+            failed, warnings, pending = [], [], []
             from trade_system.collection_profiles import phase_tasks
             required = {task.name: task.required for task in phase_tasks(selected_phase)}
             for name, command, _ in plan:
                 from trade_system.collection_profiles import task_due
-                due, reason = task_due(args.db, args.trade_date, name, phase=selected_phase)
+                due, reason = task_due(args.db, args.trade_date, name, phase=selected_phase,
+                                       now=datetime.fromisoformat(plan_as_of))
                 if not due:
                     cooling_down = reason.startswith('retry cooldown')
-                    state = ('degraded' if required[name] else 'warning') if cooling_down else 'skipped'
+                    awaiting = reason.startswith('publication pending:')
+                    state = ('degraded' if required[name] else 'warning') if cooling_down else 'awaiting_publication' if awaiting else 'skipped'
                     manifest.add_step(name, state, command, reason=reason, required=required[name])
                     if cooling_down:
                         (failed if required[name] else warnings).append(name)
+                    if awaiting:
+                        pending.append(name)
                     continue
                 started = datetime.now()
                 log = artifact_dir / (name+".log")
@@ -191,19 +196,20 @@ def main() -> int:
                     code = -1
                     err += "\nBounded collector timeout"
                 log.write_text("[stdout]\n"+out+"\n[stderr]\n"+err, encoding="utf-8")
-                status = "completed" if code == 0 else "degraded" if required[name] else "warning"
+                disclosure_pending = code == 4 and name in {'collect_xiaodefa', 'collect_xiaodefa_critical'}
+                status = "awaiting_publication" if disclosure_pending else "completed" if code == 0 else "degraded" if required[name] else "warning"
                 manifest.upsert_step(name, status, command, return_code=code, log_path=str(log),
                                      required=required[name],
                                      request_context=context,
                                      duration_seconds=round((datetime.now()-started).total_seconds(), 3))
                 if code:
-                    (failed if required[name] else warnings).append(name)
+                    (pending if disclosure_pending and required[name] else failed if required[name] else warnings).append(name)
                 # Independent data sources still run after one provider fails.
                 # No failed run is reported as a successful publication.
             if selected_phase in ('close', 'supplemental'):
                 from trade_system.collection_profiles import publication_readiness
                 manifest.data['publication_readiness'] = publication_readiness(args.db, args.trade_date)
-            if selected_phase == 'supplemental' and not failed:
+            if selected_phase == 'supplemental' and not failed and not pending:
                 from trade_system.pipeline_runtime import latest_manifests
                 prior = latest_manifests(args.reports_dir).get((args.trade_date, 'close'))
                 if (prior and prior.get('scope') == manifest.data['scope']
@@ -213,7 +219,8 @@ def main() -> int:
                         'status': prior['status'], 'completed_at': prior.get('completed_at'),
                         'manifest_sha256': prior['_manifest_sha256'],
                         'scope': 'same_day_close_recovery_not_auction_or_intraday_replay'}
-            manifest.finish("completed_with_degradation" if failed else "completed_with_warnings" if warnings else "completed",
+            manifest.data['pending'] = pending
+            manifest.finish("completed_with_degradation" if failed else "awaiting_publication" if pending else "completed_with_warnings" if warnings else "completed",
                             ",".join(failed) or None, warnings=warnings)
             print(f"COLLECTION_COMPLETE date={args.trade_date} failed={len(failed)} user_pages_published=false manifest={manifest.path}")
             return 2 if failed else 0

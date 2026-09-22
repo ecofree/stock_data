@@ -10,6 +10,7 @@ from trade_system.units import _number
 from trade_system.ths_quality import (
     qualified_membership_snapshot as _ths_membership_snapshot,
     THS_MEMBERSHIP_MAX_AGE_DAYS,
+    qualified_stock_reference,
 )
 
 
@@ -89,6 +90,73 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
         report["status"] = "budget_exhausted"
         return [], report
     flows = {str(row[0]): row for row in selected}
+    original_members = actual
+    reference = qualified_stock_reference(con, now=now)
+    inapplicable = {}
+    applicability_receipts = []
+    from trade_system.ths_quality import _table_exists
+    if str(snap) == trade_date and _table_exists(con, 'ths_concept_stock_history'):
+        identities = {}
+        for concept, code, raw in con.execute("SELECT concept_code,stock_code,raw_json FROM ths_concept_stock_history "
+                "WHERE trade_date=CAST(? AS DATE) AND date_verified=TRUE", [str(snap)]).fetchall():
+            if code not in actual.get(str(concept), set()):
+                continue
+            try:
+                item = json.loads(raw)
+                ts_code = item.get('thscode', '')
+                if (item.get('provider') != 'hithink_index_api' or item.get('fetched_date') != str(snap)
+                        or item.get('ticker') != code or ts_code.split('.')[0] != code):
+                    continue
+                identities.setdefault(code, set()).add(ts_code.split('.')[-1])
+            except (ValueError, TypeError):
+                continue
+        inapplicable.update({code:'verified_non_a_share_market_NQ' for code, markets in identities.items()
+                             if markets == {'NQ'} and code not in flows})
+    if reference:
+        for ts_code, listed, delisted in con.execute(
+                'SELECT ts_code,list_date,delist_date FROM tushare_stock_basic').fetchall():
+            if listed and str(listed) > trade_date:
+                inapplicable[ts_code[:6]] = 'before_verified_listing_date'
+            elif delisted and str(delisted) <= trade_date:
+                inapplicable[ts_code[:6]] = 'after_verified_delisting_date'
+        if reference['membership_date'] == trade_date:
+            inapplicable.update({code[:6]: 'dated_official_not_listed' for code in reference['not_listed']})
+        for kind, code, raw, digest, observed in con.execute(
+                "SELECT data_type,asset_code,payload_json,payload_hash,observed_at FROM multi_source_observation "
+                "WHERE ((data_type='stock_listing_reference' AND provider='hithink') OR "
+                "(data_type='szse_listing_membership' AND provider='szse' AND status='qualified')) "
+                "AND observed_at BETWEEN ? AND ? "
+                "QUALIFY row_number() OVER(PARTITION BY data_type,asset_code ORDER BY observed_at DESC)=1",
+                [now-timedelta(days=1),now]).fetchall():
+            if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                continue
+            evidence = json.loads(raw)
+            if kind == 'szse_listing_membership':
+                listings = evidence.get('listings', {})
+                if (evidence.get('as_of') == trade_date and evidence.get('recordcount') == len(listings)
+                        and len(listings) >= 1000 and evidence.get('xlsx_sha256') and evidence.get('metadata_sha256')):
+                    inapplicable.update({s:'dated_official_not_listed' for stocks in actual.values() for s in stocks
+                                         if s.startswith(('0','3')) and s not in listings})
+                    applicability_receipts.append(digest)
+            else:
+                items, stamp = evidence.get('item', []), evidence.get('timestamp')
+                if (len(items) != 1 or items[0].get('thscode') != code or items[0].get('asset_type') != 'a-share'
+                        or not isinstance(stamp,(int,float)) or not 0 <= now.timestamp()-stamp/1000 <= 86400):
+                    continue
+                listed, ended = items[0].get('list_date'), items[0].get('end_date')
+                if listed and date.fromisoformat(listed) > date.fromisoformat(trade_date):
+                    inapplicable[str(code)[:6]] = 'before_verified_listing_date'
+                    applicability_receipts.append(digest)
+                elif ended and date.fromisoformat(ended) <= date.fromisoformat(trade_date):
+                    inapplicable[str(code)[:6]] = 'after_verified_delisting_date'
+                    applicability_receipts.append(digest)
+        # Conflicting same-day trading evidence must not shrink the denominator.
+        inapplicable = {code: reason for code, reason in inapplicable.items() if code not in flows}
+    actual = {concept: stocks - inapplicable.keys() for concept, stocks in actual.items()}
+    report['member_applicability'] = dict(reference=reference, receipt_sha256=sorted(set(applicability_receipts)),
+        excluded={code: reason for code, reason in inapplicable.items()
+                  if any(code in stocks for stocks in original_members.values())},
+        identity_policy='unknown_or_unmapped_codes_remain_required_no_name_based_alias')
     required_stocks = set().union(*actual.values())
     missing = sorted(required_stocks-set(flows))
     report.update(required_stocks=len(required_stocks),
@@ -107,10 +175,10 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
     fields = ("main_net", "super_net", "large_net", "mid_net", "small_net")
     for code, (name, _) in expected.items():
         absent = sorted(actual[code]-flows.keys())
-        if absent:
+        if absent or not actual[code]:
             excluded.append(dict(sector_code=code, sector_name=name,
                 missing_member_count=len(absent), missing_members=absent,
-                reason='缺少同日、同口径且未过期的成员资金'))
+                reason='缺少同日、同口径且未过期的成员资金' if absent else '没有经核验的当日适用成员'))
             continue
         inputs = [flows[s] for s in sorted(actual[code])]
         values = {}
@@ -136,6 +204,9 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
                          member_codes=sorted(actual[code]),
                          change_pct=_number(change), **values,
                          raw=dict(derived_from="multi_source_stock_flow",
+                                  original_member_codes=sorted(original_members[code]),
+                                  applicability_exclusions={s: inapplicable[s] for s in original_members[code] if s in inapplicable},
+                                  reference_version=reference['version'] if reference else None,
                                   member_stock_count=len(inputs), expected_member_count=len(inputs),
                                   membership_snapshot_date=str(snap),
                                   member_set_sha256=hashlib.sha256(json.dumps(sorted(actual[code])).encode()).hexdigest(),

@@ -22,6 +22,10 @@ from typing import Any
 class EastmoneyClistUnavailable(RuntimeError):
     """Raised when the clist circuit is cooling down after upstream resets."""
 
+    def __init__(self, message, retry_after_seconds=0):
+        super().__init__(message)
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds))
+
 
 class EastmoneyClistGuard:
     _lock = Lock()
@@ -78,7 +82,8 @@ class EastmoneyClistGuard:
             if remaining > 0:
                 raise EastmoneyClistUnavailable(
                     f"Eastmoney clist circuit cooling down for {int(remaining) + 1}s; "
-                    f"last_error={state.get('last_error') or 'transport reset'}"
+                    f"last_error={state.get('last_error') or 'transport reset'}",
+                    retry_after_seconds=remaining + 0.1,
                 )
 
     def record_failure(self, error: object, endpoint: str | None = None) -> dict[str, Any]:

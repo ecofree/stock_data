@@ -66,13 +66,16 @@ def _valid_rows(data, trade_date: str) -> list[dict]:
 
 
 def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds,
-                          expected_codes=None, catalogue_version=None):
+                          expected_codes=None, catalogue_version=None, budget_seconds=180):
     """Stage a bounded batch; never infer membership from matching row counts."""
     expected = set(expected_codes or [])
     if expected_codes is not None and (not expected or len(expected) != len(expected_codes)
             or not isinstance(catalogue_version, str) or not 1 <= len(catalogue_version) <= 256 or len(expected) > 10000
             or any(not isinstance(code, str) or not 1 <= len(code) <= 64 for code in expected)):
         raise ValueError('unique bounded expected codes and catalogue version required')
+    if not math.isfinite(budget_seconds) or not 0 < budget_seconds <= 600:
+        raise ValueError('sector page budget must be between 0 and 600 seconds')
+    deadline = time.monotonic() + budget_seconds
     staged, totals, errors, cursors = {}, set(), [], []
     invalid, duplicates, requests, primary_pages, reverse_pages = 0, 0, 0, 0, 0
     transport_size = 0
@@ -83,16 +86,25 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
         for page in range(1, max_pages + 1):
             raw, meta = None, {}
             for attempt in range(attempts):
+                if time.monotonic() >= deadline:
+                    errors.append('request_budget_exhausted')
+                    break
                 requests += 1
                 try:
-                    shared_host_limiter.acquire('eastmoney', max(float(pause_seconds), 1.0))
-                    raw, meta = _from_em_sector_flow_page(page=page, page_size=page_size,
-                        return_meta=True, sort_field='f12', sort_order=direction)
+                    from trade_system.http_transport import request_budget
+                    with request_budget(max(0.001, deadline-time.monotonic())):
+                        shared_host_limiter.acquire('eastmoney', max(float(pause_seconds), 1.0))
+                        raw, meta = _from_em_sector_flow_page(page=page, page_size=page_size,
+                            return_meta=True, sort_field='f12', sort_order=direction)
                     break
                 except Exception as exc:
                     errors.append(str(exc)[:300])
                     if attempt + 1 < attempts:
-                        time.sleep(min(5.0, 1.5*(attempt+1)))
+                        delay = max(min(5.0, 1.5*(attempt+1)), float(getattr(exc, 'retry_after_seconds', 0)))
+                        if time.monotonic() + delay >= deadline:
+                            errors.append('cooldown_exceeds_request_budget')
+                            break
+                        time.sleep(delay)
             cursor = {'direction':direction, 'page':page}
             cursors.append(cursor)
             if direction == '0': primary_pages += 1
@@ -457,7 +469,29 @@ def collect_full_sector_flow(
                 {'source':'eastmoney_sector_full','status':pagination['status']},
                 trade_date=trade_date)
 
+            identity_errors = []
+            try:
+                from trade_system.tushare_history import TushareHistoryCollector
+                from trade_system.http_transport import request_budget
+                with TushareHistoryCollector(':memory:', offline=True, connection=con) as reference:
+                    if reference._reference_version():
+                        _, preview = _prepare_ths_aggregate(con, trade_date, allow_subset=True)
+                        known = {r[0] for r in con.execute('SELECT stock_code FROM tushare_stock_basic').fetchall()}
+                        missing_ids = [code for code in preview.get('missing_stock_examples', []) if code not in known]
+                        if preview.get('missing_stock_count', 0) > 20:
+                            identity_errors.append('member identity budget exceeded; no requests')
+                        else:
+                            with request_budget(60):
+                                for code in missing_ids:
+                                    from trade_system.tushare_store import stock_code_to_ts_code
+                                    try:
+                                        reference.stock_listing_evidence(con, stock_code_to_ts_code(code))
+                                    except Exception as exc:
+                                        identity_errors.append(str(code)+': '+type(exc).__name__)
+            except (ValueError, RuntimeError, duckdb.Error) as exc:
+                identity_errors.append(type(exc).__name__)
             ths_result = _publish_ths_aggregate(store, trade_date)
+            ths_result['identity_acquisition_errors'] = identity_errors
             ths_snap = ths_result["ths_membership_snapshot"]
             ths_age = ths_result["ths_membership_age_days"]
             ths_members_stale = ths_age is None or ths_age > THS_MEMBERSHIP_MAX_AGE_DAYS

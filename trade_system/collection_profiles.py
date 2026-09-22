@@ -41,6 +41,14 @@ CommandStep = tuple[str, list[str], bool]
 TUSHARE_GAPFILL_LOOKBACK_DAYS = 10
 CLOSE_READINESS_MAX_AGE_SECONDS = 7200
 
+
+def close_datasets(trade_date: str, now: datetime | str | None = None) -> tuple[str, ...]:
+    """The 19:00 release is a prerequisite for final independent flow checks."""
+    current = as_local_naive(now or datetime.now())
+    early = ("daily", "daily_basic", "adj_factor")
+    return early if current < datetime.combine(date.fromisoformat(trade_date), time(19)) else (
+        *early, "moneyflow", "industry_flow")
+
 _TASKS = {
     "build_auction_evidence": ProfileTask("build_auction_evidence", "local auction snapshots", None, "normalize retained auction observations", network=False),
     'collect_market_context': ProfileTask('collect_market_context', 'KPL market/rise-fall', 300, 'native context; final data gate still requires qualified market context', network=True, required=False),
@@ -57,14 +65,14 @@ _TASKS = {
     'collect_auction_market_daily': ProfileTask('collect_auction_market_daily', 'TuShare stk_auction matched trades', None, 'dated matched results with declared units; cached native receipts, never preopen ticks', network=True),
     'collect_lhb_daily': ProfileTask('collect_lhb_daily', 'KPL LHB', None, 'explicit late disclosure; collector coverage cache', network=True),
     'collect_index_kline_daily': ProfileTask('collect_index_kline_daily', 'KPL index', None, 'bounded index history; collector coverage cache', network=True),
-    'collect_xiaodefa_critical': ProfileTask('collect_xiaodefa_critical', 'TuShare relay', None, 'late chips and margin evidence', network=True),
+    'collect_xiaodefa_critical': ProfileTask('collect_xiaodefa_critical', 'TuShare relay', None, 'late chips and margin enhancement; dated availability remains explicit', network=True, required=False),
     'backfill_2026_tushare': ProfileTask('backfill_2026_tushare', 'TuShare relay', None, 'resumable daily/basic/moneyflow history', network=True),
     'backfill_2026_ths_concepts': ProfileTask('backfill_2026_ths_concepts', 'THS web pages', 604800, 'weekly concept catalogue and constituents snapshot', network=True),
     'collect_history_supplement': ProfileTask('collect_history_supplement', 'provider fallback graph', None, 'financials, statements, margin and historical northbound', network=True),
     'collect_ths_concepts_api': ProfileTask('collect_ths_concepts_api', 'HiThink official concept catalogue', 86400, 'qualified same-date catalogue and members', network=True),
     'collect_advanced_lhb_daily': ProfileTask('collect_advanced_lhb_daily', 'KPL advanced LHB', None, 'bounded disclosed LHB supplement', network=True, required=False),
     'collect_northbound_daily': ProfileTask('collect_northbound_daily', 'provider-defined northbound', None, 'unverified product; explicit bounded collection only', network=True, required=False),
-    'collect_xiaodefa': ProfileTask('collect_xiaodefa', 'TuShare via xiaodefa', None, 'declared date/range kinds; bounded collector budget', network=True),
+    'collect_xiaodefa': ProfileTask('collect_xiaodefa', 'TuShare via xiaodefa', None, 'declared date/range enhancement; bounded collector budget', network=True, required=False),
     'derive_market_context': ProfileTask('derive_market_context', 'local stored facts', None, 'local projection or quality check', network=False),
     'build_normalized_views': ProfileTask('build_normalized_views', 'local stored facts', None, 'local projection or quality check', network=False),
     'reconcile_independent_stock_flow': ProfileTask('reconcile_independent_stock_flow', 'local stored facts', None, 'local projection or quality check', network=False),
@@ -117,7 +125,7 @@ def command_plan(
         "--start-date", (date.fromisoformat(selected_date) - timedelta(days=TUSHARE_GAPFILL_LOOKBACK_DAYS)
                          if phase == 'close' else date.fromisoformat(selected_date)).strftime('%Y%m%d'),
         "--end-date", selected_date.replace('-', ''),
-        "--datasets", "daily,daily_basic,adj_factor,moneyflow,industry_flow", "--gap-only", "--max-days", "1",
+        "--datasets", ",".join(close_datasets(selected_date, as_of_time)), "--gap-only", "--max-days", "1",
         "--retry-passes", "0" if phase == 'supplemental' else "1", "--retry-delay-seconds", "2.0",
         "--report", report("tushare_close_latest.md")], False)
     steps: list[CommandStep] = []
@@ -192,7 +200,7 @@ def command_plan(
                  "--trade-date", selected_date,
                  "--start-date", selected_date,
                  "--end-date", (date.fromisoformat(selected_date) + timedelta(days=14)).strftime("%Y-%m-%d"),
-                 "--kinds", "cyq,margin,float,premarket,kpl,hk_hold"], False),
+                 "--kinds", "cyq,margin,float,premarket,kpl,hk_hold", "--latest-disclosed"], False),
                 # L2 is an intraday-only source.  After the market closes the
                 # upstream endpoint normally returns an empty payload, so the
                 # close phase reuses the last same-day intraday snapshot.
@@ -216,7 +224,7 @@ def command_plan(
                 collection_steps = [step for step in collection_steps if step[0] in retained]
                 collection_steps.append(("collect_xiaodefa_critical", [py, "scripts/collect_xiaodefa.py",
                     "--db", db_path, "--trade-date", selected_date, "--start-date", selected_date,
-                    "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail"], False))
+                    "--end-date", selected_date, "--kinds", "cyq,margin,margin_detail", "--latest-disclosed"], False))
         elif phase == "history":
             start = history_start or "20260101"
             end = history_end or selected_date.replace("-", "")
@@ -253,7 +261,8 @@ def command_plan(
             ("audit_multisource_readiness", [py, "scripts/audit_multisource_readiness.py", "--db", db_path,
              "--as-of", selected_date, "--out", report("multisource_readiness_latest.md")], False),
             ("check_capital_flow_health", [py, "scripts/check_capital_flow_health.py", "--db", db_path,
-             "--stage", selected_phase,
+             "--stage", ("intraday" if selected_phase == "close" and
+                         "moneyflow" not in close_datasets(selected_date, as_of_time) else selected_phase),
              "--date", selected_date, "--max-age-seconds", str(age), "--min-coverage-pct", "99.5",
              "--out", report("capital_flow_freshness_latest.md"),
              *(["--as-of", as_of_time] if as_of_time else [])], False),
@@ -381,13 +390,16 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
     task = next((item for item in tasks if item.name == task_name), None)
     if task is None:
         raise ValueError(f"unregistered task in phase {phase}: {task_name}")
+    current = now or datetime.now()
+    if (task_name == 'reconcile_independent_stock_flow'
+            and 'moneyflow' not in close_datasets(trade_date, current)):
+        return False, 'publication pending: independent moneyflow available after 19:00 Asia/Shanghai'
     if not task.network:
         return True, "declared local computation"
     if force:
         return True, "explicit forced request"
     if task.cadence_seconds is None:
         return True, "declared bounded collector/checkpoint policy"
-    current = now or datetime.now()
     try:
         con = duckdb.connect(str(db_path), read_only=True)
     except Exception:
@@ -439,7 +451,7 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
         elif task_name == "sync_tushare_close":
             if not _table_exists(con, "history_fetch_checkpoint"):
                 return True, "TuShare history checkpoint missing"
-            required = ("daily", "daily_basic", "adj_factor", "moneyflow", "industry_flow")
+            required = close_datasets(trade_date, current)
             placeholders = ",".join("?" for _ in required)
             row = _latest(
                 con,

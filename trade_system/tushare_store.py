@@ -21,6 +21,8 @@ def stock_code_to_ts_code(code: str) -> str:
     digits = "".join(ch for ch in value if ch.isdigit())
     if digits and len(digits) <= 6:
         digits = digits.zfill(6)
+    if digits.startswith('92'):
+        return f"{digits}.BJ"
     if digits.startswith(("6", "9")):
         return f"{digits}.SH"
     if digits.startswith(("4", "8")):

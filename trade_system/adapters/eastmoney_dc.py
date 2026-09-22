@@ -66,7 +66,7 @@ def _em_get_clist_json(params=None, timeout=15):
         ("https://push2.eastmoney.com/api/qt/clist/get", DEFAULT_CLIST_GUARD, "eastmoney"),
         ("https://push2delay.eastmoney.com/api/qt/clist/get", DELAY_CLIST_GUARD, "eastmoney_delay"),
     )
-    errors = []
+    errors, cooldowns = [], []
     for endpoint, guard, source in routes:
         if time.monotonic() >= deadline:
             break
@@ -74,6 +74,7 @@ def _em_get_clist_json(params=None, timeout=15):
             guard.assert_available()
         except EastmoneyClistUnavailable as exc:
             errors.append(f"{source}: {exc}")
+            cooldowns.append(exc.retry_after_seconds)
             continue
         try:
             payload = _em_get_json(endpoint, request_params, timeout=deadline-time.monotonic())
@@ -87,7 +88,12 @@ def _em_get_clist_json(params=None, timeout=15):
         except Exception as exc:
             guard.record_failure(exc, endpoint=endpoint)
             errors.append(f"{source}: {exc}")
-    raise RuntimeError("; ".join(errors) or "Eastmoney clist unavailable")
+            try:
+                guard.assert_available()
+            except EastmoneyClistUnavailable as cooling:
+                cooldowns.append(cooling.retry_after_seconds)
+    raise EastmoneyClistUnavailable("; ".join(errors) or "Eastmoney clist unavailable",
+                                   min(cooldowns) if len(cooldowns) == len(routes) else 0)
 
 
 def _em_datacenter(report_name, filter_str="", page_size=50,

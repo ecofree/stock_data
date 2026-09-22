@@ -568,8 +568,16 @@ def assess_trade_date_readiness(
                     group_results[-1]["status"] = "invalid"
             if group_name == "kline" and table_exists(con, "tushare_stock_basic"):
                 expected = int(con.execute(
-                    "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL"
+                    "SELECT count(DISTINCT ts_code) FROM tushare_stock_basic WHERE ts_code IS NOT NULL "
+                    "AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
+                    "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [trade_date, trade_date]
                 ).fetchone()[0] or 0)
+                if table_exists(con, 'close_snapshot_certification'):
+                    certified = con.execute("SELECT expected_rows,distinct_codes FROM close_snapshot_certification "
+                        "WHERE dataset='daily' AND trade_date=CAST(? AS DATE) AND status='certified' "
+                        "AND invalid_rows=0 AND coverage_pct>=99.5 ORDER BY fetched_at DESC LIMIT 1", [trade_date]).fetchone()
+                    if certified and certified[0] >= 1000 and certified[1] >= certified[0]:
+                        expected = int(certified[0])
                 selected = group_results[-1].get("selected_relation")
                 selected_rows = next(
                     (int(item.get("rows") or 0) for item in relations if item.get("relation") == selected),

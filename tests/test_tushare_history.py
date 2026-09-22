@@ -189,6 +189,9 @@ def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tm
 
 def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
     import json
+    from trade_system.tushare_store import stock_code_to_ts_code
+    assert stock_code_to_ts_code('920009') == '920009.BJ'
+    assert stock_code_to_ts_code('900901') == '900901.SH'
     client = ScopedFixture()
     with TushareHistoryCollector(tmp_path / "plan.duckdb", client=client) as c:
         seed_calendar(c)
@@ -207,8 +210,7 @@ def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
             dict(ts_code='000005.SZ', trade_date='20260701', suspend_type='S', suspend_timing='09:30-10:00'),
             dict(ts_code='000006.SZ', trade_date='20260701', suspend_type='R', suspend_timing=''),
         ])
-        c.store.conn.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json) "
-            "VALUES ('tushare_suspend_d_snapshot','custom','qualified',?)", [json.dumps(evidence)])
+        c._record_snapshot('suspend_d', evidence)
         # No daily placeholder exists for the independently confirmed full-day suspension.
         assert c._applicable_codes({'000004.SZ','000005.SZ','000006.SZ','000007.SZ'}, '20260701', 'daily') == {
             '000005.SZ', '000006.SZ', '000007.SZ'}
@@ -442,6 +444,28 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         assert result["results"][0]["status"] == "error"
         assert c.store.conn.execute("SELECT status FROM history_fetch_checkpoint").fetchone()[0] == 'error'
         assert c.store.conn.execute("SELECT pe FROM tushare_daily_basic").fetchone()[0] == 10
+        # A qualified partial response is useful evidence but cannot certify
+        # missing suspended-stock valuation fields or manufacture zeros.
+        import json
+        import pytest
+        from trade_system.xiaodefa_source import XiaodefaError
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000002.SZ')")
+        c._record_snapshot('suspend_d', dict(params={'trade_date':'20260701'}, rows=[
+            dict(ts_code='000002.SZ', trade_date='20260701', suspend_type='S', suspend_timing='')]))
+        c._is_production_source = lambda: True
+        rows = [dict(ts_code='000001.SZ',trade_date='20260701',pe=12)]
+        c._validate_stock_snapshot('daily_basic', rows, '20260701')
+        c._query_date_batch = lambda *a, **k: rows
+        with pytest.raises(XiaodefaError, match='lack qualified fields'):
+            c._collect_daily_basic('20260701')
+        assert c.store.conn.execute("SELECT pe FROM tushare_daily_basic").fetchall() == [(12,)]
+        gap = json.loads(c.store.conn.execute("SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='tushare_daily_basic_gaps_snapshot'").fetchone()[0])
+        assert gap['full_day_suspended'] == ['000002.SZ']
+        assert gap['field_status']['pe'] == 'unknown' and gap['acceptance'] == 'incomplete_not_certified'
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='tampered' "
+            "WHERE data_type='tushare_suspend_d_snapshot'")
+        assert '000002.SZ' in c._expected_stock_codes('20260701', 'daily')
 
 
 def test_stored_price_cannot_fill_an_unknown_calendar_day(tmp_path):

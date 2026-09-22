@@ -30,6 +30,41 @@ def test_ths_complete_aggregate_replaces_slice_and_preserves_unknown_buckets(tmp
         assert result['promoted'] and result['status']=='success'
         assert store.con.execute('SELECT sector_code,main_net,large_net FROM multi_source_sector_flow').fetchall() == [('THS-A',30,None)]
         assert result['membership_pairs']==2 and result['missing_stock_count']==0
+        # Dated lifecycle evidence changes applicability, never raw membership.
+        import hashlib, json
+        from trade_system.schema import init_schema
+        init_schema(store.con)
+        store.con.execute('CREATE OR REPLACE VIEW v_default_concept_daily AS SELECT * FROM fixture_catalog')
+        store.con.execute('CREATE OR REPLACE VIEW v_default_concept_stock_history AS SELECT * FROM fixture_members')
+        store.con.execute("INSERT INTO tushare_stock_basic(ts_code,stock_code,list_date) "
+            "VALUES ('000001.SZ','000001','2000-01-01'),('000002.SZ','000002','2026-09-12')")
+        reference=store.con.execute('SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date '
+                                    'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
+        payload=json.dumps(dict(scope=['L','D'],version=hashlib.sha256(json.dumps(reference,
+            ensure_ascii=False,default=str,separators=(',',':')).encode()).hexdigest()),separators=(',',':'))
+        store.con.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json,payload_hash,observed_at) "
+            "VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,?,'2026-09-11 16:00:00')",
+            [payload,hashlib.sha256(payload.encode()).hexdigest()])
+        # Existing same-day flow conflicts with the future listing: do not exclude it.
+        result=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert not result['member_applicability']['excluded']
+        store.con.execute("DELETE FROM multi_source_stock_flow WHERE stock_code='000002'")
+        result=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert result['promoted'] and result['member_applicability']['excluded']=={'000002':'before_verified_listing_date'}
+        assert store.con.execute('SELECT count(*) FROM fixture_members').fetchone()[0]==2
+        store.con.execute("UPDATE multi_source_observation SET payload_hash='tampered' WHERE data_type='tushare_stock_basic_snapshot'")
+        result=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert not result['promoted'] and result['missing_stock_examples']==['000002']
+        store.con.execute("INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,provider,flow_definition,amount_unit,fetched_at,is_stale) "
+                          "SELECT source_date,'000002',20,provider,flow_definition,amount_unit,fetched_at,is_stale FROM multi_source_stock_flow LIMIT 1")
+        store.con.execute("INSERT INTO fixture_members VALUES ('2026-09-11','THS-A','834683')")
+        store.con.execute('UPDATE fixture_catalog SET stock_count=3')
+        store.con.execute("INSERT INTO ths_concept_stock_history(trade_date,concept_code,stock_code,date_verified,raw_json) "
+            "VALUES ('2026-09-11','THS-A','834683',true,?)", [json.dumps(dict(
+                thscode='834683.NQ',ticker='834683',provider='hithink_index_api',fetched_date='2026-09-11'))])
+        result=collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert result['promoted'] and result['member_applicability']['excluded']=={'834683':'verified_non_a_share_market_NQ'}
+        assert store.con.execute('SELECT count(*) FROM fixture_members').fetchone()[0]==3
         store.con.execute("UPDATE multi_source_stock_flow SET provider='xiaodefa_moneyflow_dc',origin_provider='eastmoney',source_api='moneyflow_dc'")
         assert collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))['promoted']
         store.con.execute("UPDATE multi_source_stock_flow SET origin_provider='unknown'")
@@ -302,6 +337,26 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         ).fetchone()[0] == 4
     finally:
         con.close()
+
+    from trade_system.eastmoney_clist_guard import EastmoneyClistUnavailable
+    clock = [0.0]; attempts = []
+    monkeypatch.setattr(collector.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(collector.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    def guarded_page(**kwargs):
+        attempts.append(clock[0])
+        if clock[0] < 30:
+            raise EastmoneyClistUnavailable('fixture cooldown', 30-clock[0])
+        return [_row('BK0001')], {'total':1}
+    monkeypatch.setattr(collector, '_from_em_sector_flow_page', guarded_page)
+    with MultiSourceStore(db) as store:
+        rows, receipt = collector._collect_sector_pages(store,'2026-07-24',10,2,0,
+            expected_codes=['BK0001'],catalogue_version='fixture',budget_seconds=60)
+        assert receipt['status']=='complete' and attempts==[0,30]
+        clock[0]=0; attempts.clear()
+        rows, receipt = collector._collect_sector_pages(store,'2026-07-24',10,2,0,
+            expected_codes=['BK0001'],catalogue_version='fixture',budget_seconds=20)
+        assert receipt['status']!='complete' and attempts==[0]
+        assert 'cooldown_exceeds_request_budget' in receipt['errors']
 
 
 @pytest.mark.parametrize('failure', ['duplicate_pages', 'changed_total', 'wrong_date', 'nonfinite'])

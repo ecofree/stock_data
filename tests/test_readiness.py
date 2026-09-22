@@ -93,6 +93,12 @@ def test_close_readiness_requires_same_date_capital_flows(tmp_path):
 
     assert result["ready"] is False
     assert result["missing_groups"] == ["sector_capital_flow"]
+    with duckdb.connect(str(db_path)) as con:
+        con.execute('CREATE TABLE tushare_stock_basic(ts_code VARCHAR,list_date DATE,delist_date DATE)')
+        con.execute("INSERT INTO tushare_stock_basic SELECT 'old'||i,'2000-01-01','2026-07-01' FROM range(2000) t(i)")
+        con.execute("INSERT INTO tushare_stock_basic VALUES ('000001.SZ','2000-01-01',NULL),('new','2026-07-10',NULL)")
+    result = assess_trade_date_readiness(db_path, '2026-07-09', 'close')
+    assert result['missing_groups'] == ['sector_capital_flow']
 
 
 def test_intraday_readiness_passes_when_both_capital_flows_are_current(tmp_path):
