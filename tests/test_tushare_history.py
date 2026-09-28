@@ -274,6 +274,8 @@ def test_forced_empty_refresh_cannot_reuse_old_rows_as_success(tmp_path):
 
 
 def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path, monkeypatch):
+    from datetime import date
+
     class Repeating(XiaodefaClient):
         def __init__(self):
             super().__init__(token="fixture")
@@ -284,6 +286,8 @@ def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path
             return [{"ts_code": "000001.SZ", "trade_date": "20260701", "close": 10}] * 100
     with TushareHistoryCollector(tmp_path / "pages.duckdb", client=Repeating(), batch_limit=100) as c:
         monkeypatch.setattr(c, '_bse_listing_membership', lambda: None)
+        monkeypatch.setattr(c, '_exchange_listing_membership', lambda exchange='SZ': {
+            'as_of': date.today().isoformat(), 'listings': {'000001': '1991-04-03'}})
         seed_calendar(c)
         result = c.run("20260701", "20260701", datasets=["daily"], stock_codes=["1"])
         assert result["results"][0]["status"] == "error"
