@@ -30,14 +30,17 @@ def build(run, result):
             g=g.sort_values(['ret_20d','instrument'],ascending=[False,True])
             ic=g.ret_20d.rank().corr(g.label_next_ret.rank()) if g.ret_20d.nunique()>1 and g.label_next_ret.nunique()>1 else None
             daily.append({'date':day,'samples':len(g),'rank_ic':float(ic) if ic is not None else None,
-                'momentum_top5_target_pct':float(g.head(5).label_next_ret.mean()),
+                'selection_eligible':len(g)>5,
+                'momentum_top5_target_pct':float(g.head(5).label_next_ret.mean()) if len(g)>5 else None,
                 'equal_weight_target_pct':float(g.label_next_ret.mean())})
         folds.append({'fold':fold['fold'],'test_identity_sha256':identity(ids),'samples':len(part)})
     if len({d['date'] for d in daily})!=len(daily):raise ValueError('repeated out-of-sample date')
     summary={'samples':sum(d['samples'] for d in daily),'days':len(daily),'mse':None,
         'mean_daily_rank_ic':float(np.mean([d['rank_ic'] for d in daily if d['rank_ic'] is not None])) if any(d['rank_ic'] is not None for d in daily) else None,
-        'momentum_top5_target_pct':float(np.mean([d['momentum_top5_target_pct'] for d in daily])),
-        'equal_weight_target_pct':float(np.mean([d['equal_weight_target_pct'] for d in daily]))}
+        'selection_days':sum(d['selection_eligible'] for d in daily),
+        'momentum_top5_target_pct':float(np.mean([d['momentum_top5_target_pct'] for d in daily if d['selection_eligible']])) if any(d['selection_eligible'] for d in daily) else None,
+        'equal_weight_target_pct':float(np.mean([d['equal_weight_target_pct'] for d in daily if d['selection_eligible']])) if any(d['selection_eligible'] for d in daily) else None,
+        'all_days_equal_weight_target_pct':float(np.mean([d['equal_weight_target_pct'] for d in daily]))}
     value={'contract':CONTRACT,'summary':summary,'folds':folds,'daily':daily,
         'feature_sha256':file_hash(run/'dataset/features.parquet'),'source_sha256':file_hash(__file__),
         'execution_ready':False,'portfolio_backtest':False}

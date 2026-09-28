@@ -51,6 +51,17 @@ def validate_plan(plan):
             raise ValueError('explicit feature identifiers required')
     if plan['comparison_baseline'] not in variants:
         raise ValueError('explicit paired feature baseline required')
+    if plan.get('comparison_mode','common_cohort') not in {'common_cohort','full_pipeline'}:
+        raise ValueError('explicit common cohort or full pipeline comparison required')
+    families=plan.get('family_columns',{})
+    if not isinstance(families,dict) or any(name not in variants or not cols or
+            not set(cols)<=set(variants[name]) for name,cols in families.items()):
+        raise ValueError('family columns must belong to their registered variant')
+    policy=plan.get('value_policy',{'minimum_days':20,'minimum_mse_improvement':0.0})
+    if (type(policy.get('minimum_days')) is not int or policy['minimum_days']<5
+            or not isinstance(policy.get('minimum_mse_improvement'),(float,int))
+            or not np.isfinite(policy['minimum_mse_improvement']) or policy['minimum_mse_improvement']<0):
+        raise ValueError('predeclared finite value thresholds required')
     roles = plan.get('feature_roles', {})
     declared_features = {f for fs in variants.values() for f in fs}
     if not isinstance(roles,dict) or not set(roles)<=declared_features or any(r not in {'required','optional_event','structural_constant'} for r in roles.values()):
@@ -186,18 +197,31 @@ def daily_metrics(prediction, test, top_k):
         correlation = pred.rank().corr(actual.rank()) if pred.nunique()>1 and actual.nunique()>1 else None
         rows.append({'date':day,'samples':len(actual),'mse':float(((pred-actual)**2).mean()),
                      'rank_ic':float(correlation) if correlation is not None and np.isfinite(correlation) else None,
-                     'top_k_effective':min(top_k,len(score)),'top_k_label_mean_pct':float(score.head(top_k).label.mean())})
+                     'selection_eligible':len(score)>top_k,
+                     'top_k_effective':top_k if len(score)>top_k else 0,
+                     'top_k_label_mean_pct':float(score.head(top_k).label.mean()) if len(score)>top_k else None,
+                     'equal_weight_label_mean_pct':float(score.label.mean()),
+                     'selected_instruments':score.head(top_k).instrument.tolist() if len(score)>top_k else [],
+                     'selection_gap':None if len(score)>top_k else 'cross_section_not_larger_than_top_k'})
     return rows
 
 
 def summarize(daily, costs):
     count = sum(r['samples'] for r in daily)
     values = [r['rank_ic'] for r in daily if r['rank_ic'] is not None]
-    mean_label = float(np.mean([r['top_k_label_mean_pct'] for r in daily]))
+    eligible=[r for r in daily if r['top_k_label_mean_pct'] is not None]
+    mean_label = float(np.mean([r['top_k_label_mean_pct'] for r in eligible])) if eligible else None
+    turnover=[1-len(set(a['selected_instruments'])&set(b['selected_instruments']))/len(b['selected_instruments'])
+              for a,b in zip(daily,daily[1:]) if a.get('selected_instruments') and b.get('selected_instruments')]
     return {'samples':count,'days':len(daily),'mse':sum(r['mse']*r['samples'] for r in daily)/count,
             'mean_daily_rank_ic':float(np.mean(values)) if values else None,'rank_ic_days':len(values),
             'top_k_mean_label_pct':mean_label,
-            'cost_sensitivity_label_proxy_pct':{str(c):mean_label-c/100 for c in costs},
+            'selection_days':len(eligible),'insufficient_selection_days':len(daily)-len(eligible),
+            'equal_weight_label_mean_pct':float(np.mean([r['equal_weight_label_mean_pct'] for r in eligible])) if eligible else None,
+            'cost_sensitivity_label_proxy_pct':{str(c):mean_label-c/100 if mean_label is not None else None for c in costs},
+            'worst_selection_day_label_pct':min(r['top_k_label_mean_pct'] for r in eligible) if eligible else None,
+            'selection_replacement_ratio':float(np.mean(turnover)) if turnover else None,
+            'unfilled_orders':None,'provider_cost':None,'portfolio_drawdown':None,
             'portfolio_return':None,'scope':'label_and_equal_weight_top_k_opportunity_proxy_not_portfolio_backtest'}
 
 
@@ -224,6 +248,42 @@ def source_fingerprint():
     names = ['trade_system/v2/rolling_research.py','trade_system/v2/ml_protocol.py',
              'trade_system/v2/domain.py']
     return {name:file_hash(root/name) for name in names}
+
+
+def family_frames(frames, plan, name):
+    families=plan.get('family_columns',{})
+    cols=sorted({f for columns in families.values() for f in columns}) if plan.get('comparison_mode','common_cohort')=='common_cohort' else families.get(name,[])
+    selected={};gaps={}
+    for segment,frame in frames.items():
+        mask=frame[cols].notna().all(axis=1) if cols else pd.Series(True,index=frame.index)
+        selected[segment]=frame[mask].copy()
+        gaps[segment]={'required':len(frame),'eligible':int(mask.sum()),
+            'missing_identities':frame.loc[~mask,['datetime','instrument']].values.tolist()}
+        if selected[segment].empty:raise ValueError(f'{name}: no {segment} rows with registered family inputs')
+    return selected,gaps
+
+
+def value_decisions(all_daily, plan, runtime):
+    """Negative/inconclusive results are closed outcomes, never auto promotion."""
+    baseline=all_daily[plan['comparison_baseline']]
+    policy=plan.get('value_policy',{'minimum_days':20,'minimum_mse_improvement':0.0})
+    result={}
+    for name,rows in all_daily.items():
+        if name in (plan['comparison_baseline'],'constant'):continue
+        same=([r['date'] for r in rows]==[r['date'] for r in baseline]
+              and plan.get('comparison_mode','common_cohort')=='common_cohort')
+        comparison=paired_comparison(rows,baseline,plan['seed']) if same else None
+        sufficient=(same and len(rows)>=policy['minimum_days'] and all(r.get('selection_eligible',False) for r in rows))
+        positive=bool(sufficient and comparison['moving_block_bootstrap_95pct'][1] < -policy['minimum_mse_improvement'])
+        decision='independent_review_required' if positive else 'retain_baseline_no_positive_increment' if sufficient else 'inconclusive_keep_baseline'
+        if runtime.get('model_backend')=='injected_test_backend_not_qlib':decision='test_backend_not_value_evidence'
+        result[name]={'decision':decision,'paired_comparison':comparison,'days':len(rows),
+            'predeclared_policy':policy,'comparison_mode':plan.get('comparison_mode','common_cohort'),
+            'fee_turnover_capacity_evidence':'not_portfolio_accounting',
+            'operations_action':'keep_offline_family_pending_independent_evidence' if positive
+                else 'do_not_expand_paid_collection_keep_price_baseline',
+            'source_causality':'not_established','auto_promote':False,'execution_ready':False}
+    return result
 
 
 def runtime_versions():
@@ -255,7 +315,15 @@ def register_experiment(root, feature_path, plan, *, registered_at=None):
     features = set(f for fs in plan['variants'].values() for f in fs)
     if not features<=set(meta['feature_columns']) or plan['label_definition']!=meta['label_definition'] or plan['availability_assumption']!=meta['availability_assumption']:
         raise ValueError('registered feature/label/availability contract differs from export metadata')
+    # Inspect capacity before initializing QLib or spending any fit budget.
+    preview=load_frame(path,sorted(features),plan['max_rows'])
+    counts=preview.groupby('datetime').instrument.nunique()
+    capacity={'sessions':len(counts),'minimum_cross_section':int(counts.min()),
+        'top_k':plan['top_k'],'insufficient_dates':counts[counts<=plan['top_k']].index.tolist(),
+        'selection_scope':'identity_capacity_before_label_and_family_eligibility',
+        'missing_feature_rows':{f:int(preview[f].isna().sum()) for f in sorted(features)}}
     record = {'plan':plan,'feature_path':str(path),'artifact_hashes':hashes,
+        'capacity_preflight':capacity,
         'metadata_path':str(metadata),'metadata_sha256':file_hash(metadata),'source_hashes':source_fingerprint(),
         'registered_at':utc(registered_at or datetime.now().astimezone()).isoformat(),
         'runtime_versions':runtime_versions(),
@@ -324,22 +392,29 @@ def run_experiment(folder, *, fit=None):
         for index,fold in enumerate(partition['folds']):
             frames,coverage = fold_frames(frame,fold,plan['evaluation_asof'],partition['final_holdout'][0])
             # Validate every paired group before spending this fold's fit budget.
-            for columns in plan['variants'].values():
-                FoldDataset(frames,columns,roles=plan.get('feature_roles'))
-            target = frames['test'].set_index(['datetime','instrument']).sort_index()
+            prepared={}
+            for name,columns in plan['variants'].items():
+                variant_frames,gaps=family_frames(frames,plan,name)
+                FoldDataset(variant_frames,columns,roles=plan.get('feature_roles'))
+                prepared[name]=(variant_frames,gaps)
+            baseline_frames=prepared[plan['comparison_baseline']][0]
+            target = baseline_frames['test'].set_index(['datetime','instrument']).sort_index()
             ids = [[str(d),str(i)] for d,i in target.index]
             folder_fold = out/f'fold-{index:02d}'; folder_fold.mkdir()
             dump(folder_fold/'test_ids.json',ids)
             row = {'fold':index,'partition':fold,'coverage':coverage,'test_identity_sha256':identity(ids),'variants':{}}
             for name,columns in plan['variants'].items():
                 variant_dir = folder_fold/name; variant_dir.mkdir()
-                prediction,details = fit(frames,columns,plan,variant_dir)
-                daily = daily_metrics(prediction,frames['test'],plan['top_k']); all_daily[name].extend(daily)
+                variant_frames,gaps=prepared[name]
+                dump(variant_dir/'coverage.json',gaps)
+                dump(variant_dir/'test_ids.json',variant_frames['test'][['datetime','instrument']].values.tolist())
+                prediction,details = fit(variant_frames,columns,plan,variant_dir)
+                daily = daily_metrics(prediction,variant_frames['test'],plan['top_k']); all_daily[name].extend(daily)
                 prediction.rename('prediction').to_csv(variant_dir/'predictions.csv')
                 dump(variant_dir/'preprocessing.json',details)
                 row['variants'][name] = summarize(daily,plan['round_trip_cost_bps'])
-            constant = pd.Series(float(frames['train'].label_next_ret.mean()),index=target.index)
-            daily = daily_metrics(constant,frames['test'],plan['top_k']); all_daily['constant'].extend(daily)
+            constant = pd.Series(float(baseline_frames['train'].label_next_ret.mean()),index=target.index)
+            daily = daily_metrics(constant,baseline_frames['test'],plan['top_k']); all_daily['constant'].extend(daily)
             row['variants']['constant'] = summarize(daily,plan['round_trip_cost_bps'])
             dump(folder_fold/'metrics.json',row); reports.append(row)
         if any(len({r['date'] for r in ds})!=len(ds) for ds in all_daily.values()):
@@ -348,7 +423,10 @@ def run_experiment(folder, *, fit=None):
         baseline = all_daily[plan['comparison_baseline']]
         result = {'registration_id':record['registration_id'],'scope':'historical_research_only','execution_ready':False,
             'signal_impact':'disabled','champion_changed':False,'runtime':runtime,'folds':reports,'aggregate':aggregate,
-            'paired_comparisons':{name:paired_comparison(ds,baseline,plan['seed']) for name,ds in all_daily.items() if name!=plan['comparison_baseline']},
+            'paired_comparisons':{name:paired_comparison(ds,baseline,plan['seed']) for name,ds in all_daily.items()
+                if name!=plan['comparison_baseline'] and plan.get('comparison_mode','common_cohort')=='common_cohort'},
+            'value_decisions':value_decisions(all_daily,plan,runtime),
+            'comparison_mode':plan.get('comparison_mode','common_cohort'),
             'excluded_tail':partition['final_holdout'],'excluded_tail_scored':False,
             'exposure_status':plan['exposure_status'],'sampled_rows':len(frame),'input_identity_sha256':identity(frame[['datetime','instrument']].values.tolist()),
             'cost_contract':'fixed round-trip bps subtracted from top-k label means; not fees/settlement/turnover portfolio accounting',
@@ -393,7 +471,8 @@ def research_markdown(result):
         '|---|---:|---:|---:|---:|---:|']
     for name,row in result['aggregate'].items():
         ic = '无定义' if row['mean_daily_rank_ic'] is None else f"{row['mean_daily_rank_ic']:.6f}"
-        lines.append(f"| {name} | {row['samples']} | {row['days']} | {row['mse']:.6f} | {ic} | {row['top_k_mean_label_pct']:.6f} |")
+        top='不适用' if row['top_k_mean_label_pct'] is None else f"{row['top_k_mean_label_pct']:.6f}"
+        lines.append(f"| {name} | {row['samples']} | {row['days']} | {row['mse']:.6f} | {ic} | {top} |")
     lines += ['','## 同样本配对比较','',
               'MSE 差为模型减去冻结基线，负值较好。区间采用固定 5 日移动块、500 次重采样，仅描述性；未校正多重比较。','']
     for name,row in result['paired_comparisons'].items():

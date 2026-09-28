@@ -138,6 +138,19 @@ def test_negative_results_and_cost_proxy_not_promoted_to_portfolio(inputs):
     assert result['cost_sensitivity_label_proxy_pct']['50']==result['top_k_mean_label_pct']-.5
     comparison = paired_comparison(daily,daily,17)
     assert comparison['mean_daily_mse_difference']==0 and comparison['moving_block_bootstrap_95pct']==[0,0]
+    insufficient=daily_metrics(-y,test,4)
+    assert all(r['top_k_label_mean_pct'] is None for r in insufficient)
+    assert summarize(insufficient,[0,50])['cost_sensitivity_label_proxy_pct']['50'] is None
+    from trade_system.v2.rolling_research import family_frames, value_decisions
+    frame=test.copy();frame['g']=1.0;frame.loc[frame.index[0],'g']=np.nan
+    plan={'family_columns':{'funds':['g']},'comparison_mode':'common_cohort'}
+    selected,gaps=family_frames({'train':frame,'valid':frame,'test':frame},plan,'price')
+    assert len(selected['test'])==len(frame)-1 and len(gaps['test']['missing_identities'])==1
+    plan.update(comparison_mode='full_pipeline')
+    assert len(family_frames({'test':frame},plan,'price')[0]['test'])==len(frame)
+    assert len(family_frames({'test':frame},plan,'funds')[0]['test'])==len(frame)-1
+    plan.update(comparison_baseline='price',seed=17)
+    assert value_decisions({'price':daily,'funds':daily},plan,{})['funds']['decision']=='inconclusive_keep_baseline'
 
 
 @pytest.mark.parametrize('change',['duplicate','chronology','empty_date','tiny_budget'])

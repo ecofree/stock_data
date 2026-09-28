@@ -78,6 +78,13 @@ def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
 
 
 def test_profile_declares_full_market_flow_sources():
+    from trade_system.collection_profiles import product_usage
+    usage=product_usage([{'run_id':'synthetic','steps':[{'name':'collect_intraday_stock_flow_market',
+        'status':'degraded','rows_written':0,'request_metrics':{'transport_attempts':2}}]}])
+    entry=next(p for p in usage['products'] if p['product_id']=='collect_intraday_stock_flow_market')
+    assert entry['disposition']=='inspect_failed_input'
+    assert entry['observations'][0]['counts']=={'rows_written':0,'rows_parsed':None,'rows_published':None,'transport_attempts':2}
+    assert usage['avoidable_cost'] is None and usage['diagnostic_limits']['total']==6
     names = {task.name for task in phase_tasks("intraday")}
     assert {"collect_intraday_stock_flow_market", "collect_intraday_sector_flow_full"} <= names
     import pytest

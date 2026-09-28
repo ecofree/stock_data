@@ -33,6 +33,23 @@ def test_full_members_and_fixed_scope_previous_day(con):
     assert r['account_state']=='unknown' and not r['execution_ready']
     assert r['periods']['week']['start']=='2026-09-07'
     assert r['periods']['week']['status']=='calendar_unverified'
+    from trade_system.v2.daily_workspace import period_history, action_queue
+    from trade_system.v2.research_product_view import export_projection
+    from pathlib import Path
+    enriched=period_history(Path('__nonexistent_test_workspace__'),r)
+    assert enriched['periods']['quarter']['calendar_missing']
+    assert enriched['periods']['quarter']['theme_evolution']['rows']==[]
+    queue=action_queue({'plans':{'account':{'status':'account_unknown','open_orders':[{'instrument':'000777'}]},'rows':[]}})
+    assert queue[0]['priority']==0 and any(r['kind']=='unresolved_order' for r in queue)
+    assert '000777' not in str(export_projection({'action_queue':queue}))
+    from trade_system.review_metrics import judgement_period_summary, theme_evolution
+    note={'note_id':'n','instrument':'000001','intent':'reject','hypothesis':'原判断',
+        'invalidation':'原条件','received_at':'2026-09-01T10:00:00+08:00'}
+    month=judgement_period_summary('2026-09-11','month',[note],[])
+    assert month['rejected_count']==month['unreviewed_count']==1
+    assert month['rows'][0]['realized_return'] is None
+    assert judgement_period_summary('2026-09-11','week',[note],[])['record_count']==0
+    assert theme_evolution([],['2026-09-10'])['missing_sessions']==['2026-09-10']
     con.execute("DELETE FROM tushare_trade_cal")
     for d,opened in [('2026-09-07',0),('2026-09-08',0),('2026-09-09',0),('2026-09-10',1),('2026-09-11',1)]:
         for exchange in ('SSE','SZSE'):

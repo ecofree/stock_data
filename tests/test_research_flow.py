@@ -110,7 +110,9 @@ def test_rule_baseline_consumes_exact_test_cohort_not_other_dates(tmp_path):
     result={'folds':[{'fold':0,'test_identity_sha256':identity(ids)}]}
     b=baselines.build(tmp_path,result)
     assert b['summary']['samples']==2 and b['summary']['days']==1 and b['summary']['mse'] is None
-    assert b['summary']['equal_weight_target_pct']==pytest.approx(1.5)
+    assert b['summary']['all_days_equal_weight_target_pct']==pytest.approx(1.5)
+    assert b['summary']['equal_weight_target_pct'] is None
+    assert b['summary']['momentum_top5_target_pct'] is None
     assert all(r['date']==days[0] for r in b['daily'])
 
 

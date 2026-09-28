@@ -108,7 +108,25 @@ def main() -> int:
     parser.add_argument("--collector-contract-sha256")
     parser.add_argument("--collection-profile", choices=("priority",), default="priority")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--product-usage", nargs="*", default=None, metavar="RUN_JSON", help="Read-only product usage from at most 100 explicit run receipts; no collection")
     args = parser.parse_args()
+    if args.product_usage is not None:
+        from trade_system.collection_profiles import product_usage
+        from trade_system.http_transport import request_metrics
+        if len(args.product_usage)>100:parser.error("at most 100 explicit run receipts")
+        runs=[]
+        for name in args.product_usage:
+            path=Path(name).resolve(strict=True)
+            if path.stat().st_size>8_000_000:raise ValueError("run receipt exceeds read budget")
+            run=json.loads(path.read_text(encoding="utf-8-sig"))
+            for step in run.get("steps",[]):
+                if not step.get("log_path"):continue
+                log=Path(step["log_path"]).resolve()
+                if log.parent!=path.parent:raise ValueError("run log must be adjacent to its receipt")
+                if log.is_file():step["request_metrics"]=request_metrics([log])
+            runs.append(run)
+        print(json.dumps(product_usage(runs),ensure_ascii=False))
+        return 0
     if bool(args.collector_contract) != bool(args.collector_contract_sha256):
         parser.error("collector contract and approved hash must be supplied together")
     if args.migration_root and args.collector_contract:
@@ -247,7 +265,10 @@ def main() -> int:
                 log = artifact_dir / (name+".log")
                 manifest.upsert_step(name, "running", command, started_at=started.isoformat(), log_path=str(log))
                 try:
-                    context={'demand_id':name, 'consumer':'market_review_and_observation',
+                    import hashlib
+                    demand={'product_id':name,'semantic_version':'phase-product-v1',
+                            'phase':selected_phase,'session':args.trade_date,'scope':'profile_declared_scope'}
+                    context={**demand, 'demand_id':hashlib.sha256(json.dumps(demand,sort_keys=True).encode()).hexdigest(), 'consumer':'market_review_and_observation',
                         'phase':selected_phase,'session':args.trade_date,
                         'refresh_reason':'supplemental_retry' if selected_phase=='supplemental' else 'profile_due',
                         'coverage_before':reason}

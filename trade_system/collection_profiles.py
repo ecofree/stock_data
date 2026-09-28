@@ -317,6 +317,50 @@ def phase_matrix() -> list[dict[str, Any]]:
     ]
 
 
+def product_usage(manifests=()):
+    """Declared products joined to actual stage evidence, without fetching data.
+
+    A configured provider is not proof of entitlement or product capability.
+    Missing parse/write/publication instrumentation remains unknown, not zero.
+    """
+    from .source_authority import policy_dicts
+    runs = list(manifests)
+    if len(runs) > 100:
+        raise ValueError('product audit limited to 100 explicit run receipts')
+    products = []
+    for name, task in _TASKS.items():
+        observations = []
+        for run in runs:
+            for step in run.get('steps', []):
+                if step.get('name') != name:
+                    continue
+                observations.append({
+                    'run_id': run.get('run_id'), 'phase': run.get('phase'),
+                    'session': run.get('trade_date'), 'status': step.get('status'),
+                    'collector_sha256': run.get('collector_contract_sha256'),
+                    'completed_at': step.get('completed_at'),
+                    'transport_evidence':step.get('request_metrics'),
+                    'demand': step.get('request_context'),
+                    'counts': {key: step.get(key) for key in ('rows_parsed', 'rows_written', 'rows_published')}
+                        | {'transport_attempts':(step.get('request_metrics') or {}).get('transport_attempts')},
+                })
+        products.append({'product_id': name, 'configured_source': task.source,
+            'consumers': ['market_review_and_observation'], 'purpose': task.purpose,
+            'phases': [phase for phase, tasks in PROFILE_TASKS.items() if any(t.name==name for t in tasks)],
+            'cadence_seconds': task.cadence_seconds, 'network': task.network,
+            'required': task.required, 'capability_status': 'requires_product_and_entitlement_evidence',
+            'observations': observations,
+            'disposition': 'inspect_failed_input' if any(o['status'] in ('failed','degraded','blocked') for o in observations)
+                else 'verify_consumption' if observations else 'unmeasured_not_proven_unused'})
+    return {'products': products, 'source_policies': policy_dicts(),
+        'diagnostic_limits': {'per_endpoint': 2, 'total': 6,
+            'stop_on': ['authentication_failed','permission_denied','rate_limited','cooldown']},
+        'source_selection': 'authorized_product_capability_then_hithink_xiaodefa_other',
+        'source_independence': 'original_origin_and_definition_not_relay_count',
+        'scope': 'declared_consumers_and_observed_receipts_not_verified_all_provider_coverage',
+        'avoidable_cost': None, 'execution_ready': False}
+
+
 def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
     return bool(con.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name=?", [table]

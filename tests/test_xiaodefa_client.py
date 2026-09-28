@@ -291,6 +291,25 @@ def test_orchestrator_budget_reaches_nested_transport(monkeypatch):
     assert _call(source, 0.5) == b'{}'
     assert len(calls) == 1 and 0 < calls[0] < 0.5
     assert request_deadline.get() is None
+    from trade_system.http_transport import diagnostic_budget, stop_diagnostic
+    with diagnostic_budget() as budget:
+        for endpoint in ('one','two','three'):
+            for _ in range(2):
+                read_verified_once(urllib.request.Request('https://example.invalid/'+endpoint),timeout=1,max_bytes=100)
+        with pytest.raises(RuntimeError,match='budget'):
+            read_verified_once(urllib.request.Request('https://example.invalid/four'),timeout=1,max_bytes=100)
+        assert budget['attempts']==6 and len(calls)==7
+    with diagnostic_budget() as budget:
+        for _ in range(2):
+            read_verified_once(urllib.request.Request('https://example.invalid/same'),timeout=1,max_bytes=100)
+        with pytest.raises(RuntimeError,match='budget'):
+            read_verified_once(urllib.request.Request('https://example.invalid/same'),timeout=1,max_bytes=100)
+        assert budget['attempts']==2
+    with diagnostic_budget() as budget:
+        stop_diagnostic('permission_denied')
+        with pytest.raises(RuntimeError,match='stopped'):
+            read_verified_once(urllib.request.Request('https://example.invalid'),timeout=1,max_bytes=100)
+        assert budget['attempts']==0
 
 
 def test_blocked_transport_worker_is_reaped_at_deadline(monkeypatch):

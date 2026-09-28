@@ -80,9 +80,15 @@ class XiaodefaClient:
                     raise XiaodefaError("request deadline exhausted")
                 break
             except urllib.error.HTTPError as exc:
+                from trade_system.http_transport import diagnostic_state
+                if diagnostic_state.get() is not None:
+                    raise XiaodefaError(f"HTTP {exc.code}; explicit diagnostic comparison required") from None
                 if exc.code not in (429, 500, 502, 503, 504) or attempt + 1 == self.max_retries:
                     raise XiaodefaError(f"HTTP {exc.code}; request failed") from None
             except (urllib.error.URLError, TimeoutError, ConnectionError):
+                from trade_system.http_transport import diagnostic_state
+                if diagnostic_state.get() is not None:
+                    raise XiaodefaError('diagnostic transport failed; no automatic retry') from None
                 if attempt + 1 == self.max_retries:
                     raise XiaodefaError("transport retry budget exhausted") from None
             delay = min(2 ** attempt, 4)
@@ -108,6 +114,8 @@ class XiaodefaClient:
             error.diagnostic = diagnostic
             raise error
         if not isinstance(payload, dict) or type(payload.get("code")) is not int or payload["code"] != 0:
+            from trade_system.http_transport import stop_diagnostic
+            stop_diagnostic('business_rejected')
             fail("provider rejected request; no semantic retry")
         data = payload.get("data")
         if not isinstance(data, dict):

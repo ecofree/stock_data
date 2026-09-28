@@ -348,8 +348,9 @@ def publish_state(output,name,value,*,market=None):
 
 
 def _publish_desk(output,*,market=None):
-    from .daily_workspace import projection
+    from .daily_workspace import projection, period_history
     from .research_product_view import render
+    if market is not None:market=period_history(output,market)
     data=projection(output,market=market,research_loader=_research_projection)
     publication=Path(output)/'publication'
     generation=read_current(publication)[0]['generation']+1 if (publication/'current.json').exists() else 1
@@ -393,13 +394,16 @@ def journal_projection(output,data):
     data['note_scope']={'shown':len(notes),'total':note_total,'limit':100}
     if data.get('market'):
         from datetime import date,timedelta
-        from trade_system.review_metrics import period_bounds
+        from trade_system.review_metrics import period_bounds, judgement_period_summary
         from .journal_index import between
         from .accounts import configured_performance
-        day=data['market']['trade_date'];start=period_bounds(day,'week')[0]
+        day=data['market']['trade_date'];start=min(period_bounds(day,p)[0] for p in ('week','quarter'))
         stop=(date.fromisoformat(day)+timedelta(days=1)).isoformat()
         data['period_notes']=between(output,'note',start+'T00:00:00+08:00',stop+'T00:00:00+08:00')
         data['period_note_scope']={'start':start,'through':day,'complete':True,'count':len(data['period_notes'])}
+        period_reviews=between(output,'review',start+'T00:00:00+08:00',stop+'T00:00:00+08:00')
+        data['method_periods']={p:judgement_period_summary(day,p,data['period_notes'],period_reviews)
+                                for p in ('day','week','month','quarter')}
         import duckdb
         try:data['account_periods']=configured_performance(output,day)
         except (OSError,ValueError,KeyError,duckdb.Error):
@@ -436,7 +440,10 @@ def journal_projection(output,data):
         import json
         from .observation_workspace import present as present_observation
         try:
-            _,files=read_current(observation)
+            manifest,files=read_current(observation)
+            import hashlib
+            data['observation_evidence']={'run_id':manifest['run_id'],'generation':manifest['generation'],
+                'manifest_sha256':hashlib.sha256(canonical(manifest).encode()).hexdigest()}
             data['observation']=present_observation(json.loads(files['observation.json']),now_utc().isoformat())
         except (ValueError,KeyError,OSError):
             # A failed optional quote projection disables quotes, not saved
@@ -448,6 +455,8 @@ def journal_projection(output,data):
         data['plans']=observation_plans(output,now_utc().isoformat(),(data.get('observation') or {}).get('rows',[]))
     except (OSError,ValueError,KeyError) as exc:
         data['plans']={'rows':[],'account':{'status':'risk_unavailable','execution_ready':False},'error':str(exc)[:200]}
+    from .daily_workspace import action_queue
+    data['action_queue']=action_queue(data)
     data['report_id']=identity(data)
     return data
 

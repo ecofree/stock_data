@@ -18,8 +18,49 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 
 request_deadline = ContextVar('request_deadline', default=None)
+diagnostic_state = ContextVar('diagnostic_state', default=None)
 
 from trade_system.config import SETTINGS
+
+
+@contextmanager
+def diagnostic_budget():
+    """One explicit diagnosis: at most six wire attempts, two per endpoint.
+
+    A nested consumer shares its parent's counters and stop state. No proxy or
+    provider policy is changed; callers must establish entitlement first.
+    """
+    parent = diagnostic_state.get()
+    state = parent if parent is not None else {'attempts': 0, 'endpoints': {}, 'stopped': None}
+    token = diagnostic_state.set(state)
+    try:
+        yield state
+    finally:
+        diagnostic_state.reset(token)
+
+
+def _diagnostic_attempt(request):
+    from urllib.parse import urlsplit
+    state = diagnostic_state.get()
+    if state is None:
+        return
+    url = urlsplit(request.full_url)
+    endpoint = (url.hostname, url.path)  # Never retain query credentials.
+    if state['stopped']:
+        raise RuntimeError('diagnostic stopped: ' + state['stopped'])
+    if state['attempts'] >= 6 or state['endpoints'].get(endpoint, 0) >= 2:
+        state['stopped'] = 'request_budget_exhausted'
+        raise RuntimeError('diagnostic request budget exhausted')
+    state['attempts'] += 1
+    state['endpoints'][endpoint] = state['endpoints'].get(endpoint, 0) + 1
+
+
+def stop_diagnostic(reason):
+    """Business-level auth/permission/rate/cooldown responses stop the context."""
+    if reason not in {'authentication_failed', 'permission_denied', 'rate_limited', 'cooldown', 'business_rejected'}:
+        raise ValueError('explicit diagnostic stop category required')
+    if diagnostic_state.get() is not None:
+        diagnostic_state.get()['stopped'] = reason
 
 
 def inherited_request_remaining():
@@ -86,7 +127,8 @@ def request_receipt(request):
     import re
     try:context=json.loads(os.environ.get('STOCKDATA_REQUEST_CONTEXT','{}'))
     except ValueError:context={}
-    allowed=('demand_id','consumer','refresh_reason','phase','session','revision_of','coverage_before')
+    allowed=('demand_id','consumer','refresh_reason','phase','session','revision_of','coverage_before',
+             'product_id','semantic_version','scope')
     value['attribution']={key:item for key,item in context.items() if key in allowed
         and isinstance(item,str) and re.fullmatch(r'[A-Za-z0-9_.:/ -]{1,160}',item)} if isinstance(context,dict) else {}
     logger=get_logger('http_transport')
@@ -116,13 +158,28 @@ def summarize_requests(records):
             key=(r['request_key'],r['response_sha256'])
             repeat+=key in seen;seen.add(key)
     reasons={}
+    products={}
     for row in attempts.values():
         reason=row.get('attribution',{}).get('refresh_reason','unattributed')
         reasons[reason]=reasons.get(reason,0)+1
+        context=row.get('attribution',{})
+        product=context.get('product_id') or context.get('demand_id') or 'unattributed'
+        item=products.setdefault(product,{'transport_attempts':0,'responses_received':0,'errors':0,
+            'first_received_at':None,'last_received_at':None,'consumers':set()})
+        item['transport_attempts']+=1
+        item['responses_received']+=row['status']=='response_received'
+        item['errors']+=bool(row.get('error_category') or row.get('http_status'))
+        if context.get('consumer'):item['consumers'].add(context['consumer'])
+        if row['status']=='response_received' and row.get('finished_at'):
+            received=row['finished_at']
+            item['first_received_at']=min(item['first_received_at'] or received,received)
+            item['last_received_at']=max(item['last_received_at'] or received,received)
+    for item in products.values():item['consumers']=sorted(item['consumers'])
     return {'transport_attempts':len(attempts),'responses_received':sum(r['status']=='response_received' for r in attempts.values()),
         'same_request_same_response':repeat,'unknown_outcomes':sum(r['status']=='outcome_unknown' for r in attempts.values()),
         'conflicting_receipts':len(conflicts),'scope':'observed_shared_transport_only_not_all_providers_or_avoidable_cost',
         'attempts_by_refresh_reason':reasons,
+        'products':products,
         'attributed_attempts':sum(bool(r.get('attribution',{}).get('demand_id')) for r in attempts.values()),
         'avoidable_duplicates':None,'missing':['verified_coverage_and_revision_policy_for_cost_attribution']}
 
@@ -256,7 +313,7 @@ def open_verified(request: urllib.request.Request, *, timeout: float):
     the environment-configured proxy.  HTTP responses are never retried
     across transports, and neither path permits certificate bypass.
     """
-    if os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH') is not None:
+    if os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH') is not None or diagnostic_state.get() is not None:
         # Scheduled phases select one verified route and use a bounded network
         # child. A DNS/body stall must not strand the database writer.
         import io
@@ -282,7 +339,13 @@ def open_verified_once(request: urllib.request.Request, *, timeout: float):
     handlers=[_NoRedirect(),urllib.request.HTTPSHandler(context=default_ssl_context())]
     if _direct_first():
         handlers.append(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener(*handlers).open(request,timeout=timeout)
+    _diagnostic_attempt(request)
+    try:
+        return urllib.request.build_opener(*handlers).open(request,timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 429):
+            stop_diagnostic({401: 'authentication_failed', 403: 'permission_denied', 429: 'rate_limited'}[exc.code])
+        raise
 
 
 def _read_verified_response(request, timeout, max_bytes):
@@ -342,6 +405,7 @@ def read_verified_once(request, *, timeout, max_bytes):
     command = [sys.executable, '-I', '-B', '-c',
         'import sys;sys.path.insert(0,sys.argv[1]);from trade_system.http_transport import _response_worker;_response_worker()',
         str(Path(__file__).resolve().parents[1])]
+    _diagnostic_attempt(request)
     with request_receipt(request) as receipt:
         try:
             result = subprocess.run(command, input=payload, capture_output=True, timeout=timeout,
@@ -359,6 +423,8 @@ def read_verified_once(request, *, timeout, max_bytes):
         if not separator:
             raise urllib.error.URLError('incomplete transport worker response')
         if 'http_status' in status:
+            if status['http_status'] in (401, 403, 429):
+                stop_diagnostic({401: 'authentication_failed', 403: 'permission_denied', 429: 'rate_limited'}[status['http_status']])
             raise urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed', None, None)
         if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
             raise ValueError('response byte budget exceeded')

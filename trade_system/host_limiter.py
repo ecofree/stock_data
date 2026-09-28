@@ -78,6 +78,10 @@ class SharedHostLimiter:
                     [host],
                 ).fetchone()
                 last_started, cooldown_until = row if row else (0.0, 0.0)
+                from trade_system.http_transport import diagnostic_state, stop_diagnostic
+                if diagnostic_state.get() is not None and float(cooldown_until or 0)>now:
+                    stop_diagnostic('cooldown')
+                    raise TimeoutError('diagnostic stops at shared cooldown')
                 wait = max(float(min_interval) - (now - float(last_started or 0)),
                            float(cooldown_until or 0) - now, 0.0)
                 if wait <= 0:

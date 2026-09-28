@@ -12,6 +12,7 @@ from .ml_protocol import rolling_partitions
 
 BASE = ['ret_1d','ret_5d','ret_20d','volatility_20d','intraday_range','volume_ratio_20d']
 MONEY = ['money_ratio','money_ratio_5d']
+AUCTION = ['auction_turnover_ratio']
 LABEL = 'adjusted T+1 open to exact T+2 close percent; retrospective price target, not executable return'
 AVAILABILITY = 'assumed Shanghai 16:00 on exact T+2; original historical receipt time unavailable'
 
@@ -130,7 +131,52 @@ def load_history(config, root):
     summary['calendar_source']='stored_SSE_common_sessions_not_both_exchange_original_receipts'
     summary['source_missing_price_rows']=int(frame.close.isna().sum())
     summary['source_missing_money_rows']=int(frame.net_mf_amount.isna().sum())
+    frame, event_summary = attach_auction_receipts(frame, config, root)
+    summary.update(event_summary)
     return frame,days,summary
+
+
+def attach_auction_receipts(frame, config, root):
+    """One optional, frozen post-close event family; never fetch or infer units.
+
+    Reuse the production matched-result validator. Order-book/native-final and
+    mixed tick series cannot silently become this research feature.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trade_system.auction_evidence import observed_auction_rows
+    frame = frame.copy()
+    receipts = config.get('auction_receipts', [])
+    if len(receipts) > 256:
+        raise ValueError('auction research receipt budget exceeded')
+    values = {}; evidence = []
+    for item in receipts:
+        path = (Path(root)/item['path']).resolve(strict=True)
+        if path.stat().st_size > 8_000_000 or file_hash(path) != item['sha256']:
+            raise ValueError('frozen auction receipt changed or oversized')
+        received = datetime.fromisoformat(item['received_at'])
+        if received.tzinfo is None:
+            raise ValueError('auction receipt requires actual timezone-aware arrival')
+        received = received.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+        payload = json.loads(path.read_text(encoding='utf-8-sig'))
+        rows = observed_auction_rows(payload,item['trade_date'],item['provider'],received,item['sha256'])
+        for row in rows:
+            key=(row['trade_date'],row['stock_code'])
+            if key in values:raise ValueError('auction family has overlapping receipt identities')
+            values[key]=row['auction_amount'] if row['confirmation']=='matched_trade_confirmed' else None
+        evidence.append({'sha256':item['sha256'],'received_at':item['received_at'],
+            'product':'stk_auction_matched_result','origin':'tushare','transport':item['provider'],
+            'trade_date':item['trade_date']})
+    if receipts:
+        amount=pd.Series([values.get((str(d)[:10],str(c))) for d,c in
+                          zip(frame.datetime,frame.instrument)],index=frame.index,dtype=float)
+        frame['auction_turnover_ratio']=(amount/frame.turnover.where(frame.turnover>0)).where(amount>=0)
+        frame.loc[frame.auction_turnover_ratio>1,'auction_turnover_ratio']=np.nan
+    return frame, {'auction_family':{'configured':bool(receipts),'receipts':evidence,
+        'eligible_rows':int(frame.auction_turnover_ratio.notna().sum()) if receipts else 0,
+        'missing_rows':int(frame.auction_turnover_ratio.isna().sum()) if receipts else len(frame),
+        'task':'post_close_next_session_price_target', 'point_in_time_qualified':False,
+        'availability':'retained_actual_arrival_not_certified_original_historical_availability'}}
 
 
 def target_labels(computed, calendar, *, family='paired_alpha61'):
@@ -170,7 +216,7 @@ def write_metadata(config, summary, rows, expressions, output, *, artifacts=('fe
     """One metadata producer; legacy dataset.json remains a read-only compatibility input."""
     output=Path(output)
     meta={'label_version':'exploratory_price_target_v1_not_formal_execution_labels','label_definition':LABEL,
-        'availability_assumption':AVAILABILITY,'feature_columns':BASE+MONEY+list(expressions),
+        'availability_assumption':AVAILABILITY,'feature_columns':BASE+MONEY+list(expressions)+(AUCTION if config.get('auction_receipts') else []),
         'artifact_hashes':{name:file_hash(output/name) for name in artifacts},
         'dataset_config':config,'dataset_id':identity(config),'summary':summary,'rows':rows,
         'historical_exploration_allowed':True,'point_in_time_qualified':False,'execution_ready':False,
@@ -199,13 +245,18 @@ def build(config, root, output):
 
 def experiment_plan(config, meta, name):
     s=config['split']
-    alpha=[f for f in meta['feature_columns'] if f not in BASE+MONEY]
+    alpha=[f for f in meta['feature_columns'] if f not in BASE+MONEY+AUCTION]
     return {'scope':'historical_research_only','exposure_status':'previously_inspected_not_untouched',
         'experiment_id':name,'label_definition':LABEL,'availability_assumption':AVAILABILITY,
         'evaluation_asof':now_utc().isoformat(),'max_rows':config['max_rows'],
         'train_observations':s['train'],'valid_observations':s['valid'],'test_observations':s['test'],
         'excluded_tail_observations':s['holdout'],'max_folds':12,'num_boost_round':40,'num_threads':2,
-        'top_k':5,'seed':42,'variants':{'price_baseline':BASE,'price_money':BASE+MONEY,'price_alpha158':BASE+alpha},
+        'top_k':config.get('top_k',5),'seed':42,
+        'variants':{'price_baseline':BASE,'price_money':BASE+MONEY,'price_alpha158':BASE+alpha,
+                    **({'price_auction':BASE+AUCTION} if config.get('auction_receipts') else {})},
+        'comparison_mode':config.get('comparison_mode','common_cohort'),
+        'family_columns':{'price_money':MONEY,**({'price_auction':AUCTION} if config.get('auction_receipts') else {})},
+        'value_policy':config.get('value_policy',{'minimum_days':20,'minimum_mse_improvement':0.0}),
         'feature_roles':{f:'structural_constant' for f in alpha},'comparison_baseline':'price_baseline',
         'round_trip_cost_bps':[0,10,30,50],
         'required_export_contract':{'label_version':meta['label_version']}}

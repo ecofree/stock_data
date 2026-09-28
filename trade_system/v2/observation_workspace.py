@@ -92,6 +92,7 @@ def project_rows(rows,codes,as_of):
         projected.append({'instrument':code,'state':state,'price':chosen['price'] if chosen else None,
             'provider':chosen['provider'] if chosen else None,
             'source_event_time':chosen['source_event_time'].isoformat() if chosen else None,
+            'received_at':chosen['fetched_at'].isoformat() if chosen else None,
             'valid_until':(chosen['source_event_time']+timedelta(seconds=TTL_SECONDS)).isoformat() if chosen else None,
             'rejected_reasons':sorted({r['qualification'] for r in candidates if r not in good}),
             'retained_rows':len(candidates)})

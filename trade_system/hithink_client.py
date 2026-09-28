@@ -86,6 +86,8 @@ class HiThinkClient:
         if time.monotonic() >= deadline:
             raise HiThinkError('native request deadline exhausted')
         if not isinstance(payload, dict) or type(payload.get('code')) is not int or payload['code'] != 0:
+            from trade_system.http_transport import stop_diagnostic
+            stop_diagnostic('business_rejected')
             raise HiThinkError('provider rejected request; no semantic retry')
         data = payload.get('data')
         if not isinstance(data, dict):

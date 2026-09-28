@@ -39,11 +39,29 @@ def test_preflight_rejects_the_old_short_dataset_before_fit():
     assert dataset.preflight(configuration(),prices(218)[1])['minimum_sessions']==157
 
 
-def test_no_duplicate_calendar_or_universe():
+def test_no_duplicate_calendar_or_universe(tmp_path):
     c=configuration(); days=prices(218)[1]
     with pytest.raises(ValueError,match='unique'):dataset.preflight(c,days+[days[-1]])
     c['universe']=['000001','000001']
     with pytest.raises(ValueError,match='universe'):dataset.preflight(c,days)
+    import json
+    from trade_system.v2.domain import file_hash
+    frame,_=prices()
+    payload={'api':'stk_auction','params':{'trade_date':'20250101'},'rows':[
+        {'ts_code':'000001.SZ','trade_date':'20250101','price':10,'vol':10,'amount':100}]}
+    path=tmp_path/'raw.json';path.write_text(json.dumps(payload))
+    entry={'path':'raw.json','sha256':file_hash(path),'provider':'xiaodefa',
+        'trade_date':'2025-01-01','received_at':'2026-09-28T16:00:00+08:00'}
+    result,summary=dataset.attach_auction_receipts(frame,{'auction_receipts':[entry]},tmp_path)
+    assert result.auction_turnover_ratio.notna().sum()==1
+    assert result.iloc[0].auction_turnover_ratio==100/frame.iloc[0].turnover
+    assert not summary['auction_family']['point_in_time_qualified']
+    assert summary['auction_family']['missing_rows']==len(frame)-1
+    with pytest.raises(ValueError,match='overlapping'):
+        dataset.attach_auction_receipts(frame,{'auction_receipts':[entry,entry]},tmp_path)
+    path.write_text('{}')
+    with pytest.raises(ValueError,match='changed'):
+        dataset.attach_auction_receipts(frame,{'auction_receipts':[entry]},tmp_path)
 
 
 def test_feature_prefix_invariance_and_no_gap_bridge():

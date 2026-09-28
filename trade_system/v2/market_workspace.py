@@ -198,7 +198,8 @@ def project(con, day, as_of, research_codes):
         for row in item['themes']:
             members=row['member_codes'];valid=[values[c]['pct'] for c in members if c in values and all(values[c]['contract'])]
             rows.append({k:row[k] for k in ('concept_code','concept_name','member_count','limit_up_count','max_board')} |
-                {'member_version':identity([item['membership_date'],members]),'priced_members':len(valid),
+                {'member_version':identity([item['membership_date'],members]),'member_set_id':identity(sorted(members)),
+                 'priced_members':len(valid),
                  'mean_change_pct':sum(valid)/len(valid) if valid else None,
                  'main_flow_cny':flows.get(row['concept_code'],{}).get('main_net'),
                  'flow_status':'qualified' if row['concept_code'] in flows else 'source_missing',

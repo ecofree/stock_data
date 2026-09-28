@@ -290,3 +290,73 @@ def market_period_summary(day, period, daily, calendar):
         'rising_observation_ratio':sum(r['rise'] for r in rows)/total if total else None,
         'scope':'available_observations_not_exchange_coverage_or_strategy_win_rate',
         'point_in_time_qualified':False,'execution_ready':False}
+
+
+def judgement_period_summary(day, period, notes, reviews):
+    """Receipt-time cohort; retain revisions/rejections and unknown outcomes."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    start, end = period_bounds(day, period)
+    selected = []
+    for note in notes:
+        received = datetime.fromisoformat(note['received_at'])
+        if received.tzinfo is None:
+            raise ValueError('judgement receipt time must be timezone aware')
+        if start <= received.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() <= day:
+            selected.append(note)
+    attached = {}
+    for review in reviews:
+        received = datetime.fromisoformat(review['received_at'])
+        if received.tzinfo is None:
+            raise ValueError('review receipt time must be timezone aware')
+        if received.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() <= day:
+            attached.setdefault(review['note_id'], []).append(review)
+    rows = []
+    for note in selected:
+        history = sorted(attached.get(note['note_id'], []), key=lambda r: r['received_at'])
+        rows.append({'note_id':note['note_id'], 'instrument':note['instrument'],
+            'intent':note['intent'], 'supersedes':note.get('supersedes'),
+            'hypothesis':note['hypothesis'], 'invalidation':note['invalidation'],
+            'received_at':note['received_at'], 'reviews':history,
+            'outcome':history[-1].get('conclusion','unknown') if history else 'unreviewed',
+            'realized_return':None})
+    return {'start':start,'end':end,'through':day,'rows':rows,
+        'record_count':len(rows),'revision_count':sum(bool(r['supersedes']) for r in rows),
+        'rejected_count':sum(r['intent']=='reject' for r in rows),
+        'unreviewed_count':sum(r['outcome']=='unreviewed' for r in rows),
+        'scope':'human_receipt_cohort_not_trades_or_strategy_win_rate',
+        'execution_ready':False}
+
+
+def theme_evolution(sessions, expected_sessions):
+    """Compare certified daily members; a missing day is never a disappearance."""
+    by_date = {s['date']:s for s in sessions}
+    codes = sorted({r['concept_code'] for s in sessions for r in s.get('rows',[])})
+    rows = []
+    for code in codes:
+        observations = []
+        prior = None
+        changes = 0
+        for day in expected_sessions:
+            session = by_date.get(day,{})
+            row = next((r for r in session.get('rows',[]) if r['concept_code']==code),None)
+            if row is None:
+                observations.append({'date':day,'status':'missing','member_version':None})
+                prior = None
+                continue
+            leaders = sorted(r['stock_code'] for r in row.get('leaders',[]))
+            membership=row.get('member_set_id',row['member_version'])
+            comparable = prior is not None and prior['member_version']==membership
+            if comparable and leaders!=prior['leaders']:changes+=1
+            observations.append({'date':day,'status':'observed','member_version':row['member_version'],
+                'snapshot_id':session.get('snapshot_id'),
+                'leaders':leaders,'leader_changed':leaders!=prior['leaders'] if comparable else None,
+                'priced_members':row['priced_members'],'member_count':row['member_count'],
+                'flow_status':row['flow_status'],'mean_change_pct':row['mean_change_pct']})
+            prior = {'member_version':membership,'leaders':leaders}
+        name=next((r.get('concept_name',code) for s in sessions for r in s.get('rows',[]) if r['concept_code']==code),code)
+        rows.append({'concept_code':code,'concept_name':name,'observed_sessions':sum(r['status']=='observed' for r in observations),
+            'comparable_leader_changes':changes,'observations':observations})
+    return {'rows':rows,'missing_sessions':[d for d in expected_sessions if d not in by_date],
+        'scope':'retained_membership_and_limit_leaders_not_inferred_theme_stage',
+        'point_in_time_qualified':False}

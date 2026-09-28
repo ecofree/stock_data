@@ -44,6 +44,8 @@ def build_dataset(config, root, output):
     if output.exists():
         raise ValueError('new recent dataset version required')
     frame, days, summary = load_receipts(config, root)
+    frame, event_summary = dataset.attach_auction_receipts(frame, config, root)
+    summary.update(event_summary)
     output.mkdir(parents=True)
     calculated,expressions=dataset.assemble(frame,days,output,alpha_compute=compute)
     # The independently fitted price model must not inherit Alpha158's 61-day

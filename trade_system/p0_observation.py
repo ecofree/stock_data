@@ -28,6 +28,72 @@ GOOD_STOCK_BATCH = {"success", "success_with_unavailable", "partial"}
 GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap", "partial"}
 
 
+def phase_evidence_errors(manifest, trade_date):
+    """A green summary cannot override missed windows or failed required work."""
+    from datetime import datetime, time
+    from zoneinfo import ZoneInfo
+    if not manifest:return ['missing_run']
+    errors=[]
+    try:
+        values=[]
+        for key in ('started_at','completed_at'):
+            value=datetime.fromisoformat(manifest[key])
+            values.append(value.replace(tzinfo=ZoneInfo('Asia/Shanghai')) if value.tzinfo is None
+                          else value.astimezone(ZoneInfo('Asia/Shanghai')))
+        started,ended=values
+        if started>ended or started.date().isoformat()!=trade_date or ended.date().isoformat()!=trade_date:
+            errors.append('invalid_or_cross_day_phase_time')
+        phase=manifest['phase']
+        if phase=='auction' and not time(9,15)<=ended.time()<=time(9,30):errors.append('auction_outside_window')
+        if phase=='intraday' and not time(9,30)<=started.time()<=ended.time()<=time(15,5):errors.append('intraday_outside_window')
+        if phase in ('close','supplemental') and started.time()<time(15,5):errors.append('close_before_window')
+    except (KeyError,ValueError,TypeError):
+        errors.append('phase_time_unverified')
+    steps=manifest.get('steps') or []
+    if not steps:errors.append('step_evidence_missing')
+    for step in steps:
+        if step.get('required',True) and step.get('status') not in {'completed','skipped'}:
+            errors.append('required_step_not_complete:'+str(step.get('name')))
+        if step.get('required',True) and step.get('status')=='skipped' and not step.get('reason'):
+            errors.append('required_skip_without_evidence:'+str(step.get('name')))
+    return errors
+
+
+def _observation_evidence(workspace, pointer, day):
+    """Read the original observed bundle, not its expired evening presentation."""
+    from datetime import time
+    from trade_system.v2.publisher import read_bundle
+    from trade_system.v2.domain import identity
+    from trade_system.v2.observation_capture import read_sampling
+    from trade_system.v2.observation_workspace import local_clock, TTL_SECONDS
+    try:
+        _,files=read_bundle(Path(workspace)/'observation-publication',pointer or {})
+        value=json.loads(files['observation.json'])
+        if value['snapshot_id']!=identity({k:v for k,v in value.items() if k!='snapshot_id'}):
+            raise ValueError('observation changed')
+        at=local_clock(value['as_of'])
+        if at.date().isoformat()!=day or not (time(9,30)<=at.time()<=time(11,30) or time(13)<=at.time()<=time(15)):
+            raise ValueError('observation outside live session')
+        sampling_id=value['sampling']['sampling_id']
+        if len(sampling_id)!=64 or any(c not in '0123456789abcdef' for c in sampling_id):
+            raise ValueError('sampling identity invalid')
+        sampling=read_sampling(Path(workspace)/'sampling'/sampling_id,day)
+        if not sampling['codes']:raise ValueError('empty sampling scope')
+        rows={r['instrument']:r for r in value['rows']}
+        for code in sampling['codes']:
+            row=rows[code]
+            from datetime import datetime
+            event=datetime.fromisoformat(row['source_event_time'])
+            received=datetime.fromisoformat(row['received_at'])
+            if (row['state']!='current_observation_not_executable' or not row['price']>0
+                    or not event<=received<=at or not 0<=(at-event).total_seconds()<=TTL_SECONDS):
+                raise ValueError('subject not qualified at observation time')
+        return {'passed':True,'sampling_id':sampling_id,'snapshot_id':value['snapshot_id'],
+            'subjects':len(sampling['codes']),'as_of':value['as_of'],'pointer':pointer}
+    except (KeyError,ValueError,TypeError,OSError):
+        return {'passed':False,'error':'pre_session_scope_or_live_observation_unverified'}
+
+
 
 def _publications(workspace, dates):
     """Verify retained daily bundles, including the current published pointer."""
@@ -90,7 +156,8 @@ def _publications(workspace, dates):
             row = {'passed': at.date().isoformat() == day and at.hour >= 16,
                    'as_of': at.isoformat(), 'generation': manifest['generation'],
                    'run_id': manifest['run_id'], 'manifest_sha256': pointer['manifest_sha256'],
-                   'published_at': manifest.get('published_at'), 'content_contract': contract}
+                   'published_at': manifest.get('published_at'), 'content_contract': contract,
+                   'observation':_observation_evidence(workspace,data.get('observation_evidence'),day)}
             result[day] = row
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result[day] = {'passed': False, 'error': 'publication_' + type(exc).__name__}
@@ -305,6 +372,7 @@ def audit_five_day_observation(
                             and str(recovery.get('started_at', '')) > str(manifest.get('completed_at') or '9999')):
                         manifest = recovery
                 status = str((manifest or {}).get("status") or "missing")
+                evidence_errors=phase_evidence_errors(manifest,trade_date)
                 phases[phase] = {
                     "run_id": (manifest or {}).get("run_id"),
                     "status": status,
@@ -315,7 +383,9 @@ def audit_five_day_observation(
                     # fail-closed.
                     "passed": status in {"completed", "completed_with_warnings"}
                     and (manifest or {}).get('scope') == 'transitional_market_collection_only'
-                    and str((manifest or {}).get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower(),
+                    and str((manifest or {}).get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower()
+                    and not evidence_errors,
+                    "evidence_errors":evidence_errors,
                     "run_dir": (manifest or {}).get("_run_dir"),
                     "completed_at": (manifest or {}).get('completed_at'),
                     "original_run_id": (original or {}).get('run_id'),
@@ -352,6 +422,7 @@ def audit_five_day_observation(
                 "tushare_close": tushare["passed"],
                 "ths_weekly": ths["passed"],
                 "publication": publication['passed'],
+                "pre_session_observation": publication.get('observation',{}).get('passed',False),
             }
             daily.append(
                 {

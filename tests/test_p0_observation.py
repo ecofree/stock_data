@@ -19,9 +19,9 @@ def _manifest(reports: Path, trade_date: str, phase: str, status: str = "complet
                 "trade_date": trade_date,
                 "phase": phase,
                 "status": status,
-                "started_at": f"{trade_date}T09:00:00",
-                "completed_at": f"{trade_date}T18:00:00",
-                "steps": [],
+                "started_at": f"{trade_date}T"+{'auction':'08:50:00','intraday':'10:00:00'}.get(phase,'17:30:00'),
+                "completed_at": f"{trade_date}T"+{'auction':'09:27:00','intraday':'10:03:00'}.get(phase,'18:00:00'),
+                "steps": [{'name':'fixture_required_step','required':True,'status':'completed'}],
                 "scope": "transitional_market_collection_only",
                 "collector_contract_sha256": "a" * 64,
             }
@@ -123,7 +123,18 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
                   'scope':'read_only_market_review_not_execution','execution_ready':False,
                   'stocks':[{'stock_code':'000001'}]}
         market['snapshot_id'] = identity(market)
-        data = {'market':market,'execution_ready':False}
+        from trade_system.v2.daily_session import seal
+        sampling={'session':trade_date,'registered_at':trade_date+'T08:00:00+08:00','codes':['000001']}
+        sampling['sampling_id']=identity(sampling)
+        folder=workspace/'sampling'/sampling['sampling_id'];folder.mkdir(parents=True)
+        (folder/'sampling.json').write_text(canonical(sampling),encoding='utf-8');seal(folder)
+        observation={'as_of':trade_date+'T10:00:00+08:00','sampling':sampling,
+            'rows':[{'instrument':'000001','state':'current_observation_not_executable','price':10,
+                     'source_event_time':trade_date+'T09:59:00','received_at':trade_date+'T09:59:01'}]}
+        observation['snapshot_id']=identity(observation)
+        evidence=publish(workspace/'observation-publication',trade_date,
+            {'observation.json':canonical(observation).encode()},generation=int(trade_date[-2:]))
+        data = {'market':market,'execution_ready':False,'observation_evidence':evidence}
         data['report_id'] = identity(data)
         publish(workspace/'publication',trade_date,
                 {'desk.json':canonical(data).encode(),'index.html':render(data).encode()},
@@ -135,6 +146,13 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
 
     assert result["ready_for_p1"] is True
     assert result["consecutive_passes"] == 2
+    from trade_system.p0_observation import phase_evidence_errors
+    assert 'auction_outside_window' in phase_evidence_errors({'phase':'auction',
+        'started_at':'2026-07-24T09:15:00','completed_at':'2026-07-24T18:00:00',
+        'steps':[{'name':'core','required':True,'status':'degraded'}]},'2026-07-24')
+    assert 'required_step_not_complete:core' in phase_evidence_errors({'phase':'intraday',
+        'started_at':'2026-07-24T10:00:00','completed_at':'2026-07-24T10:03:00',
+        'steps':[{'name':'core','required':True,'status':'degraded'}]},'2026-07-24')
     assert 'dashboard' not in result['daily'][0]['checks']
     # Historical verification binds the original sealed template, not today's.
     from trade_system.v2 import research_product_view as view
