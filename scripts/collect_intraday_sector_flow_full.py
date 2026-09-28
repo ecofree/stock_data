@@ -415,6 +415,7 @@ def collect_full_sector_flow(
             if expected_codes is None and (SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')):
                 # The flow response cannot certify its own membership. Fetch a
                 # dated independent catalogue and retain its original receipt.
+                payload = None
                 try:
                     from trade_system.xiaodefa_source import XiaodefaClient
                     cached = con.execute("SELECT payload_json,payload_hash FROM multi_source_observation "
@@ -450,6 +451,17 @@ def collect_full_sector_flow(
                         [trade_date,catalogue_version])
                 except Exception as exc:
                     catalogue_error = 'independent_catalogue: ' + str(exc)[:200]
+                    if payload is None:
+                        # Empty-envelope/transport failures also consume the
+                        # existing cooldown. Reusing a failure never extends it
+                        # and never qualifies the missing catalogue.
+                        failed = json.dumps(dict(api='dc_index',
+                            params=dict(trade_date=trade_date.replace('-','')),
+                            rows=[], error_type=type(exc).__name__), sort_keys=True)
+                        con.execute("INSERT INTO multi_source_observation "
+                            "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash) "
+                            "VALUES (?,'em_industry_catalogue','reference','xiaodefa','unavailable',?,?)",
+                            [trade_date,failed,hashlib.sha256(failed.encode()).hexdigest()])
             staged_rows, pagination = _collect_sector_pages(
                 store, trade_date, page_size, max_pages, pause_seconds,
                 expected_codes, catalogue_version)

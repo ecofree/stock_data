@@ -39,6 +39,30 @@ def test_auction_evidence_prefers_tick_over_fallback_sources(tmp_path):
     con.execute("UPDATE auction_tick SET volume_unit='shares'")
     con.close()
     assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['confirmation'] == 'tick_confirmed'
+    # Auction indicative matched quantities can fall and must never be summed.
+    from trade_system.normalize import _create_auction_status
+    from trade_system.units import kpl_auction_tick_units
+    calibrated = dict(price=5.62, volume=308513, amount=173384306.0,
+                      direction='开盘撮合', flag=1)
+    assert kpl_auction_tick_units(calibrated) == ('hands', 173384306.0, 'kpl_auction_cross_source_20260928')
+    for wrong in [dict(calibrated, amount=1733843.06), dict(calibrated, amount=None),
+                  dict(calibrated, volume_unit='shares'), dict(calibrated, amount=float('nan')),
+                  dict(calibrated, direction='买入'), dict(calibrated, volume=True)]:
+        assert kpl_auction_tick_units(wrong)[0] == 'unknown'
+    assert kpl_auction_tick_units(dict(calibrated, price=10, volume=100, amount=100530))[0] == 'hands'
+    con = duckdb.connect(str(db_path))
+    con.execute('ALTER TABLE auction_tick ADD COLUMN amount DOUBLE')
+    con.execute('ALTER TABLE auction_tick ADD COLUMN volume_semantics VARCHAR')
+    con.execute("UPDATE auction_tick SET volume_semantics='indicative_match_snapshot', amount=10000")
+    con.execute("INSERT INTO auction_tick VALUES ('2026-07-08','000001','09:24:33',10,2000,'shares',20000,'indicative_match_snapshot'),"
+                "('2026-07-08','000001','09:24:36',10,1500,'shares',15000,'indicative_match_snapshot')")
+    con.execute('ALTER TABLE auction_tick ADD COLUMN fetched_at TIMESTAMP DEFAULT current_timestamp')
+    con.execute('ALTER TABLE auction_bidding_anomaly ADD COLUMN fetched_at TIMESTAMP DEFAULT current_timestamp')
+    _create_auction_status(con)
+    assert con.execute('SELECT auction_amount FROM v_auction_status').fetchone()[0] == 15000
+    con.close()
+    projected = build_auction_evidence_snapshot(db_path, '2026-07-08')[0]
+    assert projected['auction_amount'] == 15000 and projected['tick_rows'] == 3
 
 
 def test_auction_evidence_uses_anomaly_when_tick_is_empty(tmp_path):

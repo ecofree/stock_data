@@ -132,3 +132,8 @@ DELAY_CLIST_GUARD = EastmoneyClistGuard(
 # Backwards-compatible name for callers that explicitly mean the primary
 # route.  New fallback-aware code should import both named guards above.
 DEFAULT_CLIST_GUARD = PRIMARY_CLIST_GUARD
+
+# trends2 has its own persistent budget; clist health cannot reset it.
+TRENDS_GUARD = EastmoneyClistGuard(
+    os.environ.get("EASTMONEY_TRENDS_GUARD_PATH", _CACHE_DIR / "eastmoney_trends_guard.json")
+)

@@ -207,14 +207,15 @@ class HiThinkClient:
         data = self._get('/api/meta/tickers/search',
                          {'q': thscode, 'asset_type': 'a-share', 'limit': 3})
         items = data.get('item')
-        if (not isinstance(items, list) or len(items) != 1
-                or items[0].get('thscode') != thscode
-                or items[0].get('asset_type') != 'a-share'):
+        if (not isinstance(items, list) or len(items) > 1
+                or (items and (not isinstance(items[0], dict) or items[0].get('thscode') != thscode
+                or items[0].get('asset_type') != 'a-share'))):
             raise HiThinkError('ambiguous native stock identity')
         stamp = data.get('timestamp')
         if type(stamp) not in (int, float) or not 0 <= time.time() - stamp / 1000 <= 86400:
             raise HiThinkError('stale native listing reference')
-        listed = items[0].get('list_date')
+        # Empty search needs complete exchange membership; it is not delisting proof.
+        listed = items[0].get('list_date') if items else None
         if listed is not None:
             datetime.strptime(listed, '%Y-%m-%d')
         return data

@@ -58,6 +58,8 @@ def main() -> int:
 
     configure()
     snap = (args.snapshot_date or datetime.now().strftime("%Y-%m-%d"))
+    if snap != datetime.now().date().isoformat():
+        raise ValueError("current constituent API cannot certify a historical snapshot date")
     client = HiThinkClient(min_interval=0.35)
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(args.db)
@@ -84,6 +86,10 @@ def main() -> int:
         # A bounded test/repair run must not publish its partial size as the
         # production expectation.  The full official catalogue is the only
         # snapshot allowed to advance the dynamic completeness gate.
+        previous = con.execute(
+            "SELECT catalog_hash FROM ths_concept_snapshot_expectation WHERE trade_date=?",
+            [snap]).fetchone()
+        same_catalog = bool(previous and previous[0] == catalog_hash)
         if not args.max_concepts:
             con.execute(
                 """
@@ -100,13 +106,25 @@ def main() -> int:
                 [snap, len(catalog), catalog_hash],
             )
 
-        written_d = written_m = skipped = 0
+        written_d = written_m = skipped = reused = 0
         for idx, entry in enumerate(catalog):
             raw_code = str(entry.get("thscode") or "")
             numeric = raw_code.split(".")[0]
             name = str(entry.get("name") or "")
             concept_code = bridge.get(name) or f"THS-{numeric}"
 
+            cached = con.execute(
+                "SELECT d.stock_count, cp.member_rows, count(h.stock_code), count(DISTINCT h.stock_code), "
+                "bool_and(h.date_verified) FROM ths_concept_daily d "
+                "JOIN ths_concept_member_checkpoint cp USING(trade_date,concept_code) "
+                "JOIN ths_concept_stock_history h USING(trade_date,concept_code) "
+                "WHERE d.trade_date=? AND d.concept_code=? AND d.date_verified "
+                "AND cp.status='success' AND d.source='hithink_index_api' "
+                "AND json_extract_string(d.raw_json,'$.ths_index_code')=? "
+                "GROUP BY d.stock_count,cp.member_rows", [snap, concept_code, raw_code]).fetchone()
+            if same_catalog and cached and cached[0] > 0 and len(set(cached[:4])) == 1 and cached[4]:
+                reused += 1
+                continue
             try:
                 members = client.ths_index_constituents(raw_code)
             except Exception as exc:
@@ -123,6 +141,11 @@ def main() -> int:
                     seen_tickers.add(tk)
                     unique_members.append(m)
             members = unique_members
+            if not members or any(len(str(m.get("ticker", ""))) != 6 or
+                                  not str(m.get("ticker", "")).isascii() or
+                                  not str(m.get("ticker", "")).isdigit() for m in members):
+                skipped += 1
+                continue
 
             raw_daily = json.dumps({
                 "requested_date": snap, "fetched_date": snap,
@@ -200,10 +223,18 @@ def main() -> int:
 
         print(client.quota_note)
         print(f"done: daily_rows={written_d} member_rows={written_m} "
-              f"failed={skipped}")
+              f"failed={skipped} reused={reused}")
         print("next: rebuild normalized views to refresh "
               "v_default_concept_* (any collector run does it)")
-        return 0
+        from trade_system.ths_quality import canonical_ths_snapshot
+        complete = canonical_ths_snapshot(con, snap, exact_date=snap)
+        mismatches = con.execute(
+            "SELECT count(*) FROM (SELECT d.concept_code FROM ths_concept_daily d "
+            "LEFT JOIN ths_concept_stock_history h USING(trade_date,concept_code) "
+            "WHERE d.trade_date=? GROUP BY d.concept_code,d.stock_count "
+            "HAVING count(h.stock_code)<>d.stock_count OR count(DISTINCT h.stock_code)<>d.stock_count)",
+            [snap]).fetchone()[0]
+        return 0 if not skipped and complete and not mismatches else 2
     finally:
         con.close()
 

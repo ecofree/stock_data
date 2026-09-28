@@ -130,15 +130,22 @@ class TushareHistoryCollector:
         reference = self._reference_version() or {}
         if reference.get('membership_date') == _iso(trade_date) and observed & set(reference.get('not_listed', [])):
             raise XiaodefaError('price response conflicts with official listing membership')
+        if dataset == 'daily_basic':
+            observed = {r['ts_code'] for r in rows if isinstance(r, dict)
+                        and _num(r.get('pb')) is not None
+                        and (total := _num(r.get('total_mv'))) is not None and total > 0
+                        and (floating := _num(r.get('circ_mv'))) is not None and 0 < floating <= total}
         if dataset in {'daily', 'daily_basic', 'moneyflow'} and expected - observed and self._suspension_rows(trade_date) is None:
             self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                             'ts_code,trade_date,suspend_timing,suspend_type')
             expected = self._expected_stock_codes(trade_date, dataset)
         if dataset == 'daily_basic' and expected and expected - observed:
             # Retain valid rows without exempting missing valuation/share fields.
+            suspended = sorted((expected - observed) - self._expected_stock_codes(trade_date, 'daily'))
             self._record_snapshot('daily_basic_gaps', {
                 'trade_date': _iso(trade_date), 'missing_codes': sorted(expected - observed),
-                'full_day_suspended': sorted((expected - observed) - self._expected_stock_codes(trade_date, 'daily')),
+                'full_day_suspended': suspended,
+                'supplemental_fields': self._suspended_basic_evidence(trade_date, suspended),
                 'field_status': {'turnover_rate': 'not_applicable_only_if_full_day_suspended',
                     'volume_ratio': 'unknown', 'pe': 'unknown', 'pb': 'unknown',
                     'total_mv': 'unknown', 'circ_mv': 'unknown'},
@@ -147,6 +154,82 @@ class TushareHistoryCollector:
         if not expected or expected - observed:
             raise XiaodefaError(f"incomplete {dataset} response: "
                                f"{len(expected - observed)} missing instruments; expected universe={len(expected)}")
+
+    def _suspended_basic_evidence(self, trade_date, codes):
+        """Retain dated alternatives separately; none certifies daily_basic."""
+        from trade_system.http_transport import request_budget
+        results = {}
+        deadline = min(self.started + self.budget_seconds, time.monotonic() + 30)
+        for code in codes:
+            evidence = results[code] = {}
+            for api, fields in (
+                ('stk_premarket', 'total_share,float_share,pre_close'),
+                ('bak_basic', 'pe,pb,bvps,list_date'),
+            ):
+                params = {'ts_code': code, 'trade_date': _ymd(trade_date)}
+                cached = self.store.conn.execute(
+                    "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+                    "WHERE data_type=? AND provider=? AND asset_code=? "
+                    "AND json_extract_string(payload_json,'$.params.trade_date')=? "
+                    "AND observed_at BETWEEN current_timestamp-INTERVAL 1 DAY AND current_timestamp "
+                    "ORDER BY observed_at DESC LIMIT 1",
+                    ['tushare_'+api, self._provider_name(self.client), code, _ymd(trade_date)]).fetchone()
+                entry = evidence[api] = {'status': 'unknown', 'provider': self._provider_name(self.client),
+                    'source_trade_date': _iso(trade_date), 'certifies_daily_basic': False}
+                try:
+                    payload = json.loads(cached[0]) if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1] else None
+                    if payload is not None and payload.get('params') == params and payload.get('api') == api:
+                        rows = payload.get('rows', [])
+                        if rows or (datetime.now()-cached[2]).total_seconds() < 900:
+                            entry.update(received_at=cached[2].isoformat(), raw_payload_hash=cached[1], reused=True)
+                            if payload.get('error_type'):
+                                entry.update(status='retry_cooldown', error_type=payload['error_type'])
+                                continue
+                        else:
+                            payload = None
+                    else:
+                        payload = None
+                    if payload is None:
+                        if len(codes)>20 or time.monotonic() >= deadline:
+                            entry['status'] = 'budget_exhausted'
+                            continue
+                        with request_budget(deadline-time.monotonic()):
+                            rows = self._read_rows(api, params, 'ts_code,trade_date,'+fields)
+                        receipt = self.store.conn.execute(
+                            "SELECT observed_at,payload_hash FROM multi_source_observation "
+                            "WHERE data_type=? AND asset_code=? AND provider=? "
+                            "AND json_extract_string(payload_json,'$.params.trade_date')=? "
+                            "ORDER BY observed_at DESC LIMIT 1",
+                            ['tushare_'+api, code, self._provider_name(self.client), _ymd(trade_date)]).fetchone()
+                        if receipt:
+                            entry.update(received_at=receipt[0].isoformat(), raw_payload_hash=receipt[1], reused=False)
+                    if (len(rows) != 1 or rows[0].get('ts_code') != code
+                            or rows[0].get('trade_date') != _ymd(trade_date)):
+                        entry['status'] = 'unavailable_or_identity_mismatch'
+                        continue
+                    row = rows[0]
+                    values = {field: _num(row.get(field)) for field in fields.split(',') if field != 'list_date'}
+                    if api == 'stk_premarket':
+                        if (any(value is None or value <= 0 for value in values.values())
+                                or values['float_share'] > values['total_share']):
+                            entry['status'] = 'invalid_share_or_reference_price'
+                            continue
+                        entry.update(values=values, share_unit='10000_shares', price_semantics='previous_close')
+                    else:
+                        # Dynamic PE is a different metric; zero is not usable PE.
+                        entry.update(values={'pb': values['pb'], 'bvps': values['bvps'],
+                            'pe_dynamic': values['pe'] if values['pe'] is not None and values['pe'] > 0 else None},
+                            pe_static_status='unknown')
+                    entry['status'] = 'observed_alternative' if any(v is not None for v in entry['values'].values()) else 'unknown'
+                except Exception as exc:
+                    entry.update(status='unavailable', error_type=type(exc).__name__)
+                    encoded = _json({'api': api, 'params': params, 'rows': [], 'error_type': type(exc).__name__})
+                    self.store.conn.execute(
+                        "INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
+                        "VALUES (?,'receipt',?,?,'error',?,?)",
+                        ['tushare_'+api, code, self._provider_name(self.client), encoded,
+                         hashlib.sha256(encoded.encode()).hexdigest()])
+        return results
 
     def _expected_stock_codes(self, trade_date, dataset=None):
         expected = {r[0] for r in self.store.conn.execute(
@@ -226,6 +309,11 @@ class TushareHistoryCollector:
                 [_iso(trade_date)],
             ).fetchone()[0] or 0)
         coverage = round(distinct_codes * 100.0 / expected, 4) if expected else None
+        if dataset == 'daily_basic':
+            qualified = self._covered_codes(dataset, trade_date)
+            invalid_rows = observed - len(qualified)
+            applicable = self._expected_stock_codes(trade_date, dataset)
+            coverage = round(len(qualified & applicable)*100.0/expected, 4) if expected else None
         certified = (
             status == "certified"
             and expected >= 1000
@@ -349,7 +437,7 @@ class TushareHistoryCollector:
         return qualified_stock_reference(self.store.conn,
             provider='xiaodefa' if self.offline else self._provider_name(self.client))
 
-    def _szse_listing_membership(self):
+    def _exchange_listing_membership(self, exchange='SZ'):
         """Dated complete exchange inventory, only for unresolved native dates."""
         import io
         import re
@@ -360,12 +448,47 @@ class TushareHistoryCollector:
         today = date.today().isoformat()
         cached = self.store.conn.execute(
             "SELECT payload_json,payload_hash FROM multi_source_observation "
-            "WHERE data_type='szse_listing_membership' AND provider='szse' "
-            "AND observed_at>=current_timestamp-INTERVAL 15 MINUTE ORDER BY observed_at DESC LIMIT 1").fetchone()
+            "WHERE data_type=? AND provider=? "
+            "AND observed_at BETWEEN current_timestamp-INTERVAL 15 MINUTE AND current_timestamp "
+            "ORDER BY observed_at DESC LIMIT 1", [('szse' if exchange == 'SZ' else 'sse')+'_listing_membership',
+                                                   'szse' if exchange == 'SZ' else 'sse']).fetchone()
         if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1]:
             value = json.loads(cached[0])
             if value.get('as_of') == today:
                 return value
+        if exchange not in {'SZ', 'SH'}:
+            raise ValueError('unsupported listing exchange')
+        if exchange == 'SH':
+            import urllib.parse
+            base = 'https://query.sse.com.cn/sseQuery/commonQuery.do'
+            listings, receipts = {}, []
+            with request_budget(min(30, self.budget_seconds-(time.monotonic()-self.started))):
+                for board in ('1', '8'):
+                    params = {'STOCK_TYPE':board, 'sqlId':'COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L',
+                        'COMPANY_STATUS':'2,4,5,7,8', 'type':'inParams', 'isPagination':'true',
+                        'pageHelp.pageSize':'10000', 'pageHelp.pageNo':'1', 'pageHelp.beginPage':'1',
+                        'pageHelp.endPage':'1', 'pageHelp.cacheSize':'1'}
+                    raw = read_verified_once(urllib.request.Request(base+'?'+urllib.parse.urlencode(params),
+                        headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.sse.com.cn/assortment/stock/list/share/'}),
+                        timeout=12,max_bytes=3_000_000)
+                    data = json.loads(raw); rows = data.get('result'); page = data.get('pageHelp',{})
+                    if (not isinstance(rows,list) or not 100<=len(rows)<=2000 or page.get('pageNo')!=1
+                            or page.get('pageCount')!=1 or page.get('total')!=len(rows)):
+                        raise XiaodefaError('incomplete SSE listing inventory')
+                    for row in rows:
+                        code, listed = row.get('A_STOCK_CODE',''), row.get('LIST_DATE','')
+                        if (not re.fullmatch(r'6\d{5}',code) or code in listings
+                                or row.get('STOCK_TYPE')!=board or not listed
+                                or not date(1990,1,1)<=date.fromisoformat(_iso(listed))<=date.today()):
+                            raise XiaodefaError('invalid or duplicate SSE listing identity')
+                        listings[code] = _iso(listed)
+                    receipts.append(dict(board=board,rows=len(rows),sha256=hashlib.sha256(raw).hexdigest()))
+            value = dict(as_of=today,recordcount=len(listings),listings=listings,source=base,receipts=receipts)
+            encoded = _json(value)
+            self.store.conn.execute("INSERT INTO multi_source_observation(data_type,asset_type,provider,status,payload_json,payload_hash) "
+                "VALUES ('sse_listing_membership','reference','sse','qualified',?,?)",
+                [encoded,hashlib.sha256(encoded.encode()).hexdigest()])
+            return value
         base = 'https://www.szse.cn/api/report/ShowReport'
         with request_budget(min(30, self.budget_seconds - (time.monotonic()-self.started))):
             meta_raw = read_verified_once(urllib.request.Request(
@@ -453,6 +576,66 @@ class TushareHistoryCollector:
                 [code, encoded, hashlib.sha256(encoded.encode()).hexdigest()])
         return evidence
 
+    def _bse_listing_membership(self):
+        """Complete official inventory, dated by its source session and verified calendar."""
+        import re
+        import urllib.parse
+        import urllib.request
+        from trade_system.http_transport import read_verified_once, request_budget
+        today = date.today().isoformat()
+        last = self.store.conn.execute("SELECT max(cal_date) FROM (SELECT cal_date FROM tushare_trade_cal "
+            "WHERE cal_date<=? AND exchange IN ('SSE','SZSE') GROUP BY cal_date "
+            "HAVING count(*)=2 AND count(DISTINCT exchange)=2 AND bool_and(is_open))", [today]).fetchone()[0]
+        if last is None or self.ensure_calendar(str(last), today, allow_fetch=False) != [str(last)]:
+            raise XiaodefaError('BSE reference requires a complete current exchange calendar')
+        cached = self.store.conn.execute("SELECT payload_json,payload_hash FROM multi_source_observation "
+            "WHERE data_type='bse_listing_membership' AND provider='bse' "
+            "AND observed_at BETWEEN current_timestamp-INTERVAL 15 MINUTE AND current_timestamp "
+            "ORDER BY observed_at DESC LIMIT 1").fetchone()
+        if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1]:
+            value = json.loads(cached[0])
+            if value.get('as_of') == today and value.get('source_session') == str(last):
+                return value
+        url = 'https://www.bse.cn/nqxxController/nqxxCnzq.do'
+        rows, pages, expected, total_pages = [], [], None, 1
+        with request_budget(min(30, self.budget_seconds-(time.monotonic()-self.started))):
+            page = 0
+            while page < total_pages:
+                body = urllib.parse.urlencode({'page':page,'typejb':'T','xxfcbj[]':'2',
+                    'xxzqdm':'','sortfield':'xxzqdm','sorttype':'asc'}).encode()
+                raw = read_verified_once(urllib.request.Request(url, data=body, headers={
+                    'Content-Type':'application/x-www-form-urlencoded', 'User-Agent':'Mozilla/5.0',
+                    'Referer':'https://www.bse.cn/nq/listedcompany.html',
+                    'X-Requested-With':'XMLHttpRequest'}), timeout=10,max_bytes=500_000)
+                text = raw.decode('utf-8').strip()
+                if not text.startswith('null(') or not text.endswith(')'):
+                    raise XiaodefaError('unexpected BSE inventory envelope')
+                payload = json.loads(text[5:-1])
+                if not isinstance(payload,list) or len(payload)!=1:
+                    raise XiaodefaError('ambiguous BSE inventory response')
+                item = payload[0]; batch = item.get('content')
+                count, count_pages = item.get('totalElements'), item.get('totalPages')
+                if (type(count) is not int or not 1<=count<=1000 or type(count_pages) is not int
+                        or not 1<=count_pages<=50 or item.get('number')!=page or not isinstance(batch,list)
+                        or not batch or (expected is not None and (count!=expected or count_pages!=total_pages))):
+                    raise XiaodefaError('incomplete or changing BSE inventory pages')
+                expected,total_pages=count,count_pages
+                rows.extend(batch); pages.append({'page':page,'sha256':hashlib.sha256(raw).hexdigest(),
+                    'received_at':datetime.now().isoformat()}); page+=1
+        if (len(rows)!=expected or len({r.get('xxzqdm') for r in rows})!=expected or any(
+                not re.fullmatch(r'\d{6}',r.get('xxzqdm','')) or r.get('xxfcbj')!='2'
+                or r.get('xxjsrq')!=_ymd(last) for r in rows)):
+            raise XiaodefaError('BSE inventory incomplete, duplicate or stale source session')
+        # fxssrq may be a pre-2021 selected-tier date, not a BSE IPO date.
+        value={'as_of':today,'source_session':str(last),'recordcount':expected,
+            'listings':{r['xxzqdm']:r.get('fxssrq') for r in rows},'source':url,'pages':pages,
+            'date_semantics':'current_inventory_no_intervening_open_session; IPO dates require native evidence'}
+        encoded=_json(value)
+        self.store.conn.execute("INSERT INTO multi_source_observation(data_type,asset_type,provider,status,payload_json,payload_hash) "
+            "VALUES ('bse_listing_membership','reference','bse','qualified',?,?)",
+            [encoded,hashlib.sha256(encoded.encode()).hexdigest()])
+        return value
+
     def _collect_reference(self, dataset, start=None, end=None):
         if dataset == "trade_cal":
             params = {"start_date": start, "end_date": end}
@@ -484,6 +667,8 @@ class TushareHistoryCollector:
             # Unknown dates are never replaced by subscription dates or dropped.
             corrections = []
             membership = None
+            sh_membership = None
+            bse_membership = self._bse_listing_membership() if self._is_production_source() else None
             not_listed = []
             for row in rows:
                 try:
@@ -499,12 +684,12 @@ class TushareHistoryCollector:
                 evidence = self.stock_listing_evidence(self.store.conn, code)
                 items = evidence.get('item', [])
                 stamp = evidence.get('timestamp')
-                if (len(items) != 1 or items[0].get('thscode') != code
-                        or items[0].get('asset_type') != 'a-share'
+                if (len(items) > 1 or (items and (items[0].get('thscode') != code
+                        or items[0].get('asset_type') != 'a-share'))
                         or type(stamp) not in (int, float)
                         or not 0 <= time.time() - stamp / 1000 <= 86400):
                     raise XiaodefaError('native listing receipt identity mismatch')
-                replacement = items[0].get('list_date')
+                replacement = items[0].get('list_date') if items else None
                 corrections.append({'ts_code': code, 'original': row.get('list_date'),
                                     'list_date': replacement, 'provider': 'hithink'})
                 if replacement is not None:
@@ -513,10 +698,43 @@ class TushareHistoryCollector:
                     date.fromisoformat(replacement)
                     row['list_date'] = replacement
                 elif code.endswith('.SZ'):
-                    membership = membership or self._szse_listing_membership()
+                    membership = membership or self._exchange_listing_membership()
                     if code[:6] not in membership['listings']:
                         not_listed.append(code)
                         row['list_date'] = None
+                    else:
+                        row['list_date'] = membership['listings'][code[:6]]
+                        corrections[-1].update(list_date=row['list_date'], provider='szse')
+                elif code.endswith('.BJ'):
+                    bse_membership = bse_membership or self._bse_listing_membership()
+                    if code[:6] not in bse_membership['listings']:
+                        not_listed.append(code)
+                        row['list_date'] = None
+                elif code.endswith('.SH'):
+                    sh_membership = sh_membership or self._exchange_listing_membership('SH')
+                    if code[:6] not in sh_membership['listings']:
+                        not_listed.append(code)
+                        row['list_date'] = None
+                    else:
+                        row['list_date'] = sh_membership['listings'][code[:6]]
+                        corrections[-1].update(list_date=row['list_date'], provider='sse')
+            if bse_membership:
+                known = {row['ts_code'] for row in rows}
+                for code in sorted(set(bse_membership['listings'])-{c[:6] for c in known if c.endswith('.BJ')}):
+                    if len(corrections)>=20 or not self._budget_left():
+                        raise XiaodefaError('native listing repair budget exhausted')
+                    evidence=self.stock_listing_evidence(self.store.conn,code+'.BJ')
+                    items=evidence.get('item',[]); stamp=evidence.get('timestamp')
+                    if (len(items)!=1 or type(stamp) not in (int,float)
+                            or not 0<=time.time()-stamp/1000<=86400):
+                        raise XiaodefaError('native listing receipt identity mismatch')
+                    native=items[0]
+                    listed=native.get('list_date')
+                    if (native.get('thscode')!=code+'.BJ' or native.get('asset_type')!='a-share' or not listed
+                            or not date(1990,1,1)<=date.fromisoformat(listed)<=date.fromisoformat(bse_membership['source_session'])):
+                        raise XiaodefaError('BSE/native listing date disagreement: '+code)
+                    rows.append(dict(ts_code=code+'.BJ',symbol=code,name=native.get('name'),market='北交所',list_date=listed,list_status='L'))
+                    corrections.append(dict(ts_code=code+'.BJ',list_date=listed,provider='hithink',membership_provider='bse'))
             invalid = []
             for row in rows:
                 if row.get('ts_code') in not_listed:
@@ -541,9 +759,11 @@ class TushareHistoryCollector:
                 self._record_snapshot(dataset, {'rows': snapshot, 'scope': ['L', 'D'],
                     'version': hashlib.sha256(_json(snapshot).encode()).hexdigest(),
                     'listing_corrections': corrections,
-                    'listing_membership': {'as_of': membership['as_of'], 'not_listed': not_listed,
-                        'recordcount': membership['recordcount'], 'xlsx_sha256': membership['xlsx_sha256']}
-                        if not_listed else {}})
+                    'listing_membership': {'as_of': date.today().isoformat(), 'not_listed': not_listed,
+                        'szse': {k:v for k,v in (membership or {}).items() if k!='listings'},
+                        'sse': {k:v for k,v in (sh_membership or {}).items() if k!='listings'},
+                        'bse': {k:v for k,v in (bse_membership or {}).items() if k!='listings'}}
+                        if membership or sh_membership or bse_membership else {}})
                 self._checkpoint(dataset, CHECKPOINT_DATE, 'success', rows=count, attempts=1)
             return count
         return store_reference(self.store, dataset, rows)
@@ -625,8 +845,10 @@ class TushareHistoryCollector:
             predicate = "(isfinite(net_mf_amount) OR (" + " AND ".join(f"isfinite({f})" for f in
                 ("buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount")) + "))"
         elif dataset == "daily_basic":
-            predicate = "(" + " OR ".join(f"isfinite({f})" for f in
-                ("turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv")) + ")"
+            # A lone PB/PE or turnover value does not establish valuation coverage.
+            # PE may be NULL for loss-making issuers; never replace it with zero.
+            predicate = ("isfinite(pb) AND isfinite(total_mv) AND total_mv>0 "
+                         "AND isfinite(circ_mv) AND circ_mv>0 AND circ_mv<=total_mv")
         return {r[0] for r in self.store.conn.execute(
             f"SELECT ts_code FROM tushare_{dataset} WHERE date=? AND {predicate} GROUP BY ts_code HAVING count(*)=1",
             [_iso(trade_date)]).fetchall()}
@@ -683,6 +905,9 @@ class TushareHistoryCollector:
             missing = self._expected_stock_codes(trade_date, dataset) - self._covered_codes(dataset, trade_date)
             if missing:
                 raise XiaodefaError(f"coverage incomplete: {len(missing)} instruments lack qualified fields")
+            if dataset == 'daily_basic':
+                self._record_snapshot('daily_basic_gaps', {'trade_date': _iso(trade_date),
+                    'missing_codes': [], 'supplemental_fields': {}, 'acceptance': 'valuation_coverage_complete'})
             self._certify_close_snapshot(dataset, trade_date, status="certified",
                                          provider=self._provider_name(self.client))
         return count

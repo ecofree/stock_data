@@ -42,15 +42,13 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
         "AND origin_provider='eastmoney' AND source_api='moneyflow_dc' "
         "AND amount_unit='yuan' AND flow_definition='provider_main_orders_net' AND isfinite(main_net) "
         "AND fetched_at BETWEEN current_timestamp-INTERVAL 3 HOUR AND current_timestamp", [trade_date]).fetchall()
-    if {r[0] for r in cached} == set(universe):
-        on_page(1, [], 1, {'count':len(universe), 'receipt_reused':True})
-        return [], dict(source='xiaodefa_moneyflow_dc',pages=1,expected_rows=len(universe),receipt_reused=True)
     # API limit is 6000; one full page alone cannot prove completeness.
     pages = []
+    acquisition_id = uuid.uuid4().hex
     def retain(offset, rows):
         received = datetime.now()
         payload = json.dumps(dict(api='moneyflow_dc',params={'trade_date':_compact(trade_date)},
-                                  offset=offset,rows=rows), ensure_ascii=False,sort_keys=True,allow_nan=False)
+                                  acquisition_id=acquisition_id,offset=offset,rows=rows), ensure_ascii=False,sort_keys=True,allow_nan=False)
         con.execute("INSERT INTO multi_source_observation "
             "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash,observed_at) "
             "VALUES (?,'tushare_moneyflow_dc','receipt','xiaodefa','received_unverified',?,?,?)",
@@ -59,15 +57,86 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
     limit = min(3, int(max_pages)) if max_pages is not None else 3
     if limit < 1:
         raise ValueError('positive relay page budget required')
-    rows = XiaodefaClient(timeout=60,max_retries=1).query_all('moneyflow_dc',
-        trade_date=_compact(trade_date),page_size=6000,max_rows=6000*limit,on_page=retain)
+    # Re-project a complete retained page chain, preserving every arrival time.
+    # Never assemble different acquisition attempts or reuse a truncated prefix.
+    raw_reused = False
+    chain = []
+    next_offset = None
+    chain_id = None
+    saw_raw_receipt = False
+    for raw, digest, arrived in con.execute(
+            "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+            "WHERE data_type='tushare_moneyflow_dc' AND provider='xiaodefa' AND source_date=? "
+            "AND observed_at<=current_timestamp ORDER BY observed_at DESC LIMIT 12", [trade_date]).fetchall():
+        saw_raw_receipt = True
+        if hashlib.sha256(raw.encode()).hexdigest() != digest:
+            chain, next_offset = [], None
+            continue
+        payload = json.loads(raw)
+        batch, offset = payload.get('rows'), payload.get('offset')
+        valid = (payload.get('api') == 'moneyflow_dc'
+                 and payload.get('params') == {'trade_date':_compact(trade_date)}
+                 and isinstance(batch,list) and type(offset) is int and offset >= 0 and offset % 6000 == 0
+                 and arrived.date().isoformat() >= trade_date
+                 and (arrived.date().isoformat() > trade_date or arrived.hour >= 15))
+        if not valid:
+            chain, next_offset = [], None
+            continue
+        if next_offset is None:
+            if len(batch) >= 6000 or offset // 6000 >= limit:
+                continue
+            chain_id = payload.get('acquisition_id')
+            # Legacy single pages are self-contained; a time interval alone
+            # cannot establish that several pages share one acquisition.
+            if offset and (not isinstance(chain_id, str) or not chain_id):
+                continue
+            chain = [(batch, arrived.timestamp())]
+        elif (offset != next_offset or len(batch) != 6000
+              or payload.get('acquisition_id') != chain_id or chain[0][1]-arrived.timestamp() > 60):
+            chain, next_offset = [], None
+            continue
+        else:
+            chain.append((batch, arrived.timestamp()))
+        next_offset = offset - 6000
+        if offset == 0:
+            pages = list(reversed(chain))
+            rows = [row for batch, _ in pages for row in batch]
+            raw_reused = bool(rows)
+            break
+    if not raw_reused and not saw_raw_receipt and {r[0] for r in cached} == set(universe):
+        on_page(1, [], 1, {'count':len(universe), 'receipt_reused':True})
+        return [], dict(source='xiaodefa_moneyflow_dc',pages=1,expected_rows=len(universe),receipt_reused=True)
+    if not raw_reused:
+        rows = XiaodefaClient(timeout=60,max_retries=1).query_all('moneyflow_dc',
+            trade_date=_compact(trade_date),page_size=6000,max_rows=6000*limit,on_page=retain)
     identities = [r.get('ts_code') for r in rows]
     if not rows:
         raise ValueError('dated relay stock flow unavailable: empty response')
     if (len(set(identities)) != len(rows) or any(
             r.get('trade_date') != _compact(trade_date) or not isinstance(r.get('ts_code'), str)
-            or len(r['ts_code']) != 9 or r['ts_code'][-3:] not in ('.SH','.SZ','.BJ') for r in rows)):
+            or len(r['ts_code']) != 9 or not r['ts_code'][:6].isascii() or not r['ts_code'][:6].isdigit() or r['ts_code'][-3:] not in ('.SH','.SZ','.BJ') for r in rows)):
         raise ValueError('duplicate identity or wrong-date relay stock flow')
+    # A returned A-share absent from the reference is a reconciliation item,
+    # never permission to silently discard it and report 100% coverage.
+    unknown = sorted({r['ts_code'] for r in rows if (code := r['ts_code'])[:6] not in universe
+                      and ((_number(r.get('close')) or 0) > 0 or (_number(r.get('net_amount')) or 0) != 0)
+                      and not (code.endswith('.SH') and code.startswith('9'))
+                      and not (code.endswith('.SZ') and code.startswith('2'))})
+    if len(unknown) > 20:
+        raise ValueError('stock reference discrepancy exceeds bounded repair budget')
+    additions = {}
+    from trade_system.http_transport import request_budget
+    with request_budget(30):
+        for code in unknown:
+            evidence = TushareHistoryCollector.stock_listing_evidence(con, code)
+            items = evidence.get('item', [])
+            listed = items[0].get('list_date') if len(items) == 1 else None
+            if (len(items) != 1 or items[0].get('thscode') != code
+                    or items[0].get('asset_type') != 'a-share' or not listed
+                    or not date(1990,1,1) <= date.fromisoformat(listed) <= date.fromisoformat(trade_date)):
+                raise ValueError('unresolved returned stock identity: '+code)
+            additions[code[:6]] = code[-2:]
+    universe.update(additions)
     for index, (batch, received_at) in enumerate(pages, 1):
         normalized = [dict(code=r['ts_code'][:6],date=trade_date,main_net=r.get('net_amount'),
             super_net=r.get('buy_elg_amount'),large_net=r.get('buy_lg_amount'),
@@ -76,8 +145,9 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
             amount_unit='10000_yuan',flow_definition='provider_main_orders_net',
             source_api='moneyflow_dc',origin_provider='eastmoney') for r in batch
             if r['ts_code'] == f"{r['ts_code'][:6]}.{universe.get(r['ts_code'][:6])}"]
-        on_page(index,normalized,len(pages),dict(count=len(rows),received_at=received_at))
-    return rows, dict(source='xiaodefa_moneyflow_dc',pages=len(pages),expected_rows=len(universe))
+        on_page(index,normalized,len(pages),dict(count=len(rows),received_at=received_at,receipt_reused=raw_reused))
+    return rows, dict(source='xiaodefa_moneyflow_dc',pages=len(pages),expected_rows=len(universe),
+                     receipt_reused=raw_reused,raw_receipt_reused=raw_reused, verified_universe_additions=additions)
 
 
 def _ensure_checkpoint_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -453,11 +523,17 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         if os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and not expected_universe:
             raise ValueError('qualified dated A-share reference unavailable; collection not started; '+reference_error)
         dc_pages = []
+        if source_provider == 'xiaodefa_moneyflow_dc':
+            # Old completion used a potentially stale universe. Recheck the
+            # retained raw receipt before trusting its previous 100% label.
+            completed_resume = False
+            skip_pages.clear()
         if source_provider == 'xiaodefa_moneyflow_dc' and not completed_resume:
             # Retain raw pages before canonical transaction, including failed
             # pagination. No second connection and no receipt timestamp rewrite.
             rows, meta = _collect_dc_snapshot(con, trade_date, universe_by_exchange,
                 lambda *args: dc_pages.append(args), max_pages=max_pages)
+            expected_universe = set(universe_by_exchange)
         if atomic_refresh:
             con.execute("BEGIN TRANSACTION")
         if completed_resume:

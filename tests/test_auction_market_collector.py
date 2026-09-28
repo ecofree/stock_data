@@ -88,6 +88,13 @@ def test_full_market_payload_writes_ticks_and_final_match(tmp_path, monkeypatch)
         store = DuckDBStore(str(db))
         assert len(client.calls) == 1
         assert store.conn.execute("SELECT count(*) FROM raw_api_data WHERE endpoint='/auction/tick'").fetchone()[0] == count
+        arrival = store.conn.execute("SELECT fetched_at FROM auction_tick WHERE stock_code='000002'").fetchone()[0]
+        store.conn.execute("UPDATE auction_tick SET volume_unit='unknown',volume_semantics=NULL WHERE stock_code='000002'")
+        store.close()
+        assert entry.collect(db, '2026-08-28', product='tick', codes=['000002'])['status'] == 'success'
+        store = DuckDBStore(str(db))
+        assert len(client.calls) == 1
+        assert store.conn.execute("SELECT fetched_at,volume_unit FROM auction_tick WHERE stock_code='000002'").fetchone() == (arrival,'hands')
         import pytest
         from collectors.collect_misc import collect_auction_tick
         wrong = FakeAuctionClient(dict(client.payload, stock_code='600000'))

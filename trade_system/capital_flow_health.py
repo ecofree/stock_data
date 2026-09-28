@@ -185,6 +185,7 @@ def assess_capital_flow_health(
     min_coverage_pct: float = 80.0,
     max_age_seconds: int | None = None,
     now: datetime | None = None,
+    session_close: bool = False,
 ) -> dict:
     if isinstance(collected_after, str):
         collected_after = as_local_naive(collected_after)
@@ -195,6 +196,12 @@ def assess_capital_flow_health(
     # Historical as-of replay supplies its historical clock; retrospective
     # date-only inspection may explicitly omit TTL, without certifying freshness.
     effective_max_age_seconds = max_age_seconds
+    close_boundary = datetime.fromisoformat(trade_date + "T15:00:00")
+    if session_close and now >= close_boundary:
+        # Retained same-session close evidence does not expire during retry.
+        # Earlier intraday rows and future fetches remain excluded; coverage,
+        # taxonomy and independent reconciliation gates still apply.
+        effective_max_age_seconds = int((now - close_boundary).total_seconds())
     con = connect_duckdb(str(db_path), read_only=True)
     primary_stock_provider = None
     primary_stock_codes = None
@@ -475,7 +482,7 @@ def assess_capital_flow_health(
         "effective_max_age_seconds": (
             int(effective_max_age_seconds) if effective_max_age_seconds is not None else None
         ),
-        "freshness_contract": "timestamp_ttl" if max_age_seconds is not None else "same_trade_date_no_ttl_certification",
+        "freshness_contract": "same_session_postclose_window" if session_close else "timestamp_ttl" if max_age_seconds is not None else "same_trade_date_no_ttl_certification",
         "evaluated_at": now.isoformat(timespec='seconds'),
         "stock_flow": {
             "ready": stock_ready,

@@ -1194,15 +1194,15 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
         f"<div class='detail-item'><div class='d-label'>候选池</div><div class='d-value mono'>{readiness.get('actionable_candidates', 0)} 可行动 / {readiness.get('executable_candidates', 0)} 可执行</div></div>"
         "</div>"
     )
-    checkpoints = data_sources.get("provider_checkpoints") or data_sources.get("checkpoints") or []
+    checkpoints = data_sources.get("provider_checkpoints") or data_sources.get("checkpoints") or data_sources.get('tushare') or []
     if checkpoints:
         source_rows = []
         for item in checkpoints[:16]:
             source_rows.append(
                 f"<tr><td>{_e(item.get('dataset') or item.get('name') or '—')}</td>"
                 f"<td>{_status_pill(item.get('status'))}</td>"
-                f"<td class='num'>{_num(item.get('rows'))}</td>"
-                f"<td class='dim'>{_e(item.get('error') or '—')}</td></tr>"
+                f"<td class='num'>{_num(item.get('rows', item.get('rows_written')))}</td>"
+                f"<td class='dim'>{_e(item.get('error') or item.get('last_error') or '—')}</td></tr>"
             )
         parts.append(
             "<div class='sec-title'><strong>数据源检查点</strong></div>"
@@ -1210,6 +1210,19 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
             "<th class='num'>行数</th><th>错误</th></tr></thead>"
             f"<tbody>{''.join(source_rows)}</tbody></table></div>"
         )
+    gaps = data_sources.get('daily_basic_gaps') or {}
+    if gaps.get('missing_codes'):
+        parts.append("<div class='sec-title'><strong>基本面补充证据（未通过完整验收）</strong></div>"
+            "<p>股本单位为万股，价格为前收盘价；动态 PE 不替代静态 PE，补充字段不代表市值已确认。</p>"
+            f"<p>缺失代码：{_e(', '.join(gaps.get('missing_codes') or []))}</p>")
+        for code, sources in sorted((gaps.get('supplemental_fields') or {}).items()):
+            parts.append(f"<details><summary>{_e(code)}</summary><ul>")
+            for api, item in sources.items():
+                values = ', '.join(f'{key}={value if value is not None else "未知"}'
+                                   for key, value in (item.get('values') or {}).items())
+                parts.append(f"<li>{_e(api)}：{_e(item.get('status'))}；{_e(values)}；"
+                             f"源日期 {_e(item.get('source_trade_date'))}；到达 {_e(item.get('received_at') or '未知')}</li>")
+            parts.append('</ul></details>')
     return "\n".join(parts)
 
 

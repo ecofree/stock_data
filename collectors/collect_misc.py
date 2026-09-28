@@ -222,6 +222,8 @@ def _ensure_auction_market_tables(store: DuckDBStore) -> None:
     store.conn.execute(
         "ALTER TABLE auction_tick ADD COLUMN IF NOT EXISTS volume_unit VARCHAR"
     )
+    for column, kind in [('amount', 'DOUBLE'), ('volume_semantics', 'VARCHAR'), ('unit_basis', 'VARCHAR')]:
+        store.conn.execute(f'ALTER TABLE auction_tick ADD COLUMN IF NOT EXISTS {column} {kind}')
     store.conn.execute(
         "ALTER TABLE auction_quote_snapshot ADD COLUMN IF NOT EXISTS volume_unit VARCHAR"
     )
@@ -370,6 +372,7 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
     from datetime import datetime
     from trade_system.quote_transport import canonical_codes
     from trade_system.source_validation import validate_kpl
+    from trade_system.units import kpl_auction_tick_units
     import duckdb
     codes = canonical_codes(stock_codes)
     if not codes or len(codes) > 20:
@@ -377,6 +380,7 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
     _ensure_auction_market_tables(store)
     total = 0
     for code in codes:
+        reusable = False
         # Reuse a validated final receipt, or a recent in-session receipt, without
         # changing its arrival timestamp. No cached success is inferred from rows alone.
         try:
@@ -390,26 +394,36 @@ def collect_auction_tick(client: KPLClient, store: DuckDBStore, date: str, stock
             age = (datetime.now() - cached[1]).total_seconds()
             valid = validate_kpl('/auction/tick', {'code': code, 'date': date}, retained).ok
             final = valid and retained['auction_ticks'][-1]['time'] == '09:25:00' and cached[1] >= datetime.fromisoformat(date+'T09:25:00')
-            stored = store.conn.execute('SELECT time,price,volume,volume_unit FROM auction_tick WHERE date=? AND stock_code=? ORDER BY time', [date, code]).fetchall()
-            expected = [(t['time'], float(t['price']), int(t['volume']), str(t.get('volume_unit') or t.get('vol_unit') or 'unknown')) for t in retained['auction_ticks']] if valid else []
-            if valid and (0 <= age < 180 or final) and stored == expected:
+            stored = store.conn.execute('SELECT time,price,volume,volume_unit,amount,volume_semantics,unit_basis FROM auction_tick WHERE date=? AND stock_code=? ORDER BY time', [date, code]).fetchall()
+            expected = [(t['time'], float(t['price']), int(t['volume']), kpl_auction_tick_units(t)[0],
+                         kpl_auction_tick_units(t)[1], 'indicative_match_snapshot', kpl_auction_tick_units(t)[2])
+                        for t in retained['auction_ticks']] if valid else []
+            crossed_match = cached[1] < datetime.fromisoformat(date+'T09:25:00') <= datetime.now()
+            reusable = valid and ((0 <= age < 180 and not crossed_match) or final)
+            if reusable and stored == expected:
                 total += len(stored)
                 continue
-        data = client.get("/auction/tick", {"code": code, "date": date})
+        data = retained if reusable else client.get("/auction/tick", {"code": code, "date": date})
         if not data:
             continue
-        store.insert_raw('/auction/tick', data)
+        received_at = cached[1] if reusable else datetime.now()
+        if not reusable:
+            store.insert_raw('/auction/tick', data)
+            received_at = store.conn.execute("SELECT max(fetched_at) FROM raw_api_data WHERE endpoint='/auction/tick' "
+                "AND json_extract_string(raw_json,'$.stock_code')=? AND json_extract_string(raw_json,'$.date')=?",
+                [code, date]).fetchone()[0]
         validation = validate_kpl('/auction/tick', {'code': code, 'date': date}, data)
         if not validation.ok:
             raise ValueError(validation.reason)
         rows = [(date, code, tk['time'], tk['price'], tk['volume'],
-                 str(tk.get('volume_unit') or tk.get('vol_unit') or 'unknown'))
+                 kpl_auction_tick_units(tk)[0], kpl_auction_tick_units(tk)[1],
+                 'indicative_match_snapshot', kpl_auction_tick_units(tk)[2], received_at)
                 for tk in data['auction_ticks']]
         if rows:
             with store.transaction():
                 store.conn.execute('DELETE FROM auction_tick WHERE date=? AND stock_code=?', [date, code])
                 n = store.insert_rows("auction_tick", rows,
-                    ["date", "stock_code", "time", "price", "volume", "volume_unit"],
+                    ["date", "stock_code", "time", "price", "volume", "volume_unit", "amount", "volume_semantics", "unit_basis", "fetched_at"],
                     replace_on=["date", "stock_code", "time"])
             total += n
     if total:

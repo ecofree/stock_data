@@ -64,7 +64,8 @@ def observed_auction_rows(payload, trade_date, provider, received_at, payload_ha
         if final and item.get('ticker', ts_code[:6]) != ts_code[:6]:
             raise ValueError('native final ticker and exchange identity disagree')
         seen.add(ts_code)
-        reason = 'final_snapshot_not_tick_or_order_book_or_preopen_capture' if final else 'historical_bar_not_tick_or_order_book_or_preopen_capture'
+        reason = ('final_snapshot_not_tick_or_order_book_or_preopen_capture;source_session_unknown;units_unknown'
+                  if final else 'historical_bar_not_tick_or_order_book_or_preopen_capture')
         if matched:
             reason = 'matched_trade_not_tick_or_order_book_or_preopen_capture'
         price = _number(item.get('auction_price' if final else 'price' if matched else 'close'))
@@ -83,11 +84,15 @@ def observed_auction_rows(payload, trade_date, provider, received_at, payload_ha
         output.append(dict(trade_date=trade_date,stock_code=ts_code[:6],
             source_table='hithink_auction_final' if final else 'xiaodefa_auction_match' if matched else 'multi_source_observation',
             confirmation='final_snapshot_observed' if final else ('matched_trade_confirmed' if ';' not in reason else 'matched_trade_invalid') if matched else 'historical_opening_bar_observed',
-            auction_strength=None,auction_amount=amount if amount is not None and amount>=0 else None,
+            auction_strength=None,auction_amount=amount if matched and amount is not None and amount>=0 else None,
             tick_rows=0,is_fallback=True,missing_reason=reason,
             evidence_json=json.dumps(dict(native=item,provider=provider,
                 api='/api/a-share/auction/snapshot' if final else payload['api'],
                 received_at=received_at.isoformat(),raw_payload_hash=payload_hash,
+                response_timestamp=payload.get('timestamp') if final else None,
+                timestamp_semantics='response_assembly_time' if final else 'explicit_trade_date',
+                source_trade_date=None if final else item['trade_date'],
+                qualified_session=not final,
                 qualified_tick=False,qualified_order_book=False,predeclared_observation=False,
                 qualified_match=matched and ';' not in reason,
                 amount_unit='CNY' if matched else 'native_undocumented',
@@ -182,6 +187,13 @@ def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
         "WHEN 'hands' THEN price * volume * 100 "
         "WHEN 'shares' THEN price * volume ELSE NULL END"
     )
+    semantics = "volume_semantics" if "volume_semantics" in columns else "'legacy_unspecified'"
+    if 'amount' in columns:
+        amount_expr = f"CASE WHEN ({normalized_volume}) IS NOT NULL THEN coalesce(amount, ({amount_expr})) END"
+    snapshot = f"bool_and(coalesce({semantics}, '') = 'indicative_match_snapshot')"
+    basis = "unit_basis" if "unit_basis" in columns else "'legacy_unspecified'"
+    volume_aggregate = f"CASE WHEN {snapshot} THEN first(({normalized_volume}) ORDER BY time DESC) ELSE sum({normalized_volume}) END"
+    amount_aggregate = f"CASE WHEN {snapshot} THEN first(({amount_expr}) ORDER BY time DESC) ELSE sum({amount_expr}) END"
     return _fetch_dicts(
         con,
         f"""
@@ -190,9 +202,11 @@ def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
             stock_code,
             count(*) AS tick_rows,
             count(*) FILTER (WHERE {normalized_volume} IS NULL) AS unknown_unit_rows,
-            sum({amount_expr}) AS auction_amount,
-            sum({normalized_volume}) AS tick_volume,
+            {amount_aggregate} AS auction_amount,
+            {volume_aggregate} AS tick_volume,
+            CASE WHEN {snapshot} THEN 'latest_indicative_match_not_sum' ELSE 'legacy_unspecified' END AS volume_semantics,
             max({unit_expr}) AS tick_volume_unit,
+            string_agg(DISTINCT {basis}, ',') AS unit_basis,
             max(time) AS last_tick_time
         FROM auction_tick
         WHERE CAST(date AS VARCHAR)=?

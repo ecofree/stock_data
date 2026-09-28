@@ -246,7 +246,7 @@ def test_forced_empty_refresh_cannot_reuse_old_rows_as_success(tmp_path):
         assert c.store.conn.execute("SELECT * FROM tushare_daily").fetchall() == previous
 
 
-def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path):
+def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path, monkeypatch):
     class Repeating(XiaodefaClient):
         def __init__(self):
             super().__init__(token="fixture")
@@ -256,6 +256,7 @@ def test_pagination_failure_keeps_all_received_pages_without_publishing(tmp_path
                     ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L')]
             return [{"ts_code": "000001.SZ", "trade_date": "20260701", "close": 10}] * 100
     with TushareHistoryCollector(tmp_path / "pages.duckdb", client=Repeating(), batch_limit=100) as c:
+        monkeypatch.setattr(c, '_bse_listing_membership', lambda: None)
         seed_calendar(c)
         result = c.run("20260701", "20260701", datasets=["daily"], stock_codes=["1"])
         assert result["results"][0]["status"] == "error"
@@ -365,6 +366,7 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         monkeypatch.setattr(HiThinkClient, '__init__', lambda *a, **k: None)
         monkeypatch.setattr(HiThinkClient, 'stock_listing', official)
         monkeypatch.setattr(c, '_is_production_source', lambda: True)
+        monkeypatch.setattr(c, '_bse_listing_membership', lambda: None)
         def query_all(api, *, on_page, **params):
             rows = [dict(r) for r in (c.client.delisted if params.get('list_status') == 'D' else c.client.rows)]
             on_page(0, rows)
@@ -379,14 +381,12 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         c.client.rows.append(dict(ts_code='000003.SZ', list_status='L', list_date='19700101'))
         membership = {'as_of': date.today().isoformat(), 'recordcount': 2901,
                       'listings': {'000003': '1991-01-01'}, 'xlsx_sha256': 'fixture'}
-        monkeypatch.setattr(c, '_szse_listing_membership', lambda: membership)
-        with pytest.raises(Exception, match='000003.SZ'):
-            c.collect_stock_basic(force=True)
-        assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 2
+        monkeypatch.setattr(c, '_exchange_listing_membership', lambda: membership)
+        assert c.collect_stock_basic(force=True) == 3
+        assert str(c.store.conn.execute("SELECT list_date FROM tushare_stock_basic WHERE ts_code='000003.SZ'").fetchone()[0]) == '1991-01-01'
         assert calls == ['000002.SZ', '000003.SZ']
         c.store.conn.execute("UPDATE multi_source_observation SET observed_at=current_timestamp-INTERVAL 20 MINUTE WHERE data_type='stock_listing_reference' AND asset_code='000003.SZ'")
-        with pytest.raises(Exception, match='000003.SZ'):
-            c.collect_stock_basic(force=True)
+        assert c.collect_stock_basic(force=True) == 3
         assert calls == ['000002.SZ', '000003.SZ', '000003.SZ']
         membership['listings'] = {'000001': '1991-01-01'}
         assert c.collect_stock_basic(force=True) == 3
@@ -421,15 +421,15 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         return json.dumps([tab]).encode() if '/data?' in request.full_url else buffer.getvalue()
     monkeypatch.setattr(http_transport, 'read_verified_once', transport)
     with TushareHistoryCollector(tmp_path / 'membership.duckdb', client=Empty()) as c:
-        assert len(c._szse_listing_membership()['listings']) == 1000
-        assert len(c._szse_listing_membership()['listings']) == 1000 and len(reads) == 2
+        assert len(c._exchange_listing_membership()['listings']) == 1000
+        assert len(c._exchange_listing_membership()['listings']) == 1000 and len(reads) == 2
         c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='corrupted' WHERE data_type='szse_listing_membership'")
         tab['metadata']['recordcount'] = 1001
         with pytest.raises(Exception, match='incomplete or conflicting'):
-            c._szse_listing_membership()
+            c._exchange_listing_membership()
         tab['metadata']['subname'] = (date.today()-timedelta(days=1)).isoformat()
         with pytest.raises(Exception, match='undated or incomplete'):
-            c._szse_listing_membership()
+            c._exchange_listing_membership()
 
 
 def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):

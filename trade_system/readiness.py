@@ -410,6 +410,10 @@ def assess_trade_date_readiness(
     freshness_max_age_seconds = (
         None if stage == "postmarket" or historical_close else max_age_seconds
     )
+    if stage == "close" and now.date() == date.fromisoformat(trade_date):
+        boundary = datetime.fromisoformat(trade_date + "T15:00:00")
+        if now >= boundary:
+            freshness_max_age_seconds = int((now - boundary).total_seconds())
     owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
     con = duckdb.connect(str(db_path), read_only=True) if owns_connection else db_path
     try:
@@ -734,6 +738,7 @@ def assess_trade_date_readiness(
             trade_date,
             max_age_seconds=max_age_seconds,
             now=now,
+            session_close=stage in {"close", "postmarket"},
         )
         flow_certified_ready = bool(flow_health.get("flow_certified_ready", False))
         flow_blockers = list(flow_health.get("blockers") or [])

@@ -143,13 +143,12 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
                 if (len(items) != 1 or items[0].get('thscode') != code or items[0].get('asset_type') != 'a-share'
                         or not isinstance(stamp,(int,float)) or not 0 <= now.timestamp()-stamp/1000 <= 86400):
                     continue
-                listed, ended = items[0].get('list_date'), items[0].get('end_date')
+                listed = items[0].get('list_date')
                 if listed and date.fromisoformat(listed) > date.fromisoformat(trade_date):
                     inapplicable[str(code)[:6]] = 'before_verified_listing_date'
                     applicability_receipts.append(digest)
-                elif ended and date.fromisoformat(ended) <= date.fromisoformat(trade_date):
-                    inapplicable[str(code)[:6]] = 'after_verified_delisting_date'
-                    applicability_receipts.append(digest)
+                # Native end_date is contract expiry, not a stock delisting
+                # date. Only the qualified stock lifecycle above proves exit.
         # Conflicting same-day trading evidence must not shrink the denominator.
         inapplicable = {code: reason for code, reason in inapplicable.items() if code not in flows}
     actual = {concept: stocks - inapplicable.keys() for concept, stocks in actual.items()}

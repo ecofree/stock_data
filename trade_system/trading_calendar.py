@@ -62,10 +62,11 @@ def trading_session_status(
         row = con.execute(
             """
             SELECT count(*) AS rows,
-                   count(DISTINCT CAST(is_open AS BOOLEAN)) AS distinct_states,
+                   CASE WHEN count(*)=2 AND count(DISTINCT exchange)=2 AND count(is_open)=2
+                        THEN count(DISTINCT CAST(is_open AS BOOLEAN)) ELSE 0 END AS distinct_states,
                    bool_or(coalesce(CAST(is_open AS BOOLEAN), false)) AS is_open
             FROM tushare_trade_cal
-            WHERE cal_date=CAST(? AS DATE)
+            WHERE cal_date=CAST(? AS DATE) AND exchange IN ('SSE','SZSE')
             """,
             [trade_date],
         ).fetchone()
@@ -110,7 +111,7 @@ def ensure_trading_session_status(
     try:
         from trade_system.tushare_history import TushareHistoryCollector
 
-        with TushareHistoryCollector(db_path) as collector:
+        with TushareHistoryCollector(db_path, retries=1, request_timeout=10, budget_seconds=30) as collector:
             collector.ensure_calendar(trade_date, trade_date)
     except Exception as exc:
         return TradingSessionStatus(

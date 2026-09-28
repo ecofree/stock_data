@@ -91,6 +91,7 @@ def _write_eastmoney_trends_fallback(
 ) -> dict[str, int]:
     """When KPL /l2/stock-intraday is empty, fill minute curves from Eastmoney trends2."""
     from trade_system.adapters.eastmoney_dc import _from_em_trends
+    from trade_system.eastmoney_clist_guard import EastmoneyClistUnavailable
 
     ymd = "".join(ch for ch in trade_date if ch.isdigit())[:8]
     rows_written = 0
@@ -100,6 +101,8 @@ def _write_eastmoney_trends_fallback(
             break
         try:
             payload = _from_em_trends(code, ymd)
+        except EastmoneyClistUnavailable:
+            break
         except Exception:
             payload = None
         if not payload or not payload.get("trends"):

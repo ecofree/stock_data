@@ -73,7 +73,7 @@ def test_stock_code_to_ts_code_preserves_leading_zero_stock_codes():
     assert stock_code_to_ts_code("600793") == "600793.SH"
 
 
-def test_tushare_collectors_write_staging_tables_idempotently(tmp_path):
+def test_tushare_collectors_write_staging_tables_idempotently(tmp_path, monkeypatch):
     store, db_path = _store(tmp_path)
     client = XiaodefaClient(
         token="secret",
@@ -127,6 +127,7 @@ def test_tushare_collectors_write_staging_tables_idempotently(tmp_path):
 
     store.close()
     with TushareHistoryCollector(db_path, client=client) as collector:
+        monkeypatch.setattr(collector, '_bse_listing_membership', lambda: None)
         assert collector._collect_reference("trade_cal", "20260709", "20260709") == 2
         assert collector.collect_stock_basic() == 1
         options = dict(datasets=["daily", "daily_basic", "adj_factor", "index_daily"],

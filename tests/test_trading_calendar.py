@@ -21,15 +21,19 @@ def _calendar_db(path, rows):
 
 def test_trading_session_status_is_open_only_from_verified_row(tmp_path):
     db = tmp_path / "open.duckdb"
-    _calendar_db(db, [("SSE", "2026-07-27", True)])
+    _calendar_db(db, [("SSE", "2026-07-27", True), ("SZSE", "2026-07-27", True)])
     status = trading_session_status(db, "2026-07-27")
     assert status.state == "open"
     assert status.is_open is True
+    con = duckdb.connect(str(db))
+    con.execute("DELETE FROM tushare_trade_cal WHERE exchange='SZSE'")
+    con.close()
+    assert trading_session_status(db, "2026-07-27").state == "unverified"
 
 
 def test_trading_session_status_distinguishes_closed_and_missing(tmp_path):
     db = tmp_path / "closed.duckdb"
-    _calendar_db(db, [("SSE", "2026-07-27", False)])
+    _calendar_db(db, [("SSE", "2026-07-27", False), ("SZSE", "2026-07-27", False)])
     assert trading_session_status(db, "2026-07-27").state == "closed"
     assert trading_session_status(db, "2026-07-28").state == "unverified"
 

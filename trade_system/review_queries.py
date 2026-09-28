@@ -754,6 +754,15 @@ def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict
     result: dict[str, Any] = {
         "tushare": [], "kline": [], "ths": {}, "flow_features": {}, "outcomes": 0, "qlib": [], "strategy": [],
     }
+    if table_exists(con, 'multi_source_observation'):
+        import hashlib
+        import json
+        gap = con.execute("SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+            "WHERE data_type='tushare_daily_basic_gaps_snapshot' AND status='qualified' "
+            "AND provider='xiaodefa' AND json_extract_string(payload_json,'$.trade_date')=? "
+            "ORDER BY observed_at DESC LIMIT 1", [trade_date]).fetchone()
+        if gap and hashlib.sha256(gap[0].encode()).hexdigest() == gap[1]:
+            result['daily_basic_gaps'] = dict(json.loads(gap[0]), evidence_recorded_at=str(gap[2]))
     if table_exists(con, "history_fetch_checkpoint"):
         result["tushare"] = _rows(
             con,

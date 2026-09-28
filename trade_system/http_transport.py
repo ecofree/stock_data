@@ -285,7 +285,10 @@ def _response_worker():
     except ValueError:
         status = {'error': 'response byte budget exceeded'}
     except Exception as exc:
-        status = {'error': classify_transport_error(exc)}
+        cause = getattr(exc, 'reason', exc)
+        status = {'error': classify_transport_error(exc),
+                  'cause_type': type(cause).__name__,
+                  'os_error': getattr(cause, 'winerror', None) or getattr(cause, 'errno', None)}
     sys.stdout.buffer.write(json.dumps(status).encode('ascii') + b'\n' + raw)
 
 
@@ -339,6 +342,11 @@ def read_verified_once(request, *, timeout, max_bytes):
                                 'connection_refused', 'connection_interrupted', 'network_error'}:
                 category = 'network_error'
             receipt['error_category'] = category
+            cause_type = status.get('cause_type')
+            if isinstance(cause_type, str) and cause_type.isidentifier() and len(cause_type) <= 80:
+                receipt['cause_type'] = cause_type
+            if isinstance(status.get('os_error'), int):
+                receipt['os_error'] = status['os_error']
             raise urllib.error.URLError(category)
         import hashlib
         receipt.update(status='response_received',response_sha256=hashlib.sha256(raw).hexdigest(),response_bytes=len(raw))

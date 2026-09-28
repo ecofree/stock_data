@@ -488,21 +488,23 @@ def _create_auction_status(con: duckdb.DuckDBPyConnection) -> None:
             f"CASE lower(coalesce(nullif({tick_unit}, ''), 'unknown')) "
             "WHEN 'hands' THEN volume * 100 WHEN 'shares' THEN volume ELSE NULL END"
         )
+        semantics = "volume_semantics" if "volume_semantics" in tick_columns else "'legacy_unspecified'"
+        snapshot = f"bool_and(coalesce({semantics}, '') = 'indicative_match_snapshot')"
+        tick_amount = f"price * ({tick_volume_shares})"
+        if 'amount' in tick_columns:
+            tick_amount = f"CASE WHEN ({tick_volume_shares}) IS NOT NULL THEN coalesce(amount, ({tick_amount})) END"
+        valid_units = f"count(*) FILTER (WHERE ({tick_volume_shares}) IS NULL) = 0"
+        tick_amount_agg = f"CASE WHEN {valid_units} THEN CASE WHEN {snapshot} THEN first(({tick_amount}) ORDER BY time DESC) ELSE sum({tick_amount}) END END"
+        tick_volume_agg = f"CASE WHEN {valid_units} THEN CASE WHEN {snapshot} THEN first(({tick_volume_shares}) ORDER BY time DESC) ELSE sum({tick_volume_shares}) END END"
         sources.append(
             f"""
             SELECT CAST(date AS VARCHAR) AS trade_date,stock_code,
                    CAST(NULL AS VARCHAR) AS stock_name,
-                   CASE WHEN count(DISTINCT lower(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 1
-                        AND lower(max(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 'hands'
-                        THEN CAST(sum(price * volume * 100) AS BIGINT)
-                        WHEN count(DISTINCT lower(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 1
-                        AND lower(max(coalesce(nullif({tick_unit}, ''), 'unknown'))) = 'shares'
-                        THEN CAST(sum(price * volume) AS BIGINT)
-                        ELSE CAST(NULL AS BIGINT) END AS auction_amount,
+                   CAST(({tick_amount_agg}) AS BIGINT) AS auction_amount,
                    'tick_volume' AS anomaly_type,
-                   CAST(sum({tick_volume_shares}) AS DOUBLE) AS anomaly_value,
-                   round(sum({tick_volume_shares}) / 1000000.0, 2) AS auction_strength,
-                   'tick_confirmed' AS confirmation,'auction_tick' AS source_table,
+                   CAST(({tick_volume_agg}) AS DOUBLE) AS anomaly_value,
+                   round(({tick_volume_agg}) / 1000000.0, 2) AS auction_strength,
+                   CASE WHEN {valid_units} THEN 'tick_confirmed' ELSE 'tick_observed_unit_unknown' END AS confirmation,'auction_tick' AS source_table,
                    false AS is_fallback,max(fetched_at) AS fetched_at,1 AS source_priority
             FROM ({latest}) GROUP BY date,stock_code
             """

@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 from trade_system.adapters.kline_sources import UA, EM_UT, _auto_decode, _norm_code  # noqa: E402
 from trade_system.eastmoney_clist_guard import (  # noqa: E402
     DELAY_CLIST_GUARD,
+    TRENDS_GUARD,
     DEFAULT_CLIST_GUARD,
     EastmoneyClistUnavailable,
 )
@@ -769,8 +770,15 @@ def _from_em_trends(code, date=None):
         "iscr": "0", "ndays": "1", "forcect": "1",
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
     }
-    d = _em_get_json("https://push2his.eastmoney.com/api/qt/stock/trends2/get",
-                     params, timeout=12)
+    endpoint = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    TRENDS_GUARD.assert_available()
+    try:
+        d = _em_get_json(endpoint, params, timeout=12)
+    except Exception as exc:
+        from trade_system.http_transport import classify_transport_error
+        TRENDS_GUARD.record_failure(classify_transport_error(exc), endpoint)
+        raise
+    TRENDS_GUARD.record_success(endpoint)
     if not d:
         return None
     data = d.get("data") or {}

@@ -32,9 +32,11 @@ $endAtToday = (Get-Date).Date.Add($endTime.TimeOfDay)
 $effectiveMinRunWindow = if ($MinRunWindowSeconds -gt 0) {
     $MinRunWindowSeconds
 } elseif ($Phase -eq "auction") {
-    # A complete auction collection can take several minutes. Do not start
-    # another run when the 09:27 drain leaves only a short tail.
-    360
+    # The scoped tick request has a 45-second network budget. Reserve 90s
+    # for it and the local projection; a 360s start margin stopped at 09:21
+    # and prevented the essential 09:25 observation. This is a start margin,
+    # never permission to kill a writer at the end of the watch window.
+    90
 } else {
     # Intraday also needs a bounded-run window before the 15:05 drain.
     600

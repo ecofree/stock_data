@@ -136,7 +136,7 @@ def main() -> int:
             dependency_log.write_text((check.stdout+check.stderr).decode('utf-8','backslashreplace'),encoding='utf-8')
             raise ValueError(f"collector dependency check failed ({check.returncode}); details: {dependency_log}; no collection performed")
     from trade_system.pipeline_runtime import PipelineLock, PipelineAlreadyRunning, RunManifest
-    from trade_system.trading_calendar import trading_session_status
+    from trade_system.trading_calendar import trading_session_status, ensure_trading_session_status
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
     manifest.data.update(scope="transitional_market_collection_only", user_pages_published=False,
                          collector_contract_sha256=args.collector_contract_sha256, execution_ready=False)
@@ -144,6 +144,10 @@ def main() -> int:
     try:
         with PipelineLock(args.db, run_id):
             session = trading_session_status(args.db, args.trade_date)
+            if selected_phase != "history" and not args.skip_collect and session.state == "unverified":
+                # The parent already holds the single-writer guard. Fetch only
+                # this missing session; never infer it from weekday or prices.
+                session = ensure_trading_session_status(args.db, args.trade_date)
             if selected_phase != "history" and not args.skip_collect and session.state != "open":
                 state = "skipped_market_closed" if session.state == "closed" else "blocked_calendar_unverified"
                 manifest.finish(state, session.reason)

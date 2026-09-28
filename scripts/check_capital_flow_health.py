@@ -41,6 +41,7 @@ def main() -> int:
         args.expected_sectors,
         collected_after=args.collected_after,
         min_coverage_pct=args.min_coverage_pct,
+        session_close=args.stage == "close",
         max_age_seconds=args.max_age_seconds,
         now=datetime.fromisoformat(args.as_of) if args.as_of else None,
     )

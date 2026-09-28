@@ -191,6 +191,8 @@ def test_native_incomplete_pagination_never_returns_partial(monkeypatch, payload
     assert client.stock_listing('000001.SZ')['item'][0]['list_date'] is None
     with pytest.raises(native.HiThinkError, match='ambiguous'):
         client.stock_listing('600000.SH')
+    listing['item'] = []
+    assert client.stock_listing('600849.SH')['item'] == []
     listing['timestamp'] -= 86400001
     with pytest.raises(native.HiThinkError, match='stale'):
         client.stock_listing('000001.SZ')

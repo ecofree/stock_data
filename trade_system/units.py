@@ -77,6 +77,42 @@ def normalize_amount(value: Any, unit: str | None) -> float | None:
     return conversion(value, unit, 'amount')['value']
 
 
+def kpl_auction_tick_units(tick: dict) -> tuple[str, float | None, str]:
+    """KPL GetStockFenBi2/StockL2History auction snapshots, not trade increments.
+
+    2026-09-28 cross-check: 000710 21,563 hands = 2,156,300 shares;
+    000850 308,513 hands = 30,851,300 shares. Both final prices and CNY
+    amounts exactly match TuShare stk_auction (explicit shares/CNY contract).
+    The retained 966 early snapshots also obey this scale. Some volumes are
+    truncated to whole hands, so preserve source amount, not price*hands*100.
+    Calibration receipts live in completion.json/auction_unit_calibration_20260928.
+    Recheck the arithmetic on EVERY row; no magnitude-only or generic inference.
+    """
+    unit = str(tick.get('volume_unit') or tick.get('vol_unit') or 'unknown').lower()
+    price, volume, amount = (_number(tick.get(k)) for k in ('price', 'volume', 'amount'))
+    if price is None or price <= 0 or volume is None or volume < 0 or not volume.is_integer():
+        return VOLUME_UNKNOWN, None, 'invalid_price_or_volume'
+    if amount is None:
+        if tick.get('amount') not in (None, '', '-'):
+            return VOLUME_UNKNOWN, None, 'invalid_amount'
+        return (unit, None, 'provider_declared') if unit in {'hands', 'shares'} else (VOLUME_UNKNOWN, None, 'amount_missing')
+    if amount < 0:
+        return VOLUME_UNKNOWN, None, 'invalid_amount'
+    if unit not in {'unknown', 'hands', 'shares'}:
+        return VOLUME_UNKNOWN, None, 'unsupported_declared_unit'
+    if unit == 'unknown' and (tick.get('direction') not in {'集合竞价', '开盘撮合'} or
+                              type(tick.get('flag')) is not int or tick['flag'] not in {0, 1, 2, 3}):
+        return VOLUME_UNKNOWN, None, 'uncalibrated_payload_shape'
+    factor = 1 if unit == 'shares' else 100
+    residual = amount - price * volume * factor
+    # Amount rounded to yuan; hands may discard up to 99 odd shares.
+    limit = 1.01 if factor == 1 else price * 99 + 1.01
+    if not -1.01 <= residual <= limit or (volume == 0 and amount != 0):
+        return VOLUME_UNKNOWN, None, 'price_volume_amount_conflict'
+    return ('hands' if unit == 'unknown' else unit), amount, (
+        'kpl_auction_cross_source_20260928' if unit == 'unknown' else 'provider_declared_checked')
+
+
 def market_caps(row: dict) -> dict:
     """Never merge float with total, or infer the legacy ambiguous billion label."""
     result, quality = {}, {}

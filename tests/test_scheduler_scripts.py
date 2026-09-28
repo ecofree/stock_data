@@ -39,6 +39,8 @@ def test_scheduled_runners_use_absolute_project_paths_and_durable_logs():
     assert "PHASE_WATCH_STOP" in watch
     assert "PHASE_WATCH_DRAIN" in watch
     assert "MinRunWindowSeconds" in watch
+    auction_margin = watch.split('elseif ($Phase -eq "auction") {', 1)[1].split('} else {', 1)[0]
+    assert '\n    90\n' in auction_margin
     assert "PHASE_WATCH_COMPLETE" in watch
 
 

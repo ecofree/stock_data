@@ -114,8 +114,8 @@ def test_integrated_collection_exits_before_network_on_verified_holiday(
         "exchange VARCHAR, cal_date DATE, is_open BOOLEAN)"
     )
     con.execute(
-        "INSERT INTO tushare_trade_cal VALUES (?,?,false)",
-        ["SSE", date.today().isoformat()],
+        "INSERT INTO tushare_trade_cal VALUES ('SSE',?,false),('SZSE',?,false)",
+        [date.today().isoformat(), date.today().isoformat()],
     )
     con.close()
     from tools.v2.backup_verify import backup_verify
