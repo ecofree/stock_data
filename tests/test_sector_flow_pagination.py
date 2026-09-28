@@ -102,12 +102,17 @@ def test_ths_bad_inputs_never_overwrite_good_snapshot(tmp_path, fault, status):
         assert store.con.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='ths_aggregate_batch'").fetchone()[0]==1
 
 
-def test_ths_stale_members_and_write_failure_preserve_snapshot(tmp_path, monkeypatch):
+def test_ths_stale_members_and_write_failure_preserve_snapshot(tmp_path, monkeypatch, capsys):
+    import json
+    from trade_system.collection_profiles import read_product_counts
+    context = {'demand_id': 'rollback-only'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
     with MultiSourceStore(tmp_path/'ths-rollback.duckdb') as store:
         _ths_fixture(store)
         before = store.con.execute('SELECT * FROM multi_source_sector_flow').fetchall()
         stale = collector._publish_ths_aggregate(store,'2026-09-22',now=datetime(2026,9,22,17))
         assert stale['status']=='stale_members' and not stale['promoted']
+        capsys.readouterr()
         original = store.store
         def broken(*args,**kwargs):
             result=original(*args,**kwargs)
@@ -117,6 +122,8 @@ def test_ths_stale_members_and_write_failure_preserve_snapshot(tmp_path, monkeyp
         monkeypatch.setattr(store,'store',broken)
         failed = collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
         assert failed['status']=='error' and not failed['promoted']
+        counts = read_product_counts(capsys.readouterr().out, context)
+        assert counts['scopes']['multi_source_sector_flow.ths_derived']['rows_written'] == 0
         assert store.con.execute('SELECT * FROM multi_source_sector_flow').fetchall()==before
 
 

@@ -397,6 +397,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
     con.commit()
     written_pages = set()
     page_rows_seen = 0
+    parsed_count, pending_writes, committed_writes = 0, 0, 0
     expected_pages = 0
     expected_rows = 0
     error = ""
@@ -418,6 +419,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
 
     def on_page(page_no: int, raw_rows: list[dict], pages: int, result: dict) -> None:
         nonlocal page_rows_seen, expected_pages, expected_rows, source_provider, refresh_cleared, accepted_codes
+        nonlocal parsed_count, pending_writes, committed_writes
         page_provider = str(result.get("source") or source_provider)
         page_status = str(result.get("status") or ("live" if page_provider != "eastmoney_intraday_clist_delay" else "delayed"))
         # If the primary front door failed after one or more pages, the delayed
@@ -455,6 +457,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         rows = (raw_rows if source_provider == 'xiaodefa_moneyflow_dc' else _normalize_realtime_page(raw_rows, trade_date)
                 if source_provider in {"eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"}
                 else _normalize_page(raw_rows, trade_date))
+        parsed_count += len(rows)
         # The live clist contains B shares and can repeat rows at page
         # boundaries while its sort order moves.  The project contract is the
         # canonical A-share universe; filter before persistence and suppress
@@ -491,6 +494,9 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         )
         if not atomic_refresh:
             con.commit()
+            committed_writes += int(stored['rows_written'])
+        else:
+            pending_writes += int(stored['rows_written'])
         written_pages.add(page_no)
 
     buffered_pages = []
@@ -611,6 +617,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             )
     except Exception as exc:
         if atomic_refresh:
+            pending_writes = 0
             try:
                 con.execute("ROLLBACK")
             except Exception:
@@ -648,6 +655,10 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         con, trade_date, source_provider, universe_by_exchange
     ) if universe_by_exchange else {}
     con.commit()
+
+    from trade_system.collection_profiles import emit_product_counts
+    emit_product_counts('multi_source_stock_flow.primary', rows_parsed=parsed_count,
+                        rows_written=committed_writes + pending_writes)
 
     # Controlled checkpoint while no reconciliation write is pending.  After a
     # full-market batch the WAL crosses DuckDB's auto-checkpoint threshold, so

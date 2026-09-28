@@ -123,7 +123,11 @@ def main() -> int:
                 if not step.get("log_path"):continue
                 log=Path(step["log_path"]).resolve()
                 if log.parent!=path.parent:raise ValueError("run log must be adjacent to its receipt")
-                if log.is_file():step["request_metrics"]=request_metrics([log])
+                if log.is_file():
+                    step["request_metrics"]=request_metrics([log])
+                    from trade_system.collection_profiles import read_product_counts
+                    step['operation_counts'] = read_product_counts(
+                        log.read_text(encoding='utf-8'), step.get('request_context'))
             runs.append(run)
         print(json.dumps(product_usage(runs),ensure_ascii=False))
         return 0
@@ -290,11 +294,15 @@ def main() -> int:
                     code = -1
                     err += "\nBounded collector timeout"
                 log.write_text("[stdout]\n"+out+"\n[stderr]\n"+err, encoding="utf-8")
+                from trade_system.collection_profiles import read_product_counts
+                from trade_system.http_transport import request_metrics
+                counts = read_product_counts(out, context)
                 disclosure_pending = code == 4 and name in {'collect_xiaodefa', 'collect_xiaodefa_critical'}
                 status = "awaiting_publication" if disclosure_pending else "completed" if code == 0 else "degraded" if required[name] else "warning"
                 manifest.upsert_step(name, status, command, return_code=code, log_path=str(log),
                                      required=required[name],
                                      request_context=context,
+                                     operation_counts=counts, request_metrics=request_metrics([log]),
                                      duration_seconds=round((datetime.now()-started).total_seconds(), 3))
                 if code:
                     (pending if disclosure_pending and required[name] else failed if required[name] else warnings).append(name)

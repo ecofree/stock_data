@@ -80,6 +80,12 @@ def publish(root, run_id, artifacts, *, generation):
                         'renderer_sha256': hashlib.sha256(Path(view.__file__).read_bytes()).hexdigest(),
                         'projection_sha256': hashlib.sha256(canonical(view.export_projection(data)).encode()).hexdigest()}
                     manifest['published_at'] = now_utc().isoformat()
+                    manifest['publication_counts'] = {
+                        'scope': 'inline_desk_entities_not_source_rows_or_collection_success',
+                        'stocks': len(data['market'].get('stocks', [])),
+                        'themes': len(data['market'].get('themes', [])),
+                        'artifacts': len(artifacts),
+                        'visibility': 'only_when_referenced_by_verified_current_or_history_pointer'}
                     # The new atomic pointer attests these previously current bundles.
                     # A staged directory is never admitted by scanning runs/.
                     manifest['published_days'] = {day: history[day] for day in sorted(history)[-64:]}

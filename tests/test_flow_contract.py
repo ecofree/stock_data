@@ -5,6 +5,22 @@ from trade_system.flow_contract import normalize_stock_flow_row
 
 
 def test_tushare_total_is_not_main_orders_net():
+    import duckdb
+    from trade_system.flow_contract import independent_comparison_contract
+    with duckdb.connect(':memory:') as con:
+        con.execute('''CREATE TABLE multi_source_stock_flow (source_date DATE,provider VARCHAR,
+            origin_provider VARCHAR,source_api VARCHAR,flow_definition VARCHAR,amount_unit VARCHAR,
+            field_mapping_version VARCHAR,main_net DOUBLE,is_stale BOOLEAN)''')
+        con.execute("INSERT INTO multi_source_stock_flow VALUES ('2026-09-24','relay','eastmoney',"
+                    "'moneyflow_dc','provider_main_orders_net','yuan','v3',1,false),"
+                    "('2026-09-24','direct','eastmoney','dc','provider_main_orders_net','yuan','v3',1,false)")
+        assert independent_comparison_contract(con,'2026-09-24','relay','direct')['reason'] == 'same_original_source'
+        con.execute("UPDATE multi_source_stock_flow SET origin_provider='tushare',flow_definition='main_orders_net' WHERE provider='direct'")
+        assert independent_comparison_contract(con,'2026-09-24','relay','direct')['reason'] == 'definition_alignment_unproven'
+        con.execute("UPDATE multi_source_stock_flow SET flow_definition='provider_main_orders_net' WHERE provider='direct'")
+        assert independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+        con.execute("UPDATE multi_source_stock_flow SET main_net=NULL WHERE provider='direct'")
+        assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
     row = normalize_stock_flow_row(
         {
             "net_mf_amount": 8,

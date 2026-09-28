@@ -107,7 +107,12 @@ def reconcile(
             and correlation >= 0.95
             and (sign_agreement or 0.0) >= 90.0
         ) else ("empty" if not reference else "warning")
+        from trade_system.flow_contract import independent_comparison_contract
+        comparison = independent_comparison_contract(con, trade_date, primary_provider, reference_provider)
+        if not comparison['eligible']:
+            status = 'incomparable'
         result = {
+            'comparison_contract': comparison,
             "scope": "declared_data_origin_comparison_not_independent_transport_attestation",
             "trade_date": trade_date,
             "primary_provider": primary_provider,
@@ -124,7 +129,7 @@ def reconcile(
             "primary_net_total": round(sum(primary.values()), 4),
             "reference_net_total": round(sum(reference.values()), 4),
             "status": status,
-            "last_error": "",
+            "last_error": "" if comparison['eligible'] else comparison['reason'],
         }
         con.execute(
             f"""

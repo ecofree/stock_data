@@ -387,6 +387,7 @@ def assess_capital_flow_health(
     independent_overlap_pct = None
     independent_correlation = None
     independent_sign_agreement_pct = None
+    comparison_contract = {'eligible': False, 'reason': 'not_observed'}
     try:
         con = connect_duckdb(str(db_path), read_only=True)
         if table_exists(con, "intraday_stock_flow_reconciliation"):
@@ -420,7 +421,7 @@ def assess_capital_flow_health(
             ).fetchone()[0])
         if table_exists(con, "intraday_stock_flow_independent_reconciliation"):
             independent_row = con.execute(
-                "SELECT status, overlap_reference_pct, correlation_main_net, sign_agreement_pct "
+                "SELECT status, overlap_reference_pct, correlation_main_net, sign_agreement_pct, primary_provider, reference_provider "
                 "FROM intraday_stock_flow_independent_reconciliation "
                 "WHERE trade_date=CAST(? AS DATE)",
                 [trade_date],
@@ -430,6 +431,8 @@ def assess_capital_flow_health(
                 independent_overlap_pct = float(independent_row[1]) if independent_row[1] is not None else None
                 independent_correlation = float(independent_row[2]) if independent_row[2] is not None else None
                 independent_sign_agreement_pct = float(independent_row[3]) if independent_row[3] is not None else None
+                from trade_system.flow_contract import independent_comparison_contract
+                comparison_contract = independent_comparison_contract(con, trade_date, independent_row[4], independent_row[5])
         con.close()
     except Exception:
         pass
@@ -446,6 +449,7 @@ def assess_capital_flow_health(
         same_vendor_reconciliation_ready
         and independent_source_present
         and independent_status.lower() == "pass"
+        and comparison_contract['eligible']
     )
     source_ready = stock_ready and sector_ready
     # Coverage is a source/pipeline property.  Independent reconciliation is a
@@ -517,6 +521,7 @@ def assess_capital_flow_health(
             "same_vendor_reconciliation_ready": same_vendor_reconciliation_ready,
             "independent_reconciliation_ready": independent_reconciliation_ready,
             "independent_status": independent_status,
+            "comparison_contract": comparison_contract,
             "independent_overlap_pct": independent_overlap_pct,
             "independent_correlation_main_net": independent_correlation,
             "independent_sign_agreement_pct": independent_sign_agreement_pct,

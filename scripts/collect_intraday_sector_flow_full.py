@@ -175,7 +175,10 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
 
 def _replace_sector_snapshot(store, trade_date, rows, pagination):
     """Replace one provider/date atomically after membership qualification."""
-    if pagination['status'] != 'complete': return False
+    from trade_system.collection_profiles import emit_product_counts
+    if pagination['status'] != 'complete':
+        emit_product_counts('multi_source_sector_flow.eastmoney', rows_parsed=len(rows), rows_written=0)
+        return False
     con = store.con
     con.execute('BEGIN TRANSACTION')
     try:
@@ -194,6 +197,8 @@ def _replace_sector_snapshot(store, trade_date, rows, pagination):
         con.rollback()
         raise
     pagination['promoted'] = True
+    emit_product_counts('multi_source_sector_flow.eastmoney', rows_parsed=len(rows),
+                        rows_written=result['rows_written'])
     return True
 
 
@@ -242,6 +247,7 @@ def _aggregate_ths_stock_flow(con, trade_date):
 def _publish_ths_aggregate(store, trade_date, *, now=None, max_age_seconds=10800):
     """Both collector and recovery use one consistent read/write transaction."""
     con = store.con
+    rows = []
     con.execute("BEGIN TRANSACTION")
     try:
         rows, report = _prepare_ths_aggregate(
@@ -287,6 +293,9 @@ def _publish_ths_aggregate(store, trade_date, *, now=None, max_age_seconds=10800
                       rows_written=0, coverage_pct=0.0, error=str(exc)[:500],
                       ths_membership_snapshot=None, ths_membership_age_days=None)
     # Failed attempts are observable without replacing a prior successful slice.
+    from trade_system.collection_profiles import emit_product_counts
+    emit_product_counts('multi_source_sector_flow.ths_derived',
+                        rows_parsed=len(rows), rows_written=report.get('rows_written', 0))
     store.store("ths_aggregate_batch", None, report,
                 {"source":"derived_ths_stock_aggregate", "status":report["status"]},
                 trade_date=trade_date)

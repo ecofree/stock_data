@@ -183,6 +183,42 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
     }
 
 
+def independent_comparison_contract(con, trade_date, primary, reference):
+    """Read-only semantic gate. Correlation cannot establish equivalent definitions.
+
+    Different relays of one origin are never independent. Missing or mixed
+    provenance and unlike provider definitions remain diagnostics only.
+    """
+    result = {'eligible': False, 'reason': 'metadata_unavailable', 'sides': {}}
+    try:
+        for label, provider in (('primary', primary), ('reference', reference)):
+            groups = con.execute('''SELECT origin_provider,source_api,flow_definition,
+                amount_unit,field_mapping_version,count(*),
+                count(*) FILTER (WHERE isfinite(main_net))
+                FROM multi_source_stock_flow WHERE source_date=CAST(? AS DATE)
+                AND provider=? AND is_stale=FALSE GROUP BY ALL''', [trade_date, provider]).fetchall()
+            if len(groups) != 1:
+                result['reason'] = 'missing_or_mixed_provenance'
+                return result
+            origin, api, definition, unit, version, count, finite = groups[0]
+            result['sides'][label] = dict(provider=provider, origin=origin, api=api,
+                definition=definition, unit=unit, mapping_version=version, rows=count)
+            if (not all((origin, api, definition, version)) or unit != 'yuan'
+                    or origin in {'unknown', 'xiaodefa', 'tushare_relay'} or count != finite):
+                result['reason'] = 'unqualified_provenance_or_unit'
+                return result
+    except Exception:
+        return result
+    left, right = result['sides']['primary'], result['sides']['reference']
+    if left['origin'] == right['origin']:
+        result['reason'] = 'same_original_source'
+    elif left['definition'] != right['definition']:
+        result['reason'] = 'definition_alignment_unproven'
+    else:
+        result.update(eligible=True, reason='distinct_declared_origins_same_explicit_definition')
+    return result
+
+
 def ensure_stock_flow_contract(con) -> None:
     """Upgrade old DuckDB files in place; no rows are removed."""
     existing = {

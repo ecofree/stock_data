@@ -77,7 +77,23 @@ def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():
         assert command[command.index('--product') + 1] == 'match'
 
 
-def test_profile_declares_full_market_flow_sources():
+def test_profile_declares_full_market_flow_sources(monkeypatch, capsys):
+    import json
+    import pytest
+    from trade_system.collection_profiles import emit_product_counts, read_product_counts
+    context = {'demand_id': 'test-only', 'product_id': 'collect_intraday_stock_flow_market'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
+    emit_product_counts('primary', rows_parsed=8, rows_written=0, receipt_reused=True)
+    receipt = capsys.readouterr().out
+    counted = read_product_counts(receipt, context)
+    assert counted['scopes']['primary']['rows_written'] == 0
+    assert counted['scopes']['primary']['rows_parsed'] == 8
+    assert counted['scopes']['primary']['rows_published'] is None
+    assert read_product_counts('old log without instrumentation', context)['status'] == 'unmeasured'
+    with pytest.raises(ValueError, match='conflicting'):
+        read_product_counts(receipt + receipt, context)
+    with pytest.raises(ValueError, match='conflicting'):
+        read_product_counts(receipt, {'demand_id': 'other'})
     from trade_system.collection_profiles import product_usage
     usage=product_usage([{'run_id':'synthetic','steps':[{'name':'collect_intraday_stock_flow_market',
         'status':'degraded','rows_written':0,'request_metrics':{'transport_attempts':2}}]}])
@@ -87,7 +103,6 @@ def test_profile_declares_full_market_flow_sources():
     assert usage['avoidable_cost'] is None and usage['diagnostic_limits']['total']==6
     names = {task.name for task in phase_tasks("intraday")}
     assert {"collect_intraday_stock_flow_market", "collect_intraday_sector_flow_full"} <= names
-    import pytest
     from trade_system.collection_profiles import validate_plan
     for phase in ('auction','intraday','close','supplemental','history'):
         plan = command_plan('unused', '2026-09-18', include_collection=True, phase=phase)

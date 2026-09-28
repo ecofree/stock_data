@@ -317,6 +317,42 @@ def phase_matrix() -> list[dict[str, Any]]:
     ]
 
 
+def emit_product_counts(scope, *, rows_parsed, rows_written, receipt_reused=False):
+    """Emit after commit: one canonical projection, not all process writes.
+
+    Parsing includes reused input; writes are committed upserts, not new keys.
+    """
+    import json
+    import os
+    context = json.loads(os.environ.get('STOCKDATA_REQUEST_CONTEXT') or '{}')
+    if not context.get('demand_id'):
+        return
+    if any(type(n) is not int or n < 0 for n in (rows_parsed, rows_written)):
+        raise ValueError('nonnegative measured counts required')
+    print('product_counts ' + json.dumps(dict(scope=scope, context=context,
+        rows_parsed=rows_parsed, rows_written=rows_written,
+        receipt_reused=bool(receipt_reused), rows_published=None,
+        measured_at=datetime.now().isoformat(), semantics='committed_upserts_not_unique_new_rows'),
+        sort_keys=True), flush=True)
+
+
+def read_product_counts(text, context):
+    """Bind explicit counters to this invocation; missing scopes stay unknown."""
+    import json
+    scopes = {}
+    for line in text.splitlines():
+        if not line.startswith('product_counts '):
+            continue
+        row = json.loads(line.removeprefix('product_counts '))
+        if row.get('context') != context or not row.get('scope') or row['scope'] in scopes:
+            raise ValueError('conflicting product counter scope or invocation')
+        if any(type(row.get(k)) is not int or row[k] < 0 for k in ('rows_parsed', 'rows_written')):
+            raise ValueError('invalid measured product counts')
+        scopes[row['scope']] = row
+    return {'status': 'observed_scoped_counts' if scopes else 'unmeasured',
+            'scopes': scopes, 'coverage': 'explicit_projections_only_not_all_process_writes'}
+
+
 def product_usage(manifests=()):
     """Declared products joined to actual stage evidence, without fetching data.
 
@@ -341,6 +377,7 @@ def product_usage(manifests=()):
                     'completed_at': step.get('completed_at'),
                     'transport_evidence':step.get('request_metrics'),
                     'demand': step.get('request_context'),
+                    'operation_counts': step.get('operation_counts', {'status': 'unmeasured'}),
                     'counts': {key: step.get(key) for key in ('rows_parsed', 'rows_written', 'rows_published')}
                         | {'transport_attempts':(step.get('request_metrics') or {}).get('transport_attempts')},
                 })

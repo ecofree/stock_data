@@ -125,6 +125,9 @@ def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
                 count=store.insert_rows('auction_evidence_snapshot',
                     [[r.get(c) for c in EVIDENCE_COLUMNS]+[datetime.now()] for r in evidence],
                     columns,replace_on=['trade_date','stock_code','source_table'])
+                from trade_system.collection_profiles import emit_product_counts
+                emit_product_counts('auction_evidence_snapshot', rows_parsed=len(evidence),
+                                    rows_written=count, receipt_reused=reused)
                 invalid=sum(';invalid_' in r['missing_reason'] or ';no_positive_' in r['missing_reason'] for r in evidence)
                 result.update(status='partial' if invalid else 'success' if count else 'empty',stock_rows=count,
                     evidence_rows=count,receipt_reused=reused,scope='observed_native_product_not_market_phase_acceptance',

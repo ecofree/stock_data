@@ -140,6 +140,8 @@ def collect(db_path: str | Path, trade_date: str) -> dict[str, Any]:
         count = _write_snapshot(con, trade_date, items, receipt=receipt)
     finally:
         con.close()
+    from trade_system.collection_profiles import emit_product_counts
+    emit_product_counts('official_limit_pool', rows_parsed=len(items), rows_written=count)
     return {
         "trade_date": trade_date,
         "source": "hithink",
