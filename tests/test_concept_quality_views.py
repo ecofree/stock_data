@@ -71,7 +71,7 @@ def test_default_concept_views_exclude_stale_and_unchecked_snapshots(tmp_path):
     assert members[0] == ("THS-001", "000001")
 
 
-def test_default_concept_views_reject_unchecked_kpl_snapshot(tmp_path):
+def test_default_concept_views_reject_unchecked_kpl_snapshot(tmp_path, monkeypatch, capsys):
     db_path = tmp_path / "kpl_fallback.duckdb"
     con = duckdb.connect(str(db_path))
     init_schema(con)
@@ -84,6 +84,48 @@ def test_default_concept_views_reject_unchecked_kpl_snapshot(tmp_path):
         "('2026-08-06','KPL-1','兼容概念','000001','平安银行',1,'kpl','{}',false,current_timestamp)"
     )
     con.close()
+
+    # The current collector must not certify a failed replacement, and its
+    # metering must follow real commits rather than attempted member inserts.
+    import json
+    import sys
+    from types import SimpleNamespace
+    import pytest
+    from scripts import collect_ths_concepts_api as collector
+    from trade_system.collection_profiles import read_product_counts
+    context = {'demand_id': 'concept-transaction-test'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
+    monkeypatch.setattr(sys, 'argv', ['collector', '--db', str(tmp_path / 'current.duckdb')])
+    catalog = [{'thscode': '885001.TI', 'name': 'A'}, {'thscode': '885002.TI', 'name': 'B'}]
+    broken = {'ticker': '000002', 'name': {'unserializable'}}
+    calls = []
+    def constituents(code):
+        calls.append(code)
+        return ([{'ticker': '000001', 'name': 'ok'}] * 2 if code == '885001.TI' else [broken])
+    client = SimpleNamespace(ths_concept_catalog=lambda **_: catalog,
+                             ths_index_constituents=constituents, quota_note='fixture')
+    monkeypatch.setattr(collector, 'HiThinkClient', lambda **_: client)
+    with pytest.raises(TypeError):
+        collector.main()
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']
+    assert counts['ths_concept_daily']['rows_written'] == 1
+    assert counts['ths_concept_stock_history']['rows_written'] == 1
+    assert counts['ths_concept_stock_history']['rows_parsed'] == 3
+    with duckdb.connect(str(tmp_path / 'current.duckdb')) as check:
+        for table in ('ths_concept_daily', 'ths_concept_stock_history', 'ths_concept_member_checkpoint'):
+            assert check.execute(f'SELECT concept_code FROM {table}').fetchall() == [('THS-885001',)]
+    broken['name'] = 'repaired'
+    # A two-concept fixture still fails the full-market quality floor.
+    assert collector.main() == 2
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']
+    assert counts['ths_concept_daily']['rows_written'] == 1
+    assert counts['ths_concept_stock_history']['rows_written'] == 1
+    assert counts['ths_concept_stock_history']['receipt_reused'] is True
+    assert collector.main() == 2
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']
+    assert counts['ths_concept_stock_history']['rows_written'] == 0
+    assert counts['ths_concept_stock_history']['rows_parsed'] == 0
+    assert calls == ['885001.TI', '885002.TI', '885002.TI']
 
     con = duckdb.connect(str(db_path), read_only=True)
     assert con.execute(

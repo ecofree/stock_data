@@ -126,7 +126,11 @@ def command_plan(
                          if phase == 'close' else date.fromisoformat(selected_date)).strftime('%Y%m%d'),
         "--end-date", selected_date.replace('-', ''),
         "--datasets", ",".join(close_datasets(selected_date, as_of_time)), "--gap-only", "--max-days", "1",
-        "--retry-passes", "0" if phase == 'supplemental' else "1", "--retry-delay-seconds", "2.0",
+        # The 2026-09-28 first catalogue page took 18.4s: a shared 20s
+        # deadline left only 1.5s for page two. Bound the complete acquisition
+        # explicitly, without multiplying retries at transport and run levels.
+        "--request-timeout", "60", "--retries", "1", "--budget-seconds", "300",
+        "--retry-passes", "0", "--retry-delay-seconds", "0",
         "--report", report("tushare_close_latest.md")], False)
     steps: list[CommandStep] = []
     if include_collection and phase is not None:

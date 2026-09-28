@@ -27,6 +27,7 @@ from trade_system.tushare_store import (
 from trade_system.flow_contract import ensure_stock_flow_contract, normalize_stock_flow_row
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 from trade_system.units import _number as _num
+from trade_system.http_transport import diagnostic_budget, diagnostic_state
 
 
 CHECKPOINT_DATE = "1900-01-01"
@@ -93,9 +94,24 @@ class TushareHistoryCollector:
         self.moneyflow_page_size = max(100, min(int(moneyflow_page_size), 1000))
         self.budget_seconds = max(1.0, float(budget_seconds))
         self.started = time.monotonic()
+        # Per-table operations, not unique instruments or network requests.
+        # Only transaction owners may add committed writes. Receipts, schema,
+        # checkpoints and certifications are deliberately outside these scopes.
+        self._product_counts = {}
 
     def close(self) -> None:
         self.store.close()
+        from trade_system.collection_profiles import emit_product_counts
+        for scope, counts in self._product_counts.items():
+            emit_product_counts('tushare_history.' + scope, **counts)
+        self._product_counts.clear()
+
+    def _count_product(self, scope, *, parsed=0, written=0, reused=False):
+        counts = self._product_counts.setdefault(scope, {'rows_parsed': 0, 'rows_written': 0})
+        counts['rows_parsed'] += parsed
+        counts['rows_written'] += written
+        if reused:
+            counts['receipt_reused'] = True
 
     def __enter__(self) -> "TushareHistoryCollector":
         return self
@@ -155,6 +171,7 @@ class TushareHistoryCollector:
             raise XiaodefaError(f"incomplete {dataset} response: "
                                f"{len(expected - observed)} missing instruments; expected universe={len(expected)}")
 
+    @diagnostic_budget()
     def _suspended_basic_evidence(self, trade_date, codes):
         """Retain dated alternatives separately; none certifies daily_basic."""
         from trade_system.http_transport import request_budget
@@ -182,6 +199,7 @@ class TushareHistoryCollector:
                         rows = payload.get('rows', [])
                         if rows or (datetime.now()-cached[2]).total_seconds() < 900:
                             entry.update(received_at=cached[2].isoformat(), raw_payload_hash=cached[1], reused=True)
+                            self._count_product(api, parsed=len(rows), reused=True)
                             if payload.get('error_type'):
                                 entry.update(status='retry_cooldown', error_type=payload['error_type'])
                                 continue
@@ -190,6 +208,9 @@ class TushareHistoryCollector:
                     else:
                         payload = None
                     if payload is None:
+                        if diagnostic_state.get()['stopped']:
+                            entry.update(status='diagnostic_stopped', reason=diagnostic_state.get()['stopped'])
+                            continue
                         if len(codes)>20 or time.monotonic() >= deadline:
                             entry['status'] = 'budget_exhausted'
                             continue
@@ -209,6 +230,9 @@ class TushareHistoryCollector:
                         continue
                     row = rows[0]
                     values = {field: _num(row.get(field)) for field in fields.split(',') if field != 'list_date'}
+                    if any(v is not None and not math.isfinite(v) for v in values.values()):
+                        entry['status'] = 'invalid_nonfinite_value'
+                        continue
                     if api == 'stk_premarket':
                         if (any(value is None or value <= 0 for value in values.values())
                                 or values['float_share'] > values['total_share']):
@@ -396,6 +420,7 @@ class TushareHistoryCollector:
         # Keep the original acquisition time and source identity even when a
         # later page or coverage validation fails. Reuse the existing receipt table.
         def record(offset, rows):
+            self._count_product(api, parsed=len(rows))
             payload = _json({"source": "tushare", "delivery": self._provider_name(self.client),
                              "api": api, "params": params, "offset": offset, "rows": rows})
             self.store.conn.execute(
@@ -404,12 +429,17 @@ class TushareHistoryCollector:
                 "VALUES (?,?,?,?,?,?,?)",
                 ["tushare_" + api, "receipt", params.get("ts_code"), self._provider_name(self.client),
                  "received_unverified", payload, hashlib.sha256(payload.encode()).hexdigest()])
-        if self._is_production_source():
-            rows = self.client.query_all(api, page_size=self.batch_limit, fields=fields,
-                                         on_page=record, **params)
-        else:
-            rows = self.client.query_rows(api, params, fields)
-            record(0, rows)
+        from trade_system.http_transport import request_budget
+        remaining = self.started + self.budget_seconds - time.monotonic()
+        if remaining <= 0:
+            raise XiaodefaError('collection request budget exhausted')
+        with request_budget(remaining):
+            if self._is_production_source():
+                rows = self.client.query_all(api, page_size=self.batch_limit, fields=fields,
+                                             on_page=record, **params)
+            else:
+                rows = self.client.query_rows(api, params, fields)
+                record(0, rows)
         if api == 'suspend_d':
             if (len({r.get('ts_code') for r in rows}) != len(rows) or any(
                     not r.get('ts_code') or r.get('trade_date') != params['trade_date']
@@ -765,8 +795,12 @@ class TushareHistoryCollector:
                         'bse': {k:v for k,v in (bse_membership or {}).items() if k!='listings'}}
                         if membership or sh_membership or bse_membership else {}})
                 self._checkpoint(dataset, CHECKPOINT_DATE, 'success', rows=count, attempts=1)
+            self._count_product(dataset, written=count)
             return count
-        return store_reference(self.store, dataset, rows)
+        with self._transaction():
+            count = store_reference(self.store, dataset, rows)
+        self._count_product(dataset, written=count)
+        return count
 
     def _query_date_batch(self, api: str, trade_date: str, fields: str, *, with_limit: bool = True) -> list[dict[str, Any]]:
         """One acquisition; page termination and coverage are independent checks."""
@@ -895,6 +929,8 @@ class TushareHistoryCollector:
         except Exception:
             self.store.conn.execute("ROLLBACK")
             raise
+        # Coverage failure below does not undo this committed partial batch.
+        self._count_product(dataset, written=count)
         if expected is not None:
             unresolved = (expected - {r["ts_code"] for r in rows} if force
                           else expected - self._covered_codes(dataset, trade_date))
@@ -938,13 +974,16 @@ class TushareHistoryCollector:
             else ('tushare_moneyflow_industry', 'trade_date', self.sync_sector_flow))
         with self._transaction():
             self.store.conn.execute(f'DELETE FROM {table} WHERE {day}=?', [_iso(trade_date)])
-            bulk_replace(self.store.conn, table, out, columns, keys)
+            raw_count = bulk_replace(self.store.conn, table, out, columns, keys)
             if dataset == 'moneyflow' and self._expected_stock_codes(trade_date, dataset) - self._covered_codes(dataset, trade_date):
                 raise XiaodefaError('moneyflow coverage incomplete; missing values are not qualified facts')
             count = sync(trade_date, atomic=False)
             if count <= 0:
                 raise XiaodefaError('no qualified flow rows; request is not complete')
             self._checkpoint(dataset, trade_date, 'success', rows=count, attempts=attempts)
+        self._count_product('moneyflow' if dataset == 'moneyflow' else 'moneyflow_ind_dc', written=raw_count)
+        self._count_product('stock_flow_projection' if dataset == 'moneyflow' else 'sector_flow_projection',
+                            written=count)
         return count
 
     def _collect_moneyflow(self, trade_date: str, *, attempts=0) -> int:
@@ -1001,6 +1040,7 @@ class TushareHistoryCollector:
             "FROM tushare_moneyflow WHERE date=? ORDER BY fetched_at DESC",
             [_iso(trade_date)],
         ).fetchall()
+        self._count_product('stock_flow_projection', parsed=len(rows))
         out = []
         seen = set()
         for row in rows:
@@ -1033,7 +1073,9 @@ class TushareHistoryCollector:
                 ["source_date", "stock_code", "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net", "provider", "amount_unit", "flow_definition", "source_api", "origin_provider", "field_mapping_version", "is_stale", "raw_json"],
                 ["source_date", "stock_code", "provider"],
             )
-            return count
+        if atomic:
+            self._count_product('stock_flow_projection', written=count)
+        return count
 
     def sync_sector_flow(self, trade_date: str, *, atomic=True) -> int:
         rows = self.store.conn.execute(
@@ -1042,6 +1084,7 @@ class TushareHistoryCollector:
             "FROM tushare_moneyflow_industry WHERE trade_date=? AND close IS NOT NULL AND close>0",
             [_iso(trade_date)],
         ).fetchall()
+        self._count_product('sector_flow_projection', parsed=len(rows))
         out = []
         for row in rows:
             raw = json.loads(row[13] or '{}')
@@ -1065,7 +1108,9 @@ class TushareHistoryCollector:
                 ["source_date", "sector_code", "sector_name", "main_net", "super_net", "large_net", "mid_net", "small_net", "change_pct", "provider", "sector_type", "amount_unit", "is_stale", "raw_json"],
                 ["source_date", "sector_code", "provider"],
             )
-            return count
+        if atomic:
+            self._count_product('sector_flow_projection', written=count)
+        return count
 
     def run(self, start_date: str, end_date: str, *, datasets: Iterable[str],
             max_days: int | None = None, force: bool = False, gap_only: bool = False,

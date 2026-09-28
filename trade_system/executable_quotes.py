@@ -236,6 +236,7 @@ def collect_executable_quotes(
 
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(db_path))
+    parsed_count = written = 0
     try:
         ensure_executable_quote_schema(con)
         targets = codes or candidate_codes_for_quotes(
@@ -258,7 +259,9 @@ def collect_executable_quotes(
         for i in range(0, len(targets), chunk):
             batch = targets[i : i + chunk]
             try:
-                merged.update(fetch(batch) or {})
+                received = fetch(batch) or {}
+                parsed_count += len(received)
+                merged.update(received)
             except Exception as exc:
                 return {
                     "trade_date": trade_date,
@@ -270,7 +273,14 @@ def collect_executable_quotes(
                     "kpl_boost": boost_meta.get("boost"),
                     "kpl_stale": boost_meta.get("consecutive_stale"),
                 }
-        written = upsert_executable_quotes(con, trade_date, merged)
+        con.execute('BEGIN TRANSACTION')
+        try:
+            pending = upsert_executable_quotes(con, trade_date, merged)
+            con.execute('COMMIT')
+        except Exception:
+            con.execute('ROLLBACK')
+            raise
+        written = pending
         rejected = max(0, len(merged) - written)
         return {
             "trade_date": trade_date,
@@ -293,6 +303,8 @@ def collect_executable_quotes(
         }
     finally:
         con.close()
+        from trade_system.collection_profiles import emit_product_counts
+        emit_product_counts('executable_quote_snapshot', rows_parsed=parsed_count, rows_written=written)
 
 
 def load_executable_quote(

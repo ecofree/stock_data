@@ -45,7 +45,7 @@ def test_parse_tencent_parts_extracts_price_and_book():
     assert parsed["provider"] == TENCENT_SPOT_PROVIDER
 
 
-def test_wrong_date_quote_is_rejected(tmp_path):
+def test_wrong_date_quote_is_rejected(tmp_path, monkeypatch, capsys):
     db = tmp_path / "wrong_date.duckdb"
     con = duckdb.connect(str(db))
     written = upsert_executable_quotes(
@@ -64,6 +64,25 @@ def test_wrong_date_quote_is_rejected(tmp_path):
     assert written == 0
     assert con.execute("SELECT count(*) FROM executable_quote_snapshot").fetchone()[0] == 0
     con.close()
+    import json
+    import pytest
+    from trade_system import executable_quotes as quotes
+    from trade_system.collection_profiles import read_product_counts
+    context = {'demand_id': 'quote-commit-test'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
+    incoming = {'000001': {'price': 10, 'quote_time': '20260730150000'},
+                '000002': {'price': 'invalid-price', 'quote_time': '20260730150000'}}
+    with pytest.raises(duckdb.ConversionException):
+        quotes.collect_executable_quotes(db, '2026-07-30', codes=list(incoming), fetcher=lambda _: incoming)
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']['executable_quote_snapshot']
+    assert (counts['rows_parsed'], counts['rows_written']) == (2, 0)
+    with duckdb.connect(str(db)) as check:
+        assert check.execute('SELECT count(*) FROM executable_quote_snapshot').fetchone()[0] == 0
+    incoming['000002'] = {'price': 12, 'quote_time': '20260729150000'}
+    result = quotes.collect_executable_quotes(db, '2026-07-30', codes=list(incoming), fetcher=lambda _: incoming)
+    assert result['status'] == 'partial_invalid_timestamp'
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']['executable_quote_snapshot']
+    assert (counts['rows_parsed'], counts['rows_written']) == (2, 1)
 
 
 def test_quote_universe_uses_manual_state_and_ignores_old_scores(tmp_path):

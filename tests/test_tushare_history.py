@@ -69,7 +69,11 @@ def test_retained_xiaodefa_close_snapshot_is_certified(tmp_path):
 
 
 @pytest.mark.parametrize('failure', ['empty_amounts', 'invalid_amount', 'publish_failure'])
-def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_path, monkeypatch, failure):
+def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_path, monkeypatch, capsys, failure):
+    import json
+    from trade_system.collection_profiles import read_product_counts
+    context = {'demand_id': 'flow-rollback-test'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
     class FlowFixture:
         def query_rows(self, api_name, params=None, fields=""):
             if api_name == "moneyflow_ind_dc":
@@ -122,6 +126,13 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
         assert {r['status'] for r in result['results']} == {'error'}
         assert {t: collector.store.conn.execute(f'SELECT * FROM {t}').fetchall() for t in tables} == before
         assert collector.store.conn.execute('SELECT count(*) FROM multi_source_observation').fetchone()[0] == receipts + 2
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']
+    for api in ('moneyflow', 'moneyflow_ind_dc'):
+        assert counts['tushare_history.' + api]['rows_parsed'] == 2
+        assert counts['tushare_history.' + api]['rows_written'] == 1
+    for projection in ('stock_flow_projection', 'sector_flow_projection'):
+        assert counts['tushare_history.' + projection]['rows_written'] == 2
+        assert counts['tushare_history.' + projection]['rows_parsed'] == (3 if failure == 'publish_failure' else 2)
 
 
 class ScopedFixture:
@@ -169,7 +180,11 @@ def test_scoped_overlap_only_fetches_missing_sessions_and_preserves_old_done(tmp
         assert c.store.conn.execute("SELECT status,rows_inserted FROM tushare_backfill_task").fetchall() == [("done", 1)]
 
 
-def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tmp_path):
+def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tmp_path, monkeypatch, capsys):
+    import json
+    from trade_system.collection_profiles import read_product_counts
+    context = {'demand_id': 'partial-write-test'}
+    monkeypatch.setenv('STOCKDATA_REQUEST_CONTEXT', json.dumps(context))
     client = ScopedFixture()
     client.empty_codes = {"000002.SZ"}
     with TushareHistoryCollector(tmp_path / "partial.duckdb", client=client) as c:
@@ -180,11 +195,20 @@ def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tm
         assert c.store.conn.execute("SELECT status FROM history_fetch_checkpoint").fetchall() == [("error",)]
         assert c.store.conn.execute("SELECT count(*) FROM tushare_daily").fetchone()[0] == 1
         assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation").fetchone()[0] == 2
+        assert c._product_counts['daily'] == {'rows_parsed': 1, 'rows_written': 1}
         client.empty_codes.clear()
         second = c.run("20260701", "20260701", **options)
         assert second["results"][0]["status"] == "success"
         assert len(client.calls) == 3
         assert client.calls[-1][1]["ts_code"] == "000002.SZ"
+        # Fully covered third run performs no extra acquisition or upsert.
+        c.run("20260701", "20260701", **options)
+        assert len(client.calls) == 3
+    counts = read_product_counts(capsys.readouterr().out, context)['scopes']
+    assert counts['tushare_history.daily']['rows_parsed'] == 2
+    assert counts['tushare_history.daily']['rows_written'] == 2
+    c.close()
+    assert capsys.readouterr().out == ''
 
 
 def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
@@ -465,6 +489,34 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='tampered' "
             "WHERE data_type='tushare_suspend_d_snapshot'")
         assert '000002.SZ' in c._expected_stock_codes('20260701', 'daily')
+
+    from urllib.request import Request
+    from trade_system.http_transport import _diagnostic_attempt, stop_diagnostic
+    class AlternativeFixture:
+        denied = False
+        calls = []
+        def query_rows(self, api, params=None, fields=''):
+            _diagnostic_attempt(Request('https://t.xiaodefa.top/'))
+            self.calls.append((api, params['ts_code']))
+            if self.denied:
+                stop_diagnostic('permission_denied')
+                raise XiaodefaError('fixture denied')
+            return [dict(params, total_share=100, float_share=50, pre_close=2,
+                         pe=0, pb=-0.5, bvps=-4)]
+    alternative = AlternativeFixture()
+    with TushareHistoryCollector(tmp_path / 'alternatives.duckdb', client=alternative) as c:
+        codes = [f'{i:06d}.SZ' for i in range(1, 13)]
+        evidence = c._suspended_basic_evidence('20260701', codes)
+        assert len(alternative.calls) == 2  # Relay products share one HTTP endpoint.
+        assert evidence[codes[0]]['bak_basic']['values']['pe_dynamic'] is None
+        assert evidence[codes[-1]]['bak_basic']['reason'] == 'request_budget_exhausted'
+        again = c._suspended_basic_evidence('20260701', codes[:1])
+        assert len(alternative.calls) == 2 and again[codes[0]]['bak_basic']['reused']
+        assert again[codes[0]]['bak_basic']['received_at'] == evidence[codes[0]]['bak_basic']['received_at']
+        alternative.denied = True
+        stopped = c._suspended_basic_evidence('20260702', codes)
+        assert len(alternative.calls) == 3
+        assert stopped[codes[-1]]['bak_basic']['reason'] == 'permission_denied'
 
 
 def test_stored_price_cannot_fill_an_unknown_calendar_day(tmp_path):

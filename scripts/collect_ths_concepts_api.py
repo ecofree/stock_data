@@ -63,6 +63,9 @@ def main() -> int:
     client = HiThinkClient(min_interval=0.35)
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(args.db)
+    written_d = written_m = skipped = reused = 0
+    parsed_catalog = parsed_members = 0
+    catalog_received = members_received = False
     try:
         # Keep standalone repair/backfill runs safe on an older database.  The
         # integrated close runner already applies schema under PipelineLock;
@@ -70,6 +73,8 @@ def main() -> int:
         init_schema(con)
         bridge = _existing_code_by_name(con)
         catalog = client.ths_concept_catalog(tag="cn_concept")
+        parsed_catalog = len(catalog)
+        catalog_received = True
         if args.max_concepts:
             catalog = catalog[: args.max_concepts]
         print(f"catalog: {len(catalog)} concepts; bridge table {len(bridge)} names")
@@ -106,7 +111,6 @@ def main() -> int:
                 [snap, len(catalog), catalog_hash],
             )
 
-        written_d = written_m = skipped = reused = 0
         for idx, entry in enumerate(catalog):
             raw_code = str(entry.get("thscode") or "")
             numeric = raw_code.split(".")[0]
@@ -127,6 +131,8 @@ def main() -> int:
                 continue
             try:
                 members = client.ths_index_constituents(raw_code)
+                parsed_members += len(members)
+                members_received = True
             except Exception as exc:
                 logger.warning("%s (%s) constituents failed: %s", name, raw_code, exc)
                 skipped += 1
@@ -190,7 +196,6 @@ def main() -> int:
                                now(), 'hithink_index_api', 'hithink_api_v1', 'api')""",
                     [snap, concept_code, name, len(members)],
                 )
-                written_d += 1
                 for m in members:
                     ticker = str(m.get("ticker") or "")
                     if not ticker.isdigit():
@@ -198,23 +203,22 @@ def main() -> int:
                     enriched = dict(m)
                     enriched["fetched_date"] = snap
                     enriched["provider"] = "hithink_index_api"
-                    try:
-                        con.execute(
-                            """INSERT INTO ths_concept_stock_history
-                               (trade_date, concept_code, concept_name, stock_code,
-                                stock_name, concept_rank, source, raw_json,
-                                date_verified, fetched_at)
-                               VALUES (?, ?, ?, ?, ?, NULL, 'hithink_index_api',
-                                       ?, true, now())""",
-                            [snap, concept_code, name, ticker, m.get("name"),
-                             json.dumps(enriched, ensure_ascii=False)],
-                        )
-                        written_m += 1
-                    except duckdb.ConstraintException:
-                        pass  # duplicate member entry, safe to skip
-                    except Exception as exc:
-                        logger.debug("%s/%s insert error: %s", concept_code, ticker, exc)
+                    # Members were deduplicated before the transaction. An
+                    # insertion failure must roll back the success checkpoint
+                    # and the entire replacement, not leave a partial concept.
+                    con.execute(
+                        """INSERT INTO ths_concept_stock_history
+                           (trade_date, concept_code, concept_name, stock_code,
+                            stock_name, concept_rank, source, raw_json,
+                            date_verified, fetched_at)
+                           VALUES (?, ?, ?, ?, ?, NULL, 'hithink_index_api',
+                                   ?, true, now())""",
+                        [snap, concept_code, name, ticker, m.get("name"),
+                         json.dumps(enriched, ensure_ascii=False)],
+                    )
                 con.execute("COMMIT")
+                written_d += 1
+                written_m += len(members)
             except Exception:
                 con.execute("ROLLBACK")
                 raise
@@ -237,6 +241,13 @@ def main() -> int:
         return 0 if not skipped and complete and not mismatches else 2
     finally:
         con.close()
+        from trade_system.collection_profiles import emit_product_counts
+        if catalog_received:
+            emit_product_counts('ths_concept_daily', rows_parsed=parsed_catalog,
+                                rows_written=written_d, receipt_reused=bool(reused))
+        if members_received or reused:
+            emit_product_counts('ths_concept_stock_history', rows_parsed=parsed_members,
+                                rows_written=written_m, receipt_reused=bool(reused))
 
 
 if __name__ == "__main__":

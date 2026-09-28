@@ -113,6 +113,12 @@ def test_profile_declares_full_market_flow_sources(monkeypatch, capsys):
     assert command[command.index('--start-date') + 1] == '20260918'
     assert command[command.index('--end-date') + 1] == '20260918'
     assert command[command.index('--retry-passes') + 1] == '0'
+    for phase in ('close', 'supplemental'):
+        _, bounded, _ = next(step for step in command_plan('unused', '2026-09-18', include_collection=True, phase=phase)
+                             if step[0] == 'sync_tushare_close')
+        for flag, value in {'--request-timeout': '60', '--retries': '1',
+                            '--budget-seconds': '300', '--retry-passes': '0'}.items():
+            assert bounded[bounded.index(flag) + 1] == value
     with pytest.raises(ValueError, match='unregistered'):
         task_due('unused','2026-09-18','unknown',phase='close',force=True)
     with pytest.raises(ValueError, match='unregistered'):
