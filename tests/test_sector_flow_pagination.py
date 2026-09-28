@@ -405,6 +405,14 @@ def test_expected_membership_rejects_equal_count_wrong_identities(tmp_path, monk
     assert result['pagination']['unexpected_codes'] == ['X']
     assert not result['pagination']['promoted']
 
+    monkeypatch.setattr(collector, '_from_em_sector_flow_page', lambda **k: (None, {}))
+    with MultiSourceStore(tmp_path/'failed-page.duckdb') as store:
+        _, failed = collector._collect_sector_pages(store, '2026-07-24', 100, 1, 0,
+                                                   ['A','B'], 'frozen-fixture-v1')
+    assert failed['expected_total'] == 2
+    assert failed['reported_total'] == 0
+    assert failed['missing_codes'] == ['A','B']
+
 
 def test_failed_provider_status_cannot_overwrite_accepted_flow(tmp_path):
     with MultiSourceStore(tmp_path/'status.duckdb') as store:
@@ -445,6 +453,33 @@ def test_sector_contract_keeps_namespace_measure_and_raw_type(tmp_path):
         assert contract['flow_definition'] == 'sector_total_net'
         assert contract['raw_sector_type'] == 'ths_industry'
         assert json.loads(stored[2])['main_net'] == 2
+
+        store.con.execute("CREATE TABLE history_fetch_checkpoint(dataset VARCHAR,trade_date DATE,page_no INTEGER,status VARCHAR)")
+        store.con.execute("INSERT INTO history_fetch_checkpoint VALUES ('industry_flow','2026-07-24',0,'success')")
+        raw = {'source_api':'moneyflow_ind_dc','content_type':'行业','ts_code':'BK001.DC',
+               'trade_date':'20260724','close':100,'net_amount':10,'buy_elg_amount':4,
+               'buy_lg_amount':6,'buy_md_amount':-5,'buy_sm_amount':-5}
+        store.con.execute("INSERT INTO multi_source_sector_flow "
+            "(source_date,sector_code,provider,sector_type,amount_unit,is_stale,main_net,super_net,large_net,mid_net,small_net,fetched_at,raw_json) "
+            "VALUES ('2026-07-24','BK001.DC','tushare_sector_full','em_industry','yuan',FALSE,10,4,6,-5,-5,'2026-07-24 16:00:00',?)",
+            [json.dumps(raw)])
+        qualify = lambda codes: collector._retained_relay_industry(store.con, '2026-07-24', codes,
+                                        'fixture-directory', now=datetime(2026,7,24,17))
+        accepted = qualify(['BK001'])
+        assert accepted['requests'] == accepted['rows_written'] == 0
+        assert accepted['origin_provider'] == 'eastmoney'
+        assert accepted['input_received_min'] == '2026-07-24T16:00:00'
+        assert qualify(['BK002']) is None
+        assert qualify(['BK001','BK002']) is None
+        store.con.execute("CREATE TABLE tushare_moneyflow_industry(trade_date DATE,ts_code VARCHAR,raw_json VARCHAR)")
+        store.con.execute("INSERT INTO tushare_moneyflow_industry VALUES ('2026-07-24','REGION.DC','{}')")
+        assert collector._expected_sector_taxonomies(store.con, '2026-07-24')['tushare_dc_sector'] == 0
+        for bad in [dict(raw, content_type='地域'), dict(raw, trade_date='20260723'),
+                    dict(raw, net_amount=100000), dict(raw, buy_md_amount=None)]:
+            store.con.execute("UPDATE multi_source_sector_flow SET raw_json=? WHERE sector_code='BK001.DC'",[json.dumps(bad)])
+            assert qualify(['BK001']) is None
+        store.con.execute("UPDATE multi_source_sector_flow SET raw_json=?, fetched_at='2026-07-24 13:00:00' WHERE sector_code='BK001.DC'",[json.dumps(raw)])
+        assert qualify(['BK001']) is None
 
 
 def test_unknown_sector_type_never_becomes_em_from_code_prefix():

@@ -183,6 +183,13 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
     }
 
 
+# Reviewed mappings only. Each key binds BOTH original origins, products,
+# definitions and adapter versions. Provider rows cannot authorize a mapping.
+# No current pair has documented equivalent order grouping/side/buckets/session.
+# Values must include dated validity and hashes of both original specifications.
+VERIFIED_FLOW_COMPARISONS = {}
+
+
 def independent_comparison_contract(con, trade_date, primary, reference):
     """Read-only semantic gate. Correlation cannot establish equivalent definitions.
 
@@ -215,7 +222,19 @@ def independent_comparison_contract(con, trade_date, primary, reference):
     elif left['definition'] != right['definition']:
         result['reason'] = 'definition_alignment_unproven'
     else:
-        result.update(eligible=True, reason='distinct_declared_origins_same_explicit_definition')
+        signatures = tuple(sorted(tuple(side[k] for k in
+            ('origin', 'api', 'definition', 'mapping_version')) for side in (left, right)))
+        evidence = VERIFIED_FLOW_COMPARISONS.get(signatures, {})
+        hashes = evidence.get('source_specification_sha256', [])
+        day = str(trade_date)[:10]
+        if (not evidence.get('canonical_definition') or len(hashes) != 2
+                or any(not isinstance(h, str) or len(h) != 64
+                       or any(ch not in '0123456789abcdef' for ch in h) for h in hashes)
+                or not evidence.get('valid_from', '9999') <= day <= evidence.get('valid_through', '0000')):
+            result['reason'] = 'definition_evidence_missing'
+        else:
+            result.update(eligible=True, reason='verified_independent_definition_mapping',
+                          definition_evidence=evidence)
     return result
 
 

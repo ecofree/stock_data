@@ -18,7 +18,19 @@ def test_tushare_total_is_not_main_orders_net():
         con.execute("UPDATE multi_source_stock_flow SET origin_provider='tushare',flow_definition='main_orders_net' WHERE provider='direct'")
         assert independent_comparison_contract(con,'2026-09-24','relay','direct')['reason'] == 'definition_alignment_unproven'
         con.execute("UPDATE multi_source_stock_flow SET flow_definition='provider_main_orders_net' WHERE provider='direct'")
-        assert independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+        assert independent_comparison_contract(con,'2026-09-24','relay','direct')['reason'] == 'definition_evidence_missing'
+        # A shared label is not evidence of common order grouping or buckets.
+        from unittest.mock import patch
+        import trade_system.flow_contract as contract
+        key = tuple(sorted([('eastmoney','moneyflow_dc','provider_main_orders_net','v3'),
+                            ('tushare','dc','provider_main_orders_net','v3')]))
+        evidence = dict(canonical_definition='fixture_active_order_buckets',
+                        source_specification_sha256=['a'*64,'b'*64],
+                        valid_from='2026-09-24',valid_through='2026-09-24')
+        with patch.dict(contract.VERIFIED_FLOW_COMPARISONS,{key:evidence}):
+            assert independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+            evidence['source_specification_sha256'] = ['unknown','b'*64]
+            assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
         con.execute("UPDATE multi_source_stock_flow SET main_net=NULL WHERE provider='direct'")
         assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
     row = normalize_stock_flow_row(

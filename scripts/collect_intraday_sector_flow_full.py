@@ -164,13 +164,65 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
         'status':status,'promoted':False,'requests':requests,'max_requests':max_pages*5,
         'primary_pages':primary_pages,'reconciliation_pages':reverse_pages,
         'expected_pages':math.ceil(total/transport_size) if total and transport_size else 0,
-        'expected_total':total,'observed_codes':len(codes),'invalid_rows':invalid,
+        'expected_total':len(expected) if expected_codes is not None else total,
+        'reported_total':total,'observed_codes':len(codes),'invalid_rows':invalid,
         'duplicate_rows':duplicates,'total_values':sorted(totals),'errors':errors,
         'missing_codes':missing,'unexpected_codes':unexpected,'catalogue_version':catalogue_version,
         'catalogue_sha256':hashlib.sha256(json.dumps(membership,sort_keys=True).encode()).hexdigest() if expected_codes is not None else None,
         'resume_cursor':None if status=='complete' else (cursors[-1] if cursors else None),
         'cursor_scope':'diagnostic_restart_whole_capture_no_cross_snapshot_page_stitching',
     }
+
+
+def _retained_relay_industry(con, trade_date, expected_codes, catalogue_version, *, now=None):
+    """Admit a committed relay snapshot without renaming its origin or clocks.
+
+    The independent catalogue defines membership, never the flow row count.
+    This reuses facts only; it makes no additional request on native failure.
+    """
+    if not expected_codes or not catalogue_version or len(set(expected_codes)) != len(expected_codes):
+        return None
+    now = now or datetime.now()
+    try:
+        checkpoint = con.execute("SELECT status FROM history_fetch_checkpoint WHERE dataset='industry_flow' "
+            "AND trade_date=? AND page_no=0", [trade_date]).fetchone()
+        if not checkpoint or checkpoint[0] != 'success':
+            return None
+        rows = con.execute("SELECT sector_code,main_net,super_net,large_net,mid_net,small_net,"
+            "amount_unit,fetched_at,raw_json FROM multi_source_sector_flow "
+            "WHERE source_date=? AND provider='tushare_sector_full' "
+            "AND sector_type='em_industry' AND is_stale=FALSE", [trade_date]).fetchall()
+        seen, clocks = set(), []
+        for code, *values in rows:
+            flows, unit, received, encoded = values[:5], values[5], values[6], values[7]
+            raw = json.loads(encoded)
+            raw_flows = [_number(raw.get(key)) for key in
+                         ('net_amount','buy_elg_amount','buy_lg_amount','buy_md_amount','buy_sm_amount')]
+            if (not code.endswith('.DC') or code.removesuffix('.DC') in seen
+                    or unit != 'yuan' or any(_number(v) is None or not math.isfinite(float(v)) for v in flows)
+                    or any(v is None or not math.isfinite(v) for v in raw_flows)
+                    or any(not math.isclose(a, b, rel_tol=1e-9, abs_tol=0.01) for a,b in zip(flows,raw_flows))
+                    or (_number(raw.get('close')) or 0) <= 0
+                    or received is None or received.date().isoformat() != trade_date
+                    or not 0 <= (now-received).total_seconds() <= 7200
+                    or raw.get('source_api') != 'moneyflow_ind_dc'
+                    or raw.get('content_type') != '行业' or raw.get('ts_code') != code
+                    or _compact(raw.get('trade_date')) != _compact(trade_date)):
+                return None
+            seen.add(code.removesuffix('.DC'))
+            clocks.append(received.isoformat())
+        if seen != set(expected_codes):
+            return None
+        membership = {'taxonomy':'em_industry','version':catalogue_version,'codes':sorted(seen)}
+        return dict(status='complete', promoted=True, accepted_retained=True,
+            provider='tushare_sector_full', origin_provider='eastmoney', source_api='moneyflow_ind_dc',
+            expected_total=len(seen), observed_codes=len(seen), expected_pages=0,
+            primary_pages=0, reconciliation_pages=0, requests=0, errors=[],
+            missing_codes=[], unexpected_codes=[], catalogue_version=catalogue_version,
+            catalogue_sha256=hashlib.sha256(json.dumps(membership,sort_keys=True).encode()).hexdigest(),
+            input_received_min=min(clocks), input_received_max=max(clocks), rows_written=0)
+    except (duckdb.Error, ValueError, TypeError, AttributeError):
+        return None
 
 
 def _replace_sector_snapshot(store, trade_date, rows, pagination):
@@ -227,13 +279,8 @@ def _expected_sector_taxonomies(con: duckdb.DuckDBPyConnection, trade_date: str)
         ).fetchone()[0] or 0)
     except Exception:
         pass
-    try:
-        out["tushare_dc_sector"] = int(con.execute(
-            "SELECT count(DISTINCT ts_code) FROM tushare_moneyflow_industry WHERE trade_date=CAST(? AS DATE)",
-            [trade_date],
-        ).fetchone()[0] or 0)
-    except Exception:
-        pass
+    # Non-industry relay rows remain observable. Their own row count is not
+    # an independent concept/region catalogue and must not become a denominator.
     return out
 
 
@@ -472,9 +519,12 @@ def collect_full_sector_flow(
                             "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash) "
                             "VALUES (?,'em_industry_catalogue','reference','xiaodefa','unavailable',?,?)",
                             [trade_date,failed,hashlib.sha256(failed.encode()).hexdigest()])
-            staged_rows, pagination = _collect_sector_pages(
-                store, trade_date, page_size, max_pages, pause_seconds,
-                expected_codes, catalogue_version)
+            pagination = _retained_relay_industry(con, trade_date, expected_codes, catalogue_version)
+            staged_rows = []
+            if pagination is None:
+                staged_rows, pagination = _collect_sector_pages(
+                    store, trade_date, page_size, max_pages, pause_seconds,
+                    expected_codes, catalogue_version)
             em_total = pagination['expected_total']
             expected_taxonomies['em_industry'] = em_total
             expected_pages = pagination['expected_pages']
@@ -483,12 +533,14 @@ def collect_full_sector_flow(
             if catalogue_error:
                 pagination['errors'].append(catalogue_error)
             error = '; '.join(pagination['errors'])[:500]
-            if _replace_sector_snapshot(store, trade_date, staged_rows, pagination):
+            if pagination.get('accepted_retained'):
+                provider_used = pagination['provider']
+            elif _replace_sector_snapshot(store, trade_date, staged_rows, pagination):
                 provider_used = 'eastmoney_sector_full'
             # Failed/count-only captures remain observations. Never rename an
             # arbitrary resilient fallback as a different sector taxonomy.
             store.store('sector_flow_batch', None, pagination,
-                {'source':'eastmoney_sector_full','status':pagination['status']},
+                {'source':pagination.get('provider','eastmoney_sector_full'),'status':pagination['status']},
                 trade_date=trade_date)
 
             identity_errors = []
@@ -525,7 +577,7 @@ def collect_full_sector_flow(
                 provider_used = "+".join(filter(None, (provider_used, "derived_ths_stock_aggregate")))
 
             taxonomy_providers = {
-                "em_industry": "eastmoney_sector_full",
+                "em_industry": pagination.get('provider', 'eastmoney_sector_full'),
                 "tushare_dc_sector": "tushare_sector_full",
                 "ths_concept": "derived_ths_stock_aggregate",
             }
@@ -533,8 +585,10 @@ def collect_full_sector_flow(
             for taxonomy, provider in taxonomy_providers.items():
                 observed = int(con.execute(
                     "SELECT count(DISTINCT sector_code) FROM multi_source_sector_flow "
-                    "WHERE source_date=CAST(? AS DATE) AND is_stale=FALSE AND provider=?",
-                    [trade_date, provider],
+                    "WHERE source_date=CAST(? AS DATE) AND is_stale=FALSE AND provider=? "
+                    "AND (?<>'tushare_dc_sector' OR sector_type<>'em_industry') "
+                    "AND (?<>'em_industry' OR sector_type='em_industry')",
+                    [trade_date, provider, taxonomy, taxonomy],
                 ).fetchone()[0])
                 expected = int(expected_taxonomies.get(taxonomy) or 0)
                 unverified = taxonomy == "em_industry" and not em_total
@@ -553,7 +607,9 @@ def collect_full_sector_flow(
                     observed = pagination.get('observed_codes', 0)
                     tax_coverage = round(observed * 100 / expected, 2) if expected else 0.0
                     tax_status = 'success' if pagination.get('promoted') else pagination['status']
-                tax_error = "unverified denominator" if unverified else ""
+                if taxonomy == 'tushare_dc_sector' and observed:
+                    tax_status = 'unverified'
+                tax_error = "unverified denominator" if unverified or tax_status == 'unverified' else ""
                 if taxonomy == "ths_concept":
                     observed = ths_result["fetched_rows"]
                     tax_coverage = ths_result["coverage_pct"]
@@ -577,7 +633,7 @@ def collect_full_sector_flow(
                 for taxonomy, item in taxonomy_rows.items()
             }
             required_taxonomies = [item for item in taxonomy_rows.values() if item[0] > 0]
-            optional_gap = any(item[0] == 0 and item[3] == "missing" for item in taxonomy_rows.values())
+            optional_gap = any(item[0] == 0 and item[3] in {"missing", "unverified"} for item in taxonomy_rows.values())
             required_complete = bool(required_taxonomies) and all(
                 item[3] == "success"
                 and item[2] >= SECTOR_COVERAGE_SUCCESS_PCT

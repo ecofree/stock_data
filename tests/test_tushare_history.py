@@ -90,7 +90,9 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
         collector.store.conn.execute("INSERT INTO tushare_trade_cal(exchange,cal_date,is_open) "
             "VALUES ('SSE','2026-07-14',true),('SZSE','2026-07-14',true)")
         collector._collect_industry_flow("20260714")
+        collector.store.conn.execute("UPDATE tushare_moneyflow_industry SET fetched_at='2026-07-14 16:00:00'")
         collector.sync_sector_flow("20260714")
+        assert str(collector.store.conn.execute("SELECT min(fetched_at) FROM multi_source_sector_flow").fetchone()[0]) == '2026-07-14 16:00:00'
         assert collector.store.conn.execute(
             "SELECT main_net,super_net,large_net,mid_net,small_net FROM multi_source_sector_flow"
         ).fetchone() == (30, 10, -3, None, None)
@@ -489,6 +491,15 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='tampered' "
             "WHERE data_type='tushare_suspend_d_snapshot'")
         assert '000002.SZ' in c._expected_stock_codes('20260701', 'daily')
+        # Even a forced targeted refresh cannot certify PE-only input. A real
+        # same-day complete valuation may retain unknown loss-making PE.
+        c._read_rows = lambda *a, **k: [dict(ts_code='000002.SZ',trade_date='20260701',pe=12)]
+        with pytest.raises(XiaodefaError, match='coverage incomplete'):
+            c._collect_market('daily_basic','20260701',codes=['000002.SZ'],force=True)
+        c._read_rows = lambda *a, **k: [dict(ts_code='000002.SZ',trade_date='20260701',
+                                           pe=None,pb=-0.5,total_mv=100,circ_mv=50)]
+        assert c._collect_market('daily_basic','20260701',codes=['000002.SZ'],force=True) == 1
+        assert c.store.conn.execute("SELECT pe FROM tushare_daily_basic WHERE ts_code='000002.SZ'").fetchone() == (None,)
 
     from urllib.request import Request
     from trade_system.http_transport import _diagnostic_attempt, stop_diagnostic

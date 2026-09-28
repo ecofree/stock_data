@@ -148,9 +148,9 @@ class TushareHistoryCollector:
             raise XiaodefaError('price response conflicts with official listing membership')
         if dataset == 'daily_basic':
             observed = {r['ts_code'] for r in rows if isinstance(r, dict)
-                        and _num(r.get('pb')) is not None
-                        and (total := _num(r.get('total_mv'))) is not None and total > 0
-                        and (floating := _num(r.get('circ_mv'))) is not None and 0 < floating <= total}
+                        and (pb := _num(r.get('pb'))) is not None and math.isfinite(pb)
+                        and (total := _num(r.get('total_mv'))) is not None and math.isfinite(total) and total > 0
+                        and (floating := _num(r.get('circ_mv'))) is not None and math.isfinite(floating) and 0 < floating <= total}
         if dataset in {'daily', 'daily_basic', 'moneyflow'} and expected - observed and self._suspension_rows(trade_date) is None:
             self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                             'ts_code,trade_date,suspend_timing,suspend_type')
@@ -932,8 +932,10 @@ class TushareHistoryCollector:
         # Coverage failure below does not undo this committed partial batch.
         self._count_product(dataset, written=count)
         if expected is not None:
-            unresolved = (expected - {r["ts_code"] for r in rows} if force
-                          else expected - self._covered_codes(dataset, trade_date))
+            # Forced refresh still needs qualified fields, not identity alone.
+            unresolved = expected - self._covered_codes(dataset, trade_date)
+            if force:
+                unresolved |= expected - {r['ts_code'] for r in rows}
             if unresolved:
                 raise XiaodefaError(f"coverage incomplete: {len(unresolved)} missing instruments; "
                                    "provider absence does not prove suspension")
@@ -1080,7 +1082,7 @@ class TushareHistoryCollector:
     def sync_sector_flow(self, trade_date: str, *, atomic=True) -> int:
         rows = self.store.conn.execute(
             "SELECT ts_code,sector_name,change_pct,close,net_amount,buy_elg_amount,sell_elg_amount,"
-            "buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount,raw_json "
+            "buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount,raw_json,fetched_at "
             "FROM tushare_moneyflow_industry WHERE trade_date=? AND close IS NOT NULL AND close>0",
             [_iso(trade_date)],
         ).fetchall()
@@ -1095,7 +1097,7 @@ class TushareHistoryCollector:
             out.append([_iso(trade_date), row[0], row[1], _num(row[4]) if row[4] is not None else None,
                         super_net, large, mid, small, row[2], "tushare_sector_full",
                         {"行业": "em_industry", "概念": "em_concept", "地域": "em_region"}.get(raw.get('content_type'), 'tushare_dc_sector'), "yuan", False,
-                        _json({**raw, "close": row[3], "source": "moneyflow_ind_dc", "unit": "yuan"})])
+                        _json({**raw, "close": row[3], "source": "moneyflow_ind_dc", "unit": "yuan"}), row[14]])
         if not out:
             return 0
         with self._transaction(atomic):
@@ -1105,7 +1107,7 @@ class TushareHistoryCollector:
             )
             count = bulk_replace(self.store.conn,
                 "multi_source_sector_flow", out,
-                ["source_date", "sector_code", "sector_name", "main_net", "super_net", "large_net", "mid_net", "small_net", "change_pct", "provider", "sector_type", "amount_unit", "is_stale", "raw_json"],
+                ["source_date", "sector_code", "sector_name", "main_net", "super_net", "large_net", "mid_net", "small_net", "change_pct", "provider", "sector_type", "amount_unit", "is_stale", "raw_json", "fetched_at"],
                 ["source_date", "sector_code", "provider"],
             )
         if atomic:
