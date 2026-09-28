@@ -765,6 +765,28 @@ class TushareHistoryCollector:
                         raise XiaodefaError('BSE/native listing date disagreement: '+code)
                     rows.append(dict(ts_code=code+'.BJ',symbol=code,name=native.get('name'),market='北交所',list_date=listed,list_status='L'))
                     corrections.append(dict(ts_code=code+'.BJ',list_date=listed,provider='hithink',membership_provider='bse'))
+            if self._is_production_source():
+                # A plausible listing date does not prove current membership:
+                # retired/replaced codes can survive in the relay's L list.
+                # Reconcile all current SH/SZ rows against dated full exchange
+                # inventories, retaining historical rows and listing dates.
+                for suffix in ('.SZ', '.SH'):
+                    current = [r for r in rows if r.get('list_status') == 'L'
+                               and str(r.get('ts_code','')).endswith(suffix)
+                               and r.get('list_date') and _iso(r['list_date']) <= date.today().isoformat()]
+                    if not current:
+                        continue
+                    if suffix == '.SZ':
+                        membership = membership or self._exchange_listing_membership()
+                        inventory = membership
+                    else:
+                        sh_membership = sh_membership or self._exchange_listing_membership('SH')
+                        inventory = sh_membership
+                    if inventory.get('as_of') != date.today().isoformat() or not inventory.get('listings'):
+                        raise XiaodefaError('current exchange membership evidence required')
+                    not_listed.extend(r['ts_code'] for r in current
+                                      if r['ts_code'][:6] not in inventory['listings'])
+                not_listed = sorted(set(not_listed))
             invalid = []
             for row in rows:
                 if row.get('ts_code') in not_listed:

@@ -422,6 +422,12 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
         assert '000003.SZ' in c._expected_stock_codes((date.today()-timedelta(days=1)).isoformat(), 'daily')
         with pytest.raises(Exception, match='conflicts with official listing membership'):
             c._validate_stock_snapshot('daily', [{'ts_code': '000003.SZ'}], date.today().isoformat())
+        # A valid historical listing date is not current membership proof.
+        c.client.rows.append(dict(ts_code='000004.SZ',list_status='L',list_date='19950101'))
+        assert c.collect_stock_basic(force=True) == 4
+        assert str(c.store.conn.execute("SELECT list_date FROM tushare_stock_basic WHERE ts_code='000004.SZ'").fetchone()[0]) == '1995-01-01'
+        assert '000004.SZ' not in c._expected_stock_codes(date.today().isoformat(), 'daily')
+        assert '000004.SZ' in c._expected_stock_codes((date.today()-timedelta(days=1)).isoformat(), 'daily')
         c.store.conn.execute("UPDATE multi_source_observation SET payload_json=json_merge_patch(payload_json,?) "
             "WHERE data_type='tushare_stock_basic_snapshot' AND json_extract(payload_json,'$.listing_membership') IS NOT NULL",
             [json.dumps({'listing_membership': {'as_of': (date.today()-timedelta(days=1)).isoformat(), 'not_listed': ['000003.SZ']}})])
