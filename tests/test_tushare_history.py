@@ -97,7 +97,9 @@ def test_flow_normalization_preserves_missing_values_and_dc_net_definition(tmp_p
             "SELECT main_net,super_net,large_net,mid_net,small_net FROM multi_source_sector_flow"
         ).fetchone() == (30, 10, -3, None, None)
         collector._collect_moneyflow("20260714")
+        collector.store.conn.execute("UPDATE tushare_moneyflow SET fetched_at='2026-07-14 16:05:00'")
         collector.sync_stock_flow("20260714")
+        assert str(collector.store.conn.execute("SELECT min(fetched_at) FROM multi_source_stock_flow").fetchone()[0]) == '2026-07-14 16:05:00'
         assert collector.store.conn.execute(
             "SELECT main_net,super_net,large_net,mid_net,small_net,net_total FROM multi_source_stock_flow"
         ).fetchone() == (120000, 60000, 60000, 0, 0, None)

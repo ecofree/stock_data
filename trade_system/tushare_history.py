@@ -1038,7 +1038,7 @@ class TushareHistoryCollector:
     def sync_stock_flow(self, trade_date: str, *, atomic=True) -> int:
         rows = self.store.conn.execute(
             "SELECT ts_code,stock_code,buy_sm_amount,sell_sm_amount,buy_md_amount,sell_md_amount,"
-            "buy_lg_amount,sell_lg_amount,buy_elg_amount,sell_elg_amount,net_mf_amount "
+            "buy_lg_amount,sell_lg_amount,buy_elg_amount,sell_elg_amount,net_mf_amount,fetched_at "
             "FROM tushare_moneyflow WHERE date=? ORDER BY fetched_at DESC",
             [_iso(trade_date)],
         ).fetchall()
@@ -1051,14 +1051,14 @@ class TushareHistoryCollector:
             seen.add(row[1])
             raw = dict(zip(("buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
                             "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
-                            "net_mf_amount"), row[2:]))
+                            "net_mf_amount"), row[2:11]))
             normalized = normalize_stock_flow_row({**raw, "source_api": "moneyflow",
                                                    "amount_unit": "10000_yuan"}, "tushare")
             out.append([_iso(trade_date), row[1], *[normalized[k] for k in (
                         "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net")],
                         "tushare", normalized["amount_unit"], normalized["flow_definition"], "moneyflow",
                         "tushare", normalized["field_mapping_version"], False,
-                        _json({**raw, "ts_code": row[0], "source": "tushare_moneyflow", "unit": "10000_yuan"})])
+                        _json({**raw, "ts_code": row[0], "source": "tushare_moneyflow", "unit": "10000_yuan"}), row[11]])
         # An empty source batch is not a valid replacement.  In particular,
         # an upstream timeout can leave the raw table empty while the last
         # verified normalized snapshot is still usable.  Return before the
@@ -1072,7 +1072,7 @@ class TushareHistoryCollector:
             )
             count = bulk_replace(self.store.conn,
                 "multi_source_stock_flow", out,
-                ["source_date", "stock_code", "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net", "provider", "amount_unit", "flow_definition", "source_api", "origin_provider", "field_mapping_version", "is_stale", "raw_json"],
+                ["source_date", "stock_code", "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net", "provider", "amount_unit", "flow_definition", "source_api", "origin_provider", "field_mapping_version", "is_stale", "raw_json", "fetched_at"],
                 ["source_date", "stock_code", "provider"],
             )
         if atomic:
