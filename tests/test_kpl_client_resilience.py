@@ -5,6 +5,7 @@ from trade_system.source_validation import ValidationResult
 
 
 def test_network_permission_error_opens_circuit(monkeypatch):
+    monkeypatch.setattr(base.shared_host_limiter, 'acquire', lambda *a, **k: None)
     calls = []
     reason = OSError("socket access denied")
     reason.winerror = 10013

@@ -111,6 +111,19 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     value=json.loads(files['observation.json'])
     assert len(value['rows'])==201 and sum(r['state']=='capacity_blocked' for r in value['rows'])==1
     assert any(r['instrument']=='000002' and r['risk_related'] for r in value['live_scope'])
+    deferred={r['instrument'] for r in value['rows'] if r['state']=='capacity_blocked'}
+    # The next bounded pass rotates the regular tail, even with a fixed risk priority.
+    product.observe(tmp_path)
+    _,files=product.read_current(tmp_path/'observation-publication')
+    rotated=json.loads(files['observation.json'])
+    assert not deferred & {r['instrument'] for r in rotated['rows'] if r['state']=='capacity_blocked'}
+    from trade_system.v2 import journal_index
+    monkeypatch.setattr(journal_index,'effective',lambda out,kind: [{'instrument':'600999'}] if kind=='note' else [])
+    # A note omitted from the display projection is still a live attention subject.
+    product.observe(tmp_path)
+    _,files=product.read_current(tmp_path/'observation-publication')
+    assert '600999' in {r['instrument'] for r in json.loads(files['observation.json'])['live_scope']}
+
     # A damaged cache is optional evidence, not a failure of the whole view.
     cache=json.loads((tmp_path/'quote-capture-current.json').read_text())
     from pathlib import Path

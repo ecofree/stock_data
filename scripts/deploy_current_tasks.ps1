@@ -23,7 +23,7 @@ function Xml-Child($Parent,[string]$Name,[string]$Value) {
     if (-not $child) {$child=$Parent.OwnerDocument.CreateElement($Name,$Parent.NamespaceURI);[void]$Parent.AppendChild($child)}
     $child.InnerText=$Value
 }
-function Replacement-Xml($Row,[string]$ResearchStartBoundary) {
+function Replacement-Xml($Row,[string]$ResearchStartBoundary,[string]$AuctionStartBoundary="") {
     if ($Row.Disposition -eq 'preserve_disabled') {return [string]$Row.BeforeXml}
     $xml=[xml]$Row.BeforeXml; $task=$xml.DocumentElement
     $exec=$task.SelectSingleNode('*[local-name()="Actions"]/*[local-name()="Exec"]')
@@ -34,6 +34,19 @@ function Replacement-Xml($Row,[string]$ResearchStartBoundary) {
     Xml-Child $settings 'Enabled' 'true'
     # Registering an old trigger must not replay a missed close while committing.
     Xml-Child $settings 'StartWhenAvailable' 'false'
+    if ($Row.Name -in @('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-SupplementalRetry')) {
+        # Cooperative deadline belongs to the runner; Scheduler must not kill a
+        # database writer while it safely drains. IgnoreNew remains unchanged.
+        Xml-Child $settings 'ExecutionTimeLimit' 'PT0S'
+        Xml-Child $settings 'AllowHardTerminate' 'false'
+    }
+    if ($Row.Name -eq 'StockData-Auction' -and $AuctionStartBoundary) {
+        if ($AuctionStartBoundary -notmatch '^\d{4}-\d{2}-\d{2}T08:50:00\+08:00$') {throw 'Explicit 08:50 China reference preparation boundary required'}
+        [void][DateTimeOffset]::Parse($AuctionStartBoundary)
+        $boundaries=@($task.SelectNodes('*[local-name()="Triggers"]/*/*[local-name()="StartBoundary"]'))
+        if ($boundaries.Count -ne 1) {throw 'One captured auction trigger required'}
+        $boundaries[0].InnerText=$AuctionStartBoundary
+    }
     if ($Row.Name -in @('StockData-ResearchDaily','StockData-QLibResearch')) {
         $principal=$task.SelectSingleNode('*[local-name()="Principals"]/*[local-name()="Principal"]')
         Xml-Child $principal 'UserId' $Row.Principal.UserId
@@ -105,7 +118,7 @@ function Assert-EngineeringPlan($Candidate) {
         if ($monthly -ne ($row.Disposition -eq 'preserve_disabled') -or
             (-not $monthly -and $row.Disposition -ne 'replace_responsibility')) {throw 'Task disposition mismatch'}
         if ($monthly -and (([xml]$row.BeforeXml).Task.Settings.Enabled -ne 'false' -or $row.AfterXml -cne $row.BeforeXml)) {throw 'Monthly compact must be byte-for-byte preserved disabled'}
-        if (-not $row.AfterXml -or (Task-Xml $row.AfterXml) -cne (Task-Xml (Replacement-Xml $row $Candidate.ResearchStartBoundary))) {throw 'Compiled task XML mismatch'}
+        if (-not $row.AfterXml -or (Task-Xml $row.AfterXml) -cne (Task-Xml (Replacement-Xml $row $Candidate.ResearchStartBoundary $Candidate.AuctionStartBoundary))) {throw 'Compiled task XML mismatch'}
     }
 }
 function Save-Transaction($Journal,[string]$Path) {

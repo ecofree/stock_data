@@ -128,9 +128,11 @@ class KPLClient:
         }
 
     def _remaining_budget(self):
-        if self.total_budget_seconds is None:
-            return None
-        return self.total_budget_seconds - (time.monotonic() - self._started_at)
+        from trade_system.http_transport import inherited_request_remaining
+        remaining = inherited_request_remaining()
+        if self.total_budget_seconds is not None:
+            remaining = min(remaining, self.total_budget_seconds - (time.monotonic() - self._started_at))
+        return None if remaining == float('inf') else remaining
 
     def _open_circuit(self, reason):
         if self._circuit_open_reason is None:

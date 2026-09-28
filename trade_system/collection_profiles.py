@@ -142,7 +142,7 @@ def command_plan(
             collection_steps = [
                 ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
-                ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
+                ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--phase", phase, "--out", report("intraday_stock_flow_latest.md")], False),
                 # Phase mode never runs full L2; keep candidate stock curves fresh.
                 ("collect_l2_focus", [py, "scripts/collect_l2_focus.py", "--db", db_path, "--date", selected_date,
                  "--max-stocks", str(min(60, max(20, signal_limit // 3))),
@@ -172,7 +172,7 @@ def command_plan(
                  "--date", selected_date, "--max-stocks", str(signal_limit), "--max-sectors", "0",
                  "--moneyflow-only", "--no-resilient-fallback", "--total-budget-seconds", "45",
                  "--out", report("kpl_stock_flow_focus_latest.md")], False),
-                ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_stock_flow_latest.md")], False),
+                ("collect_intraday_stock_flow_market", [py, "scripts/collect_intraday_stock_flow_market.py", "--db", db_path, "--date", selected_date, "--phase", phase, "--out", report("intraday_stock_flow_latest.md")], False),
                 ("collect_intraday_sector_flow_full", [py, "scripts/collect_intraday_sector_flow_full.py", "--db", db_path, "--date", selected_date, "--out", report("intraday_sector_flow_latest.md")], False),
                 ("derive_market_context", [py, "scripts/derive_market_context.py", "--db", db_path, "--date", selected_date, "--out", report("market_context_latest.json")], False),
                 # LHB was orphaned in the phase-mode migration (fetch_all.py

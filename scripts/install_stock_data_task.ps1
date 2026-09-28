@@ -7,7 +7,7 @@ param(
     [string]$AdapterPython, [string]$ResearchPython,
     [string]$ResearchReleaseDirectory, [string]$ResearchReleaseManifestSha256,
     [string]$EnvironmentFile, [string]$Workspace, [string]$Output,
-    [string]$ResearchStartBoundary
+    [string]$ResearchStartBoundary, [string]$AuctionStartBoundary
 )
 $ErrorActionPreference='Stop'
 if ($Register -or $RegisterAll) { throw 'Legacy task registration retired. Confirm recovery, protected release and a new maintenance window before cutover.' }
@@ -113,8 +113,9 @@ if ($ResearchStartBoundary) {
     . (Join-Path $PSScriptRoot 'deploy_current_tasks.ps1') -Mode Library
     $proposal.Schema=3;$proposal.Scope='task_handover_engineering_only'
     $proposal.Version=[string]$releaseMetadata.version;$proposal.ResearchStartBoundary=$ResearchStartBoundary
+    $proposal.AuctionStartBoundary=$AuctionStartBoundary
     $proposal.AuthenticationVerified=$false;$proposal.LiveBackendEnabled=$false
-    foreach ($row in $rows) {$row | Add-Member NoteProperty AfterXml (Replacement-Xml $row $ResearchStartBoundary)}
+    foreach ($row in $rows) {$row | Add-Member NoteProperty AfterXml (Replacement-Xml $row $ResearchStartBoundary $AuctionStartBoundary)}
     Assert-EngineeringPlan $proposal
 }
 $parent=Split-Path -Parent ([IO.Path]::GetFullPath($Output))

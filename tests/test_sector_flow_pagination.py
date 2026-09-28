@@ -27,6 +27,12 @@ def test_ths_complete_aggregate_replaces_slice_and_preserves_unknown_buckets(tmp
     with MultiSourceStore(tmp_path/'ths.duckdb') as store:
         _ths_fixture(store)
         result = collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        assert store.con.execute("SELECT min(fetched_at) FROM multi_source_sector_flow WHERE sector_code='THS-A'").fetchone()[0] == datetime(2026,9,11,16)
+        import json
+        provenance=json.loads(store.con.execute("SELECT raw_json FROM multi_source_sector_flow WHERE sector_code='THS-A'").fetchone()[0])
+        assert provenance['raw']['input_received_min']=='2026-09-11 16:00:00'
+        assert provenance['raw']['generated_at']=='2026-09-11T17:00:00'
+
         assert result['promoted'] and result['status']=='success'
         assert store.con.execute('SELECT sector_code,main_net,large_net FROM multi_source_sector_flow').fetchall() == [('THS-A',30,None)]
         assert result['membership_pairs']==2 and result['missing_stock_count']==0

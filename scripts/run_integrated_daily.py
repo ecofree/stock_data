@@ -6,6 +6,8 @@ from datetime import date, datetime
 import os
 import subprocess
 import sys
+import time
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,24 @@ def _safe_stream_write(stream, value: str) -> None:
 
 
 
+def _run_writer(command, *, cwd, env, timeout, on_drain=None):
+    """Never terminate a database writer on timeout; retain the parent guard."""
+    child = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    expired = False
+    try:
+        out, err = child.communicate(timeout=max(0.01, timeout))
+    except subprocess.TimeoutExpired:
+        expired = True
+        if on_drain:
+            on_drain(child.pid)
+        # Transport children inherit a deadline and stop new requests. If a
+        # writer cannot drain, its pid/state stays visible and the guard held.
+        out, err = child.communicate()
+    if expired:
+        err += b'\nCollector deadline exceeded; writer drained without termination.\n'
+    return subprocess.CompletedProcess(command, -1 if expired else child.returncode, out, err)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Transitional market collection adapter; no legacy decisions or user-page publication.")
     parser.add_argument("--db", default="kpl_data.duckdb")
@@ -81,6 +101,7 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--step-timeout", type=int, default=900)
     parser.add_argument("--as-of", default="")
+    parser.add_argument("--prepare-reference", action="store_true", help="Auction preflight only, before 09:15; never an auction pass")
     parser.add_argument("--reports-dir", default="reports")
     parser.add_argument("--migration-root", help="Verified disposable backup for offline/migration execution")
     parser.add_argument("--collector-contract", help="Explicit hash-bound transitional source/runtime/target manifest")
@@ -93,6 +114,8 @@ def main() -> int:
     if args.migration_root and args.collector_contract:
         parser.error("migration copy and task handover are separate modes")
     selected_phase = resolve_phase(args.phase)
+    if args.prepare_reference and (selected_phase != 'auction' or datetime.now().strftime('%H:%M') >= '09:15'):
+        parser.error('reference preparation requires auction phase before 09:15')
     backend, python = ROOT, sys.executable
     if args.collector_contract:
         from trade_system.migration_boundary import verify_collection_contract
@@ -115,7 +138,14 @@ def main() -> int:
     if not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in run_id):
         parser.error("safe run id required")
     artifact_dir = Path(args.reports_dir).resolve() / "runs" / run_id
-    plan_as_of = args.as_of or datetime.now().isoformat()
+    budget = {'auction': 90, 'intraday': 240, 'close': 3600, 'supplemental': 3600, 'history': 3600}[selected_phase]
+    phase_deadline = time.time() + budget
+    inherited_deadline = os.environ.get('STOCKDATA_PHASE_DEADLINE_EPOCH')
+    if inherited_deadline:
+        supplied = float(inherited_deadline)
+        if not math.isfinite(supplied):
+            parser.error('invalid phase deadline')
+        phase_deadline = min(phase_deadline, supplied)
     plan = command_plan(args.db, args.trade_date, include_collection=not args.skip_collect,
         signal_limit=args.signal_limit, reports_dir=str(artifact_dir), phase=selected_phase,
         as_of_time=args.as_of or None, collection_profile=args.collection_profile,
@@ -123,6 +153,11 @@ def main() -> int:
     plan = [(name, [python, *command[1:]], optional) for name, command, optional in plan]
     if not args.skip_collect:
         validate_production_plan(selected_phase, [name for name, _, _ in plan])
+    if args.prepare_reference:
+        plan = [('prepare_stock_reference', [python, 'scripts/backfill_2026_tushare.py', '--db', args.db,
+            '--start-date', args.trade_date.replace('-', ''), '--end-date', args.trade_date.replace('-', ''),
+            '--datasets', 'stock_basic', '--max-days', '1', '--gap-only', '--budget-seconds', '60',
+            '--retry-passes', '0', '--report', str(artifact_dir/'stock_reference.md')], False)]
     if args.dry_run:
         for name, command, _ in plan:
             print(f"RUN {name}: {' '.join(command)}")
@@ -140,6 +175,21 @@ def main() -> int:
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
     manifest.data.update(scope="transitional_market_collection_only", user_pages_published=False,
                          collector_contract_sha256=args.collector_contract_sha256, execution_ready=False)
+    if args.prepare_reference:
+        manifest.data['scope'] = 'pre_session_reference_preparation_only'
+    from trade_system.http_transport import ssl_context_note
+    import urllib.request
+    from urllib.parse import urlsplit
+    routes = {}
+    for scheme, address in urllib.request.getproxies().items():
+        if scheme not in {'http','https'}:
+            continue
+        parsed = urlsplit(address if '://' in address else '//'+address)
+        routes[scheme] = {'host':parsed.hostname,'port':parsed.port}
+    # Current task-process context only, with proxy credentials/keys omitted.
+    manifest.data['transport_context'] = {'account':os.environ.get('USERDOMAIN','')+'\\'+os.environ.get('USERNAME',''),
+        'tls':ssl_context_note(), 'proxies':routes, 'phase_deadline_is_cooperative':True}
+    manifest.data['deadline_epoch'] = phase_deadline
     manifest.write()
     try:
         with PipelineLock(args.db, run_id):
@@ -147,7 +197,9 @@ def main() -> int:
             if selected_phase != "history" and not args.skip_collect and session.state == "unverified":
                 # The parent already holds the single-writer guard. Fetch only
                 # this missing session; never infer it from weekday or prices.
-                session = ensure_trading_session_status(args.db, args.trade_date)
+                from trade_system.http_transport import request_budget
+                with request_budget(max(.01, phase_deadline-time.time())):
+                    session = ensure_trading_session_status(args.db, args.trade_date)
             if selected_phase != "history" and not args.skip_collect and session.state != "open":
                 state = "skipped_market_closed" if session.state == "closed" else "blocked_calendar_unverified"
                 manifest.finish(state, session.reason)
@@ -158,17 +210,29 @@ def main() -> int:
             bootstrap = ("import sys; from trade_system.schema import init_schema; "
                          "from trade_system.data_store import connect_duckdb; c=connect_duckdb(sys.argv[1]); "
                          "init_schema(c); c.close()")
-            initialization = subprocess.run([python, "-X", "utf8", "-c", bootstrap, str(args.db)],
-                cwd=backend, capture_output=True, timeout=args.step_timeout, env=_utf8_subprocess_env())
+            if time.time() >= phase_deadline:
+                manifest.finish('deadline_exhausted', 'phase deadline reached before schema initialization')
+                return 2
+            initialization = _run_writer([python, "-X", "utf8", "-c", bootstrap, str(args.db)],
+                cwd=backend, timeout=min(args.step_timeout, phase_deadline-time.time()), env=_utf8_subprocess_env(),
+                on_drain=lambda pid: manifest.upsert_step('schema', 'draining', [], pid=pid))
             if initialization.returncode:
                 raise ValueError("collector schema initialization failed: "+initialization.stderr.decode("utf-8", "backslashreplace")[-500:])
             failed, warnings, pending = [], [], []
             from trade_system.collection_profiles import phase_tasks
-            required = {task.name: task.required for task in phase_tasks(selected_phase)}
+            required = {'prepare_stock_reference': True} if args.prepare_reference else {task.name: task.required for task in phase_tasks(selected_phase)}
             for name, command, _ in plan:
                 from trade_system.collection_profiles import task_due
-                due, reason = task_due(args.db, args.trade_date, name, phase=selected_phase,
-                                       now=datetime.fromisoformat(plan_as_of))
+                if time.time() >= phase_deadline:
+                    manifest.add_step(name, 'deadline_exhausted', command, required=required[name],
+                                      reason='phase deadline reached; no child started')
+                    (failed if required[name] else warnings).append(name)
+                    continue
+                if args.prepare_reference:
+                    due, reason = True, 'pre_session_reference_check'
+                else:
+                    due, reason = task_due(args.db, args.trade_date, name, phase=selected_phase,
+                                           now=datetime.fromisoformat(args.as_of) if args.as_of else datetime.now())
                 if not due:
                     cooling_down = reason.startswith('retry cooldown')
                     awaiting = reason.startswith('publication pending:')
@@ -189,8 +253,13 @@ def main() -> int:
                         'coverage_before':reason}
                     env=_utf8_subprocess_env()
                     env['STOCKDATA_REQUEST_CONTEXT']=json.dumps(context,sort_keys=True)
-                    process = subprocess.run(command, cwd=backend, capture_output=True,
-                        env=env, timeout=args.step_timeout)
+                    step_deadline = min(phase_deadline, time.time()+args.step_timeout)
+                    # Leave time for response validation and transaction commit.
+                    env['STOCKDATA_REQUEST_DEADLINE_EPOCH'] = str(step_deadline-5)
+                    process = _run_writer(command, cwd=backend, env=env,
+                        timeout=step_deadline-time.time(),
+                        on_drain=lambda pid: manifest.upsert_step(name, 'draining', command,
+                            pid=pid, reason='deadline exceeded; waiting for safe writer exit', log_path=str(log)))
                     out, bad_out = _decode_process_bytes(process.stdout, "stdout")
                     err, bad_err = _decode_process_bytes(process.stderr, "stderr")
                     code = process.returncode or (-2 if bad_out or bad_err else 0)

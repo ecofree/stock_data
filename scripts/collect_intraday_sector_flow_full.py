@@ -267,7 +267,8 @@ def _publish_ths_aggregate(store, trade_date, *, now=None, max_age_seconds=10800
         if report["status"] in {"complete", "qualified_subset"} and rows:
             complete = report['status'] == 'complete'
             stored = store.store("sector_flow", None, rows,
-                                 {"source":"derived_ths_stock_aggregate", "status":"live"},
+                                 {"source":"derived_ths_stock_aggregate", "status":"live",
+                                  "received_at": min(r["fetched_at"] for r in rows).timestamp()},
                                  trade_date=trade_date, commit=False)
             if stored["rows_written"] != len(rows):
                 raise ValueError("THS aggregate write count mismatch")

@@ -215,6 +215,15 @@ def test_strict_transport_refuses_redirects_and_propagates_failure(monkeypatch):
         transport.open_verified_once(request,timeout=1)
     assert calls==[1]
 
+    import time
+    import http.client
+    assert transport.classify_transport_error(http.client.RemoteDisconnected('closed'))=='connection_interrupted'
+    assert transport.classify_transport_error(urllib.error.HTTPError('https://example.invalid',403,'denied',{},None))=='http_403'
+    monkeypatch.setenv('STOCKDATA_REQUEST_DEADLINE_EPOCH',str(time.time()-1))
+    with pytest.raises(TimeoutError,match='deadline'):
+        transport.open_verified(request,timeout=1)
+    assert calls==[1]  # No request starts after the phase deadline.
+
 
 @pytest.mark.parametrize('change',[{'start_date':'2026-09-10'},{'max_fits':100},
     {'round_trip_cost_bps':[0]},{'scope':'production'},{'minimum_paired_sessions':2}])

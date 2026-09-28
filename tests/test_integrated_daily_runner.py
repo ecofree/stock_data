@@ -74,7 +74,25 @@ def test_close_plan_reuses_intraday_l2_instead_of_fetching_after_hours():
     )
 
 
-def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_character():
+def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_character(monkeypatch):
+    import subprocess
+    from scripts import run_integrated_daily as runner
+    calls=[]
+    class SlowWriter:
+        pid=123
+        returncode=0
+        def communicate(self, timeout=None):
+            calls.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired('fixture',timeout)
+            return b'committed',b''
+        def kill(self):
+            raise AssertionError('writer must drain without kill')
+    monkeypatch.setattr(runner.subprocess,'Popen',lambda *a,**k:SlowWriter())
+    drained=[]
+    result=runner._run_writer(['fixture'],cwd='.',env={},timeout=.01,on_drain=drained.append)
+    assert calls==[.01,None] and drained==[123] and result.returncode==-1
+    assert result.stdout==b'committed'
     env = _utf8_subprocess_env()
     assert env["PYTHONUTF8"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
@@ -192,7 +210,7 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
         code=2 if command[1]=='collectors/collect_market.py' or (
             fail_core and command[1]=='scripts/check_data_readiness.py') else 0
         return SimpleNamespace(returncode=code,stdout=b'',stderr=b'')
-    monkeypatch.setattr(runner.subprocess,'run',child)
+    monkeypatch.setattr(runner,'_run_writer',child)
     monkeypatch.setattr(pipeline_runtime,'runtime_fingerprint',lambda:{'scope':'test_fixture'})
     monkeypatch.setattr(collection_profiles,'task_due',lambda db,day,name,**k:
         (False,'retry cooldown age=0s ttl=150s status=error') if cooldown and name=='collect_intraday_stock_flow_market'

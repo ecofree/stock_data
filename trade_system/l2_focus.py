@@ -88,7 +88,7 @@ def _write_eastmoney_trends_fallback(
     codes: list[str],
     *,
     deadline: float | None = None,
-) -> dict[str, int]:
+) -> dict:
     """When KPL /l2/stock-intraday is empty, fill minute curves from Eastmoney trends2."""
     from trade_system.adapters.eastmoney_dc import _from_em_trends
     from trade_system.eastmoney_clist_guard import EastmoneyClistUnavailable
@@ -96,15 +96,23 @@ def _write_eastmoney_trends_fallback(
     ymd = "".join(ch for ch in trade_date if ch.isdigit())[:8]
     rows_written = 0
     codes_ok = 0
+    errors = []
+    attempted = 0
+    cooling_down = False
     for code in codes:
         if deadline is not None and time.monotonic() >= deadline:
             break
         try:
+            attempted += 1
             payload = _from_em_trends(code, ymd)
         except EastmoneyClistUnavailable:
+            cooling_down = True
             break
-        except Exception:
-            payload = None
+        except Exception as exc:
+            from trade_system.http_transport import classify_transport_error
+            errors.append({'category': classify_transport_error(exc), 'cause_type': type(exc).__name__})
+            # Shared endpoint failure is not sixty independent empty stocks.
+            break
         if not payload or not payload.get("trends"):
             continue
         rows = []
@@ -156,7 +164,9 @@ def _write_eastmoney_trends_fallback(
                 )
             except Exception:
                 pass
-    return {"intraday_rows": rows_written, "stock_codes_ok": codes_ok}
+    return {"intraday_rows": rows_written, "stock_codes_ok": codes_ok,
+            "attempted": attempted, "errors": errors, "cooling_down": cooling_down,
+            "budget_exhausted": deadline is not None and time.monotonic() >= deadline}
 
 
 def ensure_l2_focus_checkpoint(con: duckdb.DuckDBPyConnection) -> None:
@@ -368,6 +378,7 @@ def collect_l2_focus(
                 total_budget_seconds=min(20.0, float(total_budget_seconds)),
             )
 
+        fb = {}
         if kpl_probe_ok:
             source = "kpl_l2"
             intraday_rows = collect_l2_stock_intraday(
@@ -422,7 +433,7 @@ def collect_l2_focus(
         }
         missing_targets = [code for code in targets if code not in landed]
         if missing_targets and source == "kpl_l2":
-            _write_eastmoney_trends_fallback(
+            fb = _write_eastmoney_trends_fallback(
                 staging, trade_date, missing_targets, deadline=deadline
             )
             codes_ok = int(
@@ -458,6 +469,12 @@ def collect_l2_focus(
         ):
             status = "circuit_open" if codes_ok == 0 else "partial_circuit"
 
+        if fb.get('errors') or fb.get('cooling_down') or fb.get('budget_exhausted'):
+            failure = ('transport_failed' if fb.get('errors') else
+                       'circuit_open' if fb.get('cooling_down') else 'budget_exhausted')
+            status = 'partial_' + failure if codes_ok else failure
+            result['error'] = failure
+        result['fallback_diagnostics'] = fb
         result.update(
             {
                 "intraday_rows": int(intraday_rows or 0),

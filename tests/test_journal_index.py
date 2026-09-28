@@ -46,6 +46,7 @@ def test_read_only_legacy_workspace_and_keyset_pagination(tmp_path):
     for i in range(13):
         value=note(i);journal.durable_event(tmp_path/'notes',value['note_id'],value)
     assert index.recent(tmp_path,'note')[1]==13
+    assert len(index.effective(tmp_path,'note'))==13
     assert not index.cache_path(tmp_path).exists()
     index.rebuild(tmp_path)
     seen=[];cursor=None
@@ -82,6 +83,8 @@ def test_long_history_reads_do_not_enumerate_event_directories(tmp_path,monkeypa
     assert len(index.history(tmp_path)['events'])==100
     assert len(reads)==110
     record_property('ten_hot_reads_seconds',round(time.perf_counter()-start,3))
+    effective=index.effective(tmp_path,'note')
+    assert len(effective)==10000 and len({n['note_id'] for n in effective})==10000
     # SQLite must search a bounded ordered index, not sort or scan all events.
     with index.reader(tmp_path) as con:
         plan=str(con.execute('EXPLAIN QUERY PLAN SELECT path FROM events WHERE kind=? ORDER BY received DESC,id DESC LIMIT 100',('note',)).fetchall())

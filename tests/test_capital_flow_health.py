@@ -106,7 +106,7 @@ def test_capital_flow_health_requires_real_sector_capital(tmp_path):
 
     result = assess_capital_flow_health(db_path, "2026-07-09", 1, 1)
 
-    assert result["stock_flow"]["ready"] is True
+    assert result["stock_flow"]["ready"] is False  # L2 curves are not qualified full-market funds
     assert result["sector_flow"]["ready"] is False
     assert result["ready"] is False
 
@@ -149,7 +149,7 @@ def test_capital_flow_health_enforces_expected_coverage(tmp_path):
 
     result = assess_capital_flow_health(db_path, "2026-07-09", 2, 2)
 
-    assert result["stock_flow"]["ready"] is True
+    assert result["stock_flow"]["ready"] is False  # L2 curves are not qualified full-market funds
     assert result["sector_flow"]["coverage_pct"] == 50.0
     assert result["sector_flow"]["ready"] is False
     assert result["ready"] is False

@@ -63,7 +63,8 @@ def test_eastmoney_l2_fallback_stops_when_shared_budget_is_exhausted(
         )
     finally:
         store.close()
-    assert result == {"intraday_rows": 0, "stock_codes_ok": 0}
+    assert result["intraday_rows"] == result["stock_codes_ok"] == result["attempted"] == 0
+    assert result["budget_exhausted"] and not result["errors"]
     assert called == []
 
 

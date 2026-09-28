@@ -210,7 +210,10 @@ class HiThinkClient:
         if (not isinstance(items, list) or len(items) > 1
                 or (items and (not isinstance(items[0], dict) or items[0].get('thscode') != thscode
                 or items[0].get('asset_type') != 'a-share'))):
-            raise HiThinkError('ambiguous native stock identity')
+            returned = ([{'thscode': r.get('thscode'), 'asset_type': r.get('asset_type')}
+                         if isinstance(r, dict) else {'item_type': type(r).__name__}
+                         for r in items[:3]] if isinstance(items, list) else {'item_type': type(items).__name__})
+            raise HiThinkError(f'ambiguous native stock identity: requested={thscode}; returned={returned!r}')
         stamp = data.get('timestamp')
         if type(stamp) not in (int, float) or not 0 <= time.time() - stamp / 1000 <= 86400:
             raise HiThinkError('stale native listing reference')

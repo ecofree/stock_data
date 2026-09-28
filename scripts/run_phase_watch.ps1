@@ -39,7 +39,7 @@ $effectiveMinRunWindow = if ($MinRunWindowSeconds -gt 0) {
     90
 } else {
     # Intraday also needs a bounded-run window before the 15:05 drain.
-    600
+    270
 }
 $attempts = 0
 $successes = 0
@@ -67,8 +67,20 @@ while ((Get-Date) -lt $endAtToday) {
     }
     $attempts++
     Write-WatchEvent "PHASE_WATCH_ATTEMPT phase=$Phase attempt=$attempts"
-    & PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File $Once -Db $DbPath -Phase $Phase -Python $Python -CollectorContract $CollectorContract -CollectorContractSha256 $CollectorContractSha256 -ReportsDirectory $ReportsDirectory
-    $runCode = $LASTEXITCODE
+    $previousDeadline = $env:STOCKDATA_PHASE_DEADLINE_EPOCH
+    $env:STOCKDATA_PHASE_DEADLINE_EPOCH = ([DateTimeOffset]$endAtToday.AddSeconds(-15)).ToUnixTimeSeconds().ToString()
+    try {
+        $onceArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Once, '-Db', $DbPath,
+            '-Phase', $Phase, '-Python', $Python, '-CollectorContract', $CollectorContract,
+            '-CollectorContractSha256', $CollectorContractSha256, '-ReportsDirectory', $ReportsDirectory)
+        if ($Phase -eq 'auction' -and (Get-Date).TimeOfDay -lt [TimeSpan]::Parse('09:15')) {
+            $onceArgs += '-PrepareReference'
+        }
+        & PowerShell.exe @onceArgs
+        $runCode = $LASTEXITCODE
+    } finally {
+        $env:STOCKDATA_PHASE_DEADLINE_EPOCH = $previousDeadline
+    }
     if ($runCode -eq 0) {
         $successes++
     } elseif ($runCode -eq 3) {
@@ -90,13 +102,12 @@ while ((Get-Date) -lt $endAtToday) {
     # interval seconds after a long run silently turns a 5-minute watcher
     # into a 9-10 minute cadence and creates false freshness gaps.
     $nextRun = $nextRun.AddSeconds([Math]::Max(30, $IntervalSeconds))
-    $sleepSeconds = ($nextRun - (Get-Date)).TotalSeconds
-    if ($sleepSeconds -gt 0) {
-        Start-Sleep -Seconds ([int][Math]::Min($sleepSeconds, $remaining))
-    } else {
-        Write-WatchEvent "PHASE_WATCH_OVERRUN phase=$Phase lag_seconds=$([int][Math]::Abs($sleepSeconds))"
-        $nextRun = Get-Date
+    while ($nextRun -le (Get-Date)) {
+        Write-WatchEvent "PHASE_WATCH_SKIP_MISSED_SLOT phase=$Phase slot=$($nextRun.ToString('o'))"
+        $nextRun = $nextRun.AddSeconds([Math]::Max(30, $IntervalSeconds))
     }
+    $sleepSeconds = ($nextRun - (Get-Date)).TotalSeconds
+    Start-Sleep -Seconds ([int][Math]::Min($sleepSeconds, $remaining))
 }
 
 Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase attempts=$attempts successes=$successes deferred=$deferred failures=$failures end=$EndAt"

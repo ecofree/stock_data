@@ -13,7 +13,6 @@ import argparse
 import json
 import hashlib
 import math
-import time
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -31,7 +30,6 @@ from trade_system.auction_evidence import observed_auction_rows, EVIDENCE_COLUMN
 
 def collect(db_path: str | Path, trade_date: str, *, out: str | Path = "",
             product: str = 'market', codes=(), budget_seconds: float = 60) -> dict:
-    started=time.monotonic()
     # Distinct endpoints remain distinct products; no legacy signal-based fan-out.
     if product not in {'market', 'tick', 'anomaly', 'final', 'opening', 'match'} or (product == 'final' and not codes):
         raise ValueError('supported auction product and explicit codes for tick required')

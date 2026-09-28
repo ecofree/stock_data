@@ -344,6 +344,21 @@ def test_after_close_reconciliation_does_not_duplicate_reference_snapshot(
         _,meta=entry._collect_dc_snapshot(store.con,trade_date,{'000001':'SZ','600000':'SH'},lambda *a:pages.append(a))
         assert meta['receipt_reused'] and pages[0][3]['receipt_reused']
         store.con.execute("DELETE FROM multi_source_stock_flow WHERE provider='xiaodefa_moneyflow_dc'")
+        arrival = pages[0][3]['received_at']
+    monkeypatch.setitem(entry.SETTINGS, 'XIAODEFA_TOKEN', 'fixture-only')
+    monkeypatch.setattr(entry, '_a_share_universe_by_exchange', lambda *a: {'000001':'SZ','600000':'SH'})
+    class NoNetwork:
+        def __init__(self, **kwargs):
+            raise AssertionError('retained complete receipt must not request again')
+    monkeypatch.setattr(relay,'XiaodefaClient',NoNetwork)
+    repaired = entry.collect_market_stock_flow(db,trade_date,phase='close',crosscheck_after_close=False)
+    assert repaired['fetched_rows']==2
+    with MultiSourceStore(db) as store:
+        assert store.con.execute("SELECT count(*),min(fetched_at),max(fetched_at) FROM multi_source_stock_flow WHERE provider='xiaodefa_moneyflow_dc'").fetchone() == (2,system_datetime.fromtimestamp(arrival),system_datetime.fromtimestamp(arrival))
+        assert store.con.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_moneyflow_dc'").fetchone()[0]==1
+        assert store.con.execute("SELECT status FROM intraday_stock_flow_page_checkpoint WHERE trade_date=?",[trade_date]).fetchone()[0]=='success'
+        store.con.execute("DELETE FROM multi_source_stock_flow WHERE provider='xiaodefa_moneyflow_dc'")
+        monkeypatch.setattr(relay,'XiaodefaClient',lambda **kwargs: NativeRelay())
         store.con.execute("UPDATE multi_source_observation SET payload_hash='tampered' WHERE data_type='tushare_moneyflow_dc'")
         relay_rows[0]['trade_date']='19990101'
         with pytest.raises(ValueError,match='wrong-date'):

@@ -31,14 +31,14 @@ def test_auction_evidence_prefers_tick_over_fallback_sources(tmp_path):
     assert rows[0]["source_table"] == "auction_tick"
     assert rows[0]["confirmation"] == "tick_observed_unit_unknown"
     assert rows[0]['auction_strength'] is None and rows[0]['auction_amount'] is None
-    assert rows[0]['missing_reason'] == 'auction_tick_volume_unit_unknown'
+    assert rows[0]['missing_reason'] == 'tick_observed_unit_unknown'
     assert rows[0]["is_fallback"] is False
     assert rows[0]["tick_rows"] == 1
     con = duckdb.connect(str(db_path))
     con.execute("ALTER TABLE auction_tick ADD COLUMN volume_unit VARCHAR")
     con.execute("UPDATE auction_tick SET volume_unit='shares'")
     con.close()
-    assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['confirmation'] == 'tick_confirmed'
+    assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['confirmation'] == 'tick_observed_semantics_unknown'
     # Auction indicative matched quantities can fall and must never be summed.
     from trade_system.normalize import _create_auction_status
     from trade_system.units import kpl_auction_tick_units
@@ -63,6 +63,19 @@ def test_auction_evidence_prefers_tick_over_fallback_sources(tmp_path):
     con.close()
     projected = build_auction_evidence_snapshot(db_path, '2026-07-08')[0]
     assert projected['auction_amount'] == 15000 and projected['tick_rows'] == 3
+    # Both consumers reject mixed semantics and mixed acquisitions identically.
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("UPDATE auction_tick SET volume_semantics='incremental_trade' WHERE time='09:24:33'")
+        _create_auction_status(con)
+        assert con.execute('SELECT auction_amount FROM v_auction_status').fetchone()[0] is None
+    assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['auction_amount'] is None
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("UPDATE auction_tick SET volume_semantics='indicative_match_snapshot'")
+        con.execute("UPDATE auction_tick SET fetched_at=fetched_at+INTERVAL 1 SECOND WHERE time='09:24:33'")
+        _create_auction_status(con)
+        assert con.execute('SELECT auction_amount FROM v_auction_status').fetchone()[0] is None
+    assert build_auction_evidence_snapshot(db_path, '2026-07-08')[0]['auction_amount'] is None
+
 
 
 def test_auction_evidence_uses_anomaly_when_tick_is_empty(tmp_path):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -173,48 +172,48 @@ def ensure_auction_evidence_tables(db_path: str | Path, *, connection=None) -> N
 
 
 
+def tick_projection(columns):
+    """One fail-closed SQL contract shared by both auction consumers."""
+    unit = "volume_unit" if "volume_unit" in columns else "'unknown'"
+    semantics = "volume_semantics" if "volume_semantics" in columns else "'legacy_unspecified'"
+    basis = "unit_basis" if "unit_basis" in columns else "'legacy_unspecified'"
+    volume = f"CASE lower(coalesce({unit},'unknown')) WHEN 'hands' THEN volume*100 WHEN 'shares' THEN volume END"
+    amount = f"price*({volume})"
+    if 'amount' in columns:
+        amount = f"coalesce(amount,({amount}))"
+    valid_units = f"bool_and(({volume}) IS NOT NULL AND isfinite({volume}) AND ({volume})>=0 AND isfinite(price) AND price>0 AND isfinite({amount}) AND ({amount})>=0)"
+    if 'amount' in columns:
+        valid_units += f" AND bool_and(amount IS NULL OR (({amount})-price*({volume}) BETWEEN -1.01 AND CASE lower({unit}) WHEN 'hands' THEN price*99+1.01 ELSE 1.01 END))"
+    valid_units = f"coalesce(({valid_units}), FALSE)"
+    sequence = f"count(DISTINCT coalesce({basis},''))=1"
+    if 'fetched_at' in columns:
+        sequence += " AND count(DISTINCT fetched_at)=1 AND count(fetched_at)=count(*)"
+    snapshot = f"bool_and(coalesce({semantics},'')='indicative_match_snapshot')"
+    incremental = (f"bool_and(coalesce({semantics},'')='incremental_trade') AND count(DISTINCT trade_id)=count(*)"
+                   if 'trade_id' in columns else 'FALSE')
+    valid = f"({valid_units}) AND ({sequence}) AND (({snapshot}) OR ({incremental}))"
+    def aggregate(expr):
+        return f"CASE WHEN {valid} THEN CASE WHEN {snapshot} THEN first(({expr}) ORDER BY time DESC) ELSE sum({expr}) END END"
+    return {'volume':aggregate(volume), 'amount':aggregate(amount), 'valid':valid,
+            'confirmation':f"CASE WHEN NOT ({valid_units}) THEN 'tick_observed_unit_unknown' WHEN NOT ({valid}) THEN 'tick_observed_semantics_unknown' ELSE 'tick_confirmed' END",
+            'semantics':f"CASE WHEN {valid} THEN CASE WHEN {snapshot} THEN 'latest_indicative_match_not_sum' ELSE 'deduplicated_incremental_trade' END ELSE 'unqualified_sequence' END",
+            'unit':unit, 'basis':basis}
+
+
 def _tick_rows(con: duckdb.DuckDBPyConnection, trade_date: str) -> list[dict]:
     if _relation_count(con, "auction_tick", trade_date) == 0:
         return []
-    columns = set(table_columns(con, "auction_tick"))
-    unit_expr = "volume_unit" if "volume_unit" in columns else "'unknown'"
-    normalized_volume = (
-        f"CASE lower(coalesce(nullif({unit_expr}, ''), 'unknown')) "
-        "WHEN 'hands' THEN volume * 100 WHEN 'shares' THEN volume ELSE NULL END"
-    )
-    amount_expr = (
-        f"CASE lower(coalesce(nullif({unit_expr}, ''), 'unknown')) "
-        "WHEN 'hands' THEN price * volume * 100 "
-        "WHEN 'shares' THEN price * volume ELSE NULL END"
-    )
-    semantics = "volume_semantics" if "volume_semantics" in columns else "'legacy_unspecified'"
-    if 'amount' in columns:
-        amount_expr = f"CASE WHEN ({normalized_volume}) IS NOT NULL THEN coalesce(amount, ({amount_expr})) END"
-    snapshot = f"bool_and(coalesce({semantics}, '') = 'indicative_match_snapshot')"
-    basis = "unit_basis" if "unit_basis" in columns else "'legacy_unspecified'"
-    volume_aggregate = f"CASE WHEN {snapshot} THEN first(({normalized_volume}) ORDER BY time DESC) ELSE sum({normalized_volume}) END"
-    amount_aggregate = f"CASE WHEN {snapshot} THEN first(({amount_expr}) ORDER BY time DESC) ELSE sum({amount_expr}) END"
-    return _fetch_dicts(
-        con,
-        f"""
-        SELECT
-            CAST(date AS VARCHAR) AS trade_date,
-            stock_code,
-            count(*) AS tick_rows,
-            count(*) FILTER (WHERE {normalized_volume} IS NULL) AS unknown_unit_rows,
-            {amount_aggregate} AS auction_amount,
-            {volume_aggregate} AS tick_volume,
-            CASE WHEN {snapshot} THEN 'latest_indicative_match_not_sum' ELSE 'legacy_unspecified' END AS volume_semantics,
-            max({unit_expr}) AS tick_volume_unit,
-            string_agg(DISTINCT {basis}, ',') AS unit_basis,
-            max(time) AS last_tick_time
-        FROM auction_tick
-        WHERE CAST(date AS VARCHAR)=?
-        GROUP BY date, stock_code
-        ORDER BY auction_amount DESC NULLS LAST, stock_code
-        """,
-        [trade_date],
-    )
+    q = tick_projection(set(table_columns(con, "auction_tick")))
+    return _fetch_dicts(con, f"""
+        SELECT CAST(date AS VARCHAR) AS trade_date,stock_code,count(*) AS tick_rows,
+               {q['amount']} AS auction_amount,{q['volume']} AS tick_volume,
+               {q['valid']} AS qualified,{q['confirmation']} AS confirmation,
+               {q['semantics']} AS volume_semantics,max({q['unit']}) AS tick_volume_unit,
+               string_agg(DISTINCT {q['basis']}, ',') AS unit_basis,max(time) AS last_tick_time
+        FROM auction_tick WHERE CAST(date AS VARCHAR)=?
+          AND try_cast(time AS TIME) BETWEEN TIME '09:15:00' AND TIME '09:25:00'
+        GROUP BY date,stock_code ORDER BY auction_amount DESC NULLS LAST,stock_code
+        """, [trade_date])
 
 
 def _anomaly_rows(con: duckdb.DuckDBPyConnection, trade_date: str, tick_codes: set[str]) -> list[dict]:
@@ -313,7 +312,7 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
         tick_codes: set[str] = set()
         for row in _tick_rows(con, trade_date):
             tick_codes.add(str(row["stock_code"]))
-            qualified = not row.get('unknown_unit_rows')
+            qualified = bool(row.get('qualified'))
             strength = float(row.get("tick_volume") or 0) / 1000000.0 if qualified else None
             evidence = {**row, "source_priority": 1, "counts": counts}
             output.append(
@@ -321,12 +320,12 @@ def build_auction_evidence_snapshot(db_path: str | Path, trade_date: str) -> lis
                     "trade_date": row["trade_date"],
                     "stock_code": row["stock_code"],
                     "source_table": "auction_tick",
-                    "confirmation": "tick_confirmed" if qualified else "tick_observed_unit_unknown",
+                    "confirmation": row["confirmation"],
                     "auction_strength": round(strength, 4) if qualified else None,
                     "auction_amount": row.get("auction_amount") if qualified else None,
                     "tick_rows": int(row.get("tick_rows") or 0),
                     "is_fallback": False,
-                    "missing_reason": "" if qualified else "auction_tick_volume_unit_unknown",
+                    "missing_reason": "" if qualified else row["confirmation"],
                     "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
                 }
             )

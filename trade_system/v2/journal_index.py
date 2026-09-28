@@ -152,6 +152,19 @@ def recent(output, kind, limit=100):
     return [Path(output)/row[0] for row in rows], count
 
 
+def effective(output, kind='note', limit=10000):
+    """All current revision leaves; display pagination must not define risk scope."""
+    if kind not in FOLDERS or not 1 <= limit <= 10000:
+        raise ValueError('bounded effective journal scope required')
+    with reader(output) as con:
+        rows = con.execute("SELECT e.path FROM events e WHERE e.kind=? AND NOT EXISTS "
+            "(SELECT 1 FROM events child WHERE child.kind=e.kind AND child.parent=e.id) "
+            "ORDER BY e.received,e.id LIMIT ?", (kind,limit+1)).fetchall()
+    if len(rows)>limit:
+        raise ValueError('effective journal scope exceeds capacity; no silent truncation')
+    return [event(Path(output)/row[0],kind) for row in rows]
+
+
 def history(output, kind='note', before=None, limit=100):
     """Keyset pagination: old receipts remain accessible without OFFSET scans."""
     if kind not in FOLDERS or not 1 <= limit <= 100:

@@ -3,6 +3,7 @@ param(
     [ValidateSet("auction", "intraday", "close", "supplemental")]
     [string]$Phase = "close",
     [string]$TradeDate = "",
+    [switch]$PrepareReference,
     [string]$Python = "",
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
@@ -44,6 +45,7 @@ $args = @(
     "--collection-profile", "priority"
 )
 if ($TradeDate) { $args += @("--trade-date", $TradeDate) }
+if ($PrepareReference) { $args += "--prepare-reference" }
 
 Push-Location $Root
 try {

@@ -188,7 +188,6 @@ def test_partial_scope_retains_receipts_and_retries_only_uncovered_instrument(tm
 
 
 def test_plan_excludes_prelisting_but_does_not_infer_suspension(tmp_path):
-    import json
     from trade_system.tushare_store import stock_code_to_ts_code
     assert stock_code_to_ts_code('920009') == '920009.BJ'
     assert stock_code_to_ts_code('900901') == '900901.SH'

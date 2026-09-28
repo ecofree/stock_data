@@ -482,20 +482,9 @@ def _create_auction_status(con: duckdb.DuckDBPyConnection) -> None:
             ["date", "stock_code", "time"],
             _timestamp_column(con, "auction_tick"),
         )
-        tick_columns = set(table_columns(con, "auction_tick"))
-        tick_unit = "volume_unit" if "volume_unit" in tick_columns else "'unknown'"
-        tick_volume_shares = (
-            f"CASE lower(coalesce(nullif({tick_unit}, ''), 'unknown')) "
-            "WHEN 'hands' THEN volume * 100 WHEN 'shares' THEN volume ELSE NULL END"
-        )
-        semantics = "volume_semantics" if "volume_semantics" in tick_columns else "'legacy_unspecified'"
-        snapshot = f"bool_and(coalesce({semantics}, '') = 'indicative_match_snapshot')"
-        tick_amount = f"price * ({tick_volume_shares})"
-        if 'amount' in tick_columns:
-            tick_amount = f"CASE WHEN ({tick_volume_shares}) IS NOT NULL THEN coalesce(amount, ({tick_amount})) END"
-        valid_units = f"count(*) FILTER (WHERE ({tick_volume_shares}) IS NULL) = 0"
-        tick_amount_agg = f"CASE WHEN {valid_units} THEN CASE WHEN {snapshot} THEN first(({tick_amount}) ORDER BY time DESC) ELSE sum({tick_amount}) END END"
-        tick_volume_agg = f"CASE WHEN {valid_units} THEN CASE WHEN {snapshot} THEN first(({tick_volume_shares}) ORDER BY time DESC) ELSE sum({tick_volume_shares}) END END"
+        from trade_system.auction_evidence import tick_projection
+        q = tick_projection(set(table_columns(con, "auction_tick")))
+        tick_amount_agg, tick_volume_agg = q['amount'], q['volume']
         sources.append(
             f"""
             SELECT CAST(date AS VARCHAR) AS trade_date,stock_code,
@@ -504,9 +493,9 @@ def _create_auction_status(con: duckdb.DuckDBPyConnection) -> None:
                    'tick_volume' AS anomaly_type,
                    CAST(({tick_volume_agg}) AS DOUBLE) AS anomaly_value,
                    round(({tick_volume_agg}) / 1000000.0, 2) AS auction_strength,
-                   CASE WHEN {valid_units} THEN 'tick_confirmed' ELSE 'tick_observed_unit_unknown' END AS confirmation,'auction_tick' AS source_table,
+                   {q['confirmation']} AS confirmation,'auction_tick' AS source_table,
                    false AS is_fallback,max(fetched_at) AS fetched_at,1 AS source_priority
-            FROM ({latest}) GROUP BY date,stock_code
+            FROM ({latest}) WHERE try_cast(time AS TIME) BETWEEN TIME '09:15:00' AND TIME '09:25:00' GROUP BY date,stock_code
             """
         )
     if _relation_has_rows(con, "auction_quote_snapshot"):

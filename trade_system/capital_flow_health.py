@@ -265,14 +265,16 @@ def assess_capital_flow_health(
     stock_codes = (
         int(primary_stock_codes)
         if primary_stock_codes is not None
-        else max((item[code_field] for item in stock_relations), default=0)
+        else max((item[code_field] for item in stock_relations
+                  if item["relation"] == "multi_source_stock_flow"), default=0)
     )
     stock_coverage = (
         stock_codes * 100.0 / expected_stock_codes if expected_stock_codes else None
     )
-    stock_ready = any(item[row_field] > 0 for item in stock_relations) and (
-        stock_coverage is None or stock_coverage >= min_coverage_pct
-    )
+    stock_ready = expected_stock_codes > 0 and stock_codes > 0 and (
+        stock_coverage is not None and stock_coverage >= min_coverage_pct
+    ) and any(item[row_field] > 0 for item in stock_relations
+              if item["relation"] == "multi_source_stock_flow")
     # Sector capital is the core directional flow; intraday sector volume alone is not equivalent.
     sector_candidates = [
         item for item in sector_relations
@@ -283,8 +285,8 @@ def assess_capital_flow_health(
     sector_coverage = (
         sector_codes * 100.0 / expected_sector_codes if expected_sector_codes else None
     )
-    sector_ready = sector_flow[row_field] > 0 and (
-        sector_coverage is None or sector_coverage >= min_coverage_pct
+    sector_ready = expected_sector_codes > 0 and sector_flow[row_field] > 0 and (
+        sector_coverage is not None and sector_coverage >= min_coverage_pct
     )
     # A full-sector checkpoint is authoritative when present.  Do not let a
     # smaller bounded/legacy relation make a partial batch look ready.
@@ -368,8 +370,9 @@ def assess_capital_flow_health(
                     f"{canonical_membership_snapshot or 'none'}"
                 )
         con.close()
-    except Exception:
-        sector_taxonomy_stale = False
+    except Exception as exc:
+        sector_taxonomy_stale = True
+        sector_taxonomy_note = "taxonomy verification failed: " + type(exc).__name__
     # P1-2: surface independent-source reconciliation.  Coverage alone can pass while
     # accuracy rests on a single (delayed) Eastmoney source; the reconciliation status
     # and whether an independent provider (TuShare moneyflow) exists for the date must

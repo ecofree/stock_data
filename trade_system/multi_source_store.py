@@ -187,13 +187,23 @@ class MultiSourceStore:
                 # A cache hit is not another receipt and must not refresh any
                 # observation or canonical row's received/fetched timestamp.
                 exists = self.con.execute(
-                    "SELECT 1 FROM multi_source_observation WHERE data_type IN (?,?) "
+                    "SELECT observed_at FROM multi_source_observation WHERE data_type IN (?,?) "
                     "AND asset_code IS NOT DISTINCT FROM ? AND payload_hash=? AND provider=? "
                     "AND source_date IS NOT DISTINCT FROM ? "
-                    "AND status IN ('live','refreshed','delayed') LIMIT 1",
+                    "AND status IN ('live','refreshed','delayed') ORDER BY observed_at DESC LIMIT 1",
                     [data_type, {"stock_flow": "fund_flow_120d", "fund_flow_120d": "stock_flow"}.get(data_type, data_type),
                      code, payload_hash, provider, source_date],
                 ).fetchone()
+                if exists and data_type in {'stock_flow', 'fund_flow_120d', 'fund_flow', 'sector_flow'}:
+                    # The verified receipt authorizes rematerialization, not a
+                    # new arrival time. Canonical absence/corruption must heal.
+                    replay = dict(meta, status='live', receipt_reused=True,
+                                  received_at=exists[0].timestamp())
+                    recovered = self.store(data_type, code, data, replay,
+                        asset_type=asset_type, trade_date=trade_date, commit=False)
+                    if commit:
+                        self.con.commit()
+                    return dict(recovered, status='fresh', receipt_reused=True)
                 if exists and data_type in resilient_sources._BAR_TYPES:
                     kind = asset_type or {"index_kline": "index", "etf_kline": "etf", "cb_kline": "cb"}.get(data_type, "stock")
                     requested = set(meta.get("qualified_dates", []))
@@ -215,7 +225,12 @@ class MultiSourceStore:
                         "receipt_reused": bool(exists)}
 
             received_at = datetime.fromtimestamp(meta["received_at"]) if isinstance(meta.get("received_at"), (float, int)) else datetime.now()
-            self.con.execute(
+            if not (meta.get("receipt_reused") and self.con.execute(
+                "SELECT 1 FROM multi_source_observation WHERE provider=? AND data_type IN (?,?) "
+                "AND asset_code IS NOT DISTINCT FROM ? AND payload_hash=? AND observed_at=?",
+                [provider, data_type, {'stock_flow':'fund_flow_120d','fund_flow_120d':'stock_flow'}.get(data_type,data_type),
+                 code, payload_hash, received_at]).fetchone()):
+                self.con.execute(
                 "INSERT INTO multi_source_observation "
                 "(source_date,data_type,asset_type,asset_code,provider,status,latency_ms,is_stale,payload_json,payload_hash,observed_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -304,6 +319,19 @@ class MultiSourceStore:
                       canonical["flow_definition"], canonical["source_api"], canonical["origin_provider"],
                       canonical["field_mapping_version"], stale, _json(row), received_at]
             batch.append(values)
+        # Reprojection must never replace a later receipt from this provider.
+        if batch:
+            dates = [row[0] for row in batch]
+            existing = {(str(r[0]),r[1],r[2]): (str(r[0]),*r[1:]) for r in self.con.execute(
+                'SELECT '+','.join(columns)+' FROM multi_source_stock_flow WHERE provider=? AND source_date BETWEEN ? AND ?',
+                [provider,min(dates),max(dates)]).fetchall()}
+            batch = [r for r in batch if existing.get((str(r[0]),r[1],r[2])) != (str(r[0]),*r[1:])]
+            newer = {(str(d), str(c)) for d, c in self.con.execute(
+                "SELECT source_date,stock_code FROM multi_source_stock_flow "
+                "WHERE provider=? AND source_date BETWEEN ? AND ? AND fetched_at>?",
+                [provider, min(dates), max(dates), received_at]).fetchall()}
+            if any((str(row[0]), str(row[1])) in newer for row in batch):
+                raise ValueError('older stock-flow receipt cannot overwrite newer canonical rows')
         # Borrow the existing writer and transaction; one MERGE for the whole
         # batch keeps the receipt atomic without thousands of query plans.
         return DuckDBStore(connection=self.con).insert_rows(

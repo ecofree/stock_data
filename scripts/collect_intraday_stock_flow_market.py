@@ -37,11 +37,6 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
     from trade_system.xiaodefa_source import XiaodefaClient
     if not universe:
         raise ValueError('dated A-share reference unavailable')
-    cached = con.execute("SELECT stock_code,fetched_at FROM multi_source_stock_flow "
-        "WHERE source_date=? AND provider='xiaodefa_moneyflow_dc' AND is_stale=FALSE "
-        "AND origin_provider='eastmoney' AND source_api='moneyflow_dc' "
-        "AND amount_unit='yuan' AND flow_definition='provider_main_orders_net' AND isfinite(main_net) "
-        "AND fetched_at BETWEEN current_timestamp-INTERVAL 3 HOUR AND current_timestamp", [trade_date]).fetchall()
     # API limit is 6000; one full page alone cannot prove completeness.
     pages = []
     acquisition_id = uuid.uuid4().hex
@@ -63,12 +58,10 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
     chain = []
     next_offset = None
     chain_id = None
-    saw_raw_receipt = False
     for raw, digest, arrived in con.execute(
             "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
             "WHERE data_type='tushare_moneyflow_dc' AND provider='xiaodefa' AND source_date=? "
             "AND observed_at<=current_timestamp ORDER BY observed_at DESC LIMIT 12", [trade_date]).fetchall():
-        saw_raw_receipt = True
         if hashlib.sha256(raw.encode()).hexdigest() != digest:
             chain, next_offset = [], None
             continue
@@ -103,9 +96,6 @@ def _collect_dc_snapshot(con, trade_date, universe, on_page, *, max_pages=None):
             rows = [row for batch, _ in pages for row in batch]
             raw_reused = bool(rows)
             break
-    if not raw_reused and not saw_raw_receipt and {r[0] for r in cached} == set(universe):
-        on_page(1, [], 1, {'count':len(universe), 'receipt_reused':True})
-        return [], dict(source='xiaodefa_moneyflow_dc',pages=1,expected_rows=len(universe),receipt_reused=True)
     if not raw_reused:
         rows = XiaodefaClient(timeout=60,max_retries=1).query_all('moneyflow_dc',
             trade_date=_compact(trade_date),page_size=6000,max_rows=6000*limit,on_page=retain)
@@ -345,7 +335,7 @@ def _write_exchange_coverage(
 def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size: int = 500,
                               pause_seconds: float = 0.35, resume: bool = False,
                               max_pages: int | None = None,
-                              crosscheck_after_close: bool = True) -> dict:
+                              crosscheck_after_close: bool = True, phase: str | None = None) -> dict:
     run_id = f"em_market_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     multi_store = MultiSourceStore(db_path)
     con = multi_store.con
@@ -353,17 +343,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
     _ensure_checkpoint_table(con)
     universe_by_exchange = _a_share_universe_by_exchange(con, trade_date)
     reference_error = ''
-    if not universe_by_exchange and os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and trade_date == date.today().isoformat():
-        try:
-            # Refresh reference identity once it expires, through the existing
-            # owner. Intraday never backfills prices, flows or historical facts.
-            from trade_system.http_transport import request_budget
-            with request_budget(60), TushareHistoryCollector(db_path,connection=con,
-                    request_timeout=20,retries=1,budget_seconds=60) as reference:
-                reference._collect_reference('stock_basic')
-            universe_by_exchange = _a_share_universe_by_exchange(con, trade_date)
-        except Exception as exc:
-            reference_error = f'{type(exc).__name__}: {str(exc)[:250]}'
+    # Reference acquisition belongs to pre-session preparation, never this hot path.
     expected_universe = set(universe_by_exchange)
     previous_batch = con.execute(
         "SELECT expected_rows,expected_pages,fetched_rows,fetched_pages,provider,coverage_pct "
@@ -371,7 +351,9 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
         [trade_date],
     ).fetchone()
     now = datetime.now()
-    after_close = trade_date < date.today().isoformat() or (now.hour, now.minute) >= (15, 5)
+    if phase not in {None, 'intraday', 'close', 'supplemental'}:
+        raise ValueError('explicit supported collection phase required')
+    after_close = phase in {'close', 'supplemental'} if phase else (trade_date < date.today().isoformat() or (now.hour, now.minute) >= (15, 5))
     source_provider = "eastmoney_market" if after_close else "eastmoney_intraday_clist"
     if after_close and (SETTINGS.get('XIAODEFA_TOKEN') or SETTINGS.get('TUSHARE_XIAODEFA_TOKEN')):
         source_provider = 'xiaodefa_moneyflow_dc'
@@ -495,16 +477,16 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             rows = [row for row in rows if str(row.get("code") or "") not in accepted_codes]
             accepted_codes.update(str(row.get("code") or "") for row in rows if row.get("code"))
         page_rows_seen += len(rows)
-        stored = {'rows_written':len(expected_universe)} if result.get('receipt_reused') else multi_store.store(
+        stored = multi_store.store(
             "stock_flow", None, rows,
             {"source": source_provider, "status": page_status, "trade_date": trade_date,
-             "page_no": page_no, "pages": pages, **({'received_at': result['received_at']} if 'received_at' in result else {})},
+             "page_no": page_no, "pages": pages, "receipt_reused": bool(result.get("receipt_reused")), **({'received_at': result['received_at']} if 'received_at' in result else {})},
             asset_type="stock", trade_date=trade_date, commit=not atomic_refresh,
         )
         con.execute(
             "INSERT INTO intraday_stock_flow_page_checkpoint(trade_date,page_no,pages_expected,status,rows_written,last_error,updated_at) "
             "VALUES (?,?,?,?,?,?,current_timestamp) ON CONFLICT(trade_date,page_no) DO UPDATE SET pages_expected=excluded.pages_expected,status=excluded.status,rows_written=excluded.rows_written,last_error=excluded.last_error,updated_at=excluded.updated_at",
-            [trade_date, page_no, pages, "success" if stored.get("rows_written", 0) else "empty",
+            [trade_date, page_no, pages, "success" if rows and stored.get("status") in {"live","refreshed","fresh","delayed"} else "empty",
              int(stored.get("rows_written", 0)), ""],
         )
         if not atomic_refresh:
@@ -534,8 +516,6 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             rows, meta = _collect_dc_snapshot(con, trade_date, universe_by_exchange,
                 lambda *args: dc_pages.append(args), max_pages=max_pages)
             expected_universe = set(universe_by_exchange)
-        if atomic_refresh:
-            con.execute("BEGIN TRANSACTION")
         if completed_resume:
             rows, meta = [], {
                 "source": source_provider,
@@ -545,8 +525,7 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
                 "status": "existing_complete_pages",
             }
         elif source_provider == 'xiaodefa_moneyflow_dc':
-            for page in dc_pages:
-                on_page(*page)
+            buffered_pages.extend(dc_pages)
         elif source_provider in {"eastmoney_intraday_clist", "eastmoney_intraday_clist_delay"}:
             # During the session the datacenter/report endpoint is commonly
             # one session behind.  Use Eastmoney's live clist route directly
@@ -563,6 +542,8 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
             )
         expected_pages = int(meta.get("pages") or expected_pages or 0)
         expected_rows = len(expected_universe) or int(meta.get("expected_rows") or expected_rows or 0)
+        if atomic_refresh:
+            con.execute("BEGIN TRANSACTION")
         for page in buffered_pages:
             on_page(*page)
         source_provider = str(meta.get("source") or source_provider)
@@ -892,6 +873,7 @@ def main() -> int:
     parser.add_argument("--pause-seconds", type=float, default=0.35)
     parser.add_argument("--max-pages", type=int)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--phase", choices=("intraday", "close", "supplemental"), required=True)
     parser.add_argument("--out", default="reports/intraday_stock_flow_latest.md")
     args = parser.parse_args()
     if args.date != date.today().isoformat():
@@ -900,7 +882,7 @@ def main() -> int:
     result = collect_market_stock_flow(
         args.db, args.date, page_size=args.page_size,
         pause_seconds=args.pause_seconds, resume=args.resume,
-        max_pages=args.max_pages,
+        max_pages=args.max_pages, phase=args.phase,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,18 @@ request_deadline = ContextVar('request_deadline', default=None)
 from trade_system.config import SETTINGS
 
 
+def inherited_request_remaining():
+    import math
+    import time
+    value = os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH')
+    if value is None:
+        return float('inf')
+    remaining = float(value)-time.time()
+    if not math.isfinite(remaining):
+        raise ValueError('invalid inherited request deadline')
+    return remaining
+
+
 @contextmanager
 def request_budget(seconds):
     """Share one wall-clock budget across waiting, fallbacks and pages."""
@@ -29,7 +41,7 @@ def request_budget(seconds):
     import time
     if isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError('positive finite request budget required')
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + min(seconds, inherited_request_remaining())
     if request_deadline.get() is not None:
         deadline = min(deadline, request_deadline.get())
     if deadline <= time.monotonic():
@@ -196,7 +208,15 @@ def classify_transport_error(exc: BaseException) -> str:
     here prevents the production client and the audit scripts from reporting
     the same failure with different generic labels.
     """
+    import http.client
+    import socket
     reason = getattr(exc, "reason", exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        return f'http_{exc.code}'
+    if isinstance(reason, socket.gaierror):
+        return 'dns_resolution_failed'
+    if isinstance(reason, (http.client.RemoteDisconnected, ConnectionResetError, ConnectionAbortedError)):
+        return 'connection_interrupted'
     text = f"{exc} {reason}".upper()
     if isinstance(reason, ssl.SSLCertVerificationError) or any(
         marker in text
@@ -236,6 +256,11 @@ def open_verified(request: urllib.request.Request, *, timeout: float):
     the environment-configured proxy.  HTTP responses are never retried
     across transports, and neither path permits certificate bypass.
     """
+    if os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH') is not None:
+        # Scheduled phases select one verified route and use a bounded network
+        # child. A DNS/body stall must not strand the database writer.
+        import io
+        return io.BytesIO(read_verified_once(request, timeout=min(60, timeout), max_bytes=8_000_000))
     if not _direct_first():
         return _verified_opener(False).open(request, timeout=timeout)
     try:
@@ -303,6 +328,7 @@ def read_verified_once(request, *, timeout, max_bytes):
         raise ValueError("transport timeout must be finite and at most 60 seconds")
     if request_deadline.get() is not None:
         timeout = min(timeout, request_deadline.get()-time.monotonic())
+    timeout = min(timeout, inherited_request_remaining())
     if timeout <= 0:
         raise TimeoutError('transport deadline exhausted')
     if not 1 <= max_bytes <= 8_000_000:

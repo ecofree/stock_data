@@ -464,7 +464,9 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
         if config.get('read_only') is not True:raise ValueError('explicit read-only market source required')
         data=saved_projection(output)
         codes={r['instrument'] for r in (data.get('prediction') or {}).get('rows',[])}
-        codes.update(n['instrument'] for n in data['notes'] if n['is_latest'])
+        from .journal_index import effective
+        attention={n['instrument'] for n in effective(output,'note')}
+        codes.update(attention)
         from .domain import utc
         clock=now_utc();warnings=[];sampling=None
         plans=data.get('plans') or {};account=plans.get('account') or {}
@@ -486,8 +488,8 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
             instrument=entry.get('instrument','')
             code=instrument.split('.')[-1] if instrument.startswith(('SH.','SZ.','BJ.')) else instrument.split('.')[0]
             if len(code)==6 and code.isdigit():priority.add(code)
-        for plan in plans.get('rows',[]):
-            if plan.get('is_latest') and utc(plan['valid_until'])>utc(clock):priority.add(plan['instrument'])
+        for plan in effective(output,'plan'):
+            if utc(plan['valid_until'])>utc(clock):priority.add(plan['instrument'])
         codes.update(priority)
         previous_scope={}
         if (output/'observation-publication/current.json').exists():
@@ -514,11 +516,19 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
         live_scope=[{'instrument':c,'included_at':previous_scope.get(c,{}).get('included_at',clock.isoformat()),
                      'risk_related':c in priority,
                      'roles':(['risk_or_active_plan'] if c in priority else [])+
-                         (['human_attention'] if any(n['instrument']==c and n['is_latest'] for n in data['notes']) else [])+
+                         (['human_attention'] if c in attention else [])+
                          (['pre_session_subject'] if sampling and c in sampling['codes'] else [])+
                          (['research_forecast'] if any(r['instrument']==c for r in (data.get('prediction') or {}).get('rows',[])) else [])}
                     for c in sorted(codes)]
-        selected=set((sorted(priority)+sorted(codes-priority))[:200]);deferred=sorted(codes-selected)
+        # Oldest attempted subjects first inside each priority tier. Failed/empty
+        # responses also advance the cursor, so unavailable codes cannot starve others.
+        def turn(code):
+            return (previous_scope.get(code,{}).get('last_attempted_at',''),code)
+        selected=set((sorted(priority,key=turn)+sorted(codes-priority,key=turn))[:200])
+        deferred=sorted(codes-selected)
+        for subject in live_scope:
+            subject['last_attempted_at']=(clock.isoformat() if subject['instrument'] in selected
+                else previous_scope.get(subject['instrument'],{}).get('last_attempted_at',''))
         rows=load_rows(config['market_database'],selected,clock.isoformat())
         value=project_rows(rows,selected,clock.isoformat());acquired=None;requests=0;reused=False
         cached=None;cached_receipt=None;recent=[];recent_codes=set()
