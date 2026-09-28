@@ -143,7 +143,9 @@ def test_http_refuses_foreign_host_origin_csrf_and_paths(tmp_path,monkeypatch):
     thread=threading.Thread(target=service.serve_forever,daemon=True);thread.start()
     try:
         def request(path='/',method='GET',headers=None,body=None):
-            conn=http.client.HTTPConnection('127.0.0.1',port,timeout=3)
+            # Keep the real durable write: shared Windows CI can take over 3s
+            # for journal/index fsync. This tests security, not a 3s latency SLA.
+            conn=http.client.HTTPConnection('127.0.0.1',port,timeout=15)
             conn.request(method,path,body=body,headers=headers or {});response=conn.getresponse()
             status=response.status;response.read();conn.close();return status
         assert request(headers={'Host':'evil.invalid'})==403
