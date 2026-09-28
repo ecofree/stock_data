@@ -197,7 +197,8 @@ def test_kpl_intraday_flow_promotes_latest_cumulative_point(tmp_path):
         assert store.con.execute("SELECT fetched_at,flow_unit FROM multi_source_stock_flow").fetchone() == (source_time, 'CNY')
         store.con.execute("CREATE UNIQUE INDEX flow_key ON multi_source_stock_flow(source_date,stock_code,provider)")
         before = store.con.execute("SELECT * FROM multi_source_stock_flow").fetchall()
-        assert store.sync_kpl_intraday_flow("2026-07-13") == 1
+        # Replaying the same receipt reports actual writes and preserves arrival time.
+        assert store.sync_kpl_intraday_flow("2026-07-13") == 0
         assert store.con.execute("SELECT * FROM multi_source_stock_flow").fetchall() == before
 
 
