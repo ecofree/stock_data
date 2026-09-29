@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from trade_system.tushare_history import TushareHistoryCollector, render_report  # noqa: E402
+from trade_system.pipeline_runtime import PipelineLock  # noqa: E402
 
 
 def main() -> int:
@@ -44,7 +47,35 @@ def main() -> int:
     parser.add_argument("--moneyflow-page-size", type=int, default=1000)
     parser.add_argument("--force", action="store_true", help="Re-fetch successful checkpoints.")
     parser.add_argument("--report", default="reports/tushare_2026_backfill_latest.md")
+    valuation = parser.add_mutually_exclusive_group()
+    valuation.add_argument('--valuation-diagnostic', action='store_true',
+        help='Explicit newly authorized diagnostic only: max two requests per endpoint/six total; JSON report.')
+    valuation.add_argument('--valuation-evidence', help='Explicitly reviewed valuation bundle to import locally; no network.')
+    parser.add_argument('--valuation-evidence-sha256', help='Approved SHA256 of the exact reviewed bundle.')
     args = parser.parse_args()
+    if args.valuation_diagnostic or args.valuation_evidence:
+        if args.plan_only or args.start_date != args.end_date:
+            parser.error('valuation mode requires one explicit session and cannot combine with plan-only')
+        if args.valuation_diagnostic and not args.stock_codes:
+            parser.error('valuation diagnostic requires explicit stock codes')
+        if args.valuation_evidence and not args.valuation_evidence_sha256:
+            parser.error('valuation evidence requires its exact reviewed SHA256')
+        with PipelineLock(args.db, 'valuation-'+uuid4().hex), TushareHistoryCollector(
+                args.db, request_timeout=args.request_timeout, retries=1,
+                budget_seconds=args.budget_seconds) as collector:
+            if args.valuation_evidence:
+                result = collector.import_valuation_reviews(args.valuation_evidence,
+                    args.valuation_evidence_sha256, args.start_date)
+            else:
+                result = collector.collect_valuation_inputs(args.start_date,
+                    [c.strip() for c in args.stock_codes.split(',') if c.strip()])
+        out = Path(args.report)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str)+'\n', encoding='utf-8')
+        rows = result.get('completion', {}).get('rows', {})
+        complete = bool(args.valuation_evidence) or (bool(rows) and all(r.get('valuation_eligible') for r in rows.values()))
+        print(f'valuation_inputs complete={complete} report={out}')
+        return 0 if complete else 2
     datasets = [item.strip() for item in args.datasets.split(",") if item.strip()]
     with TushareHistoryCollector(
         args.db,

@@ -300,6 +300,8 @@ class TushareHistoryCollector:
                         and (pb := _num(r.get('pb'))) is not None and math.isfinite(pb)
                         and (total := _num(r.get('total_mv'))) is not None and math.isfinite(total) and total > 0
                         and (floating := _num(r.get('circ_mv'))) is not None and math.isfinite(floating) and 0 < floating <= total}
+        if dataset == 'daily_basic':
+            observed |= set(self.qualified_valuation_reviews(trade_date))
         if dataset in {'daily', 'daily_basic', 'moneyflow'} and expected - observed and self._suspension_rows(trade_date) is None:
             self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                             'ts_code,trade_date,suspend_timing,suspend_type')
@@ -311,6 +313,7 @@ class TushareHistoryCollector:
                 'trade_date': _iso(trade_date), 'missing_codes': sorted(expected - observed),
                 'full_day_suspended': suspended,
                 'supplemental_fields': self._suspended_basic_evidence(trade_date, suspended),
+                'reviewed_valuation': self.qualified_valuation_reviews(trade_date),
                 'field_status': {'turnover_rate': 'not_applicable_only_if_full_day_suspended',
                     'volume_ratio': 'unknown', 'pe': 'unknown', 'pb': 'unknown',
                     'total_mv': 'unknown', 'circ_mv': 'unknown'},
@@ -333,7 +336,7 @@ class TushareHistoryCollector:
         session = date.fromisoformat(_iso(trade_date))
         if session > date.today():
             raise ValueError('future valuation session')
-        fields = ('ts_code,ann_date,f_ann_date,end_date,report_type,'
+        fields = ('ts_code,ann_date,f_ann_date,end_date,report_type,update_flag,'
                   'total_hldr_eqy_exc_min_int,oth_eqt_tools')
         results = {}
         for code in sorted(set(codes)):
@@ -342,18 +345,29 @@ class TushareHistoryCollector:
             if diagnostic_state.get()['stopped'] or not self._budget_left():
                 results[code] = {'status': 'not_requested_budget_or_stop'}
                 continue
-            # Reuse retained compatible statements before any new request.
+            # A lone original statement cannot certify a revision inventory.
+            # Reuse only a completed all-report-type request for this interval.
+            params = {'ts_code': code, 'start_date': f'{session.year-1}0101', 'end_date': _ymd(trade_date)}
+            inventory = self.store.conn.execute(
+                "SELECT payload_json,payload_hash FROM multi_source_observation "
+                "WHERE data_type='tushare_balancesheet_inventory_snapshot' AND provider=? "
+                "AND json_extract_string(payload_json,'$.params.ts_code')=? "
+                "AND observed_at BETWEEN current_timestamp-INTERVAL 1 DAY AND current_timestamp "
+                'ORDER BY observed_at DESC LIMIT 1', [self._provider_name(self.client), code]).fetchone()
+            completed = (json.loads(inventory[0]) if inventory and
+                         hashlib.sha256(inventory[0].encode()).hexdigest() == inventory[1] else {})
             retained = self.valuation_completion_report(trade_date, [code])['rows'][code]
-            if retained.get('financial_input') and not any(
-                    field in retained['missing_inputs'] for field in ('equity', 'other_equity')):
+            if completed.get('params') == params and completed.get('scope') == 'all_report_types_in_requested_interval':
                 results[code] = {'status': 'retained_statement_reused',
-                                 'financial_input': retained['financial_input']}
+                                 'financial_input': retained.get('financial_input'), 'inventory_sha256': inventory[1]}
                 continue
             try:
-                rows = self._read_rows('balancesheet', {'ts_code': code, 'report_type': '1',
-                    'start_date': f'{session.year-1}0101', 'end_date': _ymd(trade_date)}, fields)
+                rows = self._read_rows('balancesheet', params, fields)
                 if any(r.get('ts_code') != code for r in rows):
                     raise XiaodefaError('financial statement identity mismatch')
+                self._record_snapshot('balancesheet_inventory', {'params': params, 'rows': rows,
+                    'scope': 'all_report_types_in_requested_interval',
+                    'qualification': 'request_completed_not_latest_applicable_statement_certification'})
                 results[code] = {'status': 'received_not_certified', 'rows': len(rows)}
             except Exception as exc:
                 results[code] = {'status': 'unavailable', 'error_type': type(exc).__name__}
@@ -364,6 +378,176 @@ class TushareHistoryCollector:
         return {'requests': results, 'transport_budget': budget,
                 'completion': self.valuation_completion_report(trade_date, results),
                 'certifies_daily_basic': False}
+
+    def _valuation_review(self, review, trade_date, observed_at):
+        """Validate an explicitly reviewed bundle against retained source bytes.
+
+        SHA bindings establish integrity, not the truth of a review. The named
+        reviewer owns the financial revision inventory and policy interpretation;
+        a supplier response cannot self-authorize either. No bare qualified flag
+        or unbound numeric input is accepted.
+        """
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo('Asia/Shanghai')
+        day = _iso(trade_date)
+        cutoff = datetime.fromisoformat(observed_at)
+        if cutoff.tzinfo is None:
+            raise ValueError('explicit observation timezone required')
+        if review.get('schema') != 'reviewed_valuation_inputs_v1' or review.get('trade_date') != day:
+            raise ValueError('valuation review schema/session mismatch')
+        reviewed = datetime.fromisoformat(review['reviewed_at'])
+        if not str(review.get('reviewed_by', '')).strip() or reviewed.tzinfo is None or reviewed > cutoff:
+            raise ValueError('dated reviewer required')
+        code = review['ts_code']
+        if code != stock_code_to_ts_code(code):
+            raise ValueError('canonical valuation identity required')
+        documents = {}
+        for digest in review['source_receipts']:
+            records = self.store.conn.execute(
+                'SELECT payload_json,observed_at FROM multi_source_observation WHERE payload_hash=?',
+                [digest]).fetchall()
+            valid = [(raw, arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival)
+                     for raw, arrival in records if hashlib.sha256(raw.encode()).hexdigest() == digest]
+            valid = [(raw, arrival) for raw, arrival in valid if arrival <= reviewed]
+            if not valid:
+                raise ValueError('review source receipt absent, changed or received after review')
+            raw, arrival = min(valid, key=lambda item: item[1])
+            documents[digest] = (json.loads(raw), arrival.isoformat())
+        inventory = review['financial_inventory']
+        if (inventory.get('as_of') != day or inventory.get('scope') != 'all_published_consolidated_revisions'
+                or not inventory.get('selection_reason') or not inventory.get('document_receipts')
+                or any(h not in documents for h in inventory['document_receipts'])
+                or inventory.get('selected_statement_receipt') not in documents
+                or inventory.get('selected_statement_receipt') not in inventory.get('statement_receipts', [])
+                or any(h not in documents for h in inventory.get('statement_receipts', []))):
+            raise ValueError('complete dated financial revision inventory required')
+        inputs = json.loads(_json(review['inputs']))
+        for field, item in inputs.items():
+            digest = item['receipt_sha256']
+            if digest not in documents:
+                raise ValueError('unbound valuation input')
+            payload, arrival = documents[digest]
+            item['received_at'] = arrival  # The bundle cannot refresh source age.
+            if field in {'suspension', 'corporate_actions'}:
+                if not item.get('review_basis'):
+                    raise ValueError('documented suspension/action interpretation required')
+                continue
+            value = payload
+            parent = None
+            for part in item['value_path']:
+                parent, value = value, value[part]
+            if isinstance(parent, dict) and parent.get('ts_code', code) != code:
+                raise ValueError('valuation source identity mismatch')
+            if isinstance(value, bool) or _num(value) is None or _num(value) != _num(item.get('value')):
+                raise ValueError('valuation value does not match retained source')
+            if not isinstance(parent, dict) or parent.get('ts_code') != code:
+                raise ValueError('valuation source row identity required')
+            if field in {'equity', 'other_equity'}:
+                native = {'equity': 'total_hldr_eqy_exc_min_int', 'other_equity': 'oth_eqt_tools'}[field]
+                announcement = _iso(parent.get('f_ann_date') or parent['ann_date'])
+                if (item['value_path'][-1] != native or str(parent.get('report_type')) not in {'1', '4'}
+                        or _iso(parent['end_date']) > announcement or announcement > day
+                        or item['source_date'] != announcement):
+                    raise ValueError('financial period, announcement or field mapping mismatch')
+            else:
+                if not parent.get('trade_date'):
+                    raise ValueError('valuation source session required')
+                source_day = _iso(parent['trade_date'])
+                expected_day = item.get('price_date') if item.get('semantic') == 'suspension_reference' else day
+                if source_day != expected_day:
+                    raise ValueError('valuation source session mismatch')
+        statement = inventory['selected_statement_receipt']
+        if any(inputs.get(f, {}).get('receipt_sha256') != statement for f in ('equity', 'other_equity')):
+            raise ValueError('financial inputs differ from reviewed statement')
+        # A newer retained revision invalidates an earlier review inventory.
+        for raw, digest in self.store.conn.execute(
+                "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_balancesheet'").fetchall():
+            if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                continue
+            for row in json.loads(raw).get('rows', []):
+                if row.get('ts_code') != code:
+                    continue
+                announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
+                if announcement <= day and digest not in inventory.get('statement_receipts', []):
+                    raise ValueError('financial revision inventory omits retained statement')
+        # A claimed full-day suspension cannot override observed trading.
+        if inputs.get('price', {}).get('semantic') == 'suspension_reference':
+            suspension = self._suspension_rows(day) or []
+            if not any(r['ts_code'] == code and r.get('suspend_type') == 'S'
+                       and r.get('suspend_timing') in (None, '') for r in suspension):
+                raise ValueError('full-day suspension source missing')
+            snapshot = self.store.conn.execute(
+                "SELECT payload_hash FROM multi_source_observation WHERE data_type='tushare_suspend_d_snapshot' "
+                "AND status='qualified' AND provider=? AND json_extract_string(payload_json,'$.params.trade_date')=? "
+                'ORDER BY observed_at DESC LIMIT 1',
+                ['xiaodefa' if self.offline else self._provider_name(self.client), _ymd(day)]).fetchone()
+            if not snapshot or inputs.get('suspension', {}).get('receipt_sha256') != snapshot[0]:
+                raise ValueError('suspension proof does not bind qualified snapshot')
+            traded = self.store.conn.execute(
+                'SELECT count(*) FROM tushare_daily WHERE date=? AND ts_code=? AND (volume>0 OR turnover>0)',
+                [day, code]).fetchone()[0]
+            if traded:
+                raise ValueError('suspension conflicts with retained trading')
+        result = derive_valuation(code, day, inputs, observed_at=observed_at)
+        result['reviewed_by'] = review['reviewed_by']
+        result['reviewed_at'] = review['reviewed_at']
+        result['financial_inventory'] = inventory
+        result['source_receipts'] = sorted(documents)
+        result['valuation_eligible'] = result['status'] == 'derived_core_fields'
+        # Daily-basic raw provenance is never relabelled as a provider result.
+        result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'
+        return result
+
+    def import_valuation_reviews(self, path, expected_sha256, trade_date):
+        """Explicit, hash-pinned local intake; no network or provider-row update."""
+        raw = Path(path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError('valuation evidence file hash mismatch')
+        bundle = json.loads(raw)
+        reviews = bundle['reviews']
+        if not reviews or len({r['ts_code'] for r in reviews}) != len(reviews):
+            raise ValueError('empty or duplicate valuation review scope')
+        now = datetime.now(timezone.utc).isoformat()
+        results = [self._valuation_review(r, trade_date, now) for r in reviews]
+        if not all(r['valuation_eligible'] for r in results):
+            raise ValueError('valuation review inputs incomplete')
+        with self._transaction(True):
+            for review in reviews:
+                payload = _json(dict(review=review, import_bundle_sha256=expected_sha256))
+                digest = hashlib.sha256(payload.encode()).hexdigest()
+                if not self.store.conn.execute(
+                        "SELECT 1 FROM multi_source_observation WHERE data_type='valuation_review' AND payload_hash=?",
+                        [digest]).fetchone():
+                    self.store.conn.execute(
+                        'INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) '
+                        "VALUES ('valuation_review','stock',?,'reviewed_evidence','reviewed',?,?)",
+                        [review['ts_code'], payload, digest])
+        return {'trade_date': _iso(trade_date), 'rows': results, 'market_requests': 0,
+                'raw_daily_basic_overwritten': False, 'bundle_sha256': expected_sha256}
+
+    def qualified_valuation_reviews(self, trade_date, *, observed_at=None):
+        """Revalidate underlying receipts on every read; never trust cached green."""
+        now = observed_at or datetime.now(timezone.utc).isoformat()
+        results, seen = {}, set()
+        records = self.store.conn.execute(
+            "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='valuation_review' "
+            "AND json_extract_string(payload_json,'$.review.trade_date')=? ORDER BY observed_at DESC,rowid DESC",
+            [_iso(trade_date)]).fetchall()
+        for raw, digest in records:
+            try:
+                payload = json.loads(raw)
+                code = payload['review']['ts_code']
+                if code in seen:
+                    continue
+                seen.add(code)  # A broken newer review must not revive an older one.
+                if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                    continue
+                result = self._valuation_review(payload['review'], trade_date, now)
+                if result['valuation_eligible']:
+                    results[code] = dict(result, review_sha256=digest)
+            except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+                continue
+        return results
 
     def valuation_completion_report(self, trade_date, codes, *, observed_at=None):
         """Read retained receipts once; never issue a diagnostic request here.
@@ -439,6 +623,7 @@ class TushareHistoryCollector:
                     financial[code] = dict(row=row, receipt_sha256=digest, received_at=received.isoformat(),
                                            rank=rank, announcement=announcement)
         output = {}
+        reviewed_values = self.qualified_valuation_reviews(day, observed_at=at.isoformat())
         for code, sources in retained.items():
             inputs = {}
             for field, native, semantic, unit in (
@@ -479,6 +664,8 @@ class TushareHistoryCollector:
                 # useful calculation, but require the dated revision inventory.
                 result['missing_inputs']['financial_revision_inventory'] = ['dated_complete_revision_inventory_required']
                 result['status'] = 'incomplete'
+            if code in reviewed_values:
+                result = reviewed_values[code]
             result['retained_sources'] = {api: {k: v for k, v in source.items() if k != 'row'}
                                           for api, source in sources.items()}
             native_pb = _num(sources.get('daily_basic', {}).get('row', {}).get('pb'))
@@ -664,8 +851,15 @@ class TushareHistoryCollector:
         coverage = round(distinct_codes * 100.0 / expected, 4) if expected else None
         if dataset == 'daily_basic':
             qualified = self._covered_codes(dataset, trade_date)
-            invalid_rows = observed - len(qualified)
             applicable = self._expected_stock_codes(trade_date, dataset)
+            raw_codes = {r[0] for r in self.store.conn.execute(
+                'SELECT ts_code FROM tushare_daily_basic WHERE date=?', [_iso(trade_date)]).fetchall()}
+            invalid_rows = len((raw_codes | applicable) - qualified) + observed - len(raw_codes)
+            reviewed_codes = set(self.qualified_valuation_reviews(trade_date))
+            observed += len(reviewed_codes - raw_codes)
+            distinct_codes = len(raw_codes | reviewed_codes)
+            if reviewed_codes:
+                error_message = 'coverage includes reviewed derived valuation; raw provider rows retained'
             coverage = round(len(qualified & applicable)*100.0/expected, 4) if expected else None
         certified = (
             status == "certified"
@@ -1234,9 +1428,12 @@ class TushareHistoryCollector:
             # PE may be NULL for loss-making issuers; never replace it with zero.
             predicate = ("isfinite(pb) AND isfinite(total_mv) AND total_mv>0 "
                          "AND isfinite(circ_mv) AND circ_mv>0 AND circ_mv<=total_mv")
-        return {r[0] for r in self.store.conn.execute(
+        native = {r[0] for r in self.store.conn.execute(
             f"SELECT ts_code FROM tushare_{dataset} WHERE date=? AND {predicate} GROUP BY ts_code HAVING count(*)=1",
             [_iso(trade_date)]).fetchall()}
+        if dataset == 'daily_basic':
+            native |= set(self.qualified_valuation_reviews(trade_date))
+        return native
 
     def _collect_market(self, dataset, trade_date, *, codes=None, force=False):
         expected = None if codes is None else (set(codes) if dataset == "index_daily"
@@ -1306,7 +1503,9 @@ class TushareHistoryCollector:
                 raise XiaodefaError(f"coverage incomplete: {len(missing)} instruments lack qualified fields")
             if dataset == 'daily_basic':
                 self._record_snapshot('daily_basic_gaps', {'trade_date': _iso(trade_date),
-                    'missing_codes': [], 'supplemental_fields': {}, 'acceptance': 'valuation_coverage_complete'})
+                    'missing_codes': [], 'supplemental_fields': {},
+                    'reviewed_valuation': self.qualified_valuation_reviews(trade_date),
+                    'acceptance': 'valuation_coverage_complete', 'raw_provider_rows_preserved': True})
             self._certify_close_snapshot(dataset, trade_date, status="certified",
                                          provider=self._provider_name(self.client))
         return count

@@ -1211,6 +1211,18 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
             f"<tbody>{''.join(source_rows)}</tbody></table></div>"
         )
     gaps = data_sources.get('daily_basic_gaps') or {}
+    reviewed = gaps.get('reviewed_valuation') or {}
+    if reviewed:
+        parts.append("<div class='sec-title'><strong>经证据核验的派生估值</strong></div>"
+                     "<p>独立计算结果；原始供应商空值保留。市值单位为万元，PE 未知不填零。</p>")
+        for code, item in sorted(reviewed.items()):
+            values = item.get('values') or {}
+            parts.append(f"<details><summary>{_e(code)}：PB {_e(values.get('pb'))}</summary>"
+                f"<p>总市值 {_e(values.get('total_mv'))}；流通市值 {_e(values.get('circ_mv'))}；"
+                f"最早输入到达 {_e(item.get('input_received_at_min'))}；"
+                f"最晚输入到达 {_e(item.get('input_received_at_max'))}；"
+                f"原价格日期 {_e(item.get('price_date') or item.get('trade_date'))}；"
+                f"核验记录 {_e(item.get('review_sha256'))}</p></details>")
     if gaps.get('missing_codes'):
         parts.append("<div class='sec-title'><strong>基本面补充证据（未通过完整验收）</strong></div>"
             "<p>股本单位为万股，价格为前收盘价；动态 PE 不替代静态 PE，补充字段不代表市值已确认。</p>"

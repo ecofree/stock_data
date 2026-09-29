@@ -628,6 +628,177 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         assert len(alternative.calls) == 6
 
 
+def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_path):
+    import hashlib
+    import json
+    from copy import deepcopy
+    import pytest
+    code = '000001.SZ'
+    with TushareHistoryCollector(tmp_path/'review.duckdb', client=ScopedFixture()) as c:
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES (?)", [code])
+        c.store.conn.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv) "
+                             "VALUES (?,'2026-07-01',NULL,1000,500)", [code])
+        def retain(payload):
+            raw = json.dumps(payload)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            c.store.conn.execute("INSERT INTO multi_source_observation(data_type,provider,payload_json,payload_hash,observed_at) "
+                "VALUES ('test_source','custom',?,?,TIMESTAMP '2026-07-01 16:00:00')", [raw,digest])
+            return digest
+        statement = retain(dict(rows=[dict(ts_code=code,report_type='1',end_date='20260331',ann_date='20260430',
+                                           total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=1000000)]))
+        market = retain(dict(rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
+        inventory = retain(dict(ts_code=code,as_of='2026-07-01',statements=[statement],review_scope='fixture only'))
+        review = dict(schema='reviewed_valuation_inputs_v1',ts_code=code,trade_date='2026-07-01',
+            reviewed_by='fixture-reviewer',reviewed_at='2026-07-01T16:30:00+08:00',
+            source_receipts=[statement,market,inventory],
+            financial_inventory=dict(as_of='2026-07-01',scope='all_published_consolidated_revisions',
+                document_receipts=[inventory],statement_receipts=[statement],selected_statement_receipt=statement,
+                selection_reason='fixture complete original and revision inventory'),inputs={})
+        for field, native, value, semantic, unit, digest in (
+                ('total_mv','total_mv',1000,'total_market_value','10000_yuan',market),
+                ('circ_mv','circ_mv',500,'circulating_market_value','10000_yuan',market),
+                ('equity','total_hldr_eqy_exc_min_int',6000000,'parent_equity','yuan',statement),
+                ('other_equity','oth_eqt_tools',1000000,'other_equity_tools','yuan',statement)):
+            review['inputs'][field] = dict(ts_code=code,value=value,unit=unit,semantic=semantic,
+                source_date='2026-07-01',valid_through='2026-07-01',available_at='2026-07-01T15:00:00+08:00',
+                received_at='2099-01-01T00:00:00+08:00',receipt_sha256=digest,value_path=['rows',0,native])
+            if field in {'equity','other_equity'}:
+                review['inputs'][field]['source_date'] = '2026-04-30'
+        path = tmp_path/'review.json'
+        def write(value):
+            path.write_text(json.dumps(dict(reviews=[value])),encoding='utf-8')
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        before = len(c.client.calls)
+        sha = write(review)
+        with pytest.raises(ValueError,match='hash mismatch'):
+            c.import_valuation_reviews(path,'0'*64,'20260701')
+        imported = c.import_valuation_reviews(path,sha,'20260701')
+        assert imported['rows'][0]['values']['pb'] == 2
+        assert imported['rows'][0]['input_received_at_max'] == '2026-07-01T16:00:00+08:00'
+        assert c._covered_codes('daily_basic','20260701') == {code}
+        assert c.store.conn.execute('SELECT pb FROM tushare_daily_basic').fetchone() == (None,)
+        report = c.valuation_completion_report('20260701',[code])
+        assert report['rows'][code]['valuation_eligible']
+        assert report['rows'][code]['native_pb_status'] == 'row_absent'  # Raw receipt not manufactured by intake.
+        assert not report['certifies_daily_basic']
+        suspended = deepcopy(review)
+        suspended['inputs'].pop('total_mv')
+        suspended['inputs'].pop('circ_mv')
+        quote = retain({'rows':[dict(ts_code=code,trade_date='20260630',close=10)]})
+        shares = retain({'rows':[dict(ts_code=code,trade_date='20260701',total_share=100,float_share=50)]})
+        c._record_snapshot('suspend_d',{'params':{'trade_date':'20260701'},'rows':[
+            dict(ts_code=code,trade_date='20260701',suspend_type='S',suspend_timing='')]})
+        c.store.conn.execute("UPDATE multi_source_observation SET observed_at=TIMESTAMP '2026-07-01 16:00:00' "
+                             "WHERE data_type='tushare_suspend_d_snapshot'")
+        proof = c.store.conn.execute("SELECT payload_hash FROM multi_source_observation WHERE data_type='tushare_suspend_d_snapshot'").fetchone()[0]
+        action = retain(dict(ts_code=code,as_of='2026-07-01',events=[],scope='fixture complete corporate actions'))
+        suspended['source_receipts'] += [quote,shares,proof,action]
+        for field, native, value, semantic, unit, digest in (
+                ('price','close',10,'suspension_reference','yuan',quote),
+                ('total_share','total_share',100,'total_shares','10000_shares',shares),
+                ('float_share','float_share',50,'circulating_shares','10000_shares',shares)):
+            suspended['inputs'][field] = dict(ts_code=code,value=value,unit=unit,semantic=semantic,
+                source_date='2026-07-01',valid_through='2026-07-01',available_at='2026-07-01T15:00:00+08:00',
+                receipt_sha256=digest,value_path=['rows',0,native],price_date='2026-06-30')
+        for field, digest, status in [('suspension',proof,'full_day_suspended'),('corporate_actions',action,'reference_price_applicable')]:
+            suspended['inputs'][field] = dict(ts_code=code,trade_date='2026-07-01',receipt_sha256=digest,
+                                              status=status,review_basis='fixture documented scope and policy')
+        result = c._valuation_review(suspended,'20260701','2026-07-01T17:00:00+08:00')
+        assert result['valuation_eligible'] and result['values']['pb'] == 2
+        assert result['price_date'] == '2026-06-30'
+        no_actions = deepcopy(suspended)
+        no_actions['inputs'].pop('corporate_actions')
+        assert not c._valuation_review(no_actions,'20260701','2026-07-01T17:00:00+08:00')['valuation_eligible']
+        c.store.conn.execute("INSERT INTO tushare_daily(ts_code,date,close,volume) VALUES (?,'2026-07-01',10,100)",[code])
+        with pytest.raises(ValueError,match='conflicts with retained trading'):
+            c._valuation_review(suspended,'20260701','2026-07-01T17:00:00+08:00')
+        c.store.conn.execute('DELETE FROM tushare_daily WHERE ts_code=?',[code])
+        # Whole-universe certification consumes the separate derived result;
+        # the missing raw provider row is not relabelled or filled.
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) "
+            "SELECT lpad(CAST(i AS VARCHAR),6,'0') || '.SZ' FROM range(2,1001) t(i)")
+        c.store.conn.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv) "
+            "SELECT ts_code,DATE '2026-07-01',1,100,50 FROM tushare_stock_basic WHERE ts_code<>?", [code])
+        c._certify_close_snapshot('daily_basic','20260701',status='certified')
+        assert c.store.conn.execute("SELECT distinct_codes,invalid_rows,status FROM close_snapshot_certification").fetchone() == (1000,0,'certified')
+        c.import_valuation_reviews(path,sha,'20260701')
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_review'").fetchone()[0] == 1
+        altered = deepcopy(review)
+        altered['inputs']['equity']['value'] = 1
+        with pytest.raises(ValueError,match='does not match'):
+            c.import_valuation_reviews(path,write(altered),'20260701')
+        altered = deepcopy(review)
+        altered['financial_inventory']['document_receipts'] = []
+        with pytest.raises(ValueError,match='revision inventory'):
+            c.import_valuation_reviews(path,write(altered),'20260701')
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_json='{}' WHERE payload_hash=?",[statement])
+        assert code not in c._covered_codes('daily_basic','20260701')
+        c._certify_close_snapshot('daily_basic','20260701',status='certified')
+        assert c.store.conn.execute("SELECT invalid_rows,status FROM close_snapshot_certification").fetchone() == (1,'incomplete')
+        assert len(c.client.calls) == before
+
+
+def test_valuation_cli_is_scoped_and_holds_pipeline_lock(tmp_path, monkeypatch):
+    import json
+    import sys
+    from scripts import backfill_2026_tushare as cli
+    calls = []
+    class Collector:
+        def __init__(self, db, **kwargs):
+            assert kwargs['retries'] == 1
+            assert (tmp_path/'cli.duckdb.pipeline.lock').exists()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def collect_valuation_inputs(self, day, codes):
+            calls.append((day,codes))
+            return dict(completion={'rows': {codes[0]: {'valuation_eligible': False}}})
+    monkeypatch.setattr(cli,'TushareHistoryCollector',Collector)
+    args = ['backfill','--db',str(tmp_path/'cli.duckdb'),'--start-date','20260701','--end-date','20260701',
+            '--stock-codes','000001.SZ','--valuation-diagnostic','--report',str(tmp_path/'diagnostic.json')]
+    monkeypatch.setattr(sys,'argv',args)
+    assert cli.main() == 2
+    assert calls == [('20260701',['000001.SZ'])]
+    assert json.loads((tmp_path/'diagnostic.json').read_text())['completion']['rows']['000001.SZ']['valuation_eligible'] is False
+    assert not (tmp_path/'cli.duckdb.pipeline.lock').exists()
+    assert (tmp_path/'cli.duckdb.pipeline.lock.guard').exists()
+    monkeypatch.setattr(sys,'argv',args+['--plan-only'])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert len(calls) == 1
+
+
+def test_dated_identity_allows_flow_publication_but_not_definition_shortcut(tmp_path, monkeypatch):
+    from trade_system.flow_contract import independent_comparison_contract
+    from trade_system.xiaodefa_source import XiaodefaError
+    class Flow:
+        def query_rows(self, api_name, params=None, fields=''):
+            assert api_name == 'moneyflow'
+            return [dict(ts_code='000001.SZ',trade_date='20260701',buy_elg_amount=2,
+                         sell_elg_amount=1,buy_lg_amount=2,sell_lg_amount=1)]
+    with TushareHistoryCollector(tmp_path/'dated-flow.duckdb',client=Flow()) as c:
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000001.SZ'),('000022.SZ')")
+        monkeypatch.setattr(c,'_is_production_source',lambda: True)
+        monkeypatch.setattr(c,'_suspension_rows',lambda day: [])
+        reference = {'membership_date':'2026-06-30','not_listed':['000022.SZ']}
+        monkeypatch.setattr(c,'_reference_version',lambda: reference)
+        # Source acquisition is fixture-only; exercise validation and atomic raw/projection commit.
+        monkeypatch.setattr(c,'_read_rows',lambda api,params,fields: c.client.query_rows(api,params,fields))
+        with pytest.raises(XiaodefaError,match='missing instruments'):
+            c._collect_moneyflow('20260701')
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_moneyflow').fetchone()[0] == 0
+        reference['membership_date']='2026-07-01'
+        assert c._collect_moneyflow('20260701') == 1
+        assert c.store.conn.execute("SELECT provider,source_api,main_net FROM multi_source_stock_flow").fetchone() == ('tushare','moneyflow',20000)
+        c.store.conn.execute("INSERT INTO multi_source_stock_flow(source_date,stock_code,provider,origin_provider,"
+            "source_api,flow_definition,amount_unit,field_mapping_version,main_net,is_stale) "
+            "VALUES ('2026-07-01','000001','relay','eastmoney','moneyflow_dc','provider_main_orders_net','yuan','v3',20000,false)")
+        contract = independent_comparison_contract(c.store.conn,'2026-07-01','relay','tushare')
+        assert not contract['eligible'] and contract['reason']=='definition_alignment_unproven'
+        assert c.store.conn.execute("SELECT count(*) FROM tushare_stock_basic WHERE ts_code='000022.SZ'").fetchone()[0] == 1
+
+
 def test_stored_price_cannot_fill_an_unknown_calendar_day(tmp_path):
     import pytest
     from trade_system.xiaodefa_source import XiaodefaError
