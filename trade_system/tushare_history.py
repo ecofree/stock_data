@@ -8,7 +8,7 @@ tables.  Every date/dataset is committed before the next request starts.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import math
 import json
 import hashlib
@@ -60,6 +60,155 @@ def _ymd(value: str | date) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
+    """Separate calculated values from dated, compatible valuation evidence.
+
+    Inputs carry original receipt hashes and clocks. This never overwrites a
+    provider row or certifies daily_basic; consumers must retain the provenance.
+    Negative adjusted equity yields a signed PB with a risk status, not zero.
+    """
+    day = date.fromisoformat(_iso(trade_date))
+    cutoff = datetime.fromisoformat(str(observed_at))
+    if cutoff.tzinfo is None:
+        raise ValueError('explicit observation timezone required')
+    from zoneinfo import ZoneInfo
+    market_zone = ZoneInfo('Asia/Shanghai')
+    if day > cutoff.astimezone(market_zone).date():
+        raise ValueError('future valuation session')
+    units = {'price': 'yuan', 'total_share': '10000_shares', 'float_share': '10000_shares',
+             'equity': 'yuan', 'other_equity': 'yuan', 'total_mv': '10000_yuan', 'circ_mv': '10000_yuan'}
+    semantics = {'price': {'official_close', 'suspension_reference'},
+                 'total_share': {'total_shares'}, 'float_share': {'circulating_shares'},
+                 'equity': {'parent_equity'}, 'other_equity': {'other_equity_tools'},
+                 'total_mv': {'total_market_value'}, 'circ_mv': {'circulating_market_value'}}
+    values, failures, clocks, available_clocks, receipts = {}, {}, [], [], {}
+    result = {'ts_code': ts_code, 'trade_date': day.isoformat(), 'values': {},
+              'field_status': {}, 'missing_inputs': failures, 'certifies_daily_basic': False,
+              'observation_at': cutoff.isoformat(), 'input_receipts': receipts}
+    native_market_values = all(f in inputs for f in ('total_mv', 'circ_mv'))
+    required = (('total_mv', 'circ_mv', 'equity', 'other_equity') if native_market_values
+                else ('price', 'total_share', 'float_share', 'equity', 'other_equity'))
+    for field in required:
+        item = inputs.get(field, {})
+        value = _num(item.get('value'))
+        reasons = []
+        if value is None or not math.isfinite(value):
+            reasons.append('missing_or_nonfinite')
+        if item.get('ts_code') != ts_code or item.get('unit') != units[field]:
+            reasons.append('identity_or_unit')
+        if item.get('semantic') not in semantics[field]:
+            reasons.append('definition_unverified')
+        digest = item.get('receipt_sha256', '')
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(ch not in '0123456789abcdef' for ch in digest)):
+            reasons.append('receipt_missing')
+        try:
+            source_day = date.fromisoformat(item['source_date'])
+            through = date.fromisoformat(item['valid_through'])
+            available = datetime.fromisoformat(item['available_at'])
+            received = datetime.fromisoformat(item['received_at'])
+            if (available.tzinfo is None or received.tzinfo is None
+                    or not source_day <= day <= through
+                    or available > cutoff or received > cutoff
+                    or available.astimezone(market_zone).date() > day):
+                reasons.append('input_not_available_at_observation')
+            if field in {'price', 'total_share', 'float_share', 'total_mv', 'circ_mv'} and source_day != day:
+                reasons.append('same_session_input_required')
+            if not reasons:
+                clocks.append(received)
+                available_clocks.append(available)
+        except (KeyError, TypeError, ValueError):
+            reasons.append('input_time_missing')
+        if reasons:
+            failures[field] = sorted(set(reasons))
+        else:
+            values[field] = value
+            receipts[field] = digest
+    price = inputs.get('price', {})
+    if not native_market_values and price.get('semantic') == 'suspension_reference':
+        # Reuse of yesterday's price is an explicit valuation policy, not a
+        # fabricated same-day trade. Both dated suspension and action review
+        # must be supported; the original price date is retained.
+        for field, expected in (('suspension', 'full_day_suspended'),
+                                ('corporate_actions', 'reference_price_applicable')):
+            proof = inputs.get(field, {})
+            digest = proof.get('receipt_sha256', '')
+            if (proof.get('ts_code') != ts_code or proof.get('trade_date') != day.isoformat()
+                    or proof.get('status') != expected or not isinstance(digest, str)
+                    or len(digest) != 64 or any(ch not in '0123456789abcdef' for ch in digest)):
+                failures[field] = ['dated_evidence_required']
+            else:
+                receipts[field] = digest
+            try:
+                proof_at = datetime.fromisoformat(proof['received_at'])
+                if proof_at.tzinfo is None or proof_at > cutoff:
+                    raise ValueError('proof after observation')
+                clocks.append(proof_at)
+            except (KeyError, TypeError, ValueError):
+                failures[field] = ['proof_time_missing_or_future']
+        try:
+            if date.fromisoformat(price['price_date']) > day:
+                raise ValueError('future reference price')
+            result['price_date'] = price['price_date']
+        except (KeyError, TypeError, ValueError):
+            failures['price_date'] = ['original_price_date_required']
+        if any(f in failures for f in ('suspension', 'corporate_actions', 'price_date')):
+            values.pop('price', None)
+    if 'price' in values and values['price'] <= 0:
+        failures['price'] = ['nonpositive_price']
+        values.pop('price')
+    for field in ('total_share', 'float_share'):
+        if field in values and values[field] <= 0:
+            failures[field] = ['nonpositive_shares']
+            values.pop(field)
+    if ('total_share' in values and 'float_share' in values
+            and values['float_share'] > values['total_share']):
+        failures['float_share'] = ['exceeds_total_shares']
+        values.pop('float_share')
+    for target, share in (('total_mv', 'total_share'), ('circ_mv', 'float_share')):
+        if 'price' in values and share in values:
+            value = values['price'] * values[share]  # yuan * 10000 shares -> 10000 yuan
+            if math.isfinite(value):
+                result['values'][target] = value
+                result['field_status'][target] = 'derived'
+    if native_market_values:
+        for field in ('total_mv', 'circ_mv'):
+            if field in values and values[field] > 0:
+                result['values'][field] = values[field]
+                result['field_status'][field] = 'observed'
+            elif field in values:
+                failures[field] = ['nonpositive_market_value']
+        if all(f in result['values'] for f in ('total_mv', 'circ_mv')):
+            if result['values']['circ_mv'] > result['values']['total_mv']:
+                failures['circ_mv'] = ['exceeds_total_market_value']
+                result['values'].pop('circ_mv')
+    if all(f in values for f in ('equity', 'other_equity')):
+        if any(inputs['equity'].get(f) != inputs['other_equity'].get(f)
+               for f in ('source_date', 'receipt_sha256')):
+            failures['equity'] = ['inconsistent_financial_statement']
+            values.pop('equity')
+    if all(f in values for f in ('equity', 'other_equity')) and 'total_mv' in result['values']:
+        denominator = values['equity'] - values['other_equity']
+        if values['other_equity'] < 0 or not math.isfinite(denominator):
+            failures['other_equity'] = ['invalid_adjusted_equity']
+        elif denominator == 0:
+            result['field_status']['pb'] = 'undefined_zero_adjusted_equity'
+        else:
+            pb = result['values']['total_mv'] * 10000 / denominator
+            if math.isfinite(pb):
+                result['values']['pb'] = pb
+                result['field_status']['pb'] = ('negative_adjusted_equity' if denominator < 0 else 'derived')
+    for field in ('pb', 'total_mv', 'circ_mv', 'pe'):
+        result['field_status'].setdefault(field, 'unknown')
+    result['input_received_at_min'] = min(clocks).isoformat() if clocks else None
+    result['input_received_at_max'] = max(clocks).isoformat() if clocks else None
+    result['input_available_at_min'] = min(available_clocks).isoformat() if available_clocks else None
+    result['input_available_at_max'] = max(available_clocks).isoformat() if available_clocks else None
+    result['status'] = ('derived_core_fields' if all(f in result['values'] for f in ('pb', 'total_mv', 'circ_mv'))
+                        and not failures else 'incomplete')
+    return result
 
 
 class TushareHistoryCollector:
@@ -170,6 +319,186 @@ class TushareHistoryCollector:
         if not expected or expected - observed:
             raise XiaodefaError(f"incomplete {dataset} response: "
                                f"{len(expected - observed)} missing instruments; expected universe={len(expected)}")
+
+    @diagnostic_budget()
+    def collect_valuation_inputs(self, trade_date, codes):
+        """Explicit bounded repair diagnostic, never an automatic close retry.
+
+        Callers authorize a new diagnostic before invoking this method. The
+        shared transport enforces two attempts per endpoint/six total, including
+        pagination and retries. No provider daily_basic row is replaced here.
+        """
+        if self.offline:
+            raise ValueError('read-only collector cannot acquire valuation inputs')
+        session = date.fromisoformat(_iso(trade_date))
+        if session > date.today():
+            raise ValueError('future valuation session')
+        fields = ('ts_code,ann_date,f_ann_date,end_date,report_type,'
+                  'total_hldr_eqy_exc_min_int,oth_eqt_tools')
+        results = {}
+        for code in sorted(set(codes)):
+            if code != stock_code_to_ts_code(code):
+                raise ValueError('explicit canonical security required')
+            if diagnostic_state.get()['stopped'] or not self._budget_left():
+                results[code] = {'status': 'not_requested_budget_or_stop'}
+                continue
+            # Reuse retained compatible statements before any new request.
+            retained = self.valuation_completion_report(trade_date, [code])['rows'][code]
+            if retained.get('financial_input') and not any(
+                    field in retained['missing_inputs'] for field in ('equity', 'other_equity')):
+                results[code] = {'status': 'retained_statement_reused',
+                                 'financial_input': retained['financial_input']}
+                continue
+            try:
+                rows = self._read_rows('balancesheet', {'ts_code': code, 'report_type': '1',
+                    'start_date': f'{session.year-1}0101', 'end_date': _ymd(trade_date)}, fields)
+                if any(r.get('ts_code') != code for r in rows):
+                    raise XiaodefaError('financial statement identity mismatch')
+                results[code] = {'status': 'received_not_certified', 'rows': len(rows)}
+            except Exception as exc:
+                results[code] = {'status': 'unavailable', 'error_type': type(exc).__name__}
+        state = diagnostic_state.get()
+        budget = {'attempts': state['attempts'], 'stopped': state['stopped'],
+                  'endpoints': [{'host': host, 'path': path, 'attempts': count}
+                                for (host, path), count in state['endpoints'].items()]}
+        return {'requests': results, 'transport_budget': budget,
+                'completion': self.valuation_completion_report(trade_date, results),
+                'certifies_daily_basic': False}
+
+    def valuation_completion_report(self, trade_date, codes, *, observed_at=None):
+        """Read retained receipts once; never issue a diagnostic request here.
+
+        BAK PB/BVPS is useful arithmetic evidence but has no verified daily_basic
+        denominator mapping. A prior close cannot silently become today's close.
+        Every unresolved security remains in the report, including null-PB rows.
+        """
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo('Asia/Shanghai')
+        at = datetime.fromisoformat(observed_at) if observed_at else datetime.now(timezone.utc)
+        if at.tzinfo is None:
+            raise ValueError('explicit observation timezone required')
+        day = _iso(trade_date)
+        wanted = set(codes)
+        provider = 'xiaodefa' if self.offline else self._provider_name(self.client)
+        retained = {code: {} for code in sorted(wanted)}
+        rejected = []
+        types = ('tushare_daily_basic', 'tushare_daily', 'tushare_stk_premarket', 'tushare_bak_basic')
+        receipts = self.store.conn.execute(
+            "SELECT data_type,payload_json,payload_hash,observed_at FROM multi_source_observation "
+            "WHERE data_type IN (?,?,?,?) AND provider=? "
+            "AND json_extract_string(payload_json,'$.params.trade_date')=? "
+            "ORDER BY observed_at DESC,payload_hash", [*types, provider, _ymd(trade_date)]).fetchall()
+        for typ, raw, digest, arrival in receipts:
+            received = arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival
+            if hashlib.sha256(raw.encode()).hexdigest() != digest or received > at:
+                rejected.append({'receipt_sha256': digest, 'reason': 'hash_or_arrival_invalid'})
+                continue
+            payload = json.loads(raw)
+            api = typ.removeprefix('tushare_')
+            if payload.get('api') != api or payload.get('error_type'):
+                continue
+            rows = payload.get('rows', [])
+            identities = [r.get('ts_code') for r in rows if isinstance(r, dict)]
+            for row in rows:
+                code = row.get('ts_code')
+                if code not in wanted or api in retained[code]:
+                    continue
+                if identities.count(code) != 1 or row.get('trade_date') != _ymd(trade_date):
+                    rejected.append({'receipt_sha256': digest, 'ts_code': code, 'reason': 'identity_or_date'})
+                    continue
+                retained[code][api] = {'row': row, 'receipt_sha256': digest, 'received_at': received.isoformat()}
+        # Financial inputs have announcement/report dates, not trade_date.
+        # Only retained original consolidated statements are eligible; absent
+        # other-equity instruments remain unknown, never assumed to be zero.
+        financial = {}
+        for raw, digest, arrival in self.store.conn.execute(
+                "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
+                "WHERE data_type='tushare_balancesheet' AND provider=? ORDER BY observed_at DESC",
+                [provider]).fetchall():
+            received = arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival
+            if hashlib.sha256(raw.encode()).hexdigest() != digest or received > at:
+                continue
+            payload = json.loads(raw)
+            if payload.get('api') != 'balancesheet' or payload.get('error_type'):
+                continue
+            for row in payload.get('rows', []):
+                code = row.get('ts_code')
+                if code not in wanted or str(row.get('report_type')) != '1':
+                    continue
+                try:
+                    announcement = _iso(row.get('f_ann_date') or row['ann_date'])
+                    period = _iso(row['end_date'])
+                    date.fromisoformat(announcement)
+                    date.fromisoformat(period)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if period > announcement or announcement > day:
+                    continue
+                rank = (period, announcement, received)
+                if code not in financial or rank > financial[code]['rank']:
+                    financial[code] = dict(row=row, receipt_sha256=digest, received_at=received.isoformat(),
+                                           rank=rank, announcement=announcement)
+        output = {}
+        for code, sources in retained.items():
+            inputs = {}
+            for field, native, semantic, unit in (
+                    ('price', 'close', 'official_close', 'yuan'),
+                    ('total_share', 'total_share', 'total_shares', '10000_shares'),
+                    ('float_share', 'float_share', 'circulating_shares', '10000_shares')):
+                source = sources.get('daily_basic', {})
+                if source.get('row', {}).get(native) is None:
+                    source = sources.get('daily' if field == 'price' else 'stk_premarket', {})
+                value = source.get('row', {}).get(native)
+                if value is not None:
+                    inputs[field] = dict(value=value, unit=unit, semantic=semantic, ts_code=code,
+                        source_date=day, valid_through=day, available_at=day+'T15:00:00+08:00',
+                        received_at=source['received_at'], receipt_sha256=source['receipt_sha256'])
+            native_source = sources.get('daily_basic', {})
+            for field, semantic in (('total_mv', 'total_market_value'), ('circ_mv', 'circulating_market_value')):
+                value = native_source.get('row', {}).get(field)
+                if value is not None:
+                    inputs[field] = dict(value=value, unit='10000_yuan', semantic=semantic, ts_code=code,
+                        source_date=day, valid_through=day, available_at=day+'T15:00:00+08:00',
+                        received_at=native_source['received_at'], receipt_sha256=native_source['receipt_sha256'])
+            balance = financial.get(code)
+            if balance:
+                for field, native, semantic in (('equity', 'total_hldr_eqy_exc_min_int', 'parent_equity'),
+                                                ('other_equity', 'oth_eqt_tools', 'other_equity_tools')):
+                    if balance['row'].get(native) is not None:
+                        inputs[field] = dict(value=balance['row'][native], unit='yuan', semantic=semantic,
+                            ts_code=code, source_date=balance['announcement'], valid_through=day,
+                            available_at=balance['announcement']+'T23:59:59+08:00',
+                            received_at=balance['received_at'], receipt_sha256=balance['receipt_sha256'])
+            result = derive_valuation(code, day, inputs, observed_at=at.isoformat())
+            if balance:
+                result['financial_input'] = dict(receipt_sha256=balance['receipt_sha256'],
+                    report_period=balance['row']['end_date'], announcement_date=balance['announcement'],
+                    status='latest_retained_original_statement_not_full_revision_inventory')
+                # A latest *retained* report is not proof that no newer or
+                # restated report was published by this session. Preserve the
+                # useful calculation, but require the dated revision inventory.
+                result['missing_inputs']['financial_revision_inventory'] = ['dated_complete_revision_inventory_required']
+                result['status'] = 'incomplete'
+            result['retained_sources'] = {api: {k: v for k, v in source.items() if k != 'row'}
+                                          for api, source in sources.items()}
+            native_pb = _num(sources.get('daily_basic', {}).get('row', {}).get('pb'))
+            raw_pb = sources.get('daily_basic', {}).get('row', {}).get('pb')
+            result['native_pb_status'] = ('finite' if native_pb is not None and math.isfinite(native_pb)
+                                         else 'row_absent' if 'daily_basic' not in sources
+                                         else 'provider_null' if raw_pb is None else 'invalid_value')
+            pre = sources.get('stk_premarket', {}).get('row', {})
+            bak = sources.get('bak_basic', {}).get('row', {})
+            price, bvps, pb = (_num(pre.get('pre_close')), _num(bak.get('bvps')), _num(bak.get('pb')))
+            if all(v is not None and math.isfinite(v) for v in (price, bvps, pb)) and price > 0 and bvps != 0:
+                implied = price / bvps
+                if math.isfinite(implied):
+                    result['alternative_pb_check'] = dict(reported_pb=pb, reference_price_div_bvps=implied,
+                        agrees_at_reported_precision=abs(implied-pb) <= 0.005000001,
+                        status='arithmetic_only', required=['denominator_definition', 'suspension_price_policy',
+                                                           'corporate_action_review', 'original_price_date'])
+            output[code] = result
+        return {'trade_date': day, 'observed_at': at.isoformat(), 'rows': output,
+                'rejected_receipts': rejected, 'market_requests': 0, 'certifies_daily_basic': False}
 
     @diagnostic_budget()
     def _suspended_basic_evidence(self, trade_date, codes):
@@ -953,6 +1282,16 @@ class TushareHistoryCollector:
             raise
         # Coverage failure below does not undo this committed partial batch.
         self._count_product(dataset, written=count)
+        if dataset == 'daily_basic':
+            unresolved_valuation = (self._expected_stock_codes(trade_date, dataset) if expected is None else expected)
+            unresolved_valuation = unresolved_valuation - self._covered_codes(dataset, trade_date)
+            if unresolved_valuation:
+                report = self.valuation_completion_report(trade_date, unresolved_valuation)
+                encoded = _json(report)
+                self.store.conn.execute(
+                    "INSERT INTO multi_source_observation(data_type,asset_type,provider,status,payload_json,payload_hash) "
+                    "VALUES ('valuation_completion','diagnostic',?,'incomplete',?,?)",
+                    [self._provider_name(self.client), encoded, hashlib.sha256(encoded.encode()).hexdigest()])
         if expected is not None:
             # Forced refresh still needs qualified fields, not identity alone.
             unresolved = expected - self._covered_codes(dataset, trade_date)

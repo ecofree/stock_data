@@ -28,9 +28,28 @@ def test_tushare_total_is_not_main_orders_net():
                         source_specification_sha256=['a'*64,'b'*64],
                         valid_from='2026-09-24',valid_through='2026-09-24')
         with patch.dict(contract.VERIFIED_FLOW_COMPARISONS,{key:evidence}):
+            assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+            semantics = dict(order_grouping='original_order', trade_side='aggressor',
+                             size_buckets='CNY:[200000,1000000),[1000000,infinity)',
+                             session='09:15-15:00 Shanghai auction included',
+                             security_scope='same listed A-share population', net_formula='large_buy-large_sell')
+            evidence['specifications'] = [semantics.copy(), semantics.copy()]
             assert independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+            evidence['specifications'][1]['order_grouping'] = 'trade_print'
+            assert independent_comparison_contract(con,'2026-09-24','relay','direct')['missing_definition_evidence'] == ['order_grouping']
+            evidence['specifications'][1]['order_grouping'] = 'original_order'
+            evidence['valid_through'] = 'not-a-date'
+            assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+            evidence['valid_through'] = '2026-09-24'
             evidence['source_specification_sha256'] = ['unknown','b'*64]
             assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
+        # Different vendor labels may map only via an explicitly reviewed,
+        # fully specified pair. Identical strings alone never authorize it.
+        con.execute("UPDATE multi_source_stock_flow SET flow_definition='other_vendor_main' WHERE provider='direct'")
+        other_key = tuple(sorted([key[0], ('tushare','dc','other_vendor_main','v3')]))
+        evidence['source_specification_sha256'] = ['a'*64, 'b'*64]
+        with patch.dict(contract.VERIFIED_FLOW_COMPARISONS,{other_key:evidence}):
+            assert independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
         con.execute("UPDATE multi_source_stock_flow SET main_net=NULL WHERE provider='direct'")
         assert not independent_comparison_contract(con,'2026-09-24','relay','direct')['eligible']
     row = normalize_stock_flow_row(

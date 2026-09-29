@@ -10,6 +10,7 @@ into explicit fields.
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Any
 from trade_system.units import _number as number, normalize_amount
 
@@ -189,6 +190,38 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
 # Values must include dated validity and hashes of both original specifications.
 VERIFIED_FLOW_COMPARISONS = {}
 
+FLOW_DEFINITION_AXES = ('order_grouping', 'trade_side', 'size_buckets',
+                        'session', 'security_scope', 'net_formula')
+
+
+def flow_definition_evidence(evidence, trade_date):
+    """Validate reviewed specifications, not similarity of reported numbers."""
+    missing = []
+    try:
+        day = date.fromisoformat(str(trade_date)[:10])
+        start = date.fromisoformat(evidence['valid_from'])
+        end = date.fromisoformat(evidence['valid_through'])
+        if not start <= day <= end:
+            missing.append('validity')
+    except (KeyError, TypeError, ValueError):
+        missing.append('validity')
+    hashes = evidence.get('source_specification_sha256', [])
+    if (not isinstance(hashes, list) or len(hashes) != 2
+            or any(not isinstance(h, str) or len(h) != 64
+                   or any(ch not in '0123456789abcdef' for ch in h) for h in hashes)):
+        missing.append('source_specification_sha256')
+    if not evidence.get('canonical_definition'):
+        missing.append('canonical_definition')
+    specifications = evidence.get('specifications', [])
+    if not isinstance(specifications, list) or len(specifications) != 2:
+        return sorted(set(missing + list(FLOW_DEFINITION_AXES)))
+    for axis in FLOW_DEFINITION_AXES:
+        values = [s.get(axis) if isinstance(s, dict) else None for s in specifications]
+        if (not all(isinstance(v, str) and v.strip() and v.lower() not in {'unknown', 'unverified'}
+                    for v in values) or values[0] != values[1]):
+            missing.append(axis)
+    return sorted(set(missing))
+
 
 def independent_comparison_contract(con, trade_date, primary, reference):
     """Read-only semantic gate. Correlation cannot establish equivalent definitions.
@@ -219,19 +252,15 @@ def independent_comparison_contract(con, trade_date, primary, reference):
     left, right = result['sides']['primary'], result['sides']['reference']
     if left['origin'] == right['origin']:
         result['reason'] = 'same_original_source'
-    elif left['definition'] != right['definition']:
-        result['reason'] = 'definition_alignment_unproven'
     else:
         signatures = tuple(sorted(tuple(side[k] for k in
             ('origin', 'api', 'definition', 'mapping_version')) for side in (left, right)))
         evidence = VERIFIED_FLOW_COMPARISONS.get(signatures, {})
-        hashes = evidence.get('source_specification_sha256', [])
-        day = str(trade_date)[:10]
-        if (not evidence.get('canonical_definition') or len(hashes) != 2
-                or any(not isinstance(h, str) or len(h) != 64
-                       or any(ch not in '0123456789abcdef' for ch in h) for h in hashes)
-                or not evidence.get('valid_from', '9999') <= day <= evidence.get('valid_through', '0000')):
-            result['reason'] = 'definition_evidence_missing'
+        missing = flow_definition_evidence(evidence, trade_date)
+        if missing:
+            result['reason'] = ('definition_alignment_unproven' if left['definition'] != right['definition']
+                                else 'definition_evidence_missing')
+            result['missing_definition_evidence'] = missing
         else:
             result.update(eligible=True, reason='verified_independent_definition_mapping',
                           definition_evidence=evidence)

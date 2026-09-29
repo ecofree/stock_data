@@ -470,6 +470,57 @@ def test_reference_failure_cannot_return_success_or_empty_skip(tmp_path, monkeyp
 
 
 def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
+    from copy import deepcopy
+    from trade_system.tushare_history import derive_valuation
+    code = '000001.SZ'
+    inputs = {}
+    for field, value, unit, semantic in (
+            ('price', 10, 'yuan', 'official_close'),
+            ('total_share', 100, '10000_shares', 'total_shares'),
+            ('float_share', 50, '10000_shares', 'circulating_shares'),
+            ('equity', 6000000, 'yuan', 'parent_equity'),
+            ('other_equity', 1000000, 'yuan', 'other_equity_tools')):
+        inputs[field] = dict(value=value, unit=unit, semantic=semantic, ts_code=code,
+            source_date='2026-07-01', valid_through='2026-07-01',
+            available_at='2026-07-01T15:00:00+08:00', received_at='2026-07-01T16:00:00+08:00',
+            receipt_sha256='a'*64)
+    def calculate(values):
+        return derive_valuation(code, '20260701', values, observed_at='2026-07-01T17:00:00+08:00')
+    result = calculate(inputs)
+    assert result['values'] == dict(total_mv=1000, circ_mv=500, pb=2)
+    assert result['status'] == 'derived_core_fields' and not result['certifies_daily_basic']
+    assert result['field_status']['pe'] == 'unknown'
+    changed = deepcopy(inputs)
+    changed['equity']['value'] = 1000000
+    assert calculate(changed)['field_status']['pb'] == 'undefined_zero_adjusted_equity'
+    changed['equity']['value'] = -4000000
+    assert calculate(changed)['values']['pb'] == -2
+    assert calculate(changed)['field_status']['pb'] == 'negative_adjusted_equity'
+    changed['other_equity']['value'] = None
+    assert 'pb' not in calculate(changed)['values']
+    changed = deepcopy(inputs)
+    changed['equity']['received_at'] = '2026-07-01T18:00:00+08:00'
+    assert calculate(changed)['status'] == 'incomplete'
+    changed = deepcopy(inputs)
+    changed['float_share']['value'] = 101
+    assert 'circ_mv' not in calculate(changed)['values']
+    changed = deepcopy(inputs)
+    changed['price']['semantic'] = 'suspension_reference'
+    changed['price']['price_date'] = '2026-06-30'
+    assert 'total_mv' not in calculate(changed)['values']
+    for field, status in [('suspension','full_day_suspended'), ('corporate_actions','reference_price_applicable')]:
+        changed[field] = dict(ts_code=code, trade_date='2026-07-01', status=status,
+                              receipt_sha256='b'*64, received_at='2026-07-01T15:01:00+08:00')
+    assert calculate(changed)['values']['total_mv'] == 1000
+    assert calculate(changed)['price_date'] == '2026-06-30'
+    changed['equity']['valid_through'] = '2026-06-30'
+    assert calculate(changed)['status'] == 'incomplete'
+    changed = {k: deepcopy(inputs[k]) for k in ('equity', 'other_equity')}
+    for field, value, semantic in [('total_mv',1000,'total_market_value'), ('circ_mv',500,'circulating_market_value')]:
+        changed[field] = dict(inputs['price'], value=value, unit='10000_yuan', semantic=semantic)
+    assert calculate(changed)['values']['pb'] == 2  # Native market value needs no duplicate price query.
+    changed['other_equity']['receipt_sha256'] = 'b'*64
+    assert 'pb' not in calculate(changed)['values']
     client = ScopedFixture()
     with TushareHistoryCollector(tmp_path / "unknown.duckdb", client=client) as c:
         seed_calendar(c)
@@ -512,6 +563,26 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
                                            pe=None,pb=-0.5,total_mv=100,circ_mv=50)]
         assert c._collect_market('daily_basic','20260701',codes=['000002.SZ'],force=True) == 1
         assert c.store.conn.execute("SELECT pe FROM tushare_daily_basic WHERE ts_code='000002.SZ'").fetchone() == (None,)
+        # Completion uses raw receipt values, never a caller's same-name field
+        # or a recomputation timestamp; raw daily_basic NULL remains untouched.
+        import hashlib
+        def receipt(api, rows):
+            raw = json.dumps(dict(api=api, params={'trade_date':'20260701'}, rows=rows))
+            c.store.conn.execute("INSERT INTO multi_source_observation(data_type,provider,payload_json,payload_hash,observed_at) "
+                "VALUES (?,'custom',?,?,TIMESTAMP '2026-07-01 16:00:00')",
+                ['tushare_'+api, raw, hashlib.sha256(raw.encode()).hexdigest()])
+        receipt('daily_basic', [dict(ts_code='000001.SZ',trade_date='20260701',pb=None,total_mv=1000,circ_mv=500)])
+        receipt('balancesheet', [dict(ts_code='000001.SZ',report_type='1',end_date='20260331',
+            f_ann_date='20260430',total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=1000000)])
+        report = c.valuation_completion_report('20260701',['000001.SZ'],observed_at='2026-07-01T17:00:00+08:00')
+        assert report['rows']['000001.SZ']['values']['pb'] == 2
+        assert report['rows']['000001.SZ']['native_pb_status'] == 'provider_null'
+        assert report['rows']['000001.SZ']['input_received_at_min'] == '2026-07-01T16:00:00+08:00'
+        assert report['market_requests'] == 0 and not report['certifies_daily_basic']
+        assert c.store.conn.execute("SELECT pb FROM tushare_daily_basic WHERE ts_code='000001.SZ'").fetchone() == (None,)
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='tampered' WHERE data_type='tushare_balancesheet'")
+        report = c.valuation_completion_report('20260701',['000001.SZ'],observed_at='2026-07-01T17:00:00+08:00')
+        assert 'pb' not in report['rows']['000001.SZ']['values']
 
     from urllib.request import Request
     from trade_system.http_transport import _diagnostic_attempt, stop_diagnostic
@@ -524,6 +595,9 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
             if self.denied:
                 stop_diagnostic('permission_denied')
                 raise XiaodefaError('fixture denied')
+            if api == 'balancesheet':
+                return [dict(ts_code=params['ts_code'],report_type='1',end_date='20260331',
+                    f_ann_date='20260430',total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=1000000)]
             return [dict(params, total_share=100, float_share=50, pre_close=2,
                          pe=0, pb=-0.5, bvps=-4)]
     alternative = AlternativeFixture()
@@ -540,6 +614,18 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         stopped = c._suspended_basic_evidence('20260702', codes)
         assert len(alternative.calls) == 3
         assert stopped[codes[-1]]['bak_basic']['reason'] == 'permission_denied'
+        alternative.denied = False
+        financial = c.collect_valuation_inputs('20260701', codes)
+        assert financial['transport_budget']['attempts'] == 2
+        assert len(alternative.calls) == 5
+        reused = c.collect_valuation_inputs('20260701', codes[:2])
+        assert reused['transport_budget']['attempts'] == 0 and len(alternative.calls) == 5
+        assert all(r['status']=='retained_statement_reused' for r in reused['requests'].values())
+        alternative.denied = True
+        denied = c.collect_valuation_inputs('20260701', codes[2:])
+        assert denied['transport_budget']['attempts'] == 1
+        assert denied['transport_budget']['stopped'] == 'permission_denied'
+        assert len(alternative.calls) == 6
 
 
 def test_stored_price_cannot_fill_an_unknown_calendar_day(tmp_path):
