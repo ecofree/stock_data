@@ -37,7 +37,9 @@ def qualified_stock_reference(con, *, provider='xiaodefa', now=None):
     if membership and membership.get('as_of') != now.date().isoformat():
         return None
     return dict(version=version, known_at=receipt[0].isoformat(), max_age_seconds=86400,
-                membership_date=membership.get('as_of'), not_listed=membership.get('not_listed', []))
+                membership_date=membership.get('as_of'), not_listed=membership.get('not_listed', []),
+                membership_only=membership.get('membership_only', []),
+                historical_listing_dates_complete=membership.get('historical_listing_dates_complete', True))
 
 
 def _table_exists(con: Any, name: str) -> bool:

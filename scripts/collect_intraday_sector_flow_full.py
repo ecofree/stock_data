@@ -475,13 +475,15 @@ def collect_full_sector_flow(
                 payload = None
                 try:
                     from trade_system.xiaodefa_source import XiaodefaClient
-                    cached = con.execute("SELECT payload_json,payload_hash FROM multi_source_observation "
+                    cached = con.execute("SELECT payload_json,payload_hash,status FROM multi_source_observation "
                         "WHERE data_type='em_industry_catalogue' AND source_date=? AND provider='xiaodefa' "
                         "AND (status='qualified' OR observed_at>=current_timestamp-INTERVAL 15 MINUTE) "
                         "ORDER BY observed_at DESC LIMIT 1", [trade_date]).fetchone()
                     payload = None
                     if cached and hashlib.sha256(cached[0].encode()).hexdigest() == cached[1]:
                         payload = json.loads(cached[0])
+                        if cached[2] == 'unavailable':
+                            raise ValueError('catalogue unavailable (cached cooldown): '+payload.get('error', payload.get('error_type','unknown')))
                     if payload is None:
                         params = dict(trade_date=trade_date.replace('-',''),idx_type='行业板块',limit=5000)
                         rows = XiaodefaClient(timeout=15,max_retries=1).query_rows('dc_index',params,
@@ -514,13 +516,19 @@ def collect_full_sector_flow(
                         # and never qualifies the missing catalogue.
                         failed = json.dumps(dict(api='dc_index',
                             params=dict(trade_date=trade_date.replace('-','')),
-                            rows=[], error_type=type(exc).__name__), sort_keys=True)
+                            rows=[], error_type=type(exc).__name__, error=str(exc)[:200]), sort_keys=True)
                         con.execute("INSERT INTO multi_source_observation "
                             "(source_date,data_type,asset_type,provider,status,payload_json,payload_hash) "
                             "VALUES (?,'em_industry_catalogue','reference','xiaodefa','unavailable',?,?)",
                             [trade_date,failed,hashlib.sha256(failed.encode()).hexdigest()])
             pagination = _retained_relay_industry(con, trade_date, expected_codes, catalogue_version)
             staged_rows = []
+            if pagination is None and catalogue_error and expected_codes is None:
+                # No qualified denominator: retain the failure and do not spend
+                # another full sweep on rows that cannot pass this invocation.
+                pagination = dict(status='catalogue_unavailable', promoted=False,
+                    requests=0, primary_pages=0, reconciliation_pages=0,
+                    expected_pages=0, expected_total=0, observed_codes=0, errors=[])
             if pagination is None:
                 staged_rows, pagination = _collect_sector_pages(
                     store, trade_date, page_size, max_pages, pause_seconds,

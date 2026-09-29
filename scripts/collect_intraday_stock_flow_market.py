@@ -343,6 +343,14 @@ def collect_market_stock_flow(db_path: str | Path, trade_date: str, *, page_size
     _ensure_checkpoint_table(con)
     universe_by_exchange = _a_share_universe_by_exchange(con, trade_date)
     reference_error = ''
+    if not universe_by_exchange:
+        try:
+            failure = con.execute("SELECT status,last_error,updated_at FROM history_fetch_checkpoint "
+                "WHERE dataset='stock_basic' AND page_no=0 ORDER BY updated_at DESC LIMIT 1").fetchone()
+            if failure:
+                reference_error = f'preparation status={failure[0]} at={failure[2]}: {failure[1] or "dated reference not qualified"}'
+        except duckdb.Error:
+            reference_error = 'reference checkpoint unavailable'
     # Reference acquisition belongs to pre-session preparation, never this hot path.
     expected_universe = set(universe_by_exchange)
     previous_batch = con.execute(

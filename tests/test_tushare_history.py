@@ -4,7 +4,7 @@ import duckdb
 import pytest
 
 from trade_system.tushare_history import TushareHistoryCollector
-from trade_system.xiaodefa_source import XiaodefaClient
+from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 
 
 class FakeClient:
@@ -809,3 +809,59 @@ def test_stored_price_cannot_fill_an_unknown_calendar_day(tmp_path):
         c.store.conn.execute("INSERT INTO tushare_daily(ts_code,date,close) VALUES ('000001.SZ','2026-07-04',10)")
         with pytest.raises(XiaodefaError, match="trade_cal fetch failed"):
             c.ensure_calendar("20260704", "20260704")
+
+
+def test_current_bse_membership_does_not_invent_listing_date(tmp_path, monkeypatch):
+    import time
+    from datetime import date, timedelta
+    import pytest
+    today = date.today().isoformat()
+    with TushareHistoryCollector(tmp_path/'member.duckdb', client=XiaodefaClient(token='fixture')) as c:
+        monkeypatch.setattr(c, '_read_rows', lambda api, params, fields: [dict(
+            ts_code='000001.SZ', symbol='000001', list_date='19910403', list_status='L')]
+            if params['list_status']=='L' else [])
+        membership = dict(as_of=today, source_session=today, listings={'920202':today.replace('-','')})
+        monkeypatch.setattr(c, '_bse_listing_membership', lambda: membership)
+        monkeypatch.setattr(c, '_exchange_listing_membership', lambda exchange='SZ':
+            dict(as_of=today,listings={'000001':'1991-04-03'}))
+        native = dict(thscode='920202.BJ',asset_type='a-share',list_date=None,name='fixture')
+        monkeypatch.setattr(c, 'stock_listing_evidence', lambda *_: dict(timestamp=int(time.time()*1000),item=[native]))
+        assert c.collect_stock_basic() == 2
+        assert c.store.conn.execute("SELECT list_date FROM tushare_stock_basic WHERE ts_code='920202.BJ'").fetchone() == (None,)
+        assert c._reference_version()['membership_only'] == ['920202.BJ']
+        assert c._expected_stock_codes(today) == {'000001.SZ','920202.BJ'}
+        with pytest.raises(XiaodefaError,match='historical listing dates unavailable'):
+            c._expected_stock_codes((date.today()-timedelta(days=1)).isoformat())
+        native['list_date'] = (date.today()+timedelta(days=1)).isoformat()
+        with pytest.raises(XiaodefaError, match='disagreement'):
+            c.collect_stock_basic(force=True)
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_stock_basic').fetchone()[0] == 2
+        native['list_date'] = None
+        membership['as_of'] = (date.today()-timedelta(days=1)).isoformat()
+        with pytest.raises(XiaodefaError, match='current membership evidence'):
+            c.collect_stock_basic(force=True)
+
+
+def test_completed_reference_acquisition_reused_without_refreshing_time(tmp_path, monkeypatch):
+    client=XiaodefaClient(token='fixture')
+    calls=[]
+    def pages(api, **kw):
+        calls.append(kw)
+        rows=[dict(ts_code='000001.SZ',list_status='L',list_date='19910403')]
+        kw['on_page'](0,rows)
+        return rows
+    monkeypatch.setattr(client,'query_all',pages)
+    with TushareHistoryCollector(tmp_path/'cache.duckdb',client=client,budget_seconds=60) as c:
+        params={'list_status':'L'}
+        first=c._read_rows('stock_basic',params,'ts_code')
+        before=c.store.conn.execute('SELECT observed_at FROM multi_source_observation ORDER BY observed_at').fetchall()
+        assert c._read_rows('stock_basic',params,'ts_code') == first
+        assert len(calls)==1 and 0<calls[0]['total_timeout']<=60
+        assert c.store.conn.execute('SELECT observed_at FROM multi_source_observation ORDER BY observed_at').fetchall()==before
+        c.store.conn.execute("UPDATE multi_source_observation SET payload_hash='bad' WHERE data_type='tushare_stock_basic_acquisition_snapshot'")
+        c._read_rows('stock_basic',params,'ts_code')
+        assert len(calls)==2
+        # Partial page receipts are never eligible for this cache.
+        c.store.conn.execute("DELETE FROM multi_source_observation WHERE data_type='tushare_stock_basic_acquisition_snapshot'")
+        c._read_rows('stock_basic',params,'ts_code')
+        assert len(calls)==3

@@ -377,3 +377,22 @@ def test_real_transport_worker_preserves_http_and_size_boundaries(status, body,m
         thread.join(5)
         server.server_close()
     assert requests == ['/fixture']*count and not thread.is_alive()
+
+
+def test_pagination_per_page_deadline_with_bounded_operation(monkeypatch):
+    from trade_system import xiaodefa_source as source
+    clock=[0.0]; deadlines=[]
+    monkeypatch.setattr(source.time,'monotonic',lambda:clock[0])
+    c=XiaodefaClient(token='fixture',timeout=20)
+    def query(api, **kw):
+        deadlines.append(kw['_deadline'])
+        clock[0]+=16
+        return [{'code':'one'}] if kw['offset']==0 else []
+    monkeypatch.setattr(c,'query',query)
+    assert c.query_all('stock_basic',page_size=1,total_timeout=60)==[{'code':'one'}]
+    assert deadlines==[20,36]
+    clock[0]=0;deadlines.clear()
+    c.query_all('stock_basic',page_size=1,total_timeout=25)
+    assert deadlines==[20,25]
+    with pytest.raises(XiaodefaError,match='within 60'):
+        c.query_all('stock_basic',total_timeout=61)

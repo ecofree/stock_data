@@ -488,3 +488,27 @@ def test_unknown_sector_type_never_becomes_em_from_code_prefix():
     assert result['sector_type'] == 'unknown'
     assert result['taxonomy_namespace'] is None
     assert result['quality_reason'] == 'unsupported_taxonomy'
+
+
+def test_unavailable_catalogue_preserves_cause_and_stops_new_sweep(tmp_path, monkeypatch):
+    from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
+    calls=[]
+    def unavailable(*args, **kwargs):
+        calls.append(1)
+        raise XiaodefaError('empty response without fields; source data unavailable')
+    monkeypatch.setitem(collector.SETTINGS,'XIAODEFA_TOKEN','fixture')
+    monkeypatch.setattr(XiaodefaClient,'query_rows',unavailable)
+    monkeypatch.setattr(collector,'_from_em_sector_flow_page',lambda **kw: pytest.fail('no sweep without denominator'))
+    db=tmp_path/'unavailable.duckdb'
+    first=collector.collect_full_sector_flow(db,'2026-09-29',pause_seconds=0)
+    assert 'empty response without fields' in first['error']
+    assert first['pagination']['requests']==0 and first['status']=='error'
+    with duckdb.connect(str(db)) as con:
+        before=con.execute("SELECT observed_at FROM multi_source_observation WHERE data_type='em_industry_catalogue'").fetchall()
+    second=collector.collect_full_sector_flow(db,'2026-09-29',pause_seconds=0)
+    assert 'cached cooldown' in second['error'] and 'empty response without fields' in second['error']
+    assert 'namespace mismatch' not in second['error']
+    assert calls==[1] and second['pagination']['requests']==0
+    with duckdb.connect(str(db)) as con:
+        assert con.execute("SELECT observed_at FROM multi_source_observation WHERE data_type='em_industry_catalogue'").fetchall()==before
+        assert con.execute('SELECT count(*) FROM multi_source_sector_flow').fetchone()[0]==0

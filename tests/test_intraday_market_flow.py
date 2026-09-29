@@ -386,3 +386,16 @@ def test_realtime_market_flow_normalizes_push2_rows(monkeypatch, tmp_path):
     assert rows[0]["main_net"] == 1000.0
     assert rows[0]["super_net"] == 500.0
     assert meta["source"] == "eastmoney_intraday_clist"
+
+
+def test_missing_reference_explains_preparation_failure_without_requests(tmp_path, monkeypatch):
+    from trade_system.tushare_history import TushareHistoryCollector
+    db=tmp_path/'reference-failure.duckdb'
+    with TushareHistoryCollector(db,client=object()) as c:
+        c._checkpoint('stock_basic','1900-01-01','error',error='native listing receipt identity mismatch: fixture')
+    monkeypatch.setenv('KPL_RUNTIME_SCHEMA_READY','1')
+    monkeypatch.setattr(eastmoney,'get_fund_flow_market',lambda *a,**k: (_ for _ in ()).throw(AssertionError('no acquisition')))
+    result=collect_market_stock_flow(db,'2026-09-29',phase='intraday')
+    assert result['status']=='error' and result['fetched_rows']==0
+    assert 'native listing receipt identity mismatch: fixture' in result['error']
+    assert 'preparation status=error' in result['error']

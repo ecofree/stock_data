@@ -777,6 +777,8 @@ class TushareHistoryCollector:
             "AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
             "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [_iso(trade_date)] * 2).fetchall()}
         reference = self._reference_version() or {}
+        if reference.get('membership_only') and reference.get('membership_date') != _iso(trade_date):
+            raise XiaodefaError('historical listing dates unavailable for membership-only identities')
         if reference.get('membership_date') == _iso(trade_date):
             expected -= set(reference.get('not_listed', []))
         if dataset in {'daily', 'moneyflow'}:
@@ -940,6 +942,21 @@ class TushareHistoryCollector:
     def _read_rows(self, api, params, fields):
         if self.client is None:
             raise XiaodefaError("offline collector cannot acquire data")
+        # Reuse only a completed L/D acquisition, never splice partial pages from
+        # different attempts. Its receipt time is not refreshed by reuse.
+        if api == 'stock_basic' and self._is_production_source() and not getattr(self, '_force_reference', False):
+            cached = self.store.conn.execute(
+                "SELECT payload_json,payload_hash FROM multi_source_observation "
+                "WHERE data_type='tushare_stock_basic_acquisition_snapshot' AND provider=? "
+                "AND status='qualified' AND CAST(observed_at AS DATE)=current_date "
+                "AND observed_at BETWEEN current_timestamp-INTERVAL 15 MINUTE AND current_timestamp "
+                "ORDER BY observed_at DESC", [self._provider_name(self.client)]).fetchall()
+            for encoded, digest in cached:
+                if hashlib.sha256(encoded.encode()).hexdigest() != digest:
+                    continue
+                value = json.loads(encoded)
+                if value.get('params') == params and value.get('fields') == fields:
+                    return value['rows']
         # Keep the original acquisition time and source identity even when a
         # later page or coverage validation fails. Reuse the existing receipt table.
         def record(offset, rows):
@@ -959,10 +976,12 @@ class TushareHistoryCollector:
         with request_budget(remaining):
             if self._is_production_source():
                 rows = self.client.query_all(api, page_size=self.batch_limit, fields=fields,
-                                             on_page=record, **params)
+                                             on_page=record, **({'total_timeout': min(60, remaining)} if api == 'stock_basic' else {}), **params)
             else:
                 rows = self.client.query_rows(api, params, fields)
                 record(0, rows)
+        if api == 'stock_basic' and self._is_production_source():
+            self._record_snapshot('stock_basic_acquisition', {'params': params, 'fields': fields, 'rows': rows})
         if api == 'suspend_d':
             if (len({r.get('ts_code') for r in rows}) != len(rows) or any(
                     not r.get('ts_code') or r.get('trade_date') != params['trade_date']
@@ -1223,6 +1242,7 @@ class TushareHistoryCollector:
             sh_membership = None
             bse_membership = self._bse_listing_membership() if self._is_production_source() else None
             not_listed = []
+            membership_only = []
             for row in rows:
                 try:
                     listed = date.fromisoformat(_iso(row.get('list_date')))
@@ -1263,6 +1283,9 @@ class TushareHistoryCollector:
                     if code[:6] not in bse_membership['listings']:
                         not_listed.append(code)
                         row['list_date'] = None
+                    else:
+                        row['list_date'] = None
+                        membership_only.append(code)
                 elif code.endswith('.SH'):
                     sh_membership = sh_membership or self._exchange_listing_membership('SH')
                     if code[:6] not in sh_membership['listings']:
@@ -1283,9 +1306,11 @@ class TushareHistoryCollector:
                         raise XiaodefaError('native listing receipt identity mismatch')
                     native=items[0]
                     listed=native.get('list_date')
-                    if (native.get('thscode')!=code+'.BJ' or native.get('asset_type')!='a-share' or not listed
-                            or not date(1990,1,1)<=date.fromisoformat(listed)<=date.fromisoformat(bse_membership['source_session'])):
+                    if (native.get('thscode')!=code+'.BJ' or native.get('asset_type')!='a-share'
+                            or (listed is not None and not date(1990,1,1)<=date.fromisoformat(listed)<=date.fromisoformat(bse_membership['source_session']))):
                         raise XiaodefaError('BSE/native listing date disagreement: '+code)
+                    if listed is None:
+                        membership_only.append(code+'.BJ')
                     rows.append(dict(ts_code=code+'.BJ',symbol=code,name=native.get('name'),market='北交所',list_date=listed,list_status='L'))
                     corrections.append(dict(ts_code=code+'.BJ',list_date=listed,provider='hithink',membership_provider='bse'))
             if self._is_production_source():
@@ -1312,6 +1337,13 @@ class TushareHistoryCollector:
                 not_listed = sorted(set(not_listed))
             invalid = []
             for row in rows:
+                if row.get('ts_code') in membership_only:
+                    if (row.get('list_date') is not None or not bse_membership
+                            or bse_membership.get('as_of') != date.today().isoformat()
+                            or bse_membership.get('source_session') != date.today().isoformat()
+                            or row['ts_code'][:6] not in bse_membership['listings']):
+                        raise XiaodefaError('current membership evidence required for unknown listing date')
+                    continue
                 if row.get('ts_code') in not_listed:
                     continue
                 try:
@@ -1335,6 +1367,7 @@ class TushareHistoryCollector:
                     'version': hashlib.sha256(_json(snapshot).encode()).hexdigest(),
                     'listing_corrections': corrections,
                     'listing_membership': {'as_of': date.today().isoformat(), 'not_listed': not_listed,
+                        'membership_only': sorted(membership_only), 'historical_listing_dates_complete': not membership_only,
                         'szse': {k:v for k,v in (membership or {}).items() if k!='listings'},
                         'sse': {k:v for k,v in (sh_membership or {}).items() if k!='listings'},
                         'bse': {k:v for k,v in (bse_membership or {}).items() if k!='listings'}}
@@ -1403,11 +1436,14 @@ class TushareHistoryCollector:
         if self._is_done("stock_basic", CHECKPOINT_DATE, force):
             return 0
         self._checkpoint("stock_basic", CHECKPOINT_DATE, "running", attempts=1)
+        self._force_reference = force
         try:
             return self._collect_reference("stock_basic")
         except Exception as exc:
             self._checkpoint("stock_basic", CHECKPOINT_DATE, "error", attempts=1, error=str(exc))
             raise
+        finally:
+            self._force_reference = False
 
     def _applicable_codes(self, codes, trade_date, dataset=None):
         known = {r[0] for r in self.store.conn.execute("SELECT ts_code FROM tushare_stock_basic").fetchall()}

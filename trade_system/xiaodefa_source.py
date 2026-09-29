@@ -147,14 +147,17 @@ class XiaodefaClient:
                 else self.query_rows(api_name, params, fields, _deadline=deadline))
 
     def query_all(self, api_name, *, page_size=DEFAULT_PAGE_SIZE,
-                  max_rows=MAX_ROWS_SAFETY, on_page=None, **params):
+                  max_rows=MAX_ROWS_SAFETY, on_page=None, total_timeout=None, **params):
         if page_size <= 0 or max_rows <= 0:
             raise XiaodefaError("positive pagination budget required")
-        deadline = time.monotonic() + self.timeout
+        if total_timeout is not None and (not isinstance(total_timeout, (int, float))
+                or not 0 < total_timeout <= 60):
+            raise XiaodefaError('pagination total timeout must be within 60 seconds')
+        deadline = time.monotonic() + (self.timeout if total_timeout is None else total_timeout)
         collected, seen = [], set()
         while len(collected) < max_rows:
             limit = min(page_size, max_rows-len(collected))
-            batch = self.query(api_name, limit=limit, offset=len(collected), _deadline=deadline, **params)
+            batch = self.query(api_name, limit=limit, offset=len(collected), _deadline=min(deadline, time.monotonic()+self.timeout), **params)
             if on_page is not None:
                 on_page(len(collected), batch)
             signature = json.dumps(batch,sort_keys=True,allow_nan=False)
