@@ -100,7 +100,11 @@ def store_reference(store, dataset, rows):
 
 
 def bulk_replace(con, table, rows, columns, replace_on):
-    """Replace only supplied keys; the caller owns the transaction."""
+    """Upsert supplied keys without delete/reinsert; caller owns transaction.
+
+    DuckDB's indexed deletes may retain keys until commit. Deleting a whole
+    slice and reinserting it can fail on a repeated production-size batch.
+    """
     if not rows:
         return 0
     temp = "_history_batch"
@@ -110,7 +114,16 @@ def bulk_replace(con, table, rows, columns, replace_on):
     placeholders = ",".join("?" for _ in columns)
     con.executemany(f"INSERT INTO {temp}({projection}) VALUES ({placeholders})", rows)
     join = " AND ".join(f"target.{key}=batch.{key}" for key in replace_on)
-    con.execute(f"DELETE FROM {table} AS target WHERE EXISTS (SELECT 1 FROM {temp} AS batch WHERE {join})")
-    con.execute(f"INSERT INTO {table}({projection}) SELECT {projection} FROM {temp}")
+    keys = ','.join(replace_on)
+    if con.execute(f"SELECT 1 FROM {temp} GROUP BY {keys} HAVING count(*)>1 LIMIT 1").fetchone():
+        raise ValueError('duplicate keys in replacement batch')
+    if con.execute(f"SELECT 1 FROM {temp} WHERE " + ' OR '.join(f'{k} IS NULL' for k in replace_on)
+                   + ' LIMIT 1').fetchone():
+        raise ValueError('null keys in replacement batch')
+    assignments = ','.join(f'{col}=batch.{col}' for col in columns if col not in replace_on)
+    if assignments:
+        con.execute(f"UPDATE {table} AS target SET {assignments} FROM {temp} AS batch WHERE {join}")
+    con.execute(f"INSERT INTO {table}({projection}) SELECT {','.join('batch.'+c for c in columns)} "
+                f"FROM {temp} AS batch WHERE NOT EXISTS (SELECT 1 FROM {table} AS target WHERE {join})")
     con.execute(f"DROP TABLE {temp}")
     return len(rows)

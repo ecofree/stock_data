@@ -79,6 +79,66 @@ def test_ths_complete_aggregate_replaces_slice_and_preserves_unknown_buckets(tmp
 
 
 
+def test_official_bse_member_applicability_requires_complete_dated_receipt(tmp_path):
+    import hashlib
+    import json
+    from trade_system.schema import init_schema
+    with MultiSourceStore(tmp_path/'bse-members.duckdb') as store:
+        _ths_fixture(store)
+        con = store.con
+        init_schema(con)
+        con.execute('CREATE OR REPLACE VIEW v_default_concept_daily AS SELECT * FROM fixture_catalog')
+        con.execute('CREATE OR REPLACE VIEW v_default_concept_stock_history AS SELECT * FROM fixture_members')
+        con.execute("INSERT INTO fixture_members VALUES ('2026-09-11','THS-A','920128'),('2026-09-11','THS-A','920157')")
+        con.execute('UPDATE fixture_catalog SET stock_count=4')
+        con.execute("INSERT INTO tushare_stock_basic(ts_code,stock_code,list_date) VALUES "
+                    "('000001.SZ','000001','2000-01-01'),('000002.SZ','000002','2000-01-01'),"
+                    "('920128.BJ','920128','2024-11-29')")
+        rows = con.execute('SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date '
+                           'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
+        reference = json.dumps(dict(scope=['L','D'], version=hashlib.sha256(json.dumps(
+            rows,ensure_ascii=False,default=str,separators=(',',':')).encode()).hexdigest()))
+        con.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json,payload_hash,observed_at) "
+                    "VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,?,'2026-09-11 16:00:00')",
+                    [reference,hashlib.sha256(reference.encode()).hexdigest()])
+        official = dict(as_of='2026-09-11',source_session='2026-09-11',recordcount=101,
+            source='https://www.bse.cn/nqxxController/nqxxCnzq.do',
+            listings={**{f'920{i:03}':'20200101' for i in range(100)},'920128':'20241129'},
+            pages=[dict(page=i,sha256=hashlib.sha256(str(i).encode()).hexdigest()) for i in range(6)])
+        def receipt(payload, *, tamper=False):
+            con.execute("DELETE FROM multi_source_observation WHERE data_type='bse_listing_membership'")
+            raw=json.dumps(payload)
+            con.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json,payload_hash,observed_at) "
+                        "VALUES ('bse_listing_membership','bse','qualified',?,?,'2026-09-11 16:01:00')",
+                        [raw,'bad' if tamper else hashlib.sha256(raw.encode()).hexdigest()])
+        def evaluate():
+            return collector._publish_ths_aggregate(store,'2026-09-11',now=datetime(2026,9,11,17))
+        receipt(official)
+        report=evaluate()
+        assert report['member_applicability']['excluded']=={'920157':'dated_official_not_listed'}
+        assert report['missing_stock_examples']==['920128'] and not report['promoted']
+        assert report['member_applicability']['receipt_sha256']
+        assert con.execute('SELECT count(*) FROM fixture_members').fetchone()[0]==4
+        for patch in [dict(source_session='2026-09-10'),dict(as_of='2026-09-10'),
+                      dict(pages=official['pages'][:-1]),dict(recordcount=102),
+                      dict(source='https://unverified.example/listings')]:
+            receipt({**official,**patch})
+            invalid=evaluate()
+            assert not invalid['member_applicability']['excluded']
+            assert invalid['missing_stock_examples']==['920128','920157']
+        receipt(official,tamper=True)
+        assert not evaluate()['member_applicability']['excluded']
+        receipt(official)
+        for code in ['920128','920157']:
+            con.execute("INSERT INTO multi_source_stock_flow(source_date,stock_code,main_net,provider,origin_provider,"
+                        "source_api,field_mapping_version,flow_definition,amount_unit,fetched_at,is_stale) "
+                        "SELECT source_date,?,20,provider,origin_provider,source_api,field_mapping_version,"
+                        "flow_definition,amount_unit,fetched_at,is_stale FROM multi_source_stock_flow LIMIT 1",[code])
+        report=evaluate()
+        assert report['promoted'] and not report['member_applicability']['excluded']
+        assert report['required_stocks']==4  # Conflicting flow never shrinks membership.
+
+
 @pytest.mark.parametrize('fault,status',[
     ("DELETE FROM multi_source_stock_flow WHERE stock_code='000002'",'partial_stock_flow'),
     ("UPDATE multi_source_stock_flow SET main_net='NaN' WHERE stock_code='000002'",'partial_stock_flow'),

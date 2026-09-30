@@ -49,6 +49,61 @@ def _table_exists(con: Any, name: str) -> bool:
     ).fetchone()[0])
 
 
+def dated_exchange_membership(con, exchange, trade_date, *, now):
+    """Read a complete retained official inventory, with no identity guessing.
+
+    Absence is evidence only for that exchange/session and complete capture.
+    A corrupt/newer receipt must not silently fall back to an older inventory.
+    """
+    contracts = {
+        'SZ': ('szse', 'https://www.szse.cn/api/report/ShowReport', 1000),
+        'SH': ('sse', 'https://query.sse.com.cn/sseQuery/commonQuery.do', 1000),
+        'BJ': ('bse', 'https://www.bse.cn/nqxxController/nqxxCnzq.do', 100),
+    }
+    provider, source, floor = contracts[exchange]
+    if not _table_exists(con, 'multi_source_observation'):
+        return None
+    receipt = con.execute(
+        "SELECT observed_at,payload_json,payload_hash,status FROM multi_source_observation "
+        "WHERE data_type=? AND provider=? AND observed_at<=? "
+        "ORDER BY observed_at DESC LIMIT 1",
+        [provider+'_listing_membership', provider, now]).fetchone()
+    if (not receipt or receipt[3] != 'qualified'
+            or receipt[0].date().isoformat() != trade_date
+            or hashlib.sha256(receipt[1].encode()).hexdigest() != receipt[2]):
+        return None
+    def digest(value):
+        return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+    try:
+        payload = json.loads(receipt[1])
+        listings = payload['listings']
+        if (payload.get('as_of') != trade_date or payload.get('source') != source
+                or not isinstance(listings, dict) or len(listings) < floor
+                or type(payload.get('recordcount')) is not int or payload['recordcount'] != len(listings)
+                or any(len(code) != 6 or not code.isascii() or not code.isdigit() for code in listings)):
+            return None
+        if exchange == 'SZ':
+            complete = digest(payload.get('xlsx_sha256')) and digest(payload.get('metadata_sha256'))
+        elif exchange == 'SH':
+            parts = payload.get('receipts', [])
+            complete = (len(parts) == 2 and {p.get('board') for p in parts} == {'1', '8'}
+                        and all(type(p.get('rows')) is int and p['rows'] > 0
+                                and digest(p.get('sha256')) for p in parts)
+                        and sum(p['rows'] for p in parts) == len(listings))
+        else:
+            pages = payload.get('pages', [])
+            complete = (payload.get('source_session') == trade_date and bool(pages)
+                        and [p.get('page') for p in pages] == list(range(len(pages)))
+                        and all(digest(p.get('sha256')) for p in pages)
+                        and 20*(len(pages)-1) < len(listings) <= 20*len(pages))
+        if not complete:
+            return None
+        return dict(exchange=exchange, as_of=trade_date, codes=set(listings),
+                    receipt_sha256=receipt[2], received_at=receipt[0].isoformat())
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def qualified_membership_snapshot(con: Any, trade_date: str):
     """Select only a quality-gated snapshot at or before the observation date.
 

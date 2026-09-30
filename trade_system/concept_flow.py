@@ -11,6 +11,7 @@ from trade_system.ths_quality import (
     qualified_membership_snapshot as _ths_membership_snapshot,
     THS_MEMBERSHIP_MAX_AGE_DAYS,
     qualified_stock_reference,
+    dated_exchange_membership,
 )
 
 
@@ -123,22 +124,14 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
             inapplicable.update({code[:6]: 'dated_official_not_listed' for code in reference['not_listed']})
         for kind, code, raw, digest, observed in con.execute(
                 "SELECT data_type,asset_code,payload_json,payload_hash,observed_at FROM multi_source_observation "
-                "WHERE ((data_type='stock_listing_reference' AND provider='hithink') OR "
-                "(data_type='szse_listing_membership' AND provider='szse' AND status='qualified')) "
+                "WHERE (data_type='stock_listing_reference' AND provider='hithink') "
                 "AND observed_at BETWEEN ? AND ? "
                 "QUALIFY row_number() OVER(PARTITION BY data_type,asset_code ORDER BY observed_at DESC)=1",
                 [now-timedelta(days=1),now]).fetchall():
             if hashlib.sha256(raw.encode()).hexdigest() != digest:
                 continue
             evidence = json.loads(raw)
-            if kind == 'szse_listing_membership':
-                listings = evidence.get('listings', {})
-                if (evidence.get('as_of') == trade_date and evidence.get('recordcount') == len(listings)
-                        and len(listings) >= 1000 and evidence.get('xlsx_sha256') and evidence.get('metadata_sha256')):
-                    inapplicable.update({s:'dated_official_not_listed' for stocks in actual.values() for s in stocks
-                                         if s.startswith(('0','3')) and s not in listings})
-                    applicability_receipts.append(digest)
-            else:
+            if kind == 'stock_listing_reference':
                 items, stamp = evidence.get('item', []), evidence.get('timestamp')
                 if (len(items) != 1 or items[0].get('thscode') != code or items[0].get('asset_type') != 'a-share'
                         or not isinstance(stamp,(int,float)) or not 0 <= now.timestamp()-stamp/1000 <= 86400):
@@ -149,6 +142,12 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
                     applicability_receipts.append(digest)
                 # Native end_date is contract expiry, not a stock delisting
                 # date. Only the qualified stock lifecycle above proves exit.
+        for exchange, prefixes in [('SZ', ('0', '3')), ('SH', ('6',)), ('BJ', ('4', '8', '92'))]:
+            official = dated_exchange_membership(con, exchange, trade_date, now=now)
+            if official:
+                inapplicable.update({s: 'dated_official_not_listed' for stocks in actual.values() for s in stocks
+                                     if s.startswith(prefixes) and s not in official['codes']})
+                applicability_receipts.append(official['receipt_sha256'])
         # Conflicting same-day trading evidence must not shrink the denominator.
         inapplicable = {code: reason for code, reason in inapplicable.items() if code not in flows}
     actual = {concept: stocks - inapplicable.keys() for concept, stocks in actual.items()}
@@ -160,6 +159,7 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
     missing = sorted(required_stocks-set(flows))
     report.update(required_stocks=len(required_stocks),
                   missing_stock_count=len(missing), missing_stock_examples=missing[:20],
+                  missing_stock_reasons={s: 'native_flow_unavailable' for s in missing},
                   complete_concepts=sum(stocks <= flows.keys() for stocks in actual.values()),
                   flow_input_sha256=hashlib.sha256(json.dumps(
                       [flows[k] for k in sorted(required_stocks & flows.keys())],
@@ -209,6 +209,7 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
                                   generated_at=now.isoformat(),
                                   original_member_codes=sorted(original_members[code]),
                                   applicability_exclusions={s: inapplicable[s] for s in original_members[code] if s in inapplicable},
+                                  applicability_receipt_sha256=sorted(set(applicability_receipts)),
                                   reference_version=reference['version'] if reference else None,
                                   member_stock_count=len(inputs), expected_member_count=len(inputs),
                                   membership_snapshot_date=str(snap),

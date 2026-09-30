@@ -13,6 +13,32 @@ class FakeClient:
         return [{"ts_code": "000001.SZ", "trade_date": "20260714", "adj_factor": 139.008}]
 
 
+def test_large_repeated_valuation_batch_preserves_keys_clocks_and_rollback(tmp_path):
+    from datetime import datetime
+    from trade_system.tushare_store import bulk_replace
+    with TushareHistoryCollector(tmp_path/'repeat.duckdb', client=FakeClient()) as h:
+        con = h.store.conn
+        columns = ['ts_code','date','pb','total_mv','circ_mv','fetched_at']
+        stamp = datetime(2026,7,14,17,0)
+        rows = [(f'{i:06d}.SZ','2026-07-14',None,100.,50.,stamp) for i in range(1,5601)]
+        for values in (rows, [(r[0],r[1],-2.,*r[3:]) for r in rows]):
+            con.execute('BEGIN')
+            assert bulk_replace(con,'tushare_daily_basic',values,columns,['ts_code','date']) == 5600
+            con.execute('COMMIT')
+        assert con.execute('SELECT count(*),count(DISTINCT ts_code),min(pb),max(pb),'
+                           'min(fetched_at),max(fetched_at) FROM tushare_daily_basic').fetchone() == (
+                               5600,5600,-2.,-2.,stamp,stamp)
+        con.execute('BEGIN')
+        bulk_replace(con,'tushare_daily_basic',rows,columns,['ts_code','date'])
+        con.execute('ROLLBACK')
+        assert con.execute('SELECT count(*) FROM tushare_daily_basic WHERE pb=-2').fetchone()[0] == 5600
+        con.execute('BEGIN')
+        with pytest.raises(ValueError,match='duplicate keys'):
+            bulk_replace(con,'tushare_daily_basic',[rows[0],rows[0]],columns,['ts_code','date'])
+        con.execute('ROLLBACK')
+        assert con.execute('SELECT count(*) FROM tushare_daily_basic WHERE pb=-2').fetchone()[0] == 5600
+
+
 def test_adj_factor_date_snapshot_is_persisted(tmp_path):
     db = tmp_path / "history.duckdb"
     with TushareHistoryCollector(db, client=FakeClient()) as collector:
@@ -596,6 +622,7 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
                 stop_diagnostic('permission_denied')
                 raise XiaodefaError('fixture denied')
             if api == 'balancesheet':
+                assert params['report_type'] == '1'
                 return [dict(ts_code=params['ts_code'],report_type='1',end_date='20260331',
                     f_ann_date='20260430',total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=1000000)]
             return [dict(params, total_share=100, float_share=50, pre_close=2,
@@ -618,6 +645,13 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         financial = c.collect_valuation_inputs('20260701', codes)
         assert financial['transport_budget']['attempts'] == 2
         assert len(alternative.calls) == 5
+        inventories = [json.loads(r[0]) for r in c.store.conn.execute(
+            "SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='tushare_balancesheet_inventory_snapshot'").fetchall()]
+        assert len(inventories) == 2
+        assert all(v['scope'] == 'latest_consolidated_in_requested_interval'
+                   and v['requested_report_types'] == ['1']
+                   and v['complete_revision_inventory'] is False for v in inventories)
         reused = c.collect_valuation_inputs('20260701', codes[:2])
         assert reused['transport_budget']['attempts'] == 0 and len(alternative.calls) == 5
         assert all(r['status']=='retained_statement_reused' for r in reused['requests'].values())
@@ -626,6 +660,20 @@ def test_full_basic_response_with_only_identity_is_not_complete(tmp_path):
         assert denied['transport_budget']['attempts'] == 1
         assert denied['transport_budget']['stopped'] == 'permission_denied'
         assert len(alternative.calls) == 6
+        # An old successful default-type request mislabeled as all report types
+        # cannot certify completeness or qualify for the new explicit cache.
+        import hashlib
+        for raw, in c.store.conn.execute("SELECT payload_json FROM multi_source_observation "
+                "WHERE data_type='tushare_balancesheet_inventory_snapshot'").fetchall():
+            old = json.loads(raw)
+            old['params'].pop('report_type')
+            old['scope'] = 'all_report_types_in_requested_interval'
+            encoded = json.dumps(old)
+            c.store.conn.execute("UPDATE multi_source_observation SET payload_json=?,payload_hash=? "
+                "WHERE payload_json=?", [encoded,hashlib.sha256(encoded.encode()).hexdigest(),raw])
+        refused = c.collect_valuation_inputs('20260701', codes[:2])
+        assert refused['transport_budget']['attempts'] == 1
+        assert refused['transport_budget']['stopped'] == 'permission_denied'
 
 
 def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_path):

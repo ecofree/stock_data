@@ -243,6 +243,7 @@ class TushareHistoryCollector:
         self.moneyflow_page_size = max(100, min(int(moneyflow_page_size), 1000))
         self.budget_seconds = max(1.0, float(budget_seconds))
         self.started = time.monotonic()
+        self._input_received = {}
         # Per-table operations, not unique instruments or network requests.
         # Only transaction owners may add committed writes. Receipts, schema,
         # checkpoints and certifications are deliberately outside these scopes.
@@ -345,9 +346,11 @@ class TushareHistoryCollector:
             if diagnostic_state.get()['stopped'] or not self._budget_left():
                 results[code] = {'status': 'not_requested_budget_or_stop'}
                 continue
-            # A lone original statement cannot certify a revision inventory.
-            # Reuse only a completed all-report-type request for this interval.
-            params = {'ts_code': code, 'start_date': f'{session.year-1}0101', 'end_date': _ymd(trade_date)}
+            # The documented default is type 1 (latest consolidated), NOT all
+            # report types. Request it explicitly and never certify a complete
+            # revision inventory merely because pagination finished.
+            params = {'ts_code': code, 'start_date': f'{session.year-1}0101',
+                      'end_date': _ymd(trade_date), 'report_type': '1'}
             inventory = self.store.conn.execute(
                 "SELECT payload_json,payload_hash FROM multi_source_observation "
                 "WHERE data_type='tushare_balancesheet_inventory_snapshot' AND provider=? "
@@ -357,16 +360,18 @@ class TushareHistoryCollector:
             completed = (json.loads(inventory[0]) if inventory and
                          hashlib.sha256(inventory[0].encode()).hexdigest() == inventory[1] else {})
             retained = self.valuation_completion_report(trade_date, [code])['rows'][code]
-            if completed.get('params') == params and completed.get('scope') == 'all_report_types_in_requested_interval':
+            if (completed.get('params') == params
+                    and completed.get('scope') == 'latest_consolidated_in_requested_interval'):
                 results[code] = {'status': 'retained_statement_reused',
                                  'financial_input': retained.get('financial_input'), 'inventory_sha256': inventory[1]}
                 continue
             try:
                 rows = self._read_rows('balancesheet', params, fields)
-                if any(r.get('ts_code') != code for r in rows):
-                    raise XiaodefaError('financial statement identity mismatch')
+                if any(r.get('ts_code') != code or str(r.get('report_type')) != '1' for r in rows):
+                    raise XiaodefaError('financial statement identity/report type mismatch')
                 self._record_snapshot('balancesheet_inventory', {'params': params, 'rows': rows,
-                    'scope': 'all_report_types_in_requested_interval',
+                    'scope': 'latest_consolidated_in_requested_interval',
+                    'requested_report_types': ['1'], 'complete_revision_inventory': False,
                     'qualification': 'request_completed_not_latest_applicable_statement_certification'})
                 results[code] = {'status': 'received_not_certified', 'rows': len(rows)}
             except Exception as exc:
@@ -961,14 +966,17 @@ class TushareHistoryCollector:
         # later page or coverage validation fails. Reuse the existing receipt table.
         def record(offset, rows):
             self._count_product(api, parsed=len(rows))
+            arrival = datetime.now()
+            for row in rows:
+                self._input_received[(api, row.get('ts_code'), row.get('trade_date'))] = arrival
             payload = _json({"source": "tushare", "delivery": self._provider_name(self.client),
                              "api": api, "params": params, "offset": offset, "rows": rows})
             self.store.conn.execute(
                 "INSERT INTO multi_source_observation "
-                "(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 ["tushare_" + api, "receipt", params.get("ts_code"), self._provider_name(self.client),
-                 "received_unverified", payload, hashlib.sha256(payload.encode()).hexdigest()])
+                 "received_unverified", payload, hashlib.sha256(payload.encode()).hexdigest(), arrival])
         from trade_system.http_transport import request_budget
         remaining = self.started + self.budget_seconds - time.monotonic()
         if remaining <= 0:
@@ -1506,6 +1514,9 @@ class TushareHistoryCollector:
         ) for r in rows):
             raise XiaodefaError("daily_basic contains no qualified fields")
         out, columns = market_batch(dataset, rows, self._provider_name(self.client))
+        out = [(*row, self._input_received.get((dataset, row[0], _ymd(trade_date)), datetime.now()))
+               for row in out]
+        columns.append('fetched_at')
         self.store.conn.execute("BEGIN TRANSACTION")
         try:
             count = bulk_replace(self.store.conn, "tushare_" + dataset, out, columns, ["ts_code", "date"])
@@ -1571,8 +1582,14 @@ class TushareHistoryCollector:
             ('tushare_moneyflow', 'date', self.sync_stock_flow) if dataset == 'moneyflow'
             else ('tushare_moneyflow_industry', 'trade_date', self.sync_sector_flow))
         with self._transaction():
-            self.store.conn.execute(f'DELETE FROM {table} WHERE {day}=?', [_iso(trade_date)])
+            api = 'moneyflow' if dataset == 'moneyflow' else 'moneyflow_ind_dc'
+            code_pos = columns.index('ts_code')
+            out = [(*row, self._input_received.get((api, row[code_pos], _ymd(trade_date)), datetime.now()))
+                   for row in out]
+            columns = [*columns, 'fetched_at']
             raw_count = bulk_replace(self.store.conn, table, out, columns, keys)
+            self.store.conn.execute(f'DELETE FROM {table} WHERE {day}=? AND ts_code NOT IN (SELECT unnest(?))',
+                                    [_iso(trade_date), [r[code_pos] for r in out]])
             if dataset == 'moneyflow' and self._expected_stock_codes(trade_date, dataset) - self._covered_codes(dataset, trade_date):
                 raise XiaodefaError('moneyflow coverage incomplete; missing values are not qualified facts')
             count = sync(trade_date, atomic=False)
@@ -1662,15 +1679,13 @@ class TushareHistoryCollector:
         if not out:
             return 0
         with self._transaction(atomic):
-            self.store.conn.execute(
-                "DELETE FROM multi_source_stock_flow WHERE source_date=? AND provider='tushare'",
-                [_iso(trade_date)],
-            )
             count = bulk_replace(self.store.conn,
                 "multi_source_stock_flow", out,
                 ["source_date", "stock_code", "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net", "provider", "amount_unit", "flow_definition", "source_api", "origin_provider", "field_mapping_version", "is_stale", "raw_json", "fetched_at"],
                 ["source_date", "stock_code", "provider"],
             )
+            self.store.conn.execute("DELETE FROM multi_source_stock_flow WHERE source_date=? AND provider='tushare' "
+                "AND stock_code NOT IN (SELECT unnest(?))", [_iso(trade_date), [r[1] for r in out]])
         if atomic:
             self._count_product('stock_flow_projection', written=count)
         return count
@@ -1697,15 +1712,14 @@ class TushareHistoryCollector:
         if not out:
             return 0
         with self._transaction(atomic):
-            self.store.conn.execute(
-                "DELETE FROM multi_source_sector_flow WHERE source_date=? AND provider IN ('tushare','tushare_sector_full')",
-                [_iso(trade_date)],
-            )
             count = bulk_replace(self.store.conn,
                 "multi_source_sector_flow", out,
                 ["source_date", "sector_code", "sector_name", "main_net", "super_net", "large_net", "mid_net", "small_net", "change_pct", "provider", "sector_type", "amount_unit", "is_stale", "raw_json", "fetched_at"],
                 ["source_date", "sector_code", "provider"],
             )
+            self.store.conn.execute("DELETE FROM multi_source_sector_flow WHERE source_date=? AND "
+                "(provider='tushare' OR (provider='tushare_sector_full' AND sector_code NOT IN (SELECT unnest(?))))",
+                [_iso(trade_date), [r[1] for r in out]])
         if atomic:
             self._count_product('sector_flow_projection', written=count)
         return count
