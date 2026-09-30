@@ -173,9 +173,58 @@ def test_intraday_capital_flow_view_feeds_strength_evidence(tmp_path):
     finally:
         con.close()
 
-    assert capital[:7] == (3_000_000, 1_000_000, 2_000_000, 73.5, 100, 1, 250)
+    # An old unlabelled KPL series cannot certify units/semantics for scoring.
+    assert capital[:7] == (None, None, None, 73.5, 100, 1, 250)
     assert capital[7] > 0
     assert "advanced_zjmm_min" in capital[8]
     assert strength[0] == capital[7]
     assert "advanced_main_activity_kline" in strength[1]
     assert strength[2] >= capital[7]
+
+
+def test_kpl_shared_projection_preserves_missing_and_rejects_mixed_or_tampered_sequence(tmp_path, monkeypatch):
+    import json
+    from trade_system import flow_contract
+    from trade_system.multi_source_store import MultiSourceStore
+    digest = 'a'*64
+    monkeypatch.setitem(flow_contract.VERIFIED_KPL_FLOW_PRODUCTS, digest, dict(product='/advanced/zjmm-min',
+        unit='yuan',quantity_semantics='cumulative_snapshot',flow_definition='fixture_main_orders_net',
+        valid_from='2026-07-09',valid_through='2026-07-09'))
+    store, db = _store(tmp_path)
+    envelope = dict(day='20260709',amount_unit='yuan',quantity_semantics='cumulative_snapshot',
+                    contract_sha256=digest,data=[dict(time='09:31',main_net=10),dict(time='09:32',main_net=25)])
+    client = FakeClient({'/advanced/zjmm-min':envelope})
+    try:
+        assert collect_advanced_zjmm_min(client,store,'2026-07-09',['000001']) == 2
+        assert store.conn.execute('SELECT DISTINCT super_net_inflow,big_net_inflow FROM advanced_zjmm_min').fetchall() == [(None,None)]
+        rows = store.conn.execute(flow_contract.kpl_flow_projection_sql(store.conn)).fetchall()
+        assert rows[0][2:5] == (25,None,None)  # NOT 10+25, and unknown is not zero.
+    finally:
+        store.close()
+    with MultiSourceStore(db) as multi:
+        assert multi.sync_kpl_intraday_flow('2026-07-09') == 1
+        assert multi.con.execute('SELECT main_net,super_net,large_net FROM multi_source_stock_flow').fetchone() == (25,None,None)
+    build_normalized_views(db)
+    with duckdb.connect(str(db)) as con:
+        assert con.execute('SELECT zjmm_main_net_inflow FROM v_intraday_capital_flow_evidence').fetchone()[0] == 25
+        con.execute("UPDATE advanced_zjmm_min SET quantity_semantics='increment' WHERE time='09:31'")
+        assert con.execute(flow_contract.kpl_flow_projection_sql(con)).fetchall() == []
+        con.execute("UPDATE advanced_zjmm_min SET quantity_semantics='cumulative_snapshot',main_net_inflow=999 WHERE time='09:31'")
+        assert con.execute(flow_contract.kpl_flow_projection_sql(con)).fetchall() == []
+        con.execute("UPDATE advanced_zjmm_min SET main_net_inflow=10 WHERE time='09:31'")
+        con.execute("UPDATE advanced_zjmm_min SET raw_json='{}' WHERE time='09:32'")
+        assert con.execute(flow_contract.kpl_flow_projection_sql(con)).fetchall() == []
+    with MultiSourceStore(db) as multi:
+        assert multi.sync_kpl_intraday_flow('2026-07-09') == 0
+        assert multi.con.execute('SELECT is_stale FROM multi_source_stock_flow').fetchone()[0]
+    store = DuckDBStore(str(db))
+    try:
+        monkeypatch.setitem(flow_contract.VERIFIED_KPL_FLOW_PRODUCTS,digest,
+            {**flow_contract.VERIFIED_KPL_FLOW_PRODUCTS[digest],'quantity_semantics':'increment'})
+        envelope.update(quantity_semantics='increment',sequence_complete=True)
+        assert collect_advanced_zjmm_min(client,store,'2026-07-09',['000001']) == 2
+        assert store.conn.execute(flow_contract.kpl_flow_projection_sql(store.conn)).fetchone()[2] == 35
+        raw = store.conn.execute('SELECT raw_json FROM advanced_zjmm_min LIMIT 1').fetchone()[0]
+        assert json.loads(raw)['envelope']['sequence_complete'] is True
+    finally:
+        store.close()

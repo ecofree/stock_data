@@ -115,7 +115,9 @@ def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
                     or available.astimezone(market_zone).date() > day):
                 reasons.append('input_not_available_at_observation')
             if field in {'price', 'total_share', 'float_share', 'total_mv', 'circ_mv'} and source_day != day:
-                reasons.append('same_session_input_required')
+                if not (field == 'price' and item.get('semantic') == 'suspension_reference'
+                        and item.get('price_date') == source_day.isoformat()):
+                    reasons.append('same_session_input_required')
             if not reasons:
                 clocks.append(received)
                 available_clocks.append(available)
@@ -186,7 +188,10 @@ def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
                 result['values'].pop('circ_mv')
     if all(f in values for f in ('equity', 'other_equity')):
         if any(inputs['equity'].get(f) != inputs['other_equity'].get(f)
-               for f in ('source_date', 'receipt_sha256')):
+               for f in ('source_date',)) or (
+                inputs['equity'].get('receipt_sha256') != inputs['other_equity'].get('receipt_sha256')
+                and (not inputs['equity'].get('statement_identity') or
+                     inputs['equity'].get('statement_identity') != inputs['other_equity'].get('statement_identity'))):
             failures['equity'] = ['inconsistent_financial_statement']
             values.pop('equity')
     if all(f in values for f in ('equity', 'other_equity')) and 'total_mv' in result['values']:
@@ -202,6 +207,10 @@ def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
                 result['field_status']['pb'] = ('negative_adjusted_equity' if denominator < 0 else 'derived')
     for field in ('pb', 'total_mv', 'circ_mv', 'pe'):
         result['field_status'].setdefault(field, 'unknown')
+    result['value_screen_eligible'] = result['field_status']['pb'] == 'derived'
+    result['valuation_risk'] = ('negative_equity' if result['field_status']['pb'] == 'negative_adjusted_equity'
+                               else 'undefined_pb' if result['field_status']['pb'] == 'undefined_zero_adjusted_equity'
+                               else None)
     result['input_received_at_min'] = min(clocks).isoformat() if clocks else None
     result['input_received_at_max'] = max(clocks).isoformat() if clocks else None
     result['input_available_at_min'] = min(available_clocks).isoformat() if available_clocks else None
@@ -209,6 +218,33 @@ def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
     result['status'] = ('derived_core_fields' if all(f in result['values'] for f in ('pb', 'total_mv', 'circ_mv'))
                         and not failures else 'incomplete')
     return result
+
+
+def _validate_valuation_document(payload):
+    """Hash-bound official file plus explicit extraction/review provenance.
+
+    This checks integrity and scope, not automatic proof of financial facts.
+    The named reviewer remains responsible for reading the cited pages.
+    """
+    from urllib.parse import urlparse
+    document = payload['document']
+    url = urlparse(document['url'])
+    if (url.scheme != 'https' or url.hostname not in
+            {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'}):
+        raise ValueError('official valuation document origin required')
+    path = Path(document['path'])
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != document['sha256']:
+        raise ValueError('official valuation document changed')
+    if document.get('format') == 'pdf' and not raw.startswith(b'%PDF-'):
+        raise ValueError('official valuation PDF format mismatch')
+    for field in payload.get('fields', {}).values():
+        if (not isinstance(field.get('page'), int) or field['page'] < 1
+                or not str(field.get('excerpt','')).strip()):
+            raise ValueError('dated page extraction required')
+    if not payload.get('ts_code') or not payload.get('as_of'):
+        raise ValueError('official document dated identity required')
+    return payload
 
 
 class TushareHistoryCollector:
@@ -293,7 +329,7 @@ class TushareHistoryCollector:
             raise XiaodefaError(f"empty {dataset} response for {_iso(trade_date)}")
         expected = self._expected_stock_codes(trade_date, dataset)
         observed = {r["ts_code"] if isinstance(r, dict) else r[0] for r in rows}
-        reference = self._reference_version() or {}
+        reference = self._reference_version(trade_date) or {}
         if reference.get('membership_date') == _iso(trade_date) and observed & set(reference.get('not_listed', [])):
             raise XiaodefaError('price response conflicts with official listing membership')
         if dataset == 'daily_basic':
@@ -398,7 +434,7 @@ class TushareHistoryCollector:
         cutoff = datetime.fromisoformat(observed_at)
         if cutoff.tzinfo is None:
             raise ValueError('explicit observation timezone required')
-        if review.get('schema') != 'reviewed_valuation_inputs_v1' or review.get('trade_date') != day:
+        if review.get('schema') not in {'reviewed_valuation_inputs_v1','reviewed_valuation_inputs_v2'} or review.get('trade_date') != day:
             raise ValueError('valuation review schema/session mismatch')
         reviewed = datetime.fromisoformat(review['reviewed_at'])
         if not str(review.get('reviewed_by', '')).strip() or reviewed.tzinfo is None or reviewed > cutoff:
@@ -417,16 +453,33 @@ class TushareHistoryCollector:
             if not valid:
                 raise ValueError('review source receipt absent, changed or received after review')
             raw, arrival = min(valid, key=lambda item: item[1])
-            documents[digest] = (json.loads(raw), arrival.isoformat())
+            payload = json.loads(raw)
+            if payload.get('schema') == 'official_valuation_document_v1':
+                _validate_valuation_document(payload)
+            documents[digest] = (payload, arrival.isoformat())
         inventory = review['financial_inventory']
-        if (inventory.get('as_of') != day or inventory.get('scope') != 'all_published_consolidated_revisions'
+        scopes = {'all_published_consolidated_revisions'}
+        if review['schema'] == 'reviewed_valuation_inputs_v2':
+            scopes.add('latest_applicable_consolidated_statement_and_corrections')
+        if (inventory.get('as_of') != day or inventory.get('scope') not in scopes
                 or not inventory.get('selection_reason') or not inventory.get('document_receipts')
                 or any(h not in documents for h in inventory['document_receipts'])
                 or inventory.get('selected_statement_receipt') not in documents
                 or inventory.get('selected_statement_receipt') not in inventory.get('statement_receipts', [])
                 or any(h not in documents for h in inventory.get('statement_receipts', []))):
             raise ValueError('complete dated financial revision inventory required')
+        if inventory.get('scope') == 'latest_applicable_consolidated_statement_and_corrections':
+            period = _iso(inventory['selected_period'])
+            catalogues = [documents[h][0] for h in inventory['document_receipts']]
+            if not any(p.get('schema') == 'official_valuation_document_v1'
+                and p.get('kind') == 'disclosure_inventory' and p.get('ts_code') == code
+                and p.get('as_of') == day and p.get('catalogue_complete') is True
+                and p.get('window_from','9999-12-31') <= period
+                and p.get('window_through') == day and p.get('document',{}).get('sha256')
+                for p in catalogues):
+                raise ValueError('selected statement and dated correction catalogue required')
         inputs = json.loads(_json(review['inputs']))
+        statement_identities = {}
         for field, item in inputs.items():
             digest = item['receipt_sha256']
             if digest not in documents:
@@ -436,6 +489,35 @@ class TushareHistoryCollector:
             if field in {'suspension', 'corporate_actions'}:
                 if not item.get('review_basis'):
                     raise ValueError('documented suspension/action interpretation required')
+                continue
+            if payload.get('schema') == 'official_valuation_document_v1':
+                if payload['ts_code'] != code:
+                    raise ValueError('official extraction identity mismatch')
+                extracted = payload.get('fields', {}).get(field, {})
+                if item.get('evidence_kind') == 'evidenced_absence_zero':
+                    absence = payload.get('other_equity_absence_review', {})
+                    components = absence.get('equity_components', [])
+                    amounts = [_num(c.get('value')) for c in components]
+                    parent_value = _num(payload.get('fields',{}).get('equity',{}).get('value'))
+                    if (field != 'other_equity' or item.get('value') != 0 or extracted.get('value') is not None
+                        or not absence.get('no_instrument_disclosure') or not absence.get('equity_changes_review')
+                        or not components or any(v is None or not math.isfinite(v) for v in amounts)
+                        or parent_value is None or abs(sum(amounts)-parent_value) > 0.01
+                        or any(not c.get('page') or not c.get('excerpt') for c in components)):
+                        raise ValueError('blank field is not evidenced absence zero')
+                elif (_num(extracted.get('value')) is None or
+                      _num(extracted['value']) != _num(item.get('value'))):
+                    raise ValueError('valuation value does not match official extraction')
+                if field in {'equity','other_equity'}:
+                    statement = payload['statement']
+                    announcement, period = _iso(statement['announcement_date']), _iso(statement['period'])
+                    if (statement.get('basis') != 'consolidated' or period > announcement
+                            or announcement > day or item['source_date'] != announcement):
+                        raise ValueError('official financial period or basis mismatch')
+                    item['statement_identity'] = [code,period,announcement]
+                    statement_identities[field] = item['statement_identity']
+                elif payload.get('as_of') != day:
+                    raise ValueError('official market input validity unproved')
                 continue
             value = payload
             parent = None
@@ -454,6 +536,8 @@ class TushareHistoryCollector:
                         or _iso(parent['end_date']) > announcement or announcement > day
                         or item['source_date'] != announcement):
                     raise ValueError('financial period, announcement or field mapping mismatch')
+                item['statement_identity'] = [code,_iso(parent['end_date']),announcement]
+                statement_identities[field] = item['statement_identity']
             else:
                 if not parent.get('trade_date'):
                     raise ValueError('valuation source session required')
@@ -462,8 +546,16 @@ class TushareHistoryCollector:
                 if source_day != expected_day:
                     raise ValueError('valuation source session mismatch')
         statement = inventory['selected_statement_receipt']
+        if (inventory.get('scope') == 'latest_applicable_consolidated_statement_and_corrections'
+            and (statement_identities.get('equity', [None,None])[1] != _iso(inventory['selected_period'])
+                 or statement_identities.get('other_equity', [None,None])[1] != _iso(inventory['selected_period']))):
+            raise ValueError('selected financial period differs from valued inputs')
         if any(inputs.get(f, {}).get('receipt_sha256') != statement for f in ('equity', 'other_equity')):
-            raise ValueError('financial inputs differ from reviewed statement')
+            if (review['schema'] != 'reviewed_valuation_inputs_v2'
+                or statement_identities.get('equity') != statement_identities.get('other_equity')
+                or any(inputs.get(f,{}).get('receipt_sha256') not in inventory['statement_receipts']
+                       for f in ('equity','other_equity'))):
+                raise ValueError('financial inputs differ from reviewed statement')
         # A newer retained revision invalidates an earlier review inventory.
         for raw, digest in self.store.conn.execute(
                 "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_balancesheet'").fetchall():
@@ -473,11 +565,30 @@ class TushareHistoryCollector:
                 if row.get('ts_code') != code:
                     continue
                 announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
-                if announcement <= day and digest not in inventory.get('statement_receipts', []):
+                relevant = (inventory.get('scope') == 'all_published_consolidated_revisions'
+                            or _iso(row['end_date']) >= _iso(inventory['selected_period']))
+                if announcement <= day and relevant and digest not in inventory.get('statement_receipts', []):
                     raise ValueError('financial revision inventory omits retained statement')
+        # A same-day zero-volume vendor quote is not proof of a same-day
+        # traded close. Calling it official_close cannot bypass the suspension
+        # reference/corporate-action policy. Native same-day market values
+        # remain a separate intake path that need not use a reference price.
+        suspension = self._suspension_rows(day) or []
+        full_day_halt = any(r['ts_code'] == code and r.get('suspend_type') == 'S'
+            and r.get('suspend_timing') in (None, '') for r in suspension)
+        if (full_day_halt and 'price' in inputs
+                and inputs['price'].get('semantic') != 'suspension_reference'):
+            raise ValueError('full-day suspension requires explicit reference price policy')
         # A claimed full-day suspension cannot override observed trading.
         if inputs.get('price', {}).get('semantic') == 'suspension_reference':
-            suspension = self._suspension_rows(day) or []
+            if review['schema'] == 'reviewed_valuation_inputs_v2':
+                action_input = inputs.get('corporate_actions', {})
+                action = documents.get(action_input.get('receipt_sha256'), ({},None))[0]
+                if (action.get('ts_code') != code or action.get('window_from','9999-12-31') > inputs['price']['price_date']
+                    or action.get('window_through') != day
+                    or action.get('coverage') != 'all_price_and_share_affecting_actions'
+                    or action.get('reviewed_effect') != 'reference_price_applicable'):
+                    raise ValueError('complete dated corporate action window required')
             if not any(r['ts_code'] == code and r.get('suspend_type') == 'S'
                        and r.get('suspend_timing') in (None, '') for r in suspension):
                 raise ValueError('full-day suspension source missing')
@@ -494,17 +605,25 @@ class TushareHistoryCollector:
             if traded:
                 raise ValueError('suspension conflicts with retained trading')
         result = derive_valuation(code, day, inputs, observed_at=observed_at)
+        if (review.get('pb_policy') == 'signed_or_known_undefined_v1'
+                and review['schema'] == 'reviewed_valuation_inputs_v2'
+                and result['field_status']['pb'] == 'undefined_zero_adjusted_equity'
+                and not result['missing_inputs']
+                and all(f in result['values'] for f in ('total_mv','circ_mv'))):
+            result['status'] = 'derived_core_fields_with_known_undefined_pb'
+            result['pb_applicability'] = 'known_undefined_zero_equity'
         result['reviewed_by'] = review['reviewed_by']
         result['reviewed_at'] = review['reviewed_at']
         result['financial_inventory'] = inventory
         result['source_receipts'] = sorted(documents)
-        result['valuation_eligible'] = result['status'] == 'derived_core_fields'
+        result['valuation_eligible'] = result['status'] in {'derived_core_fields','derived_core_fields_with_known_undefined_pb'}
         # Daily-basic raw provenance is never relabelled as a provider result.
         result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'
         return result
 
     def import_valuation_reviews(self, path, expected_sha256, trade_date):
         """Explicit, hash-pinned local intake; no network or provider-row update."""
+        from zoneinfo import ZoneInfo
         raw = Path(path).read_bytes()
         if hashlib.sha256(raw).hexdigest() != expected_sha256:
             raise ValueError('valuation evidence file hash mismatch')
@@ -513,10 +632,22 @@ class TushareHistoryCollector:
         if not reviews or len({r['ts_code'] for r in reviews}) != len(reviews):
             raise ValueError('empty or duplicate valuation review scope')
         now = datetime.now(timezone.utc).isoformat()
-        results = [self._valuation_review(r, trade_date, now) for r in reviews]
-        if not all(r['valuation_eligible'] for r in results):
-            raise ValueError('valuation review inputs incomplete')
         with self._transaction(True):
+            for document in bundle.get('reviewed_source_documents', []):
+                _validate_valuation_document(document)
+                received = datetime.fromisoformat(document['received_at'])
+                if received.tzinfo is None or received > datetime.fromisoformat(now):
+                    raise ValueError('official source arrival timezone/future mismatch')
+                encoded = _json(document)
+                digest = hashlib.sha256(encoded.encode()).hexdigest()
+                if not self.store.conn.execute('SELECT 1 FROM multi_source_observation WHERE payload_hash=?',[digest]).fetchone():
+                    self.store.conn.execute('INSERT INTO multi_source_observation '
+                        '(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) '
+                        "VALUES ('valuation_source_document','stock',?,'reviewed_official_document','reviewed',?,?,?)",
+                        [document['ts_code'],encoded,digest,received.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)])
+            results = [self._valuation_review(r, trade_date, now) for r in reviews]
+            if not all(r['valuation_eligible'] for r in results):
+                raise ValueError('valuation review inputs incomplete')
             for review in reviews:
                 payload = _json(dict(review=review, import_bundle_sha256=expected_sha256))
                 digest = hashlib.sha256(payload.encode()).hexdigest()
@@ -781,7 +912,11 @@ class TushareHistoryCollector:
             "SELECT DISTINCT ts_code FROM tushare_stock_basic WHERE ts_code IS NOT NULL "
             "AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
             "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [_iso(trade_date)] * 2).fetchall()}
-        reference = self._reference_version() or {}
+        reference = self._reference_version(trade_date) or {}
+        if not reference:
+            latest_reference = self._reference_version() or {}
+            if latest_reference.get('membership_only'):
+                raise XiaodefaError('historical listing dates unavailable for membership-only identities')
         if reference.get('membership_only') and reference.get('membership_date') != _iso(trade_date):
             raise XiaodefaError('historical listing dates unavailable for membership-only identities')
         if reference.get('membership_date') == _iso(trade_date):
@@ -1012,10 +1147,11 @@ class TushareHistoryCollector:
             'SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date '
             'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
 
-    def _reference_version(self):
+    def _reference_version(self, trade_date=None):
         from trade_system.ths_quality import qualified_stock_reference
         return qualified_stock_reference(self.store.conn,
-            provider='xiaodefa' if self.offline else self._provider_name(self.client))
+            provider='xiaodefa' if self.offline else self._provider_name(self.client),
+            membership_date=_iso(trade_date) if trade_date is not None else None)
 
     def _exchange_listing_membership(self, exchange='SZ'):
         """Dated complete exchange inventory, only for unresolved native dates."""
@@ -1467,6 +1603,9 @@ class TushareHistoryCollector:
         elif dataset == "moneyflow":
             predicate = "(isfinite(net_mf_amount) OR (" + " AND ".join(f"isfinite({f})" for f in
                 ("buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount")) + "))"
+            from trade_system.flow_contract import TUSHARE_MONEYFLOW_EXCHANGES
+            scope = ','.join("'"+exchange+"'" for exchange in sorted(TUSHARE_MONEYFLOW_EXCHANGES))
+            predicate += " AND split_part(ts_code,'.',2) IN (" + scope + ")"
         elif dataset == "daily_basic":
             # A lone PB/PE or turnover value does not establish valuation coverage.
             # PE may be NULL for loss-making issuers; never replace it with zero.
@@ -1611,7 +1750,9 @@ class TushareHistoryCollector:
                                                    'amount_unit': '10000_yuan'}, 'tushare')
             if not any(normalized.get(k) is not None and math.isfinite(normalized[k])
                        for k in ('main_net', 'net_total')):
-                raise XiaodefaError('moneyflow contains no qualified net amount')
+                raise XiaodefaError('moneyflow product security scope unverified' if
+                    normalized['flow_definition']=='product_security_scope_unverified' else
+                    'moneyflow contains no qualified net amount')
         out = [(r["ts_code"], ts_code_to_stock_code(r["ts_code"]), _iso(r["trade_date"]),
                 *[_num(r.get(k)) for k in ("buy_sm_amount","sell_sm_amount","buy_md_amount",
                   "sell_md_amount","buy_lg_amount","sell_lg_amount","buy_elg_amount",
@@ -1665,7 +1806,7 @@ class TushareHistoryCollector:
             raw = dict(zip(("buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
                             "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
                             "net_mf_amount"), row[2:11]))
-            normalized = normalize_stock_flow_row({**raw, "source_api": "moneyflow",
+            normalized = normalize_stock_flow_row({**raw, "ts_code":row[0], "source_api": "moneyflow",
                                                    "amount_unit": "10000_yuan"}, "tushare")
             out.append([_iso(trade_date), row[1], *[normalized[k] for k in (
                         "main_net", "net_total", "super_net", "large_net", "mid_net", "small_net")],

@@ -10,6 +10,7 @@ into explicit fields.
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import date
 from typing import Any
 from trade_system.units import _number as number, normalize_amount
@@ -17,6 +18,9 @@ from trade_system.units import _number as number, normalize_amount
 
 FLOW_MAPPING_VERSION = "stock_flow_v3_explicit_units"
 DEFAULT_AMOUNT_UNIT = "yuan"
+# doc_id=170 declares SH/SZ A-share moneyflow; BJ field support is unproved.
+# Expanding this set requires dated original product capability evidence.
+TUSHARE_MONEYFLOW_EXCHANGES = frozenset({'SH', 'SZ'})
 
 # Transport identity is not a new flow definition. Relay rows qualify only
 # with their explicit native API, origin, units and main-order definition.
@@ -167,6 +171,10 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
         definition = row.get("flow_definition")
 
     origin_provider = str(row.get("origin_provider") or raw.get("_src") or provider or "unknown")
+    identity = str(row.get('ts_code') or raw.get('ts_code') or '')
+    if tushare_moneyflow and identity.endswith('.BJ') and 'BJ' not in TUSHARE_MONEYFLOW_EXCHANGES:
+        main_net = reported_total = small = mid = large = super_net = None
+        definition = 'product_security_scope_unverified'
     return {
         "main_net": number(main_net),
         "net_total": number(reported_total),
@@ -190,8 +198,110 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
 # Values must include dated validity and hashes of both original specifications.
 VERIFIED_FLOW_COMPARISONS = {}
 
+# Product-specific, reviewed specifications only. Auction calibration does
+# not authorize this money-flow product. Until a specification is accepted,
+# retained points remain raw evidence and cannot contribute to a score.
+VERIFIED_KPL_FLOW_PRODUCTS = {}
+
+
+def ensure_kpl_flow_evidence(con):
+    for name, kind in (('raw_json', 'VARCHAR'), ('raw_sha256', 'VARCHAR'),
+                       ('sequence_id', 'VARCHAR'), ('amount_unit', 'VARCHAR'),
+                       ('quantity_semantics', 'VARCHAR'), ('contract_sha256', 'VARCHAR'),
+                       ('source_date_verified', 'BOOLEAN'), ('sequence_complete', 'BOOLEAN')):
+        con.execute(f'ALTER TABLE advanced_zjmm_min ADD COLUMN IF NOT EXISTS {name} {kind}')
+
+
+def kpl_flow_projection_sql(con):
+    """One query shared by the source store and scoring view, fail closed.
+
+    Select the newest acquisition before eligibility checks: a newer unknown
+    or mixed response cannot silently revive an older qualified sequence.
+    Missing buckets remain NULL; source arrival times never become build time.
+    """
+    empty = '''SELECT CAST(NULL AS DATE) AS date, CAST(NULL AS VARCHAR) AS stock_code,
+        CAST(NULL AS DOUBLE) AS main_net, CAST(NULL AS DOUBLE) AS super_net,
+        CAST(NULL AS DOUBLE) AS large_net, CAST(NULL AS TIMESTAMP) AS fetched_at,
+        CAST(NULL AS TIMESTAMP) AS input_received_at_max, CAST(NULL AS TIMESTAMP) AS source_event_time,
+        CAST(NULL AS BIGINT) AS point_count, CAST(NULL AS VARCHAR) AS flow_definition,
+        CAST(NULL AS VARCHAR) AS quantity_semantics, CAST(NULL AS VARCHAR) AS raw_json WHERE FALSE'''
+    columns = {r[1] for r in con.execute("PRAGMA table_info('advanced_zjmm_min')").fetchall()}
+    required = {'raw_json', 'raw_sha256', 'sequence_id', 'amount_unit', 'quantity_semantics',
+                'contract_sha256', 'source_date_verified', 'sequence_complete', 'time', 'fetched_at'}
+    if not required <= columns or not VERIFIED_KPL_FLOW_PRODUCTS:
+        return empty
+    def literal(v):
+        return "'" + str(v).replace("'", "''") + "'"
+    specifications = []
+    for digest, evidence in VERIFIED_KPL_FLOW_PRODUCTS.items():
+        if (len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest)
+                or evidence.get('product') != '/advanced/zjmm-min'
+                or evidence.get('unit') != 'yuan'
+                or evidence.get('quantity_semantics') not in {'cumulative_snapshot', 'increment'}
+                or not evidence.get('flow_definition')):
+            continue
+        try:
+            start, end = (date.fromisoformat(evidence[k]) for k in ('valid_from', 'valid_through'))
+        except (KeyError, ValueError, TypeError):
+            continue
+        specifications.append('(' + ','.join(literal(v) for v in
+            (digest, str(start), str(end), evidence['quantity_semantics'], evidence['flow_definition'])) + ')')
+    if not specifications:
+        return empty
+    def amount(col):
+        return (f"CASE WHEN first(quantity_semantics)='cumulative_snapshot' THEN "
+        f"first({col} ORDER BY try_cast(time AS TIME) DESC) ELSE "
+        f"CASE WHEN count({col})=count(*) THEN sum({col}) END END")
+    bound_amounts = ' AND '.join(f"try_cast(json_extract_string(raw_json,'$.parsed.{f}') AS BIGINT) "
+        f"IS NOT DISTINCT FROM {f}" for f in ('main_net_inflow','super_net_inflow','big_net_inflow'))
+    declared = lambda field: (f"coalesce(json_extract_string(raw_json,'$.item.{field}'),"
+                              f"json_extract_string(raw_json,'$.envelope.{field}'))")
+    source_day = "coalesce(" + ','.join(f"json_extract_string(raw_json,'$.{part}.{field}')"
+        for part in ('item','envelope') for field in ('date','trade_date','day')) + ")"
+    return f'''WITH specifications(digest,start_day,end_day,semantics,definition) AS
+        (VALUES {','.join(specifications)}), ranked AS (
+        SELECT *, dense_rank() OVER (PARTITION BY date,stock_code
+            ORDER BY fetched_at DESC,sequence_id DESC) AS acquisition_rank
+        FROM advanced_zjmm_min), latest AS (SELECT * FROM ranked WHERE acquisition_rank=1),
+        qualified AS (SELECT p.*,s.definition FROM latest p LEFT JOIN specifications s
+            ON p.contract_sha256=s.digest AND p.date BETWEEN CAST(s.start_day AS DATE) AND CAST(s.end_day AS DATE)
+            AND p.quantity_semantics=s.semantics)
+        SELECT date,stock_code,{amount('main_net_inflow')} AS main_net,
+            {amount('super_net_inflow')} AS super_net,{amount('big_net_inflow')} AS large_net,
+            min(fetched_at) AS fetched_at,max(fetched_at) AS input_received_at_max,
+            date+max(try_cast(time AS TIME)) AS source_event_time,
+            count(*) AS point_count,min(definition) AS flow_definition,
+            min(quantity_semantics) AS quantity_semantics,
+            to_json(list(raw_json ORDER BY try_cast(time AS TIME))) AS raw_json
+        FROM qualified GROUP BY date,stock_code,sequence_id
+        HAVING count(DISTINCT contract_sha256)=1 AND count(DISTINCT quantity_semantics)=1
+            AND bool_and(coalesce(definition IS NOT NULL AND amount_unit='yuan'
+                AND source_date_verified IS TRUE AND sequence_id IS NOT NULL
+                AND raw_sha256=sha256(raw_json) AND try_cast(time AS TIME) IS NOT NULL
+                AND json_extract_string(raw_json,'$.product')='/advanced/zjmm-min'
+                AND json_extract_string(raw_json,'$.requested_code')=stock_code
+                AND replace(json_extract_string(raw_json,'$.requested_date'),'-','')=strftime(date,'%Y%m%d')
+                AND replace({source_day},'-','')=strftime(date,'%Y%m%d')
+                AND {declared('amount_unit')}=amount_unit
+                AND {declared('quantity_semantics')}=quantity_semantics
+                AND {declared('contract_sha256')}=contract_sha256
+                AND {bound_amounts}
+                AND date+try_cast(time AS TIME)<=fetched_at,FALSE))
+            AND count(DISTINCT try_cast(time AS TIME))=count(*)
+            AND (first(quantity_semantics)='cumulative_snapshot' OR bool_and(sequence_complete IS TRUE
+                AND try_cast(json_extract_string(raw_json,'$.envelope.sequence_complete') AS BOOLEAN) IS TRUE))'''
+
 FLOW_DEFINITION_AXES = ('order_grouping', 'trade_side', 'size_buckets',
                         'session', 'security_scope', 'net_formula')
+
+
+def stock_flow_evidence_fingerprint(con, trade_date, provider):
+    """Invalidate persisted reconciliation when its values or provenance change."""
+    rows = con.execute('''SELECT stock_code,main_net,origin_provider,source_api,
+        flow_definition,amount_unit,field_mapping_version,fetched_at,raw_json
+        FROM multi_source_stock_flow WHERE source_date=? AND provider=? AND is_stale=FALSE
+        ORDER BY ALL''', [trade_date,provider]).fetchall()
+    return hashlib.sha256(json.dumps(rows,default=str,separators=(',',':')).encode()).hexdigest()
 
 
 def flow_definition_evidence(evidence, trade_date):

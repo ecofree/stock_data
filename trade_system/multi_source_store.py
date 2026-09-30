@@ -478,35 +478,38 @@ class MultiSourceStore:
     def sync_kpl_intraday_flow(self, trade_date: str | None = None) -> int:
         """Promote the latest KPL minute money-flow point into the source layer.
 
-        ``advanced_zjmm_min`` is a cumulative intraday series, so summing its
-        points would double count.  One latest point per stock/date is the
-        correct daily snapshot and keeps KPL as an auditable provider rather
-        than replacing the Eastmoney/Sina historical series.
+        Unit, quantity semantics and product evidence are independent gates.
+        Unreviewed legacy rows remain raw and cannot masquerade as yuan flow.
         """
         try:
             tables = {row[0] for row in self.con.execute("show tables").fetchall()}
             if "advanced_zjmm_min" not in tables:
                 return 0
-            where = "? IS NULL OR CAST(date AS DATE)=CAST(? AS DATE)"
+            from trade_system.flow_contract import kpl_flow_projection_sql
+            projection = kpl_flow_projection_sql(self.con)
             rows = self.con.execute(
-                "SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow,fetched_at "
-                "FROM (SELECT date,stock_code,main_net_inflow,super_net_inflow,big_net_inflow,fetched_at, "
-                "row_number() OVER (PARTITION BY date,stock_code ORDER BY try_cast(time AS TIME) DESC NULLS LAST, fetched_at DESC) AS rn "
-                "FROM advanced_zjmm_min WHERE " + where + ") q WHERE rn=1",
+                "SELECT * FROM (" + projection + ") WHERE (? IS NULL OR date=CAST(? AS DATE)) AND main_net IS NOT NULL",
                 [trade_date, trade_date],
             ).fetchall()
-            if not rows:
-                return 0
             self.con.execute("BEGIN TRANSACTION")
+            # Revoke old invented unit/semantics when no qualified sequence
+            # remains, preserving the original row for historical inspection.
+            self.con.execute("UPDATE multi_source_stock_flow SET is_stale=TRUE WHERE provider='kpl' "
+                "AND source_api='advanced_zjmm_min' AND (? IS NULL OR source_date=CAST(? AS DATE)) "
+                "AND NOT EXISTS (SELECT 1 FROM (" + projection + ") q WHERE q.date=source_date "
+                "AND q.stock_code=multi_source_stock_flow.stock_code AND q.main_net IS NOT NULL)",
+                [trade_date, trade_date])
             count = 0
-            for day, stock, main, super_net, large, received in rows:
+            for day, stock, main, super_net, large, received, received_max, event, points, definition, semantics, raw in rows:
                 if received is None:
                     continue
                 count += self._store_stock_flow(stock, [{
                     "date": str(day), "main_net": main, "super_net": super_net, "large_net": large,
-                    "amount_unit": "yuan", "flow_definition": "provider_main_orders_net",
+                    "amount_unit": "yuan", "flow_definition": definition,
                     "source_api": "advanced_zjmm_min", "origin_provider": "kpl",
-                    "aggregation": "latest_cumulative_point",
+                    "aggregation": semantics, 'source_event_time':event,
+                    'input_received_at_min':str(received), 'input_received_at_max':str(received_max),
+                    'point_count':points, 'raw':raw,
                 }], "kpl", False, received)
             self.con.commit()
             return count

@@ -178,7 +178,7 @@ def test_readiness_audit_never_uses_future_rows_or_historical_peak_as_denominato
     assert flow["status"] == "available"
 
 
-def test_kpl_intraday_flow_promotes_latest_cumulative_point(tmp_path):
+def test_unreviewed_legacy_kpl_intraday_flow_cannot_claim_cumulative_yuan(tmp_path):
     db = tmp_path / "kpl.duckdb"
     con = duckdb.connect(str(db))
     con.execute(
@@ -189,17 +189,9 @@ def test_kpl_intraday_flow_promotes_latest_cumulative_point(tmp_path):
     con.execute("insert into advanced_zjmm_min values ('2026-07-13','000001','13:08',25,4,3,current_timestamp)")
     con.close()
     with MultiSourceStore(db) as store:
-        assert store.sync_kpl_intraday_flow("2026-07-13") == 1
-        assert store.con.execute(
-            "select main_net,super_net,large_net,provider from multi_source_stock_flow"
-        ).fetchone() == (25.0, 4.0, 3.0, "kpl")
-        source_time = store.con.execute("SELECT max(fetched_at) FROM advanced_zjmm_min").fetchone()[0]
-        assert store.con.execute("SELECT fetched_at,flow_unit FROM multi_source_stock_flow").fetchone() == (source_time, 'CNY')
-        store.con.execute("CREATE UNIQUE INDEX flow_key ON multi_source_stock_flow(source_date,stock_code,provider)")
-        before = store.con.execute("SELECT * FROM multi_source_stock_flow").fetchall()
-        # Replaying the same receipt reports actual writes and preserves arrival time.
         assert store.sync_kpl_intraday_flow("2026-07-13") == 0
-        assert store.con.execute("SELECT * FROM multi_source_stock_flow").fetchall() == before
+        assert store.con.execute("SELECT * FROM multi_source_stock_flow").fetchall() == []
+        assert store.con.execute('SELECT count(*) FROM advanced_zjmm_min').fetchone()[0] == 2
 
 
 def test_empty_dc_sector_flow_does_not_substitute_ths_definition(monkeypatch):

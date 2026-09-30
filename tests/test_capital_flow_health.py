@@ -228,3 +228,22 @@ def test_capital_flow_health_rejects_count_complete_partial_sector_batch(tmp_pat
 
     assert result["sector_flow"]["ready"] is False
     assert result["ready"] is False
+
+
+def test_damaged_independent_pass_cannot_survive_evidence_read_error(tmp_path, monkeypatch):
+    from trade_system.schema import init_schema
+    import trade_system.flow_contract as contract
+    db_path = tmp_path/'damaged-reconciliation.duckdb'
+    with duckdb.connect(str(db_path)) as con:
+        init_schema(con)
+        con.execute('''CREATE TABLE intraday_stock_flow_independent_reconciliation (
+            trade_date DATE,status VARCHAR,overlap_reference_pct DOUBLE,correlation_main_net DOUBLE,
+            sign_agreement_pct DOUBLE,primary_provider VARCHAR,reference_provider VARCHAR,
+            evidence_json VARCHAR,rule_version VARCHAR)''')
+        con.execute("INSERT INTO intraday_stock_flow_independent_reconciliation VALUES "
+            "('2026-07-09','pass',100,1,100,'primary','tushare','{broken',"
+            "'independent-flow-v2-amount-and-dated-scope')")
+    monkeypatch.setattr(contract,'independent_comparison_contract',lambda *args:{'eligible':True})
+    result = assess_capital_flow_health(db_path,'2026-07-09',1,1)
+    assert result['reconciliation']['independent_status'] == 'unverified_or_changed_amount_evidence'
+    assert result['reconciliation']['independent_reconciliation_ready'] is False

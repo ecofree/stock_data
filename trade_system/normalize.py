@@ -1067,7 +1067,9 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
 
     if _table_has_columns(con, "advanced_main_monitor", ["date", "stock_code"]):
         monitor_cols = set(table_columns(con, "advanced_main_monitor"))
-        amount_expr = "sum(coalesce(main_net_inflow, 0))" if "main_net_inflow" in monitor_cols else "CAST(NULL AS BIGINT)"
+        # Raw amounts are retained, but this legacy product has no reviewed
+        # unit/quantity contract. It cannot contribute a guessed yuan amount.
+        amount_expr = "CAST(NULL AS BIGINT)"
         rank_expr = "min(ranking)" if "ranking" in monitor_cols else "CAST(NULL AS INTEGER)"
         monitor_sql = f"""
             SELECT
@@ -1089,20 +1091,12 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
         )
 
     if _table_has_columns(con, "advanced_zjmm_min", ["date", "stock_code"]):
-        zjmm_cols = set(table_columns(con, "advanced_zjmm_min"))
-        main_expr = "sum(coalesce(main_net_inflow, 0))" if "main_net_inflow" in zjmm_cols else "CAST(NULL AS BIGINT)"
-        super_expr = "sum(coalesce(super_net_inflow, 0))" if "super_net_inflow" in zjmm_cols else "CAST(NULL AS BIGINT)"
-        big_expr = "sum(coalesce(big_net_inflow, 0))" if "big_net_inflow" in zjmm_cols else "CAST(NULL AS BIGINT)"
+        from trade_system.flow_contract import kpl_flow_projection_sql
         zjmm_sql = f"""
-            SELECT
-                CAST(date AS VARCHAR) AS trade_date,
-                stock_code,
-                {main_expr} AS zjmm_main_net_inflow,
-                {super_expr} AS zjmm_super_net_inflow,
-                {big_expr} AS zjmm_big_net_inflow,
-                count(*) AS zjmm_rows
-            FROM advanced_zjmm_min
-            GROUP BY date, stock_code
+            SELECT CAST(date AS VARCHAR) AS trade_date, stock_code,
+                main_net AS zjmm_main_net_inflow, super_net AS zjmm_super_net_inflow,
+                large_net AS zjmm_big_net_inflow, point_count AS zjmm_rows
+            FROM ({kpl_flow_projection_sql(con)})
         """
     else:
         zjmm_sql = empty(
@@ -1116,37 +1110,10 @@ def _create_intraday_capital_flow_evidence(con: duckdb.DuckDBPyConnection) -> No
             ]
         )
 
-    dadan_parts = []
-    for table_name in ("advanced_dadan_kline", "advanced_dadan_kline_today", "advanced_kline_today_dadan_new"):
-        if _table_has_columns(con, table_name, ["date", "stock_code"]):
-            table_cols = set(table_columns(con, table_name))
-            amount_expr = "big_net_amount" if "big_net_amount" in table_cols else "0"
-            # The THS daily large-order endpoint has used both ``D`` and ``1``
-            # for its daily record across API versions.  Minute values (5/15/
-            # 30/60) must not be mixed into the daily evidence or the UNION
-            # would multiply the daily net amount several times over.
-            ktype_filter = (
-                "WHERE upper(coalesce(ktype, 'D')) IN ('D', '1')"
-                if "ktype" in table_cols else ""
-            )
-            dadan_parts.append(
-                f"""
-                SELECT
-                    CAST(date AS VARCHAR) AS trade_date,
-                    stock_code,
-                    coalesce({amount_expr}, 0) AS dadan_big_net_amount
-                FROM {table_name}
-                {ktype_filter}
-                """
-            )
-    if dadan_parts:
-        dadan_sql = f"""
-            SELECT trade_date, stock_code, sum(dadan_big_net_amount) AS dadan_big_net_amount
-            FROM ({" UNION ALL ".join(dadan_parts)})
-            GROUP BY trade_date, stock_code
-        """
-    else:
-        dadan_sql = empty([("trade_date", "VARCHAR"), ("stock_code", "VARCHAR"), ("dadan_big_net_amount", "BIGINT")])
+    # Three legacy aliases may represent the same daily snapshot. Their unit
+    # and relationship are not reviewed; neither summing nor choosing one can
+    # establish a certified amount. Keep their source tables unchanged.
+    dadan_sql = empty([("trade_date", "VARCHAR"), ("stock_code", "VARCHAR"), ("dadan_big_net_amount", "BIGINT")])
 
     activity_parts = []
     for table_name in ("advanced_main_activity_kline", "advanced_kline_today_main_activity"):

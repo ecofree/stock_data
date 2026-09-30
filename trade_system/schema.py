@@ -2203,6 +2203,8 @@ def init_schema(db: duckdb.DuckDBPyConnection):
             fetched_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
+    from trade_system.flow_contract import ensure_kpl_flow_evidence
+    ensure_kpl_flow_evidence(db)
     
     db.execute("""
         CREATE TABLE IF NOT EXISTS advanced_fenbi2 (

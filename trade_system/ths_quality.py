@@ -14,7 +14,7 @@ THS_MIN_CONCEPTS: int | None = None
 THS_MEMBERSHIP_MAX_AGE_DAYS = 7
 
 
-def qualified_stock_reference(con, *, provider='xiaodefa', now=None):
+def qualified_stock_reference(con, *, provider='xiaodefa', now=None, membership_date=None):
     """Read the collector's sealed L/D reference; never acquire or repair it."""
     now = now or datetime.now()
     if not _table_exists(con, 'multi_source_observation') or not _table_exists(con, 'tushare_stock_basic'):
@@ -34,7 +34,16 @@ def qualified_stock_reference(con, *, provider='xiaodefa', now=None):
     if payload.get('version') != version or payload.get('scope') != ['L', 'D']:
         return None
     membership = payload.get('listing_membership', {})
-    if membership and membership.get('as_of') != now.date().isoformat():
+    # A retained previous-session inventory may still be within its arrival
+    # TTL. Bind its membership to the requested session, never today's date.
+    # This does not extend the original arrival TTL or relabel the inventory.
+    requested_day = str(membership_date)[:10] if membership_date is not None else now.date().isoformat()
+    try:
+        if date.fromisoformat(requested_day) > now.date():
+            return None
+    except ValueError:
+        return None
+    if membership and membership.get('as_of') != requested_day:
         return None
     return dict(version=version, known_at=receipt[0].isoformat(), max_age_seconds=86400,
                 membership_date=membership.get('as_of'), not_listed=membership.get('not_listed', []),

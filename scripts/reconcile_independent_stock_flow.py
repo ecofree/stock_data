@@ -10,9 +10,11 @@ snapshot.
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 import math
+import json
+import hashlib
 import sys
 
 import duckdb
@@ -22,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 
 TABLE = "intraday_stock_flow_independent_reconciliation"
+RULE_VERSION = 'independent-flow-v2-amount-and-dated-scope'
 
 
 def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -48,6 +51,8 @@ def _ensure_table(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    con.execute(f'ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS evidence_json VARCHAR')
+    con.execute(f'ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS rule_version VARCHAR')
 
 
 def _rows(con: duckdb.DuckDBPyConnection, trade_date: str, provider: str) -> dict[str, float]:
@@ -61,7 +66,7 @@ def _rows(con: duckdb.DuckDBPyConnection, trade_date: str, provider: str) -> dic
         """,
         [trade_date, provider],
     ).fetchall()
-    return {str(code): float(value) for code, value in rows if code and value is not None}
+    return {str(code): float(value) for code, value in rows if code and value is not None and math.isfinite(value)}
 
 
 def reconcile(
@@ -82,7 +87,9 @@ def reconcile(
             primary_provider = batch[0] if batch else 'eastmoney_intraday_clist_delay'
         primary = _rows(con, trade_date, primary_provider)
         reference = _rows(con, trade_date, reference_provider)
-        overlap_codes = sorted(set(primary) & set(reference))
+        from scripts.collect_intraday_stock_flow_market import _a_share_universe_by_exchange
+        universe = set(_a_share_universe_by_exchange(con, trade_date))
+        overlap_codes = sorted(set(primary) & set(reference) & universe)
         primary_only = set(primary) - set(reference)
         reference_only = set(reference) - set(primary)
         pairs = [(primary[c], reference[c]) for c in overlap_codes]
@@ -97,22 +104,48 @@ def reconcile(
             r_var = sum((r - r_mean) ** 2 for _, r in pairs)
             if p_var > 0 and r_var > 0:
                 correlation = sum((p - p_mean) * (r - r_mean) for p, r in pairs) / math.sqrt(p_var * r_var)
-            sign_agreement = sum(1 for p, r in pairs if (p == 0 and r == 0) or (p > 0) == (r > 0)) * 100.0 / n
+            sign_agreement = sum(1 for p, r in pairs if (p > 0)-(p < 0) == (r > 0)-(r < 0)) * 100.0 / n
             mean_abs_diff = sum(abs(p - r) / max(abs(p), abs(r), 1_000_000.0) for p, r in pairs) * 100.0 / n
-        overlap_pct = len(overlap_codes) * 100.0 / len(reference) if reference else 0.0
-        status = "pass" if (
-            reference
-            and overlap_pct >= 99.5
-            and correlation is not None
-            and correlation >= 0.95
-            and (sign_agreement or 0.0) >= 90.0
-        ) else ("empty" if not reference else "warning")
-        from trade_system.flow_contract import independent_comparison_contract
+        overlap_pct = len(overlap_codes) * 100.0 / len(universe) if universe else 0.0
+        from trade_system.flow_contract import independent_comparison_contract, stock_flow_evidence_fingerprint
         comparison = independent_comparison_contract(con, trade_date, primary_provider, reference_provider)
+        policy = comparison.get('definition_evidence', {}).get('amount_precision', {})
+        quantums = [policy.get(k) for k in ('primary_quantum_yuan', 'reference_quantum_yuan')]
+        precision_valid = all(isinstance(v, (int,float)) and not isinstance(v,bool)
+                              and math.isfinite(v) and v > 0 for v in quantums)
+        absolute_tolerance = sum(quantums)/2 if precision_valid else None
+        disagreements = [c for c in overlap_codes if absolute_tolerance is None or
+            abs(primary[c]-reference[c]) > absolute_tolerance + 1e-9*max(abs(primary[c]),abs(reference[c]))]
+        amount_match_pct = (n-len(disagreements))*100.0/n if n else 0.0
+        clocks = {}
+        close_at = datetime.combine(date.fromisoformat(trade_date), time(15))
+        for provider in (primary_provider, reference_provider):
+            minimum, maximum, absent = con.execute('''SELECT min(fetched_at),max(fetched_at),
+                count(*) FILTER (WHERE fetched_at IS NULL) FROM multi_source_stock_flow
+                WHERE source_date=? AND provider=? AND is_stale=FALSE''', [trade_date,provider]).fetchone()
+            clocks[provider] = {'min':str(minimum), 'max':str(maximum), 'missing':absent}
+            if absent or minimum is None or minimum < close_at or maximum > datetime.now():
+                comparison.update(eligible=False, reason='close_input_time_unqualified')
+        status = 'warning'
         if not comparison['eligible']:
             status = 'incomparable'
+        elif not universe:
+            status = 'unknown_scope'
+        elif not precision_valid:
+            status = 'unverified_amount_precision'
+        elif (overlap_pct >= 99.5 and amount_match_pct >= 99.5
+              and not (set(primary) | set(reference))-universe):
+            status = 'pass'
         result = {
+            'rule_version':RULE_VERSION,
+            'expected_codes_sha256':hashlib.sha256(json.dumps(sorted(universe)).encode()).hexdigest(),
+            'source_fingerprints':{p:stock_flow_evidence_fingerprint(con,trade_date,p)
+                                   for p in (primary_provider,reference_provider)},
             'comparison_contract': comparison,
+            'expected_rows':len(universe), 'coverage_denominator':'dated_approved_stock_universe',
+            'input_arrival_times':clocks, 'absolute_tolerance_yuan':absolute_tolerance,
+            'amount_match_pct':amount_match_pct, 'amount_mismatch_codes':disagreements,
+            'unexpected_codes':sorted((set(primary)|set(reference))-universe),
             "scope": "declared_data_origin_comparison_not_independent_transport_attestation",
             "trade_date": trade_date,
             "primary_provider": primary_provider,
@@ -129,7 +162,8 @@ def reconcile(
             "primary_net_total": round(sum(primary.values()), 4),
             "reference_net_total": round(sum(reference.values()), 4),
             "status": status,
-            "last_error": "" if comparison['eligible'] else comparison['reason'],
+            "last_error": ("" if status=='pass' else comparison['reason'] if not comparison['eligible']
+                           else status),
         }
         con.execute(
             f"""
@@ -166,6 +200,8 @@ def reconcile(
                 datetime.now(),
             ],
         )
+        con.execute(f'UPDATE {TABLE} SET evidence_json=?,rule_version=? WHERE trade_date=?',
+                    [json.dumps(result,default=str), RULE_VERSION,trade_date])
         con.commit()
         return result
     finally:

@@ -247,7 +247,7 @@ def _a_share_universe_by_exchange(con: duckdb.DuckDBPyConnection, trade_date=Non
     try:
         day = trade_date or date.today().isoformat()
         with TushareHistoryCollector(':memory:', offline=True, connection=con) as reference:
-            qualified = reference._reference_version()
+            qualified = reference._reference_version(day)
             if os.environ.get('KPL_RUNTIME_SCHEMA_READY') == '1' and not qualified:
                 return {}
             # A missing native listing date needs current official membership,

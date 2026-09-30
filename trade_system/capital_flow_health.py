@@ -427,12 +427,37 @@ def assess_capital_flow_health(
                 [trade_date],
             ).fetchone()
             if independent_row:
-                independent_status = str(independent_row[0] or "not_run")
+                # Stay blocked even if reading or validating the evidence raises.
+                stored_status = str(independent_row[0] or "not_run")
+                independent_status = 'unverified_or_changed_amount_evidence'
                 independent_overlap_pct = float(independent_row[1]) if independent_row[1] is not None else None
                 independent_correlation = float(independent_row[2]) if independent_row[2] is not None else None
                 independent_sign_agreement_pct = float(independent_row[3]) if independent_row[3] is not None else None
                 from trade_system.flow_contract import independent_comparison_contract
                 comparison_contract = independent_comparison_contract(con, trade_date, independent_row[4], independent_row[5])
+                # Old correlation-only passes, and changed source rows, cannot
+                # certify the new amount/scope rule through a stored green flag.
+                import json
+                import hashlib
+                from scripts.reconcile_independent_stock_flow import RULE_VERSION
+                from scripts.collect_intraday_stock_flow_market import _a_share_universe_by_exchange
+                from trade_system.flow_contract import stock_flow_evidence_fingerprint
+                columns = {r[1] for r in con.execute("PRAGMA table_info('intraday_stock_flow_independent_reconciliation')").fetchall()}
+                qualified = False
+                if {'evidence_json','rule_version'} <= columns:
+                    encoded, version = con.execute('SELECT evidence_json,rule_version FROM '
+                        'intraday_stock_flow_independent_reconciliation WHERE trade_date=?', [trade_date]).fetchone()
+                    evidence = json.loads(encoded or '{}')
+                    qualified = (version == RULE_VERSION and evidence.get('status') == 'pass'
+                        and evidence.get('rule_version') == RULE_VERSION
+                        and evidence.get('expected_rows',0) == expected_stock_codes
+                        and evidence.get('expected_codes_sha256') == hashlib.sha256(json.dumps(
+                            sorted(_a_share_universe_by_exchange(con,trade_date))).encode()).hexdigest()
+                        and evidence.get('amount_match_pct',0) >= 99.5
+                        and all(evidence.get('source_fingerprints',{}).get(p) ==
+                            stock_flow_evidence_fingerprint(con,trade_date,p) for p in independent_row[4:6]))
+                if qualified and stored_status.lower() == 'pass':
+                    independent_status = 'pass'
         con.close()
     except Exception:
         pass

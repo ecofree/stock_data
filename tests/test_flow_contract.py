@@ -99,3 +99,47 @@ def test_normalized_overflow_cannot_reappear_from_raw_on_second_ingestion():
     assert normalized["super_net"] is None and normalized["net_total"] is None
     again = normalize_stock_flow_row({**normalized, "raw": raw}, "xiaodefa")
     assert again == normalized
+
+
+def test_independent_amount_gate_rejects_unit_scale_and_shrunk_denominator(tmp_path, monkeypatch):
+    import duckdb
+    from trade_system.schema import init_schema
+    import trade_system.flow_contract as contract
+    from scripts import reconcile_independent_stock_flow as entry
+    import scripts.collect_intraday_stock_flow_market as market
+    db = tmp_path/'amount.duckdb'
+    with duckdb.connect(str(db)) as con:
+        init_schema(con)
+        for provider,origin,api in [('primary','eastmoney','moneyflow_dc'),('reference','tushare','moneyflow')]:
+            for code,amount in [('000001',10000),('600000',-20000)]:
+                con.execute('''INSERT INTO multi_source_stock_flow(source_date,stock_code,provider,origin_provider,
+                    source_api,flow_definition,amount_unit,field_mapping_version,main_net,is_stale,fetched_at)
+                    VALUES ('2026-07-09',?,?,?,?, 'fixture_definition','yuan','v3',?,false,'2026-07-09 17:00:00')''',
+                    [code,provider,origin,api,amount])
+    monkeypatch.setattr(market,'_a_share_universe_by_exchange',lambda *args:{'000001':'SZ','600000':'SH'})
+    semantics = {k:'fixture_identical' for k in contract.FLOW_DEFINITION_AXES}
+    key = tuple(sorted([('eastmoney','moneyflow_dc','fixture_definition','v3'),('tushare','moneyflow','fixture_definition','v3')]))
+    proof = dict(canonical_definition='fixture',source_specification_sha256=['a'*64,'b'*64],
+        valid_from='2026-07-09',valid_through='2026-07-09',specifications=[semantics,semantics],
+        amount_precision=dict(primary_quantum_yuan=100,reference_quantum_yuan=100))
+    monkeypatch.setitem(contract.VERIFIED_FLOW_COMPARISONS,key,proof)
+    assert entry.reconcile(db,'2026-07-09',primary_provider='primary',reference_provider='reference')['status'] == 'pass'
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE multi_source_stock_flow SET main_net=main_net*10000 WHERE provider='primary'")
+    result = entry.reconcile(db,'2026-07-09',primary_provider='primary',reference_provider='reference')
+    assert result['correlation_main_net'] == 1 and result['sign_agreement_pct'] == 100
+    assert result['status'] == 'warning' and result['amount_match_pct'] == 0
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE multi_source_stock_flow SET main_net=main_net/10000 WHERE provider='primary'")
+    monkeypatch.setattr(market,'_a_share_universe_by_exchange',lambda *args:{'000001':'SZ','600000':'SH','600001':'SH'})
+    result = entry.reconcile(db,'2026-07-09',primary_provider='primary',reference_provider='reference')
+    assert result['status'] == 'warning' and result['expected_rows'] == 3
+    assert result['overlap_reference_pct'] < 67
+
+
+def test_bj_tushare_moneyflow_zero_is_not_proof_of_field_capability():
+    row = dict(ts_code='920128.BJ',source_api='moneyflow',amount_unit='10000_yuan',
+               buy_lg_amount=0,sell_lg_amount=0,buy_elg_amount=0,sell_elg_amount=0,net_mf_amount=0)
+    result = normalize_stock_flow_row(row,'tushare')
+    assert result['main_net'] is None and result['net_total'] is None
+    assert result['flow_definition'] == 'product_security_scope_unverified'

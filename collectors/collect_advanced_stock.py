@@ -1,6 +1,9 @@
 """Advanced stock-level data collectors."""
 
 import json
+import hashlib
+import math
+from datetime import datetime
 
 from trade_system.data_store import KPLClient, DuckDBStore, logger
 
@@ -204,9 +207,29 @@ def collect_advanced_main_monitor(client: KPLClient, store: DuckDBStore, date: s
 
 def collect_advanced_zjmm_min(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
     """Collect intraday main-money minute evidence."""
+    from trade_system.flow_contract import ensure_kpl_flow_evidence
+    ensure_kpl_flow_evidence(store.conn)
+    def amount(value):
+        try:
+            value = float(value) if not isinstance(value, bool) else math.nan
+            return int(value) if math.isfinite(value) and value == int(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
     total = 0
     for code in stock_codes[:50]:
         data = client.get("/advanced/zjmm-min", {"code": code, "date": date})
+        envelope = data if isinstance(data, dict) else {}
+        sequence = hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        received = datetime.now()
+        if data is not None and store.conn.execute("SELECT count(*) FROM information_schema.tables "
+                "WHERE table_name='multi_source_observation'").fetchone()[0]:
+            receipt = json.dumps({'product':'/advanced/zjmm-min','code':code,'trade_date':date,
+                                  'response':data}, ensure_ascii=False,sort_keys=True)
+            receipt_hash = hashlib.sha256(receipt.encode()).hexdigest()
+            store.conn.execute('INSERT INTO multi_source_observation '
+                '(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) '
+                "VALUES ('kpl_zjmm_min_response','stock',?,'kpl','raw_unreviewed',?,?,?)",
+                [code,receipt,receipt_hash,received])
         rows = []
         for item in _items(data, "minutes", "points"):
             if isinstance(item, dict):
@@ -217,18 +240,34 @@ def collect_advanced_zjmm_min(client: KPLClient, store: DuckDBStore, date: str, 
                         date,
                         code,
                         str(_field(item, "time", "t", "timestamp", default="")),
-                        _to_int(_field(item, "main_net_inflow", "main_net", "main_fund_net", "net_amount", default=0)),
-                        _to_int(_field(item, "super_net_inflow", "super_net", "super_amount", default=0)),
-                        _to_int(_field(item, "big_net_inflow", "big_net", "big_amount", "big_net_amount", default=0)),
+                        amount(_field(item, "main_net_inflow", "main_net", "main_fund_net", "net_amount")),
+                        amount(_field(item, "super_net_inflow", "super_net", "super_amount")),
+                        amount(_field(item, "big_net_inflow", "big_net", "big_amount", "big_net_amount")),
                     )
                 )
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                rows.append((date, code, str(item[0]), _to_int(item[1]), 0, 0))
+                rows.append((date, code, str(item[0]), amount(item[1]), None, None))
+            else:
+                continue
+            raw = json.dumps({'product':'/advanced/zjmm-min', 'requested_code':code,
+                'requested_date':date, 'envelope':envelope, 'item':item,
+                'parsed': dict(zip(('main_net_inflow','super_net_inflow','big_net_inflow'), rows[-1][3:6]))},
+                ensure_ascii=False, sort_keys=True)
+            declaration = item if isinstance(item, dict) else {}
+            source_day = _field(declaration, 'date', 'trade_date', 'day') or _field(envelope, 'date', 'trade_date', 'day')
+            rows[-1] += (raw, hashlib.sha256(raw.encode()).hexdigest(), sequence,
+                declaration.get('amount_unit', envelope.get('amount_unit', 'unknown')),
+                declaration.get('quantity_semantics', envelope.get('quantity_semantics', 'unknown')),
+                declaration.get('contract_sha256', envelope.get('contract_sha256')),
+                _compact_date(source_day) == _compact_date(date),
+                envelope.get('sequence_complete') is True, received)
         if rows:
             total += store.insert_rows(
                 "advanced_zjmm_min",
                 rows,
-                ["date", "stock_code", "time", "main_net_inflow", "super_net_inflow", "big_net_inflow"],
+                ["date", "stock_code", "time", "main_net_inflow", "super_net_inflow", "big_net_inflow",
+                 'raw_json','raw_sha256','sequence_id','amount_unit','quantity_semantics',
+                 'contract_sha256','source_date_verified','sequence_complete','fetched_at'],
                 replace_on=["date", "stock_code", "time"],
             )
     if total:
