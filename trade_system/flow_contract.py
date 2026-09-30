@@ -239,7 +239,7 @@ def candidate_flow_capabilities(settings=None):
         'ifind_refresh_token_present': present('IFIND_REFRESH_TOKEN'),
         'ifind_sdk_present': importlib.util.find_spec('iFinDPy') is not None,
         'gangtise_authorization_present': present('GANGTISE_AUTHORIZATION'),
-        'gangtise_ak_sk_present': present('GANGTISE_AK') and present('GANGTISE_SK'),
+        'gangtise_ak_sk_present': present('GTS_ACCESS_KEY') and present('GTS_SECRET_KEY'),
         'entitlement_verified': False,
         'hithink_ai_key_authorizes_ifind': False,
         'independent_definition_verified': False,

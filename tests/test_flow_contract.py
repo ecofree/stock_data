@@ -278,6 +278,12 @@ def test_candidate_file_hash_and_configuration_presence_are_not_entitlement(tmp_
     capabilities = candidate_flow_capabilities({'HITHINK_FINANCE_API_KEY': 'fixture-secret'})
     assert capabilities['hithink_ai_client_key_present']
     assert not capabilities['hithink_ai_key_authorizes_ifind'] and not capabilities['entitlement_verified']
+    official_keys = {'GTS_ACCESS_KEY': 'fixture-access', 'GTS_SECRET_KEY': 'fixture-secret'}
+    assert candidate_flow_capabilities(official_keys)['gangtise_ak_sk_present']
+    assert not candidate_flow_capabilities({'GTS_ACCESS_KEY': 'fixture-access'})['gangtise_ak_sk_present']
+    assert not candidate_flow_capabilities({'GANGTISE_AK': 'fixture-access',
+                                          'GANGTISE_SK': 'fixture-secret'})['gangtise_ak_sk_present']
+    assert not candidate_flow_capabilities(official_keys)['entitlement_verified']
     for codes in (['aShares'], ['920128'], ['000001.SZ', '000001.SZ']):
         with pytest.raises(ValueError):
             candidate_flow_request('2026-09-29', codes)
