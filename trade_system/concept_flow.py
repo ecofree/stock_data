@@ -92,7 +92,7 @@ def _prepare_ths_aggregate(con, trade_date, *, now=None, max_age_seconds=10800, 
         return [], report
     flows = {str(row[0]): row for row in selected}
     original_members = actual
-    reference = qualified_stock_reference(con, now=now)
+    reference = qualified_stock_reference(con, now=now, membership_date=trade_date)
     inapplicable = {}
     applicability_receipts = []
     from trade_system.ths_quality import _table_exists

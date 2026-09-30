@@ -96,7 +96,7 @@ def test_official_bse_member_applicability_requires_complete_dated_receipt(tmp_p
                     "('920128.BJ','920128','2024-11-29')")
         rows = con.execute('SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date '
                            'FROM tushare_stock_basic ORDER BY ts_code').fetchall()
-        reference = json.dumps(dict(scope=['L','D'], version=hashlib.sha256(json.dumps(
+        reference = json.dumps(dict(scope=['L','D'], listing_membership={'as_of':'2026-09-11'}, version=hashlib.sha256(json.dumps(
             rows,ensure_ascii=False,default=str,separators=(',',':')).encode()).hexdigest()))
         con.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json,payload_hash,observed_at) "
                     "VALUES ('tushare_stock_basic_snapshot','xiaodefa','qualified',?,?,'2026-09-11 16:00:00')",
@@ -119,6 +119,17 @@ def test_official_bse_member_applicability_requires_complete_dated_receipt(tmp_p
         assert report['missing_stock_examples']==['920128'] and not report['promoted']
         assert report['member_applicability']['receipt_sha256']
         assert con.execute('SELECT count(*) FROM fixture_members').fetchone()[0]==4
+        # A late historical completion still uses the requested day's dated
+        # universe, without extending the original reference arrival TTL.
+        from trade_system.concept_flow import _prepare_ths_aggregate
+        _, late = _prepare_ths_aggregate(con,'2026-09-11',now=datetime(2026,9,12,10),
+                                         max_age_seconds=86400,allow_subset=True)
+        assert late['member_applicability']['excluded']=={'920157':'dated_official_not_listed'}
+        assert late['missing_stock_examples']==['920128']
+        assert late['member_applicability']['reference']['known_at']=='2026-09-11T16:00:00'
+        _, expired = _prepare_ths_aggregate(con,'2026-09-11',now=datetime(2026,9,12,16),
+                                            max_age_seconds=86400,allow_subset=True)
+        assert expired['member_applicability']['reference'] is None
         for patch in [dict(source_session='2026-09-10'),dict(as_of='2026-09-10'),
                       dict(pages=official['pages'][:-1]),dict(recordcount=102),
                       dict(source='https://unverified.example/listings')]:
