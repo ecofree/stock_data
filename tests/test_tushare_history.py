@@ -796,6 +796,7 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
     import hashlib
     import json
     from copy import deepcopy
+    from pathlib import Path
     import pytest
     from trade_system.tushare_history import _json
     code, day = '000001.SZ','2026-07-01'
@@ -819,8 +820,23 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
                 equity_changes_review='fixture complete instruments and equity changes',
                 equity_components=[dict(value=-6000000,page=1,excerpt='fixture full equity breakdown')]))
         digest = hashlib.sha256(_json(source).encode()).hexdigest()
-        catalogue = deepcopy(source)
-        catalogue.update(kind='disclosure_inventory',window_from='2026-03-31',window_through=day,catalogue_complete=True)
+        catalogue_pages = []
+        for number in (1,2):
+            page_path = tmp_path/f'catalogue-page-{number}.json'
+            body = dict(totalAnnouncement=2,totalpages=1,hasMore=number == 1,
+                announcements=[dict(secCode='000001',orgId='fixture-org',announcementId=str(number))])
+            page_path.write_text(_json(body),encoding='utf-8')
+            catalogue_pages.append(dict(path=str(page_path),sha256=hashlib.sha256(page_path.read_bytes()).hexdigest(),
+                http_status=200,params=dict(stock='000001,fixture-org',tabName='fulltext',pageNum=str(number),
+                    seDate='2026-03-31~'+day)))
+        catalogue_path = tmp_path/'catalogue-manifest.json'
+        catalogue_path.write_text(_json(dict(schema='official_disclosure_page_set_v1',ts_code=code,
+            source_pages=catalogue_pages)),encoding='utf-8')
+        catalogue = dict(schema='official_valuation_document_v1',ts_code=code,as_of=day,
+            received_at=source['received_at'],kind='disclosure_inventory',window_from='2026-03-31',
+            window_through=day,catalogue_complete=True,
+            document=dict(url='https://www.cninfo.com.cn/new/hisAnnouncement/query',path=str(catalogue_path),
+                format='json',sha256=hashlib.sha256(catalogue_path.read_bytes()).hexdigest()))
         catalogue_digest = hashlib.sha256(_json(catalogue).encode()).hexdigest()
         market = receipt(dict(rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
         review = dict(schema='reviewed_valuation_inputs_v2',ts_code=code,trade_date=day,
@@ -855,6 +871,45 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         altered['financial_inventory']['document_receipts']=[digest]
         with pytest.raises(ValueError,match='correction catalogue'):
             c.import_valuation_reviews(path,write(altered,[source,catalogue]),day)
+        # A totalpages value of one did not hide the second page. Conversely,
+        # editing any original page revokes the already imported qualification.
+        first_page = Path(catalogue_pages[0]['path'])
+        original_page = first_page.read_bytes()
+        first_page.write_text('{}',encoding='utf-8')
+        assert c.qualified_valuation_reviews(day) == {}
+        first_page.write_bytes(original_page)
+        assert code in c.qualified_valuation_reviews(day)
+        first_page.unlink()
+        assert c.qualified_valuation_reviews(day) == {}
+        first_page.write_bytes(original_page)
+        from trade_system.tushare_history import _validate_valuation_document
+        manifest_bytes = catalogue_path.read_bytes()
+        second_page = Path(catalogue_pages[1]['path'])
+        second_bytes = second_page.read_bytes()
+        for change, message in [('missing_page','pagination'),('duplicate_id','duplicate'),
+                                ('wrong_security','identity'),('filtered_query','scope')]:
+            manifest = json.loads(manifest_bytes)
+            if change == 'missing_page':
+                manifest['source_pages'].pop()
+            elif change == 'filtered_query':
+                manifest['source_pages'][0]['params']['category']='half_year_only'
+            else:
+                page = json.loads(second_bytes)
+                page['announcements'][0]['announcementId' if change == 'duplicate_id' else 'secCode'] = (
+                    '1' if change == 'duplicate_id' else '000002')
+                second_page.write_text(_json(page),encoding='utf-8')
+                manifest['source_pages'][1]['sha256']=hashlib.sha256(second_page.read_bytes()).hexdigest()
+            catalogue_path.write_text(_json(manifest),encoding='utf-8')
+            invalid = deepcopy(catalogue)
+            invalid['document']['sha256']=hashlib.sha256(catalogue_path.read_bytes()).hexdigest()
+            with pytest.raises(ValueError,match=message):
+                _validate_valuation_document(invalid)
+            second_page.write_bytes(second_bytes)
+        catalogue_path.write_bytes(manifest_bytes)
+        invalid = deepcopy(catalogue)
+        invalid['document']['url']='https://www.cninfo.com.cn/unrelated'
+        with pytest.raises(ValueError,match='origin'):
+            c.import_valuation_reviews(path,write(review,[source,invalid]),day)
         document_path.write_text('changed source',encoding='utf-8')
         assert c.qualified_valuation_reviews(day) == {}
         assert c.client.calls == []

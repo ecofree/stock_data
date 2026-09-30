@@ -229,8 +229,11 @@ def _validate_valuation_document(payload):
     from urllib.parse import urlparse
     document = payload['document']
     url = urlparse(document['url'])
-    if (url.scheme != 'https' or url.hostname not in
-            {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'}):
+    catalogue = payload.get('kind') == 'disclosure_inventory'
+    official_catalogue = (catalogue and url.hostname == 'www.cninfo.com.cn'
+        and url.path == '/new/hisAnnouncement/query' and document.get('format') == 'json')
+    if (url.scheme != 'https' or (not official_catalogue and url.hostname not in
+            {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'})):
         raise ValueError('official valuation document origin required')
     path = Path(document['path'])
     raw = path.read_bytes()
@@ -244,6 +247,49 @@ def _validate_valuation_document(payload):
             raise ValueError('dated page extraction required')
     if not payload.get('ts_code') or not payload.get('as_of'):
         raise ValueError('official document dated identity required')
+    if catalogue:
+        # The manifest is a local index of original public responses, not an
+        # official response itself. Revalidate every page on every read; a
+        # boolean review or the supplier's totalpages cannot establish coverage.
+        if not official_catalogue or payload.get('fields'):
+            raise ValueError('official disclosure catalogue page manifest required')
+        manifest = json.loads(raw)
+        pages = manifest.get('source_pages', [])
+        if (manifest.get('schema') != 'official_disclosure_page_set_v1' or not pages
+                or manifest.get('ts_code') != payload['ts_code']):
+            raise ValueError('dated disclosure page scope required')
+        identities, total, org = [], None, None
+        for number, page in enumerate(pages, 1):
+            params = page['params']
+            stock, org_id = params['stock'].split(',')
+            start, through = params['seDate'].split('~')
+            expected_column = {'SZ':'szse','SH':'sse'}.get(payload['ts_code'].split('.')[1])
+            if (stock != payload['ts_code'].split('.')[0] or not org_id
+                    or (org is not None and org != org_id)
+                    or params.get('tabName') != 'fulltext' or int(params['pageNum']) != number
+                    or start != payload['window_from'] or through != payload['window_through']
+                    or through != payload['as_of'] or params.get('category') or params.get('searchkey')
+                    or params.get('column') not in (None,'',expected_column)
+                    or set(params) - {'stock','tabName','column','pageSize','pageNum','seDate','isHLtitle'}
+                    or page.get('http_status') != 200):
+                raise ValueError('disclosure catalogue query scope mismatch')
+            org = org_id
+            page_raw = Path(page['path']).read_bytes()
+            if hashlib.sha256(page_raw).hexdigest() != page['sha256']:
+                raise ValueError('official disclosure catalogue page changed')
+            body = json.loads(page_raw)
+            declared = body['totalAnnouncement']
+            rows = body.get('announcements') or []
+            if (isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
+                    or (total is not None and total != declared)
+                    or body.get('hasMore') is not (number < len(pages))
+                    or any(r.get('secCode') != stock or r.get('orgId') != org
+                           or not r.get('announcementId') for r in rows)):
+                raise ValueError('disclosure catalogue pagination or identity mismatch')
+            total = declared
+            identities.extend(r['announcementId'] for r in rows)
+        if len(identities) != total or len(set(identities)) != total:
+            raise ValueError('disclosure catalogue incomplete or duplicate pages')
     return payload
 
 
@@ -681,7 +727,7 @@ class TushareHistoryCollector:
                 result = self._valuation_review(payload['review'], trade_date, now)
                 if result['valuation_eligible']:
                     results[code] = dict(result, review_sha256=digest)
-            except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            except (KeyError, TypeError, ValueError, IndexError, AttributeError, OSError):
                 continue
         return results
 
