@@ -143,3 +143,166 @@ def test_bj_tushare_moneyflow_zero_is_not_proof_of_field_capability():
     result = normalize_stock_flow_row(row,'tushare')
     assert result['main_net'] is None and result['net_total'] is None
     assert result['flow_definition'] == 'product_security_scope_unverified'
+
+
+def _candidate_bytes(codes=('000001.SZ', '600000.SH', '920128.BJ')):
+    """Synthetic protocol fixture, never labelled a supplier market receipt."""
+    import json
+    from trade_system.flow_contract import GANGTISE_FLOW_FIELDS
+    fields = ['securityCode', 'tradeDate', *GANGTISE_FLOW_FIELDS]
+    buckets = [(1, 3, -2), (2, 1, 1), (5, 2, 3), (7, 3, 4), (15, 9, 6), (12, 5, 7)]
+    return json.dumps({'code': '000000', 'status': True, 'data': {
+        'fieldList': fields, 'list': [[c, '20260929', *(v for bucket in buckets for v in bucket)]
+                                    for c in codes]}}).encode()
+
+
+def test_candidate_scope_units_arithmetic_and_original_time_do_not_authorize_independence():
+    from trade_system.flow_contract import parse_candidate_flow_response
+    codes = ['000001.SZ', '600000.SH', '920128.BJ']
+    arrival = '2026-09-29T17:00:00+08:00'
+    result = parse_candidate_flow_response(_candidate_bytes(), '2026-09-29', codes, received_at=arrival)
+    assert result['returned_scope_complete'] and result['arithmetic_qualified']
+    assert result['rows'][2]['security_code'] == '920128.BJ'
+    assert all(r['received_at'] == arrival and r['candidate_main_net_yuan'] == '7' for r in result['rows'])
+    assert result['origin_provider'] == 'unknown' and not result['independent_comparison_eligible']
+    assert result['canonical_writes'] == result['production_writes'] == 0
+    partial = parse_candidate_flow_response(_candidate_bytes(codes[:2]), '2026-09-29', codes, received_at=arrival)
+    assert partial['missing_securities'] == ['920128.BJ'] and not partial['returned_scope_complete']
+
+
+def test_candidate_rejects_date_fallback_width_duplicates_nonfinite_and_preserves_null():
+    import json
+    import pytest
+    from copy import deepcopy
+    from trade_system.flow_contract import parse_candidate_flow_response
+    raw = json.loads(_candidate_bytes())
+    kwargs = dict(trade_date='2026-09-29', securities=['000001.SZ', '600000.SH', '920128.BJ'],
+                  received_at='2026-09-29T17:00:00+08:00')
+    for mutation in ('date', 'width', 'duplicate', 'scope', 'field', 'nonfinite', 'boolean'):
+        payload = deepcopy(raw)
+        data = payload['data']
+        if mutation == 'date':
+            data['list'][0][1] = '2026-09-28'
+        elif mutation == 'width':
+            data['list'][0].pop()
+        elif mutation == 'duplicate':
+            data['list'][1][0] = data['list'][0][0]
+        elif mutation == 'scope':
+            data['list'][2][0] = '920000.BJ'
+        elif mutation == 'field':
+            data['fieldList'][3] = data['fieldList'][2]
+        elif mutation == 'nonfinite':
+            data['list'][0][2] = float('nan')
+        else:
+            data['list'][0][2] = True
+        with pytest.raises(ValueError):
+            parse_candidate_flow_response(json.dumps(payload).encode(), **kwargs)
+    with pytest.raises(ValueError, match='duplicate response'):
+        parse_candidate_flow_response(b'{"code":"000000","code":"000000"}', **kwargs)
+    with pytest.raises(ValueError, match='timezone'):
+        parse_candidate_flow_response(_candidate_bytes(), **dict(kwargs, received_at='2026-09-29T17:00:00'))
+    raw['data']['list'][0][2] = None
+    result = parse_candidate_flow_response(json.dumps(raw).encode(), **kwargs)
+    assert not result['arithmetic_qualified']
+    assert 'missing_amount:smallInflow' in result['rows'][0]['quality_issues']
+    raw['data']['list'][0][2] = -1
+    raw['data']['list'][0][-1] = 999
+    result = parse_candidate_flow_response(json.dumps(raw).encode(), **kwargs)
+    assert any('negative_gross' in v for v in result['rows'][0]['quality_issues'])
+    assert 'main_bucket_arithmetic:NetInflow' in result['rows'][0]['quality_issues']
+
+
+def test_candidate_request_uses_shared_wire_budget_and_stops_rejected_response(monkeypatch):
+    import json
+    import subprocess
+    import pytest
+    from types import SimpleNamespace
+    from trade_system.flow_contract import request_candidate_flow
+    from trade_system.http_transport import diagnostic_budget
+    calls = []
+    rejected = False
+
+    def run(command, *, input, timeout, **kwargs):
+        wire = json.loads(input)
+        assert 'fixture-secret' not in ' '.join(command)
+        assert wire['headers']['Authorization'] == 'Bearer fixture-secret'
+        request = json.loads(wire['body'])
+        assert request['startDate'] == request['endDate'] == '2026-09-29'
+        assert len(request['securityList']) == request['limit'] == 1
+        assert 0 < timeout <= 20
+        calls.append(wire)
+        raw = (b'{"code":"8000014","status":false,"msg":"fixture-secret"}' if rejected
+               else _candidate_bytes(request['securityList']))
+        return SimpleNamespace(returncode=0, stdout=b'{"ok":true}\n' + raw)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    kwargs = dict(authorization='fixture-secret', entitlement_sha256='a'*64)
+    with pytest.raises(RuntimeError, match='diagnostic context'):
+        request_candidate_flow('2026-09-29', ['000001.SZ'], **kwargs)
+    assert not calls
+    with diagnostic_budget() as budget:
+        original, result = request_candidate_flow('2026-09-29', ['000001.SZ'], **kwargs)
+        assert original == _candidate_bytes(['000001.SZ']) and not result['independent_comparison_eligible']
+        reused_raw, reused = request_candidate_flow('2026-09-29', ['000001.SZ'], **kwargs)
+        assert reused_raw == original and reused['reused'] and reused['received_at'] == result['received_at']
+        assert budget['attempts'] == len(calls) == 1
+        request_candidate_flow('2026-09-29', ['600000.SH'], **kwargs)
+        with pytest.raises(RuntimeError, match='budget'):
+            request_candidate_flow('2026-09-29', ['920128.BJ'], **kwargs)
+        assert len(calls) == budget['attempts'] == 2
+    rejected = True
+    with diagnostic_budget() as budget:
+        original, result = request_candidate_flow('2026-09-29', ['000001.SZ'], **kwargs)
+        assert b'8000014' in original and result['status'] == 'response_rejected'
+        assert 'fixture-secret' not in json.dumps(result)
+        assert budget['stopped'] == 'business_rejected'
+        with pytest.raises(RuntimeError, match='stopped'):
+            request_candidate_flow('2026-09-29', ['000001.SZ'], **kwargs)
+        assert budget['attempts'] == 1
+
+
+def test_candidate_file_hash_and_configuration_presence_are_not_entitlement(tmp_path):
+    import hashlib
+    import pytest
+    from scripts.audit_stock_flow_contract import audit_candidate_file
+    from trade_system.flow_contract import candidate_flow_capabilities, candidate_flow_request
+    path = tmp_path / 'original.json'
+    raw = _candidate_bytes(['000001.SZ'])
+    path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    result = audit_candidate_file(path, digest, '2026-09-29', ['000001.SZ'], '2026-09-29T17:00:00+08:00')
+    assert result['response_sha256'] == digest
+    path.write_bytes(raw + b' ')
+    with pytest.raises(ValueError, match='SHA256 differs'):
+        audit_candidate_file(path, digest, '2026-09-29', ['000001.SZ'], '2026-09-29T17:00:00+08:00')
+    capabilities = candidate_flow_capabilities({'HITHINK_FINANCE_API_KEY': 'fixture-secret'})
+    assert capabilities['hithink_ai_client_key_present']
+    assert not capabilities['hithink_ai_key_authorizes_ifind'] and not capabilities['entitlement_verified']
+    for codes in (['aShares'], ['920128'], ['000001.SZ', '000001.SZ']):
+        with pytest.raises(ValueError):
+            candidate_flow_request('2026-09-29', codes)
+
+
+def test_candidate_cli_never_opens_database_and_refuses_output_escape_or_overwrite(tmp_path, monkeypatch):
+    import json
+    import sys
+    import pytest
+    from scripts import audit_stock_flow_contract as entry
+    monkeypatch.setattr(entry, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(entry.duckdb, 'connect', lambda *a, **k: pytest.fail('candidate opened database'))
+    target = tmp_path / 'reports' / 'candidate.json'
+    base = ['audit', '--candidate-plan', '--date', '2026-09-29', '--codes', '000001.SZ',
+            '--db', 'production-path-must-not-open.duckdb', '--out']
+    monkeypatch.setattr(sys, 'argv', base + [str(target)])
+    assert entry.main() == 0
+    result = json.loads(target.read_text(encoding='utf-8'))
+    assert result['authenticated_requests'] == result['production_writes'] == 0
+    assert not result['independent_comparison_eligible']
+    original = target.read_bytes()
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert target.read_bytes() == original
+    monkeypatch.setattr(sys, 'argv', base + [str(tmp_path / 'escape.json')])
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert not (tmp_path / 'escape.json').exists()
