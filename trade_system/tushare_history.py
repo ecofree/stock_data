@@ -247,6 +247,24 @@ def _validate_valuation_document(payload):
             raise ValueError('dated page extraction required')
     if not payload.get('ts_code') or not payload.get('as_of'):
         raise ValueError('official document dated identity required')
+    related = payload.get('related_original_document_receipts', [])
+    if not isinstance(related, list) or (payload.get('coverage') ==
+            'all_price_and_share_affecting_actions' and not related):
+        raise ValueError('original corporate action documents required')
+    for source in related:
+        origin = urlparse(source['url'])
+        source_raw = Path(source['path']).read_bytes()
+        if (origin.scheme != 'https' or origin.hostname not in
+                {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'}
+                or source.get('code') != payload['ts_code']
+                or hashlib.sha256(source_raw).hexdigest() != source['sha256']
+                or not source_raw.startswith(b'%PDF-')
+                or source.get('announcement',{}).get('secCode') != payload['ts_code'].split('.')[0]):
+            raise ValueError('original corporate action document changed or mismatched')
+        received = datetime.fromisoformat(source.get('received_at', ''))
+        parent_received = datetime.fromisoformat(payload['received_at'])
+        if received.tzinfo is None or parent_received.tzinfo is None or received > parent_received:
+            raise ValueError('corporate action arrival omitted from input clock')
     if catalogue:
         # The manifest is a local index of original public responses, not an
         # official response itself. Revalidate every page on every read; a
@@ -662,6 +680,11 @@ class TushareHistoryCollector:
         result['reviewed_at'] = review['reviewed_at']
         result['financial_inventory'] = inventory
         result['source_receipts'] = sorted(documents)
+        # Revision and action evidence is also an input. Its actual arrival
+        # participates even when it does not supply a numeric field.
+        source_arrivals = [datetime.fromisoformat(arrival) for _, arrival in documents.values()]
+        result['input_received_at_min'] = min(source_arrivals).isoformat()
+        result['input_received_at_max'] = max(source_arrivals).isoformat()
         result['valuation_eligible'] = result['status'] in {'derived_core_fields','derived_core_fields_with_known_undefined_pb'}
         # Daily-basic raw provenance is never relabelled as a provider result.
         result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'

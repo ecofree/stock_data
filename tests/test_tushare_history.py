@@ -833,7 +833,7 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         catalogue_path.write_text(_json(dict(schema='official_disclosure_page_set_v1',ts_code=code,
             source_pages=catalogue_pages)),encoding='utf-8')
         catalogue = dict(schema='official_valuation_document_v1',ts_code=code,as_of=day,
-            received_at=source['received_at'],kind='disclosure_inventory',window_from='2026-03-31',
+            received_at='2026-07-01T16:05:00+08:00',kind='disclosure_inventory',window_from='2026-03-31',
             window_through=day,catalogue_complete=True,
             document=dict(url='https://www.cninfo.com.cn/new/hisAnnouncement/query',path=str(catalogue_path),
                 format='json',sha256=hashlib.sha256(catalogue_path.read_bytes()).hexdigest()))
@@ -858,6 +858,8 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
             return hashlib.sha256(path.read_bytes()).hexdigest()
         result = c.import_valuation_reviews(path,write(review,[source,catalogue]),day)['rows'][0]
         assert result['valuation_eligible'] and result['values']['pb'] < 0
+        assert result['input_received_at_min'] == '2026-07-01T16:00:00+08:00'
+        assert result['input_received_at_max'] == catalogue['received_at']
         assert not result['value_screen_eligible'] and result['valuation_risk'] == 'negative_equity'
         original = c.store.conn.execute('SELECT payload_json FROM multi_source_observation WHERE payload_hash=?',[digest]).fetchone()[0]
         assert json.loads(original)['fields']['other_equity']['value'] is None
@@ -910,6 +912,41 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         invalid['document']['url']='https://www.cninfo.com.cn/unrelated'
         with pytest.raises(ValueError,match='origin'):
             c.import_valuation_reviews(path,write(review,[source,invalid]),day)
+        # Related action originals participate in integrity and arrival checks,
+        # even when the dated catalogue pages themselves remain unchanged.
+        action_path = tmp_path/'action.pdf'
+        action_bytes = b'%PDF-fixture corporate action original'
+        action_path.write_bytes(action_bytes)
+        action = deepcopy(catalogue)
+        action['coverage']='all_price_and_share_affecting_actions'
+        action['related_original_document_receipts']=[dict(code=code,
+            url='https://static.cninfo.com.cn/action.pdf',path=str(action_path),
+            sha256=hashlib.sha256(action_bytes).hexdigest(),announcement=dict(secCode='000001'),
+            received_at=action['received_at'])]
+        _validate_valuation_document(action)
+        action_digest = hashlib.sha256(_json(action).encode()).hexdigest()
+        action_review = deepcopy(review)
+        action_review['source_receipts']=[action_digest if h == catalogue_digest else h
+                                         for h in review['source_receipts']]
+        action_review['financial_inventory']['document_receipts']=[action_digest]
+        c.import_valuation_reviews(path,write(action_review,[source,action]),day)
+        action_path.write_bytes(b'%PDF-changed corporate action')
+        assert c.qualified_valuation_reviews(day) == {}
+        action_path.write_bytes(action_bytes)
+        assert code in c.qualified_valuation_reviews(day)
+        for change in ('late_arrival','missing_arrival','missing_original','wrong_security'):
+            invalid = deepcopy(action)
+            original = invalid['related_original_document_receipts'][0]
+            if change == 'late_arrival':
+                original['received_at']='2026-07-01T16:06:00+08:00'
+            elif change == 'missing_arrival':
+                original.pop('received_at')
+            elif change == 'missing_original':
+                invalid['related_original_document_receipts']=[]
+            else:
+                original['announcement']['secCode']='000002'
+            with pytest.raises(ValueError):
+                _validate_valuation_document(invalid)
         document_path.write_text('changed source',encoding='utf-8')
         assert c.qualified_valuation_reviews(day) == {}
         assert c.client.calls == []
