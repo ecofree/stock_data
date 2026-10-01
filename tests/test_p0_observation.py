@@ -448,3 +448,81 @@ def test_partial_stock_batch_keeps_available_facts_but_cannot_qualify_a_complete
             assert _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
     finally:
         con.close()
+
+
+@pytest.mark.parametrize("expected,fetched,coverage,status", [
+    (5000, 1, 100, 'success'),
+    (5000, 4974, 99.5, 'success'),
+    (5000, 5001, 100, 'success'),
+    (5000, 5000, 100.1, 'success'),
+    (5000, 5000, float('nan'), 'success'),
+    (float('nan'), 5000, 100, 'success'),
+    (5000, float('inf'), 100, 'success'),
+    (5000.5, 5000, 100, 'success'),
+    (5000, 5000.5, 100, 'success'),
+    (0, 0, 100, 'success'),
+    (5000, 5000, 100, 'partial'),
+])
+def test_p0_batch_requires_finite_coherent_counts(expected, fetched, coverage, status):
+    from trade_system.p0_observation import _batch_status, GOOD_STOCK_BATCH
+    con = duckdb.connect(':memory:')
+    try:
+        con.execute('CREATE TABLE intraday_stock_flow_batch(trade_date DATE,expected_rows DOUBLE,'
+                    'fetched_rows DOUBLE,coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)')
+        con.execute("INSERT INTO intraday_stock_flow_batch VALUES ('2026-09-29',?,?,?,?,"
+                    "'2026-09-29 15:00:00')", [expected, fetched, coverage, status])
+        result = _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)
+        assert not result['passed']
+        assert result['updated_at'] == '2026-09-29 15:00:00'
+    finally:
+        con.close()
+
+
+def test_p0_missing_or_duplicate_batch_cannot_choose_a_green_row():
+    from trade_system.p0_observation import _batch_status, GOOD_STOCK_BATCH
+    con = duckdb.connect(':memory:')
+    try:
+        assert not _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
+        con.execute('CREATE TABLE intraday_stock_flow_batch(trade_date DATE,expected_rows INTEGER,'
+                    'fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)')
+        assert not _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
+        con.execute("INSERT INTO intraday_stock_flow_batch VALUES "
+                    "('2026-09-29',5000,5000,100,'success','2026-09-29 15:00:00')")
+        qualified = _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)
+        # A historical metadata audit must not age the original checkpoint against today.
+        assert qualified['passed'] and qualified['updated_at'] == '2026-09-29 15:00:00'
+        con.execute("INSERT INTO intraday_stock_flow_batch SELECT * FROM intraday_stock_flow_batch")
+        assert not _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("expected,fetched,coverage", [
+    (390, 1, 100), (390, 391, 100), (390.5, 390, 100),
+    (390, 390, 100.1), (390, 390, float('nan')),
+])
+def test_p0_sector_taxonomies_need_coherent_separate_denominators(expected, fetched, coverage):
+    from trade_system.p0_observation import _sector_status
+    con = duckdb.connect(':memory:')
+    try:
+        con.execute('CREATE TABLE intraday_sector_flow_batch(trade_date DATE,expected_rows INTEGER,'
+                    'fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)')
+        con.execute("INSERT INTO intraday_sector_flow_batch VALUES "
+                    "('2026-09-29',886,886,100,'success','2026-09-29 15:00:00')")
+        con.execute('CREATE TABLE intraday_sector_flow_taxonomy(trade_date DATE,taxonomy VARCHAR,'
+                    'expected_rows DOUBLE,fetched_rows DOUBLE,coverage_pct DOUBLE,status VARCHAR)')
+        con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES "
+                    "('2026-09-29','em_industry',496,496,100,'success')")
+        con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES "
+                    "('2026-09-29','ths_concept',?,?,?,'success')", [expected, fetched, coverage])
+        result = _sector_status(con, '2026-09-29')
+        assert not result['passed'] and not result['taxonomy_evidence_passed']
+        con.execute("DELETE FROM intraday_sector_flow_taxonomy WHERE taxonomy='ths_concept'")
+        con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES "
+                    "('2026-09-29','ths_concept',390,390,100,'success')")
+        assert _sector_status(con, '2026-09-29')['passed']
+        con.execute("INSERT INTO intraday_sector_flow_taxonomy SELECT * FROM intraday_sector_flow_taxonomy "
+                    "WHERE taxonomy='ths_concept'")
+        assert not _sector_status(con, '2026-09-29')['passed']
+    finally:
+        con.close()

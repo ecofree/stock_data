@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -27,31 +28,163 @@ def _normalize_trade_date(value: str) -> str:
     return str(value)[:10]
 
 
-def required_sector_taxonomy_coverage(con, trade_date):
-    """Shared required-product gate; aggregate rows cannot prove a denominator."""
-    required=('em_industry','ths_concept')
-    if not table_exists(con,'intraday_sector_flow_taxonomy'):
-        return {'passed':False,'taxonomies':{},'reason':'required_taxonomy_evidence_missing'}
+def _finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _coverage_fact(expected, observed, coverage, status, good_statuses) -> dict:
+    known = _finite_number(expected) and expected > 0 and float(expected).is_integer()
+    counts_valid = bool(known and _finite_number(observed) and 0 <= observed <= expected
+                        and float(observed).is_integer())
+    percentage_valid = _finite_number(coverage) and 0 <= coverage <= 100
+    actual_pct = observed * 100.0 / expected if counts_valid else None
+    passed = bool(counts_valid and percentage_valid and coverage >= 99.5
+                  and actual_pct >= 99.5 and coverage <= actual_pct + 0.011
+                  and status in good_statuses)
+    return {
+        "passed": passed, "denominator_known": bool(known),
+        "expected_rows": int(expected) if known else None,
+        "fetched_rows": int(observed) if _finite_number(observed) and float(observed).is_integer() else None,
+        "coverage_pct": float(coverage) if known and percentage_valid else None,
+        "observed_coverage_pct": actual_pct, "status": str(status or "missing"),
+        "reason": None if passed else "invalid_or_incomplete_coverage_evidence",
+    }
+
+
+def required_sector_taxonomy_coverage(con, trade_date, *, now=None):
+    """Require each dated product's own valid denominator, not aggregate counts."""
+    required = ("em_industry", "ths_concept")
+    table = "intraday_sector_flow_taxonomy"
+    if not table_exists(con, table):
+        return {"passed": False, "taxonomies": {}, "reason": "required_taxonomy_evidence_missing"}
+    timestamp = _timestamp_column(con, table)
+    time_sql = f', TRY_CAST("{timestamp}" AS TIMESTAMP)' if timestamp else ', NULL'
     try:
-        rows=con.execute('SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status '
-            'FROM intraday_sector_flow_taxonomy WHERE trade_date=CAST(? AS DATE)',[trade_date]).fetchall()
+        rows = con.execute(
+            "SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status" + time_sql
+            + " FROM intraday_sector_flow_taxonomy WHERE trade_date=CAST(? AS DATE)",
+            [_normalize_trade_date(trade_date)],
+        ).fetchall()
     except duckdb.Error:
-        return {'passed':False,'taxonomies':{},'reason':'required_taxonomy_evidence_invalid'}
-    facts={}
-    for name,expected,observed,coverage,status in rows:
+        return {"passed": False, "taxonomies": {}, "reason": "required_taxonomy_evidence_invalid"}
+    facts = {}
+    for name, expected, observed, coverage, status, updated_at in rows:
         if name not in required:
             continue
         if name in facts:
-            return {'passed':False,'taxonomies':facts,'reason':'duplicate_taxonomy_evidence'}
-        known=isinstance(expected,(int,float)) and expected>0
-        passed=bool(known and status=='success' and coverage is not None and coverage>=99.5
-                    and observed is not None and observed*100/expected>=99.5)
-        facts[name]={'expected_rows':expected if known else None,'fetched_rows':observed,
-            'coverage_pct':coverage if known else None,'denominator_known':known,
-            'status':status,'passed':passed}
-    passed=all(name in facts and facts[name]['passed'] for name in required)
-    return {'passed':passed,'taxonomies':facts,
-            'reason':None if passed else 'required_taxonomy_missing_unknown_or_partial'}
+            return {"passed": False, "taxonomies": facts, "reason": "duplicate_taxonomy_evidence"}
+        fact = _coverage_fact(expected, observed, coverage, status, {"success"})
+        if now is not None and timestamp and (updated_at is None or updated_at > as_local_naive(now)):
+            fact.update(passed=False, reason="taxonomy_evidence_not_available_as_of")
+        facts[name] = fact
+    passed = all(name in facts and facts[name]["passed"] for name in required)
+    return {"passed": passed, "taxonomies": facts,
+            "reason": None if passed else "required_taxonomy_missing_unknown_or_partial"}
+
+
+def _actual_flow_coverage(con, trade_date, kind, evidence, *, max_age_seconds=None, now=None):
+    """Compare a checkpoint with usable canonical facts, never a bounded fallback."""
+    relation = "multi_source_stock_flow" if kind == "stock" else "multi_source_sector_flow"
+    result = {"passed": False, "relation": relation, "reason": "canonical_flow_evidence_missing"}
+    if not table_exists(con, relation):
+        return result
+    columns = set(table_columns(con, relation))
+    code = "stock_code" if kind == "stock" else "sector_code"
+    if not {"source_date", code, "main_net"} <= columns:
+        return {**result, "reason": "canonical_flow_schema_invalid"}
+    filters = ['source_date=CAST(? AS DATE)', 'isfinite(TRY_CAST(main_net AS DOUBLE))',
+               f'nullif(trim("{code}"),\'\') IS NOT NULL']
+    params = [_normalize_trade_date(trade_date)]
+    if "is_stale" in columns:
+        filters.append("coalesce(is_stale,false)=false")
+    if "is_fallback" in columns:
+        filters.append("coalesce(is_fallback,false)=false")
+    timestamp = _timestamp_column(con, relation)
+    if timestamp:
+        time_expr = f'TRY_CAST("{timestamp}" AS TIMESTAMP)'
+        filters.append(f"{time_expr} IS NOT NULL")
+        if now is not None:
+            filters.append(f"{time_expr}<=?")
+            params.append(as_local_naive(now))
+        if max_age_seconds is not None:
+            filters.append(f"{time_expr}>=?")
+            params.append((as_local_naive(now) or datetime.now())
+                          - timedelta(seconds=max(0, int(max_age_seconds))))
+    else:
+        return {**result, "reason": "canonical_flow_timestamp_missing"}
+    if kind == "stock":
+        provider = evidence.get("provider")
+        if provider:
+            if "provider" not in columns:
+                return {**result, "reason": "canonical_flow_provider_missing"}
+            filters.append("provider=?")
+            params.append(provider)
+        rows = con.execute(f'SELECT count(DISTINCT "{code}") FROM "{relation}" WHERE '
+                           + " AND ".join(filters), params).fetchone()[0]
+        expected = evidence.get("expected_rows")
+        pct = rows * 100.0 / expected if expected else None
+        passed = bool(expected and 99.5 <= pct <= 100)
+        return {**result, "passed": passed, "observed_codes": rows, "coverage_pct": pct,
+                "reason": None if passed else "canonical_flow_scope_incomplete"}
+    if "sector_type" not in columns:
+        return {**result, "reason": "canonical_taxonomy_identity_missing"}
+    actual = {}
+    for name, fact in evidence.get("taxonomies", {}).items():
+        types = ("ths_concept", "ths_concept_derived") if name == "ths_concept" else (name,)
+        rows = con.execute(f'SELECT count(DISTINCT "{code}") FROM "{relation}" WHERE '
+                           + " AND ".join(filters) + " AND sector_type IN ("
+                           + ",".join("?" for _ in types) + ")", params + list(types)).fetchone()[0]
+        expected = fact.get("expected_rows")
+        pct = rows * 100.0 / expected if expected else None
+        actual[name] = {"observed_codes": rows, "coverage_pct": pct,
+                        "passed": bool(expected and 99.5 <= pct <= 100)}
+    passed = all(name in actual and actual[name]["passed"] for name in ("em_industry", "ths_concept"))
+    return {**result, "passed": passed, "taxonomies": actual,
+            "reason": None if passed else "canonical_taxonomy_scope_incomplete"}
+
+
+def capital_flow_coverage(con, trade_date, kind, *, require_actual=False, max_age_seconds=None, now=None):
+    """Single gate shared by relation and group: missing metadata is unknown."""
+    if kind not in {"stock", "sector"}:
+        raise ValueError("unknown capital flow kind")
+    table = f"intraday_{kind}_flow_batch"
+    result = {"passed": False, "denominator_known": False, "expected_rows": None,
+              "fetched_rows": None, "coverage_pct": None, "status": "missing",
+              "reason": "batch_evidence_missing"}
+    if not table_exists(con, table):
+        return result
+    columns = set(table_columns(con, table))
+    timestamp = _timestamp_column(con, table)
+    time_sql = f', TRY_CAST("{timestamp}" AS TIMESTAMP)' if timestamp else ', NULL'
+    provider_sql = ', provider' if "provider" in columns else ', NULL'
+    try:
+        rows = con.execute("SELECT expected_rows,fetched_rows,coverage_pct,status" + time_sql + provider_sql
+                           + f" FROM {table} WHERE trade_date=CAST(? AS DATE)",
+                           [_normalize_trade_date(trade_date)]).fetchall()
+    except duckdb.Error:
+        return {**result, "reason": "batch_evidence_invalid"}
+    if len(rows) != 1:
+        return {**result, "reason": "duplicate_batch_evidence" if rows else "same_date_batch_evidence_missing"}
+    expected, observed, pct, status, updated_at, provider = rows[0]
+    good = {"success", "success_with_unavailable"} if kind == "stock" else {"success", "success_with_optional_gap"}
+    result = _coverage_fact(expected, observed, pct, status, good)
+    result.update(updated_at=str(updated_at) if updated_at else None, provider=provider)
+    if now is not None and timestamp and (updated_at is None or updated_at > as_local_naive(now)):
+        result.update(passed=False, reason="batch_evidence_not_available_as_of")
+    if kind == "sector":
+        required = required_sector_taxonomy_coverage(con, trade_date, now=now)
+        result["taxonomies"] = required["taxonomies"]
+        if not required["passed"]:
+            result.update(passed=False, reason=required["reason"])
+    if require_actual:
+        actual = _actual_flow_coverage(con, trade_date, kind, result,
+                                       max_age_seconds=max_age_seconds, now=now)
+        result["actual"] = actual
+        if not actual["passed"]:
+            result["passed"] = False
+            if result.get("reason") is None:
+                result["reason"] = actual["reason"]
+    return result
 
 
 @dataclass(frozen=True)
@@ -158,6 +291,7 @@ def relation_freshness(
     max_age_seconds: int | None = None,
     now: datetime | None = None,
 ) -> dict:
+    trade_date = _normalize_trade_date(trade_date)
     now = as_local_naive(now) or datetime.now()
     if not table_exists(con, relation):
         return {
@@ -229,11 +363,11 @@ def relation_freshness(
         ("main_net", "super_net", "large_net", "mid_net", "small_net")
         if relation == "multi_source_sector_flow"
         else ("main_net_inflow", "super_net_inflow", "big_net_inflow", "mid_net_inflow", "small_net_inflow")
-        if relation == "sector_capital"
+        if relation in {"sector_capital", "v_sector_capital"}
         else ()
     )
     valid_flow = (
-        "(" + " OR ".join(f'"{name}" IS NOT NULL' for name in flow_columns if name in columns) + ")"
+        "(" + " OR ".join(f'isfinite(TRY_CAST("{name}" AS DOUBLE))' for name in flow_columns if name in columns) + ")"
         if any(name in columns for name in flow_columns)
         else "TRUE"
     )
@@ -241,7 +375,9 @@ def relation_freshness(
     # Count only rows with a canonical main-order value; the raw total-net
     # value remains available through ``net_total`` for separate analysis.
     if relation == "multi_source_stock_flow" and "main_net" in columns:
-        valid_flow = '"main_net" IS NOT NULL'
+        valid_flow = 'isfinite(TRY_CAST("main_net" AS DOUBLE))'
+    if "is_stale" in columns:
+        valid_flow += " AND coalesce(is_stale,false)=false"
     as_of_filter = (
         f" AND {timestamp_value_expr} <= ?"
         if now is not None and timestamp_column
@@ -258,6 +394,7 @@ def relation_freshness(
         """,
         base_params,
     ).fetchone()
+    same_date_rows = int(rows or 0)
     latest_date = con.execute(
         f'SELECT max(CAST("{date_column}" AS VARCHAR)) FROM "{relation}"'
     ).fetchone()[0]
@@ -284,7 +421,7 @@ def relation_freshness(
             pass
     status = "ready" if rows and real_rows else "fallback_only" if rows else "stale_or_empty"
     freshness_age_seconds = None
-    if rows and timestamp_column and latest_timestamp is not None:
+    if timestamp_column and latest_timestamp is not None:
         try:
             observed_at = latest_timestamp
             if isinstance(observed_at, str):
@@ -314,59 +451,38 @@ def relation_freshness(
         }:
             real_rows = 0
             status = "fallback_only"
-    batch_meta = None
-    sector_batch = None
-    if relation == "multi_source_stock_flow" and table_exists(con, "intraday_stock_flow_batch"):
-        try:
-            batch_meta = con.execute(
-                "SELECT expected_rows,fetched_rows,coverage_pct,status FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                [trade_date],
-            ).fetchone()
-        except Exception:
-            batch_meta = None
-        batch_status = str(batch_meta[3] or "") if batch_meta else ""
-        batch_coverage = float(batch_meta[2] or 0) if batch_meta else 0.0
-        batch_complete = (
-            batch_status == "success"
-            or (batch_status == "success_with_unavailable" and batch_coverage >= 99.5)
+    data_status = status
+    kind = (
+        "stock" if relation in GROUPS["stock_capital_flow"].relations
+        else "sector" if relation in {*GROUPS["sector_capital_flow"].relations, "multi_source_sector_flow"}
+        else None
+    )
+    coverage = None
+    if kind:
+        coverage = capital_flow_coverage(
+            con, trade_date, kind, require_actual=True, max_age_seconds=max_age_seconds, now=now,
         )
-        if batch_meta and (not batch_complete or int(batch_meta[0] or 0) <= 0
-                           or batch_coverage < 80.0):
-            status = "partial"
-    if relation in {"multi_source_sector_flow", "sector_capital"} and table_exists(con, "intraday_sector_flow_batch"):
-        try:
-            sector_batch = con.execute(
-                "SELECT expected_rows,fetched_rows,coverage_pct,status FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                [trade_date],
-            ).fetchone()
-        except Exception:
-            sector_batch = None
-        taxonomy_coverage=required_sector_taxonomy_coverage(con,trade_date)
-        sector_complete = bool(
-            sector_batch
-            and int(sector_batch[0] or 0) > 0
-            and float(sector_batch[2] or 0) >= 99.5
-            and sector_batch[3] in {
-                "success",
-                "success_with_optional_gap",
-            }
-            and taxonomy_coverage['passed']
-        )
-        if sector_batch and not sector_complete:
+        # Qualification and freshness are independent facts.  An unknown
+        # denominator must block readiness without concealing a stale source.
+        if not coverage["passed"] and status == "ready":
             status = "partial"
     return {
         "relation": relation,
         "exists": True,
         "date_column": date_column,
         "rows": int(rows or 0),
+        "same_date_rows": same_date_rows,
         "real_rows": int(real_rows or 0),
         "fallback_rows": int(fallback_rows or 0),
         "latest_date": str(latest_date) if latest_date is not None else None,
         "latest_timestamp": str(latest_timestamp) if latest_timestamp is not None else None,
         "freshness_age_seconds": freshness_age_seconds,
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
-        "coverage_pct": float((batch_meta or sector_batch)[2]) if (batch_meta or locals().get("sector_batch")) else None,
-        "expected_rows": int((batch_meta or sector_batch)[0]) if (batch_meta or locals().get("sector_batch")) else None,
+        "coverage_pct": coverage.get("coverage_pct") if coverage else None,
+        "expected_rows": coverage.get("expected_rows") if coverage else None,
+        "coverage": coverage,
+        "coverage_reason": coverage.get("reason") if coverage else None,
+        "data_status": data_status,
         "status": status,
     }
 
@@ -380,6 +496,9 @@ def _sector_semantic_gate(con: duckdb.DuckDBPyConnection, trade_date: str) -> di
         # "validated" from "legacy semantic checks unavailable".
         return {"ready": True, "invalid_rows": 0, "issues": ["multi_source_sector_flow missing; legacy validation only"]}
     cols = set(table_columns(con, "multi_source_sector_flow"))
+    if not {"source_date", "main_net"} <= cols:
+        return {"ready": False, "invalid_rows": 0,
+                "issues": ["canonical sector semantic evidence schema invalid"]}
     amount_expr = (
         "amount_unit IS NULL OR amount_unit NOT IN "
         "('yuan', 'yuan_from_10000', 'yuan_from_100m_yuan')"
@@ -394,7 +513,8 @@ def _sector_semantic_gate(con: duckdb.DuckDBPyConnection, trade_date: str) -> di
     # to the DC endpoint, whose fields are already yuan.
     absurd = int(con.execute(
         "SELECT count(*) FROM multi_source_sector_flow "
-        "WHERE source_date=CAST(? AS DATE) AND main_net IS NOT NULL AND abs(main_net)>1e12",
+        "WHERE source_date=CAST(? AS DATE) AND main_net IS NOT NULL "
+        "AND (NOT isfinite(TRY_CAST(main_net AS DOUBLE)) OR abs(TRY_CAST(main_net AS DOUBLE))>1e12)",
         [trade_date],
     ).fetchone()[0])
     issues = []
@@ -442,6 +562,12 @@ def assess_trade_date_readiness(
         group_results = []
         for group_name in selected_groups:
             definition = GROUPS[group_name]
+            capital_coverage = None
+            if group_name in {"stock_capital_flow", "sector_capital_flow"}:
+                capital_coverage = capital_flow_coverage(
+                    con, trade_date, "stock" if group_name == "stock_capital_flow" else "sector",
+                    require_actual=True, max_age_seconds=freshness_max_age_seconds, now=now,
+                )
             relations = [
                 {
                     **relation_freshness(
@@ -528,55 +654,26 @@ def assess_trade_date_readiness(
                     "relations": relations,
                 }
             )
-            # A full-market batch checkpoint and a realtime candidate-pool
-            # snapshot are stronger contracts than the bounded fallback rows.
-            # If either exists for this date but is partial, do not let a
-            # smaller relation make the stage look actionable.
-            if group_name == "stock_capital_flow" and table_exists(con, "intraday_stock_flow_batch"):
-                batch = con.execute(
-                    "SELECT status,coverage_pct FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                    [trade_date],
-                ).fetchone()
-                batch_status = str(batch[0] or "") if batch else ""
-                batch_coverage = float(batch[1] or 0) if batch else 0.0
-                # Retain usable facts from partial batches for display, but do
-                # not promote their coverage percentage into stage readiness.
-                batch_complete = (
-                    batch_status == "success"
-                    or (
-                        batch_status == "success_with_unavailable"
-                        and batch_coverage >= 99.5
-                    )
-                )
-                if batch and (not batch_complete or batch_coverage < 80.0):
+            # Missing metadata is unknown, even when a view or bounded feed
+            # contains a current row.  Apply the same gate unconditionally to
+            # every candidate relation, then preserve both reasons in reports.
+            if capital_coverage is not None:
+                group_results[-1]["coverage"] = capital_coverage
+                group_results[-1]["coverage_reason"] = capital_coverage.get("reason")
+                if not capital_coverage["passed"]:
                     group_results[-1]["ready"] = False
-                    group_results[-1]["status"] = "partial"
+                    group_results[-1]["data_status"] = (
+                        "ready" if any(item.get("data_status") == "ready" for item in relations)
+                        else status
+                    )
+                    if group_results[-1]["data_status"] == "ready":
+                        group_results[-1]["status"] = "partial"
             if group_name == "candidate_pool" and table_exists(con, "realtime_candidate_pool_snapshot"):
                 pool = con.execute(
                     "SELECT status,stock_count FROM realtime_candidate_pool_snapshot WHERE trade_date=CAST(? AS DATE)",
                     [trade_date],
                 ).fetchone()
                 if pool and (pool[0] != "success" or int(pool[1] or 0) <= 0):
-                    group_results[-1]["ready"] = False
-                    group_results[-1]["status"] = "partial"
-            if group_name == "sector_capital_flow" and table_exists(con, "intraday_sector_flow_batch"):
-                try:
-                    sector_batch = con.execute(
-                        "SELECT status,coverage_pct FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                        [trade_date],
-                    ).fetchone()
-                except Exception:
-                    sector_batch = None
-                sector_complete = bool(
-                    sector_batch
-                    and float(sector_batch[1] or 0) >= 99.5
-                    and sector_batch[0] in {
-                        "success",
-                        "success_with_optional_gap",
-                    }
-                    and required_sector_taxonomy_coverage(con,trade_date)['passed']
-                )
-                if sector_batch and not sector_complete:
                     group_results[-1]["ready"] = False
                     group_results[-1]["status"] = "partial"
             if group_name == "sector_capital_flow":

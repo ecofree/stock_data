@@ -385,42 +385,32 @@ def _batch_status(
     trade_date: str,
     good_statuses: set[str],
 ) -> dict[str, Any]:
-    row = _fetchone(
-        con,
-        f"SELECT expected_rows,fetched_rows,coverage_pct,status,updated_at "
-        f"FROM {table} WHERE trade_date=CAST(? AS DATE)",
-        [trade_date],
-    )
-    expected, fetched, coverage, status, updated_at = row or (0, 0, 0, "missing", None)
-    passed = (
-        int(expected or 0) > 0
-        and float(coverage or 0) >= 99.5
-        and str(status or "").lower() in good_statuses
-    )
+    from trade_system.readiness import capital_flow_coverage
+    kind = {"intraday_stock_flow_batch": "stock", "intraday_sector_flow_batch": "sector"}[table]
+    # Historical phase receipts already carry their real observation windows.
+    # Reuse strict metadata qualification without applying today's TTL or
+    # replacing the recorded checkpoint time with the audit time.
+    evidence = capital_flow_coverage(con, trade_date, kind)
     return {
-        "expected": int(expected or 0),
-        "fetched": int(fetched or 0),
-        "coverage_pct": float(coverage or 0),
-        "status": str(status or "missing"),
-        "updated_at": str(updated_at) if updated_at is not None else None,
-        "passed": passed,
+        **evidence,
+        "expected": evidence["expected_rows"],
+        "fetched": evidence["fetched_rows"],
+        "updated_at": evidence.get("updated_at"),
+        "passed": bool(evidence["passed"] and evidence["status"] in good_statuses),
     }
 
 
 def _sector_status(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
     """A known successful industry product cannot certify an unknown THS scope."""
-    from trade_system.readiness import required_sector_taxonomy_coverage
     batch = _batch_status(con, 'intraday_sector_flow_batch', trade_date, GOOD_SECTOR_BATCH)
-    required = required_sector_taxonomy_coverage(con, trade_date)
-    aggregate_passed = batch['passed']
+    taxonomies = batch.get('taxonomies', {})
+    taxonomy_passed = all(name in taxonomies and taxonomies[name]['passed']
+                          for name in ('em_industry', 'ths_concept'))
     return {
         **batch,
-        'passed': bool(aggregate_passed and required['passed']),
-        'taxonomies': required['taxonomies'],
+        'taxonomies': taxonomies,
         'required_taxonomies': ['em_industry', 'ths_concept'],
-        'taxonomy_evidence_passed': required['passed'],
-        'reason': (required['reason'] if not required['passed']
-                   else None if aggregate_passed else 'aggregate_batch_not_qualified'),
+        'taxonomy_evidence_passed': taxonomy_passed,
         'coverage_scope': 'independent_required_taxonomies_not_aggregate_minimum',
         'row_count_scope': 'sum_product_rows_not_unique_industries',
     }
