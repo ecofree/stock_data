@@ -395,7 +395,11 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         pause_seconds=0,
     )
 
-    assert result["status"] == "success_with_optional_gap"
+    assert result["status"] == "partial", "missing required THS catalogue must remain a gap"
+    assert result['full_coverage'] is False
+    assert result['taxonomy_status']['em_industry']['qualified'] is True
+    assert result['taxonomy_status']['ths_concept']['denominator_known'] is False
+    assert result['taxonomy_status']['ths_concept']['coverage_pct'] is None
     assert result["coverage_pct"] == 100.0
     assert result["reconciliation_pages"] == 1
     assert calls == [
@@ -404,7 +408,7 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         (1, "f12", "1"),
     ]
     reused=collector.collect_full_sector_flow(db,'2026-07-24',max_pages=2,pause_seconds=0)
-    assert reused['status']=='success_with_optional_gap', reused
+    assert reused['status']=='partial', reused
     assert len(catalogue_calls)==1, 'qualified dated catalogue must be reused'
     con = duckdb.connect(str(db), read_only=True)
     try:
@@ -415,7 +419,7 @@ def test_reverse_code_reconciliation_closes_dynamic_page_gap(tmp_path, monkeypat
         assert con.execute(
             "SELECT status FROM intraday_sector_flow_batch "
             "WHERE trade_date='2026-07-24'"
-        ).fetchone()[0] == "success_with_optional_gap"
+        ).fetchone()[0] == "partial"
         assert con.execute(
             "SELECT count(*) FROM sector_capital WHERE date='2026-07-24'"
         ).fetchone()[0] == 4

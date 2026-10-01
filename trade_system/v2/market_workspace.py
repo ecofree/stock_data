@@ -114,6 +114,40 @@ def theme_facts(con,day,current,research_codes,limits):
         'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded}
 
 
+def collection_diagnostics(con, day, clock):
+    """Inline product receipts, independent of the available-price projection.
+
+    Receipt update times are diagnostic clocks, not refreshed source ages.
+    Missing tables/denominators do not certify full-market readiness.
+    """
+    names={r[0] for r in con.execute('SHOW TABLES').fetchall()}
+    products=[]
+    if 'history_fetch_checkpoint' in names:
+        columns={r[0] for r in con.execute('DESCRIBE history_fetch_checkpoint').fetchall()}
+        if {'dataset','trade_date','status','rows_written','last_error','updated_at'} <= columns:
+            for dataset,status,count,error,updated in con.execute(
+                'SELECT dataset,status,sum(rows_written),max(last_error),max(updated_at) '
+                'FROM history_fetch_checkpoint WHERE trade_date=? AND updated_at<=? '
+                'GROUP BY dataset,status ORDER BY dataset,status LIMIT 101',[day,clock]).fetchall():
+                products.append({'product':dataset,'status':status,'committed_upserts':count,
+                    'count_scope':'upserts_not_unique_new_rows','reason':str(error or '')[:500],
+                    'receipt_updated_at':updated.isoformat() if updated else None})
+    taxonomies=[]
+    if 'intraday_sector_flow_taxonomy' in names:
+        for name,expected,observed,pct,status,error in con.execute(
+            'SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status,last_error '
+            'FROM intraday_sector_flow_taxonomy WHERE trade_date=? ORDER BY taxonomy',[day]).fetchall():
+            taxonomies.append({'taxonomy':name,'expected_rows':expected if expected else None,
+                'observed_rows':observed,'coverage_pct':pct if expected else None,
+                'denominator_known':bool(expected),'status':status,'reason':str(error or '')[:500]})
+    failed=any(p['status'] not in {'success','complete'} for p in products)
+    failed=failed or any(t['status']!='success' or not t['denominator_known'] for t in taxonomies
+                         if t['taxonomy'] in {'em_industry','ths_concept'})
+    return {'status':'gaps_present' if failed else 'not_certified',
+        'products':products,'taxonomies':taxonomies,'full_market_certified':False,
+        'scope':'retained_receipts_not_independent_funds_or_observation_acceptance'}
+
+
 def project(con, day, as_of, research_codes):
     clock=datetime.fromisoformat(as_of)
     if clock.tzinfo is not None:
@@ -156,6 +190,7 @@ def project(con, day, as_of, research_codes):
     result={'schema':2,'scope':'read_only_market_review_not_execution','trade_date':day,'as_of':as_of,
         'breadth':breadth(r['pct'] for r in current.values()),'regime':'未评级（价格广度不替代情绪模型）',
         'breadth_scope':'available_canonical_price_rows_not_exchange_total','matched_previous':matched,
+        'collection_diagnostics':collection_diagnostics(con,day,clock),
         **theme,'theme_scope':'all_quality_gated_declared_members_not_all_market_coverage',
         'membership_max_age_days':THS_MEMBERSHIP_MAX_AGE_DAYS,
         'membership_time_scope':'retained_quality_gated_snapshot_not_historical_arrival_certification',

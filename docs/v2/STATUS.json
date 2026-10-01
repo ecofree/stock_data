@@ -1,33 +1,32 @@
 {
-  "schema": 1,
-  "as_of": "2026-09-21",
-  "status": "isolated_delivery_remediation_live_trial_degraded",
-  "baseline": "229ecc8bd50055c99977193f230939f8315fef0b",
-  "branch": "codex/delivery-20260921",
-  "candidate_version": "0.3.30",
-  "code_cleanup": "candidate_fixes_reference_failure_receipts_native_catalogue_live_scope_publication_and_period_queries",
-  "ledger": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29",
-  "remaining": "docs/v2/REMAINING_TASKS.md",
+  "schema": 2,
+  "as_of": "2026-10-01",
+  "status": "full_pause_by_user",
+  "branch": "codex/qualified-input-closure-20260930",
+  "candidate_version": "0.3.42",
+  "candidate_workspace": "D:/accio/stock_data-qualified-input-closure",
+  "candidate_deployed": false,
+  "baseline": "2c8a6312520de087df62147b5669aa174091ac49",
+  "automation_status": "PAUSED",
   "execution_ready": false,
   "production_cutover": false,
-  "historical_records": "Git history and original handover artifacts; no historical result is current acceptance",
-  "market_trial": true,
-  "trial_approval": "2026-09-21 explicit user approval; five market tasks only",
-  "live_acceptance": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921",
-  "candidate_workspace": "D:/accio/stock_data-delivery",
-  "candidate_deployed": false,
-  "observed_runtime": {
-    "verified_at": "2026-09-21T18:06:00+08:00",
-    "release": "0.3.29",
-    "collector_contract_sha256": "a11bb950f565e0bd563b6c00f6f6fa147f2af46b7a242a5b45e4d38a34124b36",
-    "last_close": "completed_with_degradation",
-    "readiness": false,
-    "scope": "retained_admin_capture_and_close_receipts_not_continuous_live_probe"
+  "ledger": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921",
+  "current_remediation": "one_shot_remediation_20261001",
+  "evidence": "reports/one-shot-remediation-20261001/verification.json",
+  "installed_runtime": {
+    "version": "0.3.37",
+    "source": "D:/accio/stock_data-runtime-closure",
+    "commit": "64b3cc5c7d9eeb4d4949936a1452b1e2fdb05113",
+    "enabled": false,
+    "scope": "user disabled all seven tasks; latest ordinary read-only session sees four protected-task subset"
   },
   "acceptance": {
-    "engineering": "candidate_validation_in_progress",
-    "market_trial": "five_complete_sessions_pending_20260921_excluded",
-    "research_value": "unproven_independent_experiments_required",
-    "real_account": "no_user_export_performance_unknown"
-  }
+    "engineering": "current final head gates and seal recorded in authoritative ledger; isolated checks are not production",
+    "qualified_valuation_inputs": "64_of_65_for_20260929_only; corrected physical-page citations require dated review; not production",
+    "independent_funds": "strict definition/full scope unavailable; auxiliary evidence separate",
+    "complete_production_day": "not_passed",
+    "five_complete_sessions": "0/5; no historical backfill credit",
+    "real_account": "not_exported; returns unknown"
+  },
+  "historical_records": "Prior versions, reports and failed receipts retained. New source and isolated checks do not supersede production acceptance."
 }

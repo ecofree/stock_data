@@ -43,6 +43,33 @@ def audit_candidate_file(path, expected_sha256, trade_date, securities, received
     return parse_candidate_flow_response(raw, trade_date, securities, received_at=received_at)
 
 
+def audit_product_selection_file(path, expected_sha256, trade_date, primary_origin, required_scope_sha256):
+    """Screen an exact saved product observation; no requests or qualification writes."""
+    import re
+    from trade_system.flow_contract import select_flow_product_candidate
+    if not isinstance(expected_sha256, str) or not re.fullmatch('[0-9a-f]{64}', expected_sha256):
+        raise ValueError('exact product selection evidence SHA256 required')
+    with Path(path).open('rb') as source:
+        raw = source.read(1_000_001)
+    if not raw or len(raw) > 1_000_000 or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError('bounded original product selection SHA256 differs')
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate product selection field')
+            result[key] = value
+        return result
+    def invalid_constant(_):
+        raise ValueError('nonfinite product selection field')
+    candidate = json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object,
+                           parse_constant=invalid_constant)
+    result = select_flow_product_candidate(candidate, trade_date, primary_origin=primary_origin,
+                                           required_scope_sha256=required_scope_sha256)
+    result['selection_evidence_sha256'] = expected_sha256
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(DB_PATH))
@@ -50,6 +77,10 @@ def main() -> int:
     parser.add_argument("--date", default="")
     parser.add_argument('--candidate-plan', action='store_true', help='Build an offline Gangtise request plan; no requests.')
     parser.add_argument('--candidate-receipt', help='Audit original candidate JSON bytes offline; no database access.')
+    parser.add_argument('--candidate-selection', help='Screen saved product evidence offline; no requests or database access.')
+    parser.add_argument('--selection-sha256', help='Exact saved product observation SHA256.')
+    parser.add_argument('--primary-origin', help='Explicit original compute source of the primary product.')
+    parser.add_argument('--required-scope-sha256', help='Exact dated full required security scope fingerprint.')
     parser.add_argument('--candidate-provider', choices=('gangtise', 'sina'), default='gangtise')
     parser.add_argument('--request-url', help='Original Sina request URL, including its exact bounded query.')
     parser.add_argument('--sina-page-source', help='Saved official PC page bytes.')
@@ -62,16 +93,23 @@ def main() -> int:
     sina_paths = {'page': args.sina_page_source, 'fields': args.sina_fields_source,
                   'method': args.sina_method_source}
     has_sina_options = args.request_url is not None or any(v is not None for v in sina_paths.values())
+    if any(v is not None for v in (args.selection_sha256, args.primary_origin, args.required_scope_sha256)) and not args.candidate_selection:
+        parser.error('product selection options require --candidate-selection')
     if (args.candidate_provider == 'sina' or has_sina_options) and not args.candidate_receipt:
         parser.error('Sina supports explicit offline --candidate-receipt only')
     if has_sina_options and args.candidate_provider != 'sina':
         parser.error('Sina source options require --candidate-provider sina')
-    if args.candidate_plan or args.candidate_receipt:
-        if (args.candidate_plan and args.candidate_receipt) or not args.date or not args.codes:
-            parser.error('select one candidate mode with explicit --date and --codes')
+    if args.candidate_plan or args.candidate_receipt or args.candidate_selection:
+        if sum(bool(v) for v in (args.candidate_plan, args.candidate_receipt, args.candidate_selection)) != 1 or not args.date:
+            parser.error('select one candidate mode with explicit --date')
+        if not args.candidate_selection and not args.codes:
+            parser.error('candidate plan or receipt requires explicit --codes')
         from trade_system.flow_contract import candidate_flow_capabilities, candidate_flow_request, GANGTISE_FLOW_URL
         try:
-            if args.candidate_receipt:
+            if args.candidate_selection:
+                result = audit_product_selection_file(args.candidate_selection, args.selection_sha256,
+                    args.date, args.primary_origin, args.required_scope_sha256)
+            elif args.candidate_receipt:
                 if not args.received_at:
                     raise ValueError('original --received-at required')
                 result = audit_candidate_file(args.candidate_receipt, args.response_sha256,

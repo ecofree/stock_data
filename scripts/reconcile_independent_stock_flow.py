@@ -1,8 +1,8 @@
 """Persist an independent stock-flow reconciliation for a trade date.
 
-The primary full-market flow is normally the delayed Eastmoney snapshot.  The
-TuShare moneyflow rows are a genuinely independent vendor and must be checked
-against it after both feeds are durable.  This script only compares canonical
+The primary full-market flow is normally the delayed Eastmoney snapshot. A
+different vendor label does not establish an independent same-definition
+product: both sides need the reviewed source contract. This script compares canonical
 rows already in DuckDB; it never refetches a provider or creates a new market
 snapshot.
 """
@@ -212,9 +212,9 @@ def render_report(results: list[dict]) -> str:
     lines = [
         "# Independent Stock Flow Reconciliation",
         "",
-        "TuShare moneyflow is compared with the canonical delayed Eastmoney full-market snapshot.",
+        "Recorded primary and reference products are compared under their reviewed same-definition contract. Vendor labels, auxiliary research and correlated values do not certify independence.",
         "",
-        "| Trade date | Primary rows | TuShare rows | Overlap | Coverage | Corr(main_net) | Sign agreement | Mean abs diff | Status |",
+        "| Trade date | Primary rows | Reference rows | Overlap | Coverage | Corr(main_net) | Sign agreement | Mean abs diff | Status |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for r in results:

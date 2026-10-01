@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 import hashlib
 import json
 import os
@@ -10,6 +10,7 @@ import platform
 from pathlib import Path
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
 
 from trade_system.file_lock import FileLock, FileLockBusy
 
@@ -147,13 +148,16 @@ class PipelineLock:
             self._guard.__exit__(exc_type, exc, tb)
 
 
-def latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict]:
+def all_manifests(reports_dir: str | Path) -> list[dict]:
+    """Retain every receipt. A later green run must not erase a missed slot."""
     root = Path(reports_dir).resolve() / "runs"
-    out: dict[tuple[str, str], dict] = {}
+    out: list[dict] = []
     if not root.exists():
         return out
     for path in root.glob("*/run.json"):
         try:
+            if path.stat().st_size > 8 * 1024 * 1024:
+                continue
             raw = path.read_bytes()
             item = json.loads(raw.decode("utf-8-sig"))
         except (OSError, ValueError):
@@ -166,7 +170,15 @@ def latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict]:
             continue
         item["_run_dir"] = str(path.parent)
         item["_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-        key = (trade_date, phase)
+        out.append(item)
+    return out
+
+
+def latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict]:
+    """Presentation helper only; complete-day acceptance uses all receipts."""
+    out: dict[tuple[str, str], dict] = {}
+    for item in all_manifests(reports_dir):
+        key = (str(item["trade_date"])[:10], str(item["phase"]).lower())
         stamp = str(item.get("completed_at") or item.get("started_at") or "")
         old_stamp = str(
             out.get(key, {}).get("completed_at")
@@ -176,6 +188,126 @@ def latest_manifests(reports_dir: str | Path) -> dict[tuple[str, str], dict]:
         if key not in out or stamp >= old_stamp:
             out[key] = item
     return out
+
+
+def default_observation_policy() -> dict:
+    """Declare the existing full-day task cadence only when sealing a new contract.
+
+    This is never an acceptance fallback for an old undeclared contract.
+    """
+    def segment(first, last, interval, tolerance, budget):
+        return {"first_start": first, "last_start": last, "interval_seconds": interval,
+                "start_tolerance_seconds": tolerance, "completion_budget_seconds": budget}
+    return {"schema": 1, "timezone": "Asia/Shanghai", "day_rule": "all_required_windows",
+            "phases": {
+                "auction": [segment("09:16:00", "09:24:00", 120, 30, 90)],
+                "intraday": [segment("09:30:00", "11:25:00", 300, 30, 240),
+                             segment("13:00:00", "15:00:00", 300, 30, 240)],
+                "close": [segment("17:30:00", "17:30:00", 0, 360, 3600)]}}
+
+
+def observation_windows(policy: dict, trade_date: str, phase: str) -> list[dict]:
+    """Expand the accepted, hash-bound schedule without inventing legacy slots.
+
+    Start tolerance accounts for local task launch overhead. The completion
+    deadline stays anchored to the slot, so retries cannot reset its budget.
+    Lunch is not an observation slot. Trading-day verification is performed
+    separately by the caller against the real exchange calendar.
+    """
+    if (not isinstance(policy, dict) or type(policy.get("schema")) is not int or policy.get("schema") != 1
+            or policy.get("timezone") != "Asia/Shanghai"
+            or policy.get("day_rule") != "all_required_windows"
+            or not isinstance(policy.get("phases"), dict)
+            or set(policy["phases"]) != {"auction", "intraday", "close"}):
+        raise ValueError("observation window contract missing or unsupported")
+    if phase not in {"auction", "intraday", "close"}:
+        raise ValueError("unsupported observation phase")
+    day = date.fromisoformat(trade_date)
+    segments = policy["phases"][phase]
+    if not isinstance(segments, list) or not 1 <= len(segments) <= 4:
+        raise ValueError("observation segments missing or excessive")
+    budget_limit = {"auction": 90, "intraday": 240, "close": 3600}[phase]
+    tolerance_limit = 360 if phase == "close" else 30
+    windows = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("invalid observation segment")
+        clocks = []
+        for name in ("first_start", "last_start"):
+            text = segment.get(name)
+            if not isinstance(text, str) or len(text) != 8:
+                raise ValueError("observation clock must be HH:MM:SS")
+            try:
+                clock = datetime.strptime(text, "%H:%M:%S").time()
+            except ValueError as exc:
+                raise ValueError("invalid observation clock") from exc
+            if clock.strftime("%H:%M:%S") != text:
+                raise ValueError("noncanonical observation clock")
+            clocks.append(datetime.combine(day, clock, ZoneInfo("Asia/Shanghai")))
+        first, last = clocks
+        numbers = {}
+        for name in ("interval_seconds", "start_tolerance_seconds", "completion_budget_seconds"):
+            value = segment.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("observation budgets must be explicit integers")
+            numbers[name] = value
+        interval, tolerance, budget = (numbers[n] for n in
+            ("interval_seconds", "start_tolerance_seconds", "completion_budget_seconds"))
+        if (last < first or not 0 <= tolerance <= tolerance_limit
+                or not 1 <= budget <= budget_limit or not 0 <= interval <= 86400
+                or (interval == 0 and first != last)
+                or (interval and (interval < 30 or (last-first).total_seconds() % interval
+                                  or tolerance + budget > interval))):
+            raise ValueError("observation interval or budget invalid")
+        current = first
+        while current <= last:
+            clock = current.time()
+            deadline = current + timedelta(seconds=tolerance + budget)
+            legal = (
+                phase == "auction" and time(9, 15) <= clock < time(9, 30)
+                and deadline.time() <= time(9, 30)
+                or phase == "intraday" and (
+                    time(9, 30) <= clock < time(11, 30) and deadline.time() <= time(11, 30)
+                    or time(13) <= clock <= time(15) and deadline.time() <= time(15, 5))
+                or phase == "close" and clock >= time(15, 5)
+                and deadline.date() == day
+            )
+            if not legal or len(windows) >= 200:
+                raise ValueError("observation slot outside market phase or excessive")
+            windows.append({
+                "window_id": phase + ":" + current.strftime("%H:%M:%S"),
+                "phase": phase, "start_at": current.isoformat(),
+                "start_latest_at": (current + timedelta(seconds=tolerance)).isoformat(),
+                "deadline_at": deadline.isoformat(),
+                "deadline_epoch": deadline.timestamp(), "interval_seconds": interval,
+                "completion_budget_seconds": budget,
+            })
+            if interval == 0:
+                break
+            current += timedelta(seconds=interval)
+    windows.sort(key=lambda item: item["start_at"])
+    for previous, current in zip(windows, windows[1:]):
+        if previous["deadline_at"] > current["start_at"]:
+            raise ValueError("duplicate or overlapping observation slots")
+    return windows
+
+
+def load_observation_contract(path: str | Path, expected_sha256: str) -> dict:
+    """Verify the original accepted bytes; run self-reported policy is not proof."""
+    expected = str(expected_sha256).lower()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("explicit collector contract SHA256 required")
+    source = Path(path).resolve()
+    if source.stat().st_size > 8 * 1024 * 1024:
+        raise ValueError("collector contract exceeds read budget")
+    raw = source.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("collector contract SHA256 mismatch")
+    contract = json.loads(raw.decode("utf-8-sig"))
+    policy = contract.get("observation_windows") if isinstance(contract, dict) else None
+    for phase in ("auction", "intraday", "close"):
+        observation_windows(policy, "2000-01-04", phase)
+    return policy
 
 
 class RunManifest:
@@ -204,6 +336,16 @@ class RunManifest:
     def add_step(self, name: str, status: str, command: list[str], **extra) -> None:
         item = {"name": name, "status": status, "command": command, **extra}
         self.data["steps"].append(item)
+        self.write()
+
+    def bind_observation_contract(self, path: str | Path, expected_sha256: str) -> None:
+        policy = load_observation_contract(path, expected_sha256)
+        self.data["observation_contract_path"] = str(Path(path).resolve())
+        self.data["observation_contract_sha256"] = expected_sha256.lower()
+        self.data["observation_windows"] = policy
+        window_id = os.environ.get("STOCKDATA_OBSERVATION_WINDOW_ID")
+        if window_id:
+            self.data["observation_window_id"] = window_id
         self.write()
 
     def upsert_step(self, name: str, status: str, command: list[str], **extra) -> None:

@@ -1,6 +1,19 @@
 # 清理剩余工作
 
-当前实现候选为 `D:\accio\stock_data-delivery` / `codex/delivery-20260921`，基线 229ecc8；原 `stock_data-retirement` 封存运行文件不原地修改。2026-09-21 用户单独批准启动限定市场试运行，尚未完成连续五交易日验收，不代表全面生产切换。
+2026-10-01 当前统一候选为 `D:\accio\stock_data-qualified-input-closure` / `codex/qualified-input-closure-20260930`，版本 0.3.42。项目按用户要求全量暂停，自动化 PAUSED，已安装 0.3.37 不恢复。当前整改证据集中于原关闭账 `one_shot_remediation_20261001` 与 [状态入口](STATUS.json)。
+
+当前验收分开记录：
+
+- 工程：同一最终提交的本地检查、CI、collector/research 封存和离线交接验证。
+- 合格输入：9 月 29 日 53 条派生 PB、11 只停牌核心估值的原始输入和修订引用；002731 及缺失利润口径继续阻断。日后每日输入需单独复审，不改写原空值。
+- 独立资金：新浪仅为已保存行的辅助核验；强认证仍需合格第二来源、全范围/时段及六轴定义映射，不用降低阈值替代。
+- 生产恢复：另获明确批准后交接同一封存包；暂停态不能计完整生产日。
+- 市场验收：合同定义全部必需窗口，失败/缺窗保留。一个完整生产日通过后累计连续五日，当前 0/5。
+- 真实账户：东方证券资料暂未导出，月季收益保持未知，不阻断市场工程修复。
+
+以下为历史整改记录，旧分支、窗口、测试数量及输入状态不代表当前版本：
+
+2026-09-21 实现候选曾为 `D:\accio\stock_data-delivery` / `codex/delivery-20260921`，基线 229ecc8；原 `stock_data-retirement` 封存运行文件不原地修改。
 唯一关闭账：[handover completion](D:/accio/stock_data-retirement/reports/handover-20260917/completion.json)；本轮为 `value_delivery_0_3_29.delivery_remediation_229ecc8`，此前结果保留，不再复制关闭账。
 此前提交的记录留在 Git 与原工件中；旧维护窗口、0.3.15 合约和测试数量不代表本次结果。
 
@@ -17,7 +30,7 @@
 
 仍待真实证据：七只证券的异常上市日期由合格来源纠正；跨交易日样本回执；全阶段采集请求的原因/修订对账；缺失题材历史资金；真实账户导出、成交归因与完整估值路径；付费特征新族的独立评价；同 SHA 安装恢复及新版本交接；连续五个完整交易日实际通过。9 月 21 日缺完整竞价/盘中任务，不计通过日。保留日数据的未认证回执不解除参考资料及覆盖认证要求。
 
-五日验收复用 `audit_p0_five_day_observation.py`，显式传 `--workspace` 和 `--collector-contract-sha256`；核验独立发布包、页面内联数据、交易日与收盘完成时间，不再要求已退役的旧复盘 Markdown 或旧大屏。
+五日验收复用 `audit_p0_five_day_observation.py`，显式传运行库、回执目录、`--workspace`、`--collector-contract` 和 `--collector-contract-sha256`；新合同核验每个必需窗口及后续独立发布，旧缺窗不补算。
 
 此前清理与尚需完成的验收：
 

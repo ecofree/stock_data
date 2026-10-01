@@ -41,54 +41,122 @@ $effectiveMinRunWindow = if ($MinRunWindowSeconds -gt 0) {
     # Intraday also needs a bounded-run window before the 15:05 drain.
     270
 }
-$attempts = 0
-$successes = 0
-$failures = 0
-$deferred = 0
-$nextRun = Get-Date
-
 function Write-WatchEvent([string]$Message) {
     $line = "$(Get-Date -Format o) $Message"
     $line | Tee-Object -FilePath $Log -Append
 }
 
-Write-WatchEvent "PHASE_WATCH_START phase=$Phase db=$DbPath interval=$IntervalSeconds end=$EndAt"
-while ((Get-Date) -lt $endAtToday) {
-    $remainingBeforeRun = [int][Math]::Max(0, ($endAtToday - (Get-Date)).TotalSeconds)
-    if ($remainingBeforeRun -lt [Math]::Max(30, $effectiveMinRunWindow)) {
-        Write-WatchEvent "PHASE_WATCH_DRAIN phase=$Phase remaining=$remainingBeforeRun min_run_window=$effectiveMinRunWindow"
-        break
+function Get-WatchClock {
+    [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'China Standard Time')
+}
+
+function Wait-WatchUntil([DateTimeOffset]$Target) {
+    while ((Get-WatchClock) -lt $Target) {
+        Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min(60, ($Target - (Get-WatchClock)).TotalSeconds)))
     }
-    if ($SkipLunch -and $Phase -eq "intraday" -and (Get-Date).TimeOfDay -ge ([timespan]::Parse("11:30")) -and (Get-Date).TimeOfDay -lt ([timespan]::Parse("13:00"))) {
-        $sleepUntil = (Get-Date).Date.AddHours(13)
-        Start-Sleep -Seconds ([int][Math]::Max(1, ($sleepUntil - (Get-Date)).TotalSeconds))
-        $nextRun = Get-Date
-        continue
-    }
-    $attempts++
-    Write-WatchEvent "PHASE_WATCH_ATTEMPT phase=$Phase attempt=$attempts"
+}
+
+function Invoke-WatchAttempt([DateTimeOffset]$Deadline, [string]$WindowId, [bool]$Prepare) {
     $previousDeadline = $env:STOCKDATA_PHASE_DEADLINE_EPOCH
-    $env:STOCKDATA_PHASE_DEADLINE_EPOCH = ([DateTimeOffset]$endAtToday.AddSeconds(-15)).ToUnixTimeSeconds().ToString()
+    $previousWindowDeadline = $env:STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH
+    $previousWindowId = $env:STOCKDATA_OBSERVATION_WINDOW_ID
+    $env:STOCKDATA_PHASE_DEADLINE_EPOCH = $Deadline.ToUnixTimeSeconds().ToString()
+    $env:STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH = $Deadline.ToUnixTimeSeconds().ToString()
+    $env:STOCKDATA_OBSERVATION_WINDOW_ID = $WindowId
     try {
         $onceArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Once, '-Db', $DbPath,
             '-Phase', $Phase, '-Python', $Python, '-CollectorContract', $CollectorContract,
             '-CollectorContractSha256', $CollectorContractSha256, '-ReportsDirectory', $ReportsDirectory)
-        if ($Phase -eq 'auction' -and (Get-Date).TimeOfDay -lt [TimeSpan]::Parse('09:15')) {
-            $onceArgs += '-PrepareReference'
-        }
+        if ($Prepare) { $onceArgs += '-PrepareReference' }
         & PowerShell.exe @onceArgs
-        $runCode = $LASTEXITCODE
+        $script:runCode = $LASTEXITCODE
     } finally {
         $env:STOCKDATA_PHASE_DEADLINE_EPOCH = $previousDeadline
+        $env:STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH = $previousWindowDeadline
+        $env:STOCKDATA_OBSERVATION_WINDOW_ID = $previousWindowId
     }
-    if ($runCode -eq 0) {
+}
+
+if (-not $Python) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
+if (-not (Test-Path -LiteralPath $Python)) { throw "Python runtime not found: $Python" }
+$day = (Get-WatchClock).ToString('yyyy-MM-dd')
+# The same pure expansion is used by complete-day acceptance. There is no
+# fallback policy for old contracts and no network/calendar repair in a watch.
+$readPolicy = "import json,sys; from trade_system.pipeline_runtime import load_observation_contract,observation_windows; from trade_system.trading_calendar import trading_session_status; p=load_observation_contract(sys.argv[1],sys.argv[2]); s=trading_session_status(sys.argv[5],sys.argv[3]); print(json.dumps({'state':s.state,'reason':s.reason,'windows':observation_windows(p,sys.argv[3],sys.argv[4])}))"
+Push-Location $Root
+try {
+    $policyOutput = & $Python -c $readPolicy $CollectorContract $CollectorContractSha256 $day $Phase $DbPath
+    if ($LASTEXITCODE -ne 0) { throw 'Accepted observation window contract is unavailable; no collection started' }
+    $schedule = ($policyOutput -join "`n") | ConvertFrom-Json
+} finally { Pop-Location }
+Write-WatchEvent "PHASE_WATCH_START phase=$Phase db=$DbPath interval=$IntervalSeconds end=$EndAt contract=$CollectorContractSha256"
+if ($schedule.state -eq 'closed') {
+    Write-WatchEvent "PHASE_WATCH_MARKET_CLOSED phase=$Phase day=$day no_observation_windows_required=true"
+    exit 0
+}
+if ($schedule.state -ne 'open') {
+    Write-WatchEvent "PHASE_WATCH_STOP phase=$Phase reason=calendar_unverified detail=$($schedule.reason)"
+    exit 2
+}
+$windows = @($schedule.windows)
+$endOffset = [DateTimeOffset]::ParseExact(($day+'T'+$EndAt+':00+08:00'), 'yyyy-MM-ddTHH:mm:sszzz', $null)
+foreach ($window in $windows) {
+    if ($window.interval_seconds -ne $IntervalSeconds -or
+        [DateTimeOffset]::Parse($window.deadline_at) -gt $endOffset.AddSeconds(-15)) {
+        throw 'Watch interval/end differs from accepted observation contract; no collection started'
+    }
+}
+$prepareAttempts = 0
+$prepareFailures = 0
+# Early reference preparation has its own scope and is never an auction pass.
+if ($Phase -eq 'auction') {
+    $prepareEnd = [DateTimeOffset]::Parse($day+'T09:15:00+08:00')
+    $nextPreparation = Get-WatchClock
+    while ((Get-WatchClock) -lt $prepareEnd) {
+        $remaining = ($prepareEnd - (Get-WatchClock)).TotalSeconds
+        if ($remaining -lt [Math]::Max(30, $effectiveMinRunWindow)) {
+            Write-WatchEvent "PHASE_WATCH_DRAIN phase=$Phase scope=prepare_reference remaining=$remaining"
+            break
+        }
+        $prepareAttempts++
+        Invoke-WatchAttempt $prepareEnd '' $true
+        if ($runCode -notin @(0,3)) { $prepareFailures++ }
+        Write-WatchEvent "PHASE_WATCH_PREPARE phase=$Phase attempt=$prepareAttempts code=$runCode core_window_pass=false"
+        $nextPreparation = $nextPreparation.AddSeconds($IntervalSeconds)
+        while ($nextPreparation -le (Get-WatchClock)) { $nextPreparation = $nextPreparation.AddSeconds($IntervalSeconds) }
+        if ($nextPreparation -lt $prepareEnd) { Wait-WatchUntil $nextPreparation } else { break }
+    }
+}
+$attempts = 0
+$successes = 0
+$failures = 0
+$deferred = 0
+$missed = 0
+foreach ($window in $windows) {
+    $start = [DateTimeOffset]::Parse($window.start_at)
+    $latestStart = [DateTimeOffset]::Parse($window.start_latest_at)
+    $deadline = [DateTimeOffset]::Parse($window.deadline_at)
+    Wait-WatchUntil $start
+    if (($endOffset - (Get-WatchClock)).TotalSeconds -lt [Math]::Max(30, $effectiveMinRunWindow)) {
+        $missed++
+        Write-WatchEvent "PHASE_WATCH_DRAIN phase=$Phase window=$($window.window_id) reason=min_run_window_unavailable"
+        continue
+    }
+    if ((Get-WatchClock) -gt $latestStart) {
+        $missed++
+        Write-WatchEvent "PHASE_WATCH_MISSED_WINDOW phase=$Phase window=$($window.window_id) reason=start_window_elapsed"
+        continue
+    }
+    $attempts++
+    Write-WatchEvent "PHASE_WATCH_ATTEMPT phase=$Phase window=$($window.window_id) deadline=$($deadline.ToString('o')) attempt=$attempts"
+    # Exactly one automatic attempt per existing slot, never a renewed request
+    # budget. The Python runner cooperatively caps work to this original deadline.
+    Invoke-WatchAttempt $deadline $window.window_id $false
+    if ($runCode -eq 0 -and (Get-WatchClock) -le $deadline) {
         $successes++
     } elseif ($runCode -eq 3) {
-        # Another phase owns the single-writer pipeline lock.  This attempt
-        # was safely deferred; counting it as a provider failure makes the
-        # scheduler red even though no data task actually failed.
         $deferred++
-        Write-WatchEvent "PHASE_WATCH_DEFER phase=$Phase attempt=$attempts reason=pipeline_busy"
+        Write-WatchEvent "PHASE_WATCH_DEFER phase=$Phase window=$($window.window_id) reason=pipeline_busy required_window_unqualified=true"
     } else {
         $failures++
         if (-not $ContinueOnFailure) {
@@ -96,22 +164,21 @@ while ((Get-Date) -lt $endAtToday) {
             break
         }
     }
-    $remaining = [int][Math]::Max(0, ($endAtToday - (Get-Date)).TotalSeconds)
-    if ($remaining -le 0) { break }
-    # Keep the interval anchored to the scheduled start time.  Sleeping for
-    # interval seconds after a long run silently turns a 5-minute watcher
-    # into a 9-10 minute cadence and creates false freshness gaps.
-    $nextRun = $nextRun.AddSeconds([Math]::Max(30, $IntervalSeconds))
-    while ($nextRun -le (Get-Date)) {
-        Write-WatchEvent "PHASE_WATCH_SKIP_MISSED_SLOT phase=$Phase slot=$($nextRun.ToString('o'))"
-        $nextRun = $nextRun.AddSeconds([Math]::Max(30, $IntervalSeconds))
-    }
-    $sleepSeconds = ($nextRun - (Get-Date)).TotalSeconds
-    Start-Sleep -Seconds ([int][Math]::Min($sleepSeconds, $remaining))
 }
-
-Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase attempts=$attempts successes=$successes deferred=$deferred failures=$failures end=$EndAt"
-# A watch is successful only when every attempted run succeeded.  A single
-# green attempt must not hide later provider failures or stale data.
-if ($attempts -gt 0 -and $failures -eq 0) { exit 0 }
+$unattempted = $windows.Count - $attempts - $missed
+# Let the final original budget close before classifying it. This wait starts
+# no new work and permits only an already authorized bounded recovery receipt.
+if ($unattempted -eq 0) { Wait-WatchUntil ([DateTimeOffset]::Parse($windows[-1].deadline_at)) }
+$readResult = "import json,sys; from trade_system.pipeline_runtime import load_observation_contract,all_manifests; from trade_system.p0_observation import audit_phase_windows; p=load_observation_contract(sys.argv[1],sys.argv[2]); r=audit_phase_windows(all_manifests(sys.argv[5]),sys.argv[3],sys.argv[4],sys.argv[2],p); print(json.dumps({'passed':r['passed'],'required':r['required_window_count'],'qualified':r['qualified_window_count'],'errors':r['evidence_errors']}))"
+Push-Location $Root
+try {
+    $resultOutput = & $Python -c $readResult $CollectorContract $CollectorContractSha256 $day $Phase $ReportsDirectory
+    if ($LASTEXITCODE -ne 0) { throw 'Observation receipts could not be verified; watch remains unqualified' }
+    $windowResult = ($resultOutput -join "`n") | ConvertFrom-Json
+} finally { Pop-Location }
+Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase required_windows=$($windows.Count) attempts=$attempts successes=$successes deferred=$deferred failures=$failures missed=$missed unattempted=$unattempted prepare_attempts=$prepareAttempts prepare_failures=$prepareFailures end=$EndAt"
+Write-WatchEvent "PHASE_WATCH_QUALIFICATION phase=$Phase qualified_windows=$($windowResult.qualified)/$($windowResult.required) passed=$($windowResult.passed) errors=$($windowResult.errors -join ',')"
+# Closed sessions and lunch have no declared slots. On an open day, every
+# declared slot must qualify; a green latest receipt cannot hide another slot.
+if ($windowResult.passed -eq $true) { exit 0 }
 exit 1

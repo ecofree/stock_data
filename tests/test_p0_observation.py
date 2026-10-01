@@ -1,33 +1,48 @@
 import json
+import hashlib
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from trade_system.p0_observation import audit_five_day_observation
+from trade_system.pipeline_runtime import all_manifests, default_observation_policy, observation_windows
 from trade_system.v2.domain import canonical, identity
 from trade_system.v2.publisher import publish
 from trade_system.v2.research_product_view import render
 
 
+POLICY = default_observation_policy()
+CONTRACT_BYTES = json.dumps({'observation_windows': POLICY}, sort_keys=True).encode()
+CONTRACT_SHA = hashlib.sha256(CONTRACT_BYTES).hexdigest()
+
+
+def _contract(reports):
+    path = reports / 'accepted-collector.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_bytes(CONTRACT_BYTES)
+    return path
+
+
 def _manifest(reports: Path, trade_date: str, phase: str, status: str = "completed"):
-    run_dir = reports / "runs" / f"{trade_date}-{phase}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "run.json").write_text(
-        json.dumps(
-            {
-                "run_id": f"{trade_date}-{phase}",
-                "trade_date": trade_date,
-                "phase": phase,
-                "status": status,
-                "started_at": f"{trade_date}T"+{'auction':'08:50:00','intraday':'10:00:00'}.get(phase,'17:30:00'),
-                "completed_at": f"{trade_date}T"+{'auction':'09:27:00','intraday':'10:03:00'}.get(phase,'18:00:00'),
-                "steps": [{'name':'fixture_required_step','required':True,'status':'completed'}],
-                "scope": "transitional_market_collection_only",
-                "collector_contract_sha256": "a" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
+    _contract(reports)
+    windows = (observation_windows(POLICY, trade_date, phase) if phase != 'supplemental'
+               else [{'start_at': trade_date + 'T17:30:00+08:00'}])
+    for index, window in enumerate(windows):
+        run_id = f'{trade_date}-{phase}' + (f'-{index}' if index else '')
+        run_dir = reports / 'runs' / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        started = datetime.fromisoformat(window['start_at'])
+        ended = started + timedelta(seconds={'auction': 45, 'intraday': 180}.get(phase, 1800))
+        (run_dir / 'run.json').write_text(json.dumps({
+            'run_id': run_id, 'trade_date': trade_date, 'phase': phase, 'status': status,
+            'started_at': started.isoformat(), 'completed_at': ended.isoformat(),
+            'steps': [{'name': 'fixture_required_step', 'required': True, 'status': 'completed'}],
+            'scope': 'transitional_market_collection_only',
+            'collector_contract_sha256': CONTRACT_SHA,
+        }), encoding='utf-8')
 
 
 def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monkeypatch):
@@ -117,6 +132,8 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     )
     con.close()
     for trade_date in ("2026-07-23", "2026-07-24"):
+        from trade_system.v2 import publisher
+        monkeypatch.setattr(publisher, 'now_utc', lambda day=trade_date: datetime.fromisoformat(day+'T19:30:00+08:00'))
         for phase in ("auction", "intraday", "close"):
             _manifest(reports, trade_date, phase)
         market = {'trade_date':trade_date,'as_of':trade_date+'T19:30:00+08:00',
@@ -141,11 +158,17 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
                 generation=int(trade_date[-2:]))
 
     result = audit_five_day_observation(
-        db, reports, "2026-07-24", required_days=2, workspace=workspace, collector_contract_sha256='a'*64
+        db, reports, "2026-07-24", required_days=2, workspace=workspace,
+        collector_contract_sha256=CONTRACT_SHA, collector_contract_path=_contract(reports)
     )
 
     assert result["ready_for_p1"] is True
     assert result["consecutive_passes"] == 2
+    assert result['daily'][-1]['phases']['auction']['required_window_count'] == 5
+    assert result['daily'][-1]['phases']['intraday']['required_window_count'] == 49
+    undeclared = audit_five_day_observation(db, reports, '2026-07-24', required_days=2,
+        workspace=workspace, collector_contract_sha256=CONTRACT_SHA)
+    assert not undeclared['ready_for_p1'] and undeclared['observation_window_contract_error']
     from trade_system.p0_observation import phase_evidence_errors
     assert 'auction_outside_window' in phase_evidence_errors({'phase':'auction',
         'started_at':'2026-07-24T09:15:00','completed_at':'2026-07-24T18:00:00',
@@ -173,7 +196,8 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     historical.write_bytes(saved)
 
     wrong_version = audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
-                                               workspace=workspace,collector_contract_sha256='b'*64)
+                                               workspace=workspace,collector_contract_sha256='b'*64,
+                                               collector_contract_path=_contract(reports))
     assert not wrong_version['ready_for_p1']
 
     close_path = reports/'runs/2026-07-24-close/run.json'
@@ -181,7 +205,8 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     close['completed_at'] = '2026-07-24T20:00:00+08:00'
     close_path.write_text(json.dumps(close))
     premature = audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
-                                           workspace=workspace,collector_contract_sha256='a'*64)
+                                           workspace=workspace,collector_contract_sha256=CONTRACT_SHA,
+                                           collector_contract_path=_contract(reports))
     assert premature['daily'][-1]['publication']['error'] == 'publication_precedes_close_completion'
     _manifest(reports,'2026-07-24','close')
 
@@ -189,13 +214,13 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     original = page.read_bytes()
     page.write_bytes(b'<html>tampered</html>')
     corrupt = audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
-                                        workspace=workspace,collector_contract_sha256='a'*64)
+                                        workspace=workspace,collector_contract_sha256=CONTRACT_SHA,
+                                        collector_contract_path=_contract(reports))
     assert not corrupt['ready_for_p1'] and not corrupt['daily'][-1]['checks']['publication']
     page.write_bytes(original)
 
     # Recovery is a new linked receipt, not a rewrite of a failed close or
     # permission to recover missed auction/intraday stages after the fact.
-    import hashlib
     _manifest(reports,'2026-07-24','close','completed_with_degradation')
     close_bytes=close_path.read_bytes();close=json.loads(close_bytes)
     _manifest(reports,'2026-07-24','supplemental','completed_with_warnings')
@@ -207,7 +232,8 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
                      'scope':'same_day_close_recovery_not_auction_or_intraday_replay'})
     recovery_path.write_text(json.dumps(recovery))
     recovered=audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
-                                         workspace=workspace,collector_contract_sha256='a'*64)
+                                         workspace=workspace,collector_contract_sha256=CONTRACT_SHA,
+                                         collector_contract_path=_contract(reports))
     assert recovered['consecutive_passes']==2
     assert recovered['daily'][-1]['phases']['close']['recovered_by_supplemental']
     assert recovered['daily'][-1]['phases']['close']['original_status']=='completed_with_degradation'
@@ -215,14 +241,142 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
     recovery['recovery_of']['manifest_sha256']='b'*64
     recovery_path.write_text(json.dumps(recovery))
     invalid=audit_five_day_observation(db,reports,'2026-07-24',required_days=2,
-                                      workspace=workspace,collector_contract_sha256='a'*64)
+                                      workspace=workspace,collector_contract_sha256=CONTRACT_SHA,
+                                      collector_contract_path=_contract(reports))
     assert not invalid['daily'][-1]['checks']['close_run']
     recovery['recovery_of']['manifest_sha256']=hashlib.sha256(close_bytes).hexdigest()
     recovery_path.write_text(json.dumps(recovery))
 
     _manifest(reports, "2026-07-24", "auction", "completed_with_degradation")
     result = audit_five_day_observation(
-        db, reports, "2026-07-24", required_days=2, workspace=workspace, collector_contract_sha256='a'*64
+        db, reports, "2026-07-24", required_days=2, workspace=workspace,
+        collector_contract_sha256=CONTRACT_SHA, collector_contract_path=_contract(reports)
     )
     assert result["ready_for_p1"] is False
     assert result["consecutive_passes"] == 0
+
+
+def _phase_check(reports, phase='intraday', publication=None):
+    from trade_system.p0_observation import audit_phase_windows
+    return audit_phase_windows(all_manifests(reports), '2026-09-29', phase,
+                               CONTRACT_SHA, POLICY, publication)
+
+
+def test_missing_window_and_latest_green_do_not_mask_failed_required_slot(tmp_path):
+    _manifest(tmp_path, '2026-09-29', 'intraday')
+    path = tmp_path / 'runs/2026-09-29-intraday/run.json'
+    first = json.loads(path.read_text())
+    first['status'] = 'completed_with_degradation'
+    path.write_text(json.dumps(first))
+    check = _phase_check(tmp_path)
+    assert not check['passed'] and check['qualified_window_count'] == 48
+    assert not check['windows'][0]['passed'] and check['windows'][-1]['passed']
+    path.unlink()
+    check = _phase_check(tmp_path)
+    assert not check['passed'] and not check['windows'][0]['attempts']
+
+
+@pytest.mark.parametrize('late_end,wrong_sha,renewed_deadline,passed', [
+    ('09:33:00', False, False, True), ('09:35:00', False, False, False),
+    ('09:33:00', True, False, False), ('09:33:00', False, True, False)])
+def test_same_window_recovery_preserves_failure_and_original_budget(tmp_path, late_end, wrong_sha, renewed_deadline, passed):
+    _manifest(tmp_path, '2026-09-29', 'intraday')
+    path = tmp_path / 'runs/2026-09-29-intraday/run.json'
+    first = json.loads(path.read_text())
+    first.update(status='failed', completed_at='2026-09-29T09:30:40+08:00')
+    path.write_text(json.dumps(first))
+    recovery = dict(first, run_id='bounded-recovery', status='completed',
+                    started_at='2026-09-29T09:31:00+08:00', completed_at='2026-09-29T'+late_end+'+08:00')
+    if wrong_sha:
+        recovery['collector_contract_sha256'] = 'b'*64
+    if renewed_deadline:
+        recovery['deadline_epoch'] = datetime.fromisoformat('2026-09-29T09:35:00+08:00').timestamp()
+    folder = tmp_path / 'runs/bounded-recovery'
+    folder.mkdir()
+    (folder / 'run.json').write_text(json.dumps(recovery))
+    check = _phase_check(tmp_path)
+    assert check['passed'] is passed
+    assert len(check['windows'][0]['attempts']) == 2
+    assert check['windows'][0]['attempts'][0]['status'] == 'failed'
+    assert check['windows'][0]['recovered_in_window'] is passed
+
+
+def test_success_before_later_failure_and_late_success_without_original_attempt_stay_red(tmp_path):
+    _manifest(tmp_path, '2026-09-29', 'intraday')
+    first = json.loads((tmp_path / 'runs/2026-09-29-intraday/run.json').read_text())
+    late = dict(first, run_id='later-failure', status='failed',
+                started_at='2026-09-29T09:33:10+08:00', completed_at='2026-09-29T09:33:20+08:00')
+    folder = tmp_path / 'runs/later-failure'
+    folder.mkdir()
+    (folder / 'run.json').write_text(json.dumps(late))
+    assert not _phase_check(tmp_path)['passed']
+    original = tmp_path / 'runs/2026-09-29-intraday/run.json'
+    original.unlink()
+    late['status'] = 'completed'
+    (folder / 'run.json').write_text(json.dumps(late))
+    check = _phase_check(tmp_path)
+    assert not check['passed']
+    assert 'late_start_without_same_window_attempt' in check['windows'][0]['attempts'][0]['evidence_errors']
+
+
+def test_preparation_and_outside_window_receipts_cannot_replace_auction_slots(tmp_path):
+    _manifest(tmp_path, '2026-09-29', 'auction')
+    path = tmp_path / 'runs/2026-09-29-auction/run.json'
+    prepare = json.loads(path.read_text())
+    prepare.update(started_at='2026-09-29T08:50:00+08:00', completed_at='2026-09-29T09:27:00+08:00',
+                   scope='pre_session_reference_preparation_only')
+    path.write_text(json.dumps(prepare))
+    check = _phase_check(tmp_path, 'auction')
+    assert not check['passed'] and check['qualified_window_count'] == 4
+    assert check['unassigned_attempts'][0]['run_id'] == prepare['run_id']
+    assert not check['windows'][0]['attempts']
+
+
+@pytest.mark.parametrize('defect', ['parent_missing', 'parent_hash', 'wrong_sha', 'cross_day', 'early_publication', 'naive_publication'])
+def test_supplemental_cannot_create_missing_close_or_use_unbound_early_publication(tmp_path, defect):
+    _manifest(tmp_path, '2026-09-29', 'close', 'failed')
+    path = tmp_path / 'runs/2026-09-29-close/run.json'
+    raw = path.read_bytes()
+    parent = json.loads(raw)
+    recovery = dict(parent, phase='supplemental', run_id='recovery', status='completed',
+        started_at='2026-09-29T20:00:00+08:00', completed_at='2026-09-29T20:10:00+08:00',
+        recovery_of={'phase':'close', 'run_id':parent['run_id'], 'completed_at':parent['completed_at'],
+                     'manifest_sha256':hashlib.sha256(raw).hexdigest(),
+                     'scope':'same_day_close_recovery_not_auction_or_intraday_replay'})
+    publication = {'passed':True, 'as_of':'2026-09-29T20:20:00+08:00',
+                   'published_at':'2026-09-29T20:21:00+08:00'}
+    if defect == 'parent_missing':
+        path.unlink()
+    elif defect == 'parent_hash':
+        recovery['recovery_of']['manifest_sha256'] = 'b'*64
+    elif defect == 'wrong_sha':
+        recovery['collector_contract_sha256'] = 'b'*64
+    elif defect == 'cross_day':
+        recovery['completed_at'] = '2026-09-30T00:10:00+08:00'
+    elif defect == 'early_publication':
+        publication['published_at'] = '2026-09-29T19:31:00+08:00'
+    else:
+        publication['published_at'] = '2026-09-29T20:21:00'
+    folder = tmp_path / 'runs/recovery'
+    folder.mkdir()
+    (folder / 'run.json').write_text(json.dumps(recovery))
+    check = _phase_check(tmp_path, 'close', publication)
+    assert not check['passed'] and not check['recovered_by_supplemental']
+
+
+def test_window_attempts_sort_by_actual_timezone_and_unverified_time_stays_red(tmp_path):
+    _manifest(tmp_path, '2026-09-29', 'intraday')
+    original = tmp_path / 'runs/2026-09-29-intraday/run.json'
+    first = json.loads(original.read_text())
+    first.update(status='failed', completed_at='2026-09-29T09:30:40+08:00')
+    original.write_text(json.dumps(first))
+    recovery = dict(first, run_id='utc-recovery', status='completed',
+                    started_at='2026-09-29T01:31:00+00:00', completed_at='2026-09-29T01:33:00+00:00')
+    folder = tmp_path / 'runs/utc-recovery'
+    folder.mkdir()
+    path = folder / 'run.json'
+    path.write_text(json.dumps(recovery))
+    assert _phase_check(tmp_path)['passed']
+    recovery['started_at'] = None
+    path.write_text(json.dumps(recovery))
+    assert 'unassigned_phase_time_unverified' in _phase_check(tmp_path)['evidence_errors']

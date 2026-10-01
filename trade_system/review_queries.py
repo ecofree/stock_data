@@ -763,6 +763,29 @@ def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict
             "ORDER BY observed_at DESC LIMIT 1", [trade_date]).fetchone()
         if gap and hashlib.sha256(gap[0].encode()).hexdigest() == gap[1]:
             result['daily_basic_gaps'] = dict(json.loads(gap[0]), evidence_recorded_at=str(gap[2]))
+        review_codes = [row[0] for row in con.execute(
+            "SELECT DISTINCT asset_code FROM multi_source_observation WHERE data_type='valuation_review' "
+            "AND json_extract_string(payload_json,'$.review.trade_date')=?", [trade_date]).fetchall() if row[0]]
+        if review_codes:
+            from trade_system.tushare_history import TushareHistoryCollector
+            collector = None
+            try:
+                # Rendering owns no acquisition or database writes. Revalidate
+                # original bytes so an old snapshot cannot hide revoked input.
+                collector = TushareHistoryCollector('', offline=True, connection=con)
+                qualified = collector.qualified_valuation_reviews(trade_date)
+                details = result.setdefault('daily_basic_gaps', {})
+                details['reviewed_valuation'] = qualified
+                details['revoked_review_codes'] = sorted(set(review_codes)-set(qualified))
+                details['qualification_scope'] = 'core_pb_market_value_pe_separate'
+            except (ValueError, KeyError, OSError, duckdb.Error) as exc:
+                details = result.setdefault('daily_basic_gaps', {})
+                details['reviewed_valuation'] = {}
+                details['review_revalidation_error'] = str(exc)
+                details['revoked_review_codes'] = sorted(review_codes)
+            finally:
+                if collector is not None:
+                    collector.close()
     if table_exists(con, "history_fetch_checkpoint"):
         result["tushare"] = _rows(
             con,

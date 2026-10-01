@@ -216,6 +216,96 @@ SINA_NET_FIELDS = ('netamount', *SINA_NET_BUCKET_LABELS)
 SINA_GROSS_FIELDS = ('r0', 'r1', 'r2', 'r3')
 
 
+def _sina_definition_evidence(source_documents):
+    """Separate a publisher's documented method from server and pair qualification."""
+    statements = {
+        'order_grouping': 'linked method describes single-trade statistics, not original-order reconstruction',
+        'trade_side': 'active buy plus neutral is inflow; active sell is outflow',
+        'size_buckets': 'r0>=1000000; r1=200000..1000000; r2=50000..200000; r3<50000 yuan; exact boundaries unproved',
+        'session': 'linked method documents delayed five-minute updates; complete auction/close/after-hours scope unproved',
+        'security_scope': 'PC page presents SH/SZ; this response is bound to one requested security only',
+        'net_formula': 'PC main is r0_net; netamount is checked against the four reported net buckets',
+    }
+    return {axis: dict(documented_product_statement=statement,
+                       document_sha256=[source_documents['fields']['sha256'],
+                                        source_documents['method']['sha256']],
+                       current_response_binding=('reported_net_arithmetic_checked' if axis == 'net_formula'
+                                                 else 'request_security_bound' if axis == 'security_scope'
+                                                 else 'server_rule_unverified'),
+                       cross_source_alignment='unverified')
+            for axis, statement in statements.items()}
+
+
+def select_flow_product_candidate(candidate, trade_date, *, primary_origin, required_scope_sha256=None):
+    """Offline screening of recorded evidence, never source certification or rights acquisition.
+
+    Records are explicit review observations, not credential-presence flags.
+    Even a complete screening result must enter the existing independently
+    reviewed comparison contract; it cannot authorize requests or a pass.
+    """
+    import re
+    if (not isinstance(candidate, dict) or not isinstance(candidate.get('product_id'), str)
+            or not candidate['product_id'].strip() or len(candidate['product_id']) > 200):
+        raise ValueError('explicit product identity required')
+    day = date.fromisoformat(trade_date)
+    if day.isoformat() != trade_date or not isinstance(primary_origin, str) or not primary_origin.strip():
+        raise ValueError('explicit ISO date and primary original source required')
+    scope_known = required_scope_sha256 is not None
+    if scope_known and (not isinstance(required_scope_sha256, str) or not re.fullmatch('[0-9a-f]{64}', required_scope_sha256)):
+        raise ValueError('dated required security scope SHA256 required')
+    stages = ('product_access', 'original_source', 'required_security_scope',
+              'complete_session', 'definition_alignment', 'original_receipt')
+    checks, blockers = {}, []
+    for stage in stages:
+        record = candidate.get(stage)
+        qualified = isinstance(record, dict) and record.get('status') == 'reviewed'
+        reason = record.get('reason') if isinstance(record, dict) else None
+        if qualified:
+            digest = record.get('evidence_sha256')
+            qualified = (isinstance(digest, str) and bool(re.fullmatch('[0-9a-f]{64}', digest))
+                         and isinstance(reason, str) and bool(reason.strip()))
+            try:
+                qualified = qualified and date.fromisoformat(record['valid_from']) <= day <= date.fromisoformat(record['valid_through'])
+            except (KeyError, TypeError, ValueError):
+                qualified = False
+            if not qualified:
+                reason = 'reviewed_observation_missing_hash_date_or_explanation'
+        if qualified and stage == 'original_source':
+            origin = record.get('origin')
+            qualified = isinstance(origin, str) and bool(origin.strip()) and origin.strip().lower() not in {
+                'unknown', 'xiaodefa', 'tushare_relay', primary_origin.strip().lower()}
+            if not qualified:
+                reason = 'same_or_unverified_original_compute_source'
+        if stage == 'required_security_scope' and not scope_known:
+            qualified = False
+            reason = 'required_scope_unknown'
+        elif qualified and stage == 'required_security_scope':
+            qualified = record.get('required_scope_sha256') == required_scope_sha256
+            if not qualified:
+                reason = 'required_scope_fingerprint_differs'
+        if qualified and stage == 'definition_alignment':
+            evidence = record.get('comparison_evidence')
+            missing = flow_definition_evidence(evidence if isinstance(evidence, dict) else {}, trade_date)
+            qualified = not missing
+            if missing:
+                reason = 'definition_evidence_missing:' + ','.join(missing)
+        checks[stage] = dict(qualified=bool(qualified), reason=(reason[:2000] if isinstance(reason, str) and reason.strip()
+                                                             else 'no_reviewed_product_evidence'))
+        if not qualified:
+            blockers.append(stage + ':' + checks[stage]['reason'])
+    before_receipt = all(checks[s]['qualified'] for s in stages[:-1])
+    next_action = ('existing_comparison_contract_review' if not blockers else
+                   'separate_bounded_request_budget_review' if before_receipt else
+                   'stop_and_resolve_first_missing_precondition')
+    return dict(product_id=candidate['product_id'], trade_date=trade_date,
+                required_scope_sha256=required_scope_sha256, required_scope_known=scope_known, checks=checks,
+                first_blocker=blockers[0] if blockers else None, blocking_reasons=blockers,
+                next_action=next_action, screening_complete=not blockers,
+                independent_comparison_eligible=False, requests_authorized=False,
+                new_market_requests=0, canonical_writes=0, production_writes=0,
+                original_certification_gate_changed=False)
+
+
 def parse_sina_flow_response(raw, trade_date, securities, *, received_at, request_url, source_documents):
     """Offline PC-product facts. No eval, requests, canonical mapping or DB writes.
 
@@ -340,11 +430,18 @@ def parse_sina_flow_response(raw, trade_date, securities, *, received_at, reques
                          gross_raw={f: display(values[f]) for f in SINA_GROSS_FIELDS},
                          gross_amount_unit='unknown',
                          other_numeric_fields={f: display(values[f]) for f in scalar_fields},
+                         auxiliary_field_qualification={
+                             f: dict(eligible=bool(net_complete and net_matches), unit='yuan',
+                                     reason='documented_unit_and_reported_net_balance' if net_complete and net_matches
+                                     else 'missing_or_inconsistent_reported_net') for f in SINA_NET_FIELDS},
+                         auxiliary_net_eligible=net_complete and net_matches,
+                         gross_auxiliary_eligible=False,
                          net_arithmetic_qualified=net_complete and net_matches,
                          arithmetic_qualified=not issues, quality_issues=issues))
     if trade_date not in seen:
         raise ValueError('explicit target date missing; no date fallback')
-    return dict(provider='sina_pc_candidate', origin_provider='unknown',
+    target = next(row for row in rows if row['selected_target_date'])
+    return dict(provider='sina_pc_candidate', product_publisher='sina', origin_provider='unknown',
                 source_api='MoneyFlow.ssl_qsfx_lscjfb',
                 flow_definition='sina_pc_reported_r0_net', official_pc_main_field='r0_net',
                 request_url=request_url, request_sha256=hashlib.sha256(request_url.encode()).hexdigest(),
@@ -355,9 +452,20 @@ def parse_sina_flow_response(raw, trade_date, securities, *, received_at, reques
                 target_date_present=True, response_security_identity_verified=False,
                 arithmetic_qualified=all(r['arithmetic_qualified'] for r in rows),
                 net_arithmetic_qualified=all(r['net_arithmetic_qualified'] for r in rows),
+                definition_evidence_by_axis=_sina_definition_evidence(proof),
+                auxiliary_research=dict(eligible=target['auxiliary_net_eligible'],
+                    status='qualified_reported_net_facts' if target['auxiliary_net_eligible'] else 'unqualified_reported_net_facts',
+                    product_definition='sina_pc_reported_r0_net', amount_unit='yuan',
+                    observed_security_codes=[code], observed_dates=[r['source_date'] for r in rows],
+                    target_date=trade_date, original_received_at=received_at,
+                    identity_binding='original_request_only', gross_fields_eligible=False,
+                    same_definition_comparison_eligible=False, global_scope_complete=False,
+                    canonical_promotion_allowed=False, p0_or_five_day_certification=False),
                 six_axis_definition_verified=False, full_sh_sz_bj_scope_verified=False,
                 independent_comparison_eligible=False,
-                missing_evidence=['original_producer', *FLOW_DEFINITION_AXES, 'full_bj_scope'],
+                missing_evidence=['original_compute_source', 'server_order_grouping',
+                                  'server_side_and_boundary_rules', 'complete_session', 'complete_required_security_scope',
+                                  *('cross_source_alignment:' + axis for axis in FLOW_DEFINITION_AXES)],
                 authenticated_requests=0, new_market_requests=0, canonical_writes=0, production_writes=0)
 
 # Acquisition vendor and original producer are distinct. This public SDK

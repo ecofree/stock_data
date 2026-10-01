@@ -12,6 +12,11 @@ from datetime import date, datetime, timezone
 import math
 import json
 import hashlib
+import io
+import re
+from threading import RLock
+from collections import OrderedDict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import time
 from typing import Any, Iterable
@@ -45,6 +50,88 @@ INDUSTRY_FIELDS = (
     "net_amount_rate,buy_elg_amount,buy_lg_amount,buy_md_amount,buy_sm_amount"
 )
 STOCK_SNAPSHOT_DATASETS = {"daily", "daily_basic", "adj_factor"}
+_VALUATION_PAGE_CACHE = OrderedDict()
+_VALUATION_PDF_LOCK = RLock()
+_PDF_MAX_BYTES = 32 * 1024 * 1024
+_PDF_MAX_PAGE_BYTES = 4 * 1024 * 1024
+_PDF_MAX_PAGE_TEXT = 300_000
+
+
+def _document_pages(raw, digest, field, document_format):
+    """Return only explicitly cited physical pages; no whole-PDF search fallback."""
+    with _VALUATION_PDF_LOCK:
+        return _document_pages_locked(raw, digest, field, document_format)
+
+
+def _document_pages_locked(raw, digest, field, document_format):
+    span = field.get('page_range', [field.get('page'), field.get('page')])
+    if (not isinstance(span, list) or len(span) != 2
+            or any(isinstance(p, bool) or not isinstance(p, int) for p in span)
+            or not 1 <= span[0] <= span[1] or span[1] - span[0] > 3
+            or (field.get('page') is not None and field['page'] != span[0])):
+        raise ValueError('explicit physical page or bounded page range required')
+    if len(raw) > _PDF_MAX_BYTES:
+        raise ValueError('valuation document exceeds size limit')
+    if document_format != 'pdf':
+        if span != [1, 1]:
+            raise ValueError('non-PDF document requires physical page one')
+        return raw.decode('utf-8')
+    missing = [page for page in range(span[0], span[1]+1) if (digest, page) not in _VALUATION_PAGE_CACHE]
+    if missing:
+        try:
+            from pypdf import PdfReader, filters
+            from pypdf import __version__ as pdf_version
+            if tuple(int(p) for p in pdf_version.split('.')[:2]) < (6, 19):
+                raise ValueError('patched pypdf 6.19 or newer required')
+            # Keep the decoder's own allocation guard enabled and bounded.
+            limit = filters.ZLIB_MAX_OUTPUT_LENGTH
+            filters.ZLIB_MAX_OUTPUT_LENGTH = min(limit or _PDF_MAX_PAGE_BYTES, _PDF_MAX_PAGE_BYTES)
+            try:
+                reader = PdfReader(io.BytesIO(raw), strict=True)
+                if reader.is_encrypted or len(reader.pages) > 800 or span[1] > len(reader.pages):
+                    raise ValueError('valuation PDF page scope unavailable')
+                for number in missing:
+                    page = reader.pages[number-1]
+                    content = page.get_contents()
+                    if content is not None and len(content.get_data()) > _PDF_MAX_PAGE_BYTES:
+                        raise ValueError('valuation page content exceeds limit')
+                    value = page.extract_text() or ''
+                    if len(value) > _PDF_MAX_PAGE_TEXT:
+                        raise ValueError('valuation page text exceeds limit')
+                    _VALUATION_PAGE_CACHE[digest, number] = value
+                    while len(_VALUATION_PAGE_CACHE) > 256:
+                        _VALUATION_PAGE_CACHE.popitem(last=False)
+            finally:
+                filters.ZLIB_MAX_OUTPUT_LENGTH = limit
+        except ImportError as exc:
+            raise ValueError('PDF extraction dependency unavailable; document unqualified') from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError('cited valuation PDF page cannot be extracted') from exc
+    return '\n'.join(_VALUATION_PAGE_CACHE[digest, p] for p in range(span[0], span[1]+1))
+
+
+def _validate_page_value(raw, digest, field, document_format, *, subtraction=False):
+    text = _document_pages(raw, digest, field, document_format)
+    if not str(field.get('excerpt', '')).strip():
+        raise ValueError('dated page extraction required')
+    value = field.get('value')
+    if value is None:
+        # An empty cell remains unknown. Separate absence reviews own any zero.
+        return
+    try:
+        wanted = Decimal(str(value))
+        if not wanted.is_finite() or isinstance(value, bool):
+            raise InvalidOperation
+        normalized = text.replace('，', ',').replace('−', '-')
+        tokens = re.findall(r'(?<![\d.])-?\d[\d,]*(?:\.\d+)?(?![\d.])', normalized)
+        amounts = [Decimal(token.replace(',', '')) for token in tokens]
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError('valuation extraction amount invalid') from exc
+    if not any(abs(amount-wanted) < Decimal('0.000001') or
+               (subtraction and abs(amount+wanted) < Decimal('0.000001')) for amount in amounts):
+        raise ValueError('valuation amount absent from cited physical page range')
 
 
 def _iso(value: str | date) -> str:
@@ -60,6 +147,75 @@ def _ymd(value: str | date) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def derive_earnings_valuation(total_mv, earnings, *, ts_code, trade_date):
+    """Static annual and rolling twelve-month ordinary profit are separate facts.
+
+    The caller must bind each component to reviewed original documents. This
+    arithmetic function cannot turn an annualized interim result into TTM PE.
+    """
+    day = date.fromisoformat(_iso(trade_date))
+    result = {'values': {}, 'field_status': {}, 'earnings_evidence': {}, 'missing_inputs': {}}
+    for mode, field in (('static', 'pe'), ('ttm', 'pe_ttm')):
+        proof = earnings.get(mode, {})
+        failures = []
+        periods = proof.get('periods', [])
+        expected_count = 1 if mode == 'static' else 3
+        if (proof.get('definition') != 'ordinary_shareholder_profit_v1'
+                or proof.get('qualified') is not True or proof.get('ts_code') != ts_code
+                or proof.get('trade_date') != day.isoformat() or len(periods) != expected_count):
+            failures.append('reviewed_ordinary_profit_and_revision_inventory_required')
+        values = []
+        spans = []
+        for component in periods:
+            try:
+                start, end = (date.fromisoformat(component[key]) for key in ('period_start', 'period_end'))
+                parent, allocation = (_num(component.get(key)) for key in
+                                      ('parent_profit', 'other_equity_profit_distribution'))
+                if (start.month != 1 or start.day != 1 or start > end or end >= day
+                        or parent is None or allocation is None or not math.isfinite(parent)
+                        or not math.isfinite(allocation) or allocation < 0):
+                    raise ValueError('incomplete income component')
+                values.append(parent-allocation)
+                spans.append((start, end))
+            except (KeyError, TypeError, ValueError):
+                failures.append('dated_profit_or_other_equity_distribution_missing')
+        if len(spans) == expected_count:
+            annual = spans[0]
+            if annual[1].month != 12 or annual[1].day != 31 or annual[0].year != annual[1].year:
+                failures.append('full_annual_profit_required')
+            if mode == 'static' and annual[1].year != day.year-1:
+                failures.append('latest_closed_annual_period_required')
+            if mode == 'ttm':
+                current, prior = spans[1:]
+                if (current[1].year != annual[1].year+1 or current[0].year != current[1].year
+                        or prior[0].year != annual[1].year or prior[1].year != annual[1].year
+                        or (current[1].month, current[1].day) != (prior[1].month, prior[1].day)
+                        or (current[1].month, current[1].day) not in {(3,31),(6,30),(9,30)}
+                        or proof.get('selected_period') != current[1].isoformat()):
+                    failures.append('matched_annual_and_current_prior_ytd_required')
+        if _num(total_mv) is None or not math.isfinite(total_mv) or total_mv <= 0:
+            failures.append('same_session_market_value_required')
+        result['earnings_evidence'][mode] = {'periods': periods,
+            'definition': proof.get('definition'), 'revision_inventory': proof.get('revision_inventory')}
+        if failures:
+            result['field_status'][field] = 'unknown'
+            result['missing_inputs'][field] = sorted(set(failures))
+            continue
+        profit = values[0] if mode == 'static' else values[0] + values[1] - values[2]
+        result['earnings_evidence'][mode]['ordinary_profit_yuan'] = profit
+        if profit <= 0:
+            result['field_status'][field] = 'not_applicable_nonpositive_ordinary_profit'
+        else:
+            value = total_mv*10000/profit
+            if math.isfinite(value):
+                result['values'][field] = value
+                result['field_status'][field] = 'derived_static_annual' if mode == 'static' else 'derived_ttm'
+            else:
+                result['field_status'][field] = 'unknown'
+                result['missing_inputs'][field] = ['nonfinite_earnings_ratio']
+    return result
 
 
 def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
@@ -236,15 +392,20 @@ def _validate_valuation_document(payload):
             {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'})):
         raise ValueError('official valuation document origin required')
     path = Path(document['path'])
+    if path.stat().st_size > _PDF_MAX_BYTES:
+        raise ValueError('valuation document exceeds size limit')
     raw = path.read_bytes()
     if hashlib.sha256(raw).hexdigest() != document['sha256']:
         raise ValueError('official valuation document changed')
     if document.get('format') == 'pdf' and not raw.startswith(b'%PDF-'):
         raise ValueError('official valuation PDF format mismatch')
     for field in payload.get('fields', {}).values():
-        if (not isinstance(field.get('page'), int) or field['page'] < 1
-                or not str(field.get('excerpt','')).strip()):
-            raise ValueError('dated page extraction required')
+        _validate_page_value(raw, document['sha256'], field, document.get('format'))
+    # A component arithmetic reconciliation also needs the actual cited values;
+    # a negative treasury-stock deduction may be printed as a positive subtotal.
+    for field in payload.get('other_equity_absence_review', {}).get('equity_components', []):
+        _validate_page_value(raw, document['sha256'], field, document.get('format'),
+                             subtraction=field.get('name') == 'treasury_stock')
     if not payload.get('ts_code') or not payload.get('as_of'):
         raise ValueError('official document dated identity required')
     related = payload.get('related_original_document_receipts', [])
@@ -253,7 +414,10 @@ def _validate_valuation_document(payload):
         raise ValueError('original corporate action documents required')
     for source in related:
         origin = urlparse(source['url'])
-        source_raw = Path(source['path']).read_bytes()
+        source_path = Path(source['path'])
+        if source_path.stat().st_size > _PDF_MAX_BYTES:
+            raise ValueError('corporate action document exceeds size limit')
+        source_raw = source_path.read_bytes()
         if (origin.scheme != 'https' or origin.hostname not in
                 {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'}
                 or source.get('code') != payload['ts_code']
@@ -344,6 +508,7 @@ class TushareHistoryCollector:
         self.budget_seconds = max(1.0, float(budget_seconds))
         self.started = time.monotonic()
         self._input_received = {}
+        self._market_batch_errors = []
         # Per-table operations, not unique instruments or network requests.
         # Only transaction owners may add committed writes. Receipts, schema,
         # checkpoints and certifications are deliberately outside these scopes.
@@ -669,6 +834,13 @@ class TushareHistoryCollector:
             if traded:
                 raise ValueError('suspension conflicts with retained trading')
         result = derive_valuation(code, day, inputs, observed_at=observed_at)
+        earnings = self._reviewed_earnings(review.get('earnings_reviews', {}), documents, code, day)
+        earnings_result = derive_earnings_valuation(result['values'].get('total_mv'), earnings,
+                                                  ts_code=code, trade_date=day)
+        result['values'].update(earnings_result['values'])
+        result['field_status'].update(earnings_result['field_status'])
+        result['earnings_evidence'] = earnings_result['earnings_evidence']
+        result['earnings_missing_inputs'] = earnings_result['missing_inputs']
         if (review.get('pb_policy') == 'signed_or_known_undefined_v1'
                 and review['schema'] == 'reviewed_valuation_inputs_v2'
                 and result['field_status']['pb'] == 'undefined_zero_adjusted_equity'
@@ -689,6 +861,82 @@ class TushareHistoryCollector:
         # Daily-basic raw provenance is never relabelled as a provider result.
         result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'
         return result
+
+    def _reviewed_earnings(self, proofs, documents, code, day):
+        """Bind profit, allocation and every period's corrections independently.
+
+        Missing PE evidence does not discard qualified PB. Malformed evidence is
+        reported as unknown; it is never replaced by equity, EPS times current
+        shares, dynamic PE, or annualization of a half-year result.
+        """
+        results = {}
+        for mode in ('static', 'ttm'):
+            proof = proofs.get(mode, {})
+            out = dict(proof, qualified=False, ts_code=code, trade_date=day)
+            try:
+                inventory = proof['revision_inventory']
+                components = proof['periods']
+                if (proof.get('definition') != 'ordinary_shareholder_profit_v1'
+                        or inventory.get('as_of') != day
+                        or inventory.get('scope') != 'all_published_consolidated_income_revisions'
+                        or not inventory.get('selection_reason') or not components):
+                    raise ValueError('dated income revision inventory missing')
+                receipts = inventory['statement_receipts']
+                catalogues = [documents[h][0] for h in inventory['document_receipts']]
+                oldest = min(component['period_start'] for component in components)
+                if (any(h not in documents for h in receipts) or not any(
+                    p.get('kind') == 'disclosure_inventory' and p.get('ts_code') == code
+                    and p.get('as_of') == day and p.get('catalogue_complete') is True
+                    and p.get('window_from', '9999-12-31') <= oldest
+                    and p.get('window_through') == day for p in catalogues)):
+                    raise ValueError('complete dated income correction catalogue missing')
+                periods = []
+                for component in components:
+                    values = {}
+                    identity = None
+                    hashes = []
+                    for field in ('parent_profit', 'other_equity_profit_distribution'):
+                        item = component['inputs'][field]
+                        digest = item['receipt_sha256']
+                        source, arrival = documents[digest]
+                        statement = source['statement']
+                        announcement = _iso(statement['announcement_date'])
+                        current_identity = (statement.get('period_start'), _iso(statement['period']), announcement)
+                        if (source.get('schema') != 'official_valuation_document_v1'
+                                or source.get('ts_code') != code or digest not in receipts
+                                or statement.get('basis') != 'consolidated'
+                                or current_identity[:2] != (component['period_start'], component['period_end'])
+                                or component['period_end'] > announcement or announcement > day
+                                or item.get('unit') != 'yuan' or item.get('semantic') != field
+                                or (identity is not None and identity != current_identity)):
+                            raise ValueError('income identity, period or definition mismatch')
+                        extracted = source['fields'][field]
+                        number = _num(extracted.get('value'))
+                        if (number is None or not math.isfinite(number) or isinstance(item.get('value'), bool)
+                                or number != _num(item.get('value'))):
+                            raise ValueError('income or allocation not evidenced')
+                        _validate_valuation_document(source)
+                        identity = current_identity
+                        hashes.append(digest)
+                        values[field] = number
+                        values[field+'_received_at'] = arrival
+                    periods.append(dict(values, period_start=component['period_start'],
+                                        period_end=component['period_end'], statement_receipts=hashes))
+                # Any later retained applicable income revision must appear in
+                # this inventory, even when the caller selected another PDF.
+                for raw, digest in self.store.conn.execute(
+                        "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_income'").fetchall():
+                    if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                        continue
+                    for row in json.loads(raw).get('rows', []):
+                        if (row.get('ts_code') == code and _iso(row.get('f_ann_date') or row['ann_date']) <= day
+                                and _iso(row['end_date']) >= oldest and digest not in receipts):
+                            raise ValueError('retained income revision omitted')
+                out.update(qualified=True, periods=periods)
+            except (KeyError, ValueError, TypeError, IndexError, OSError) as exc:
+                out['qualification_error'] = str(exc)
+            results[mode] = out
+        return results
 
     def import_valuation_reviews(self, path, expected_sha256, trade_date):
         """Explicit, hash-pinned local intake; no network or provider-row update."""
@@ -753,6 +1001,70 @@ class TushareHistoryCollector:
             except (KeyError, TypeError, ValueError, IndexError, AttributeError, OSError):
                 continue
         return results
+
+    def prepare_valuation_reviews(self, trade_date, codes, *, observed_at=None):
+        """Offline daily worklist; reusable finance never becomes today's quote.
+
+        Original statements and their original arrival clocks may be reused.
+        Each new session still needs its own market inputs, dated correction /
+        action review, named reviewer and exact-SHA explicit import. A worklist
+        grants no new request budget and cannot itself establish qualification.
+        """
+        day = _iso(trade_date)
+        now = observed_at or datetime.now(timezone.utc).isoformat()
+        wanted = sorted(set(codes))
+        completion = self.valuation_completion_report(day, wanted, observed_at=now)
+        qualified = self.qualified_valuation_reviews(day, observed_at=now)
+        templates, seen, invalid = {}, set(), {}
+        for raw, digest in self.store.conn.execute(
+                "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='valuation_review' "
+                "AND json_extract_string(payload_json,'$.review.trade_date')<=? ORDER BY observed_at DESC,rowid DESC",
+                [day]).fetchall():
+            code = None
+            try:
+                payload = json.loads(raw)
+                review = payload['review']
+                code = review['ts_code']
+                if code not in wanted or code in seen:
+                    continue
+                seen.add(code)
+                if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                    raise ValueError('valuation review hash mismatch')
+                previous = self._valuation_review(review, review['trade_date'], now)
+                if not previous['valuation_eligible']:
+                    raise ValueError('previous finance review no longer qualified')
+                templates[code] = {'previous_session': review['trade_date'],
+                    'review_sha256': digest,
+                    'reusable_financial_inputs': {field: review['inputs'][field] for field in ('equity','other_equity')},
+                    'previous_financial_inventory': review['financial_inventory'],
+                    'input_received_at_min': previous['input_received_at_min'],
+                    'input_received_at_max': previous['input_received_at_max']}
+            except (KeyError, ValueError, TypeError, IndexError, AttributeError, OSError) as exc:
+                if code in wanted:
+                    invalid[code] = str(exc)
+        rows = {}
+        for code in wanted:
+            current = completion['rows'][code]
+            rows[code] = {'status': 'same_session_qualified' if code in qualified else 'awaiting_inputs_and_review',
+                'core_missing_inputs': current.get('missing_inputs', {}),
+                'qualified_core': code in qualified, 'reusable_financial_evidence': templates.get(code),
+                'invalid_prior_evidence': invalid.get(code),
+                'required_review': [] if code in qualified else [
+                    'same_session_price_or_native_market_value_and_dated_shares',
+                    'financial_correction_inventory_through_target_session',
+                    'dated_suspension_and_full_action_window_if_reference_price',
+                    'named_review_and_exact_bundle_sha256_import'],
+                'earnings': {'pe': qualified.get(code, {}).get('field_status', {}).get('pe', 'unknown'),
+                    'pe_ttm': qualified.get(code, {}).get('field_status', {}).get('pe_ttm', 'unknown'),
+                    'required_inputs': ['latest_closed_annual_ordinary_profit',
+                        'matching_annual_current_ytd_prior_ytd_for_ttm',
+                        'actual_other_equity_profit_distribution_for_each_period',
+                        'complete_dated_income_correction_inventory']}}
+        return {'schema': 'valuation_daily_worklist_v1', 'trade_date': day, 'observed_at': now,
+            'rows': rows, 'market_requests': 0, 'business_rows_written': 0,
+            'permits_requests': False, 'certifies_daily_basic': False,
+            'qualification_scope': 'core_pb_and_market_value_pe_independent',
+            'review_boundary': 'reuse_original_finance_then_review_new_session_never_relabel_old_bundle'}
 
     def valuation_completion_report(self, trade_date, codes, *, observed_at=None):
         """Read retained receipts once; never issue a diagnostic request here.
@@ -1070,7 +1382,7 @@ class TushareHistoryCollector:
             observed += len(reviewed_codes - raw_codes)
             distinct_codes = len(raw_codes | reviewed_codes)
             if reviewed_codes:
-                error_message = 'coverage includes reviewed derived valuation; raw provider rows retained'
+                error_message = ((error_message + '; ') if error_message else '') + 'coverage includes reviewed derived valuation; raw provider rows retained'
             coverage = round(len(qualified & applicable)*100.0/expected, 4) if expected else None
         certified = (
             status == "certified"
@@ -1151,6 +1463,7 @@ class TushareHistoryCollector:
     def _read_rows(self, api, params, fields):
         if self.client is None:
             raise XiaodefaError("offline collector cannot acquire data")
+        self._last_acquisition = {'api': api, 'params': dict(params), 'rows': []}
         # Reuse only a completed L/D acquisition, never splice partial pages from
         # different attempts. Its receipt time is not refreshed by reuse.
         if api == 'stock_basic' and self._is_production_source() and not getattr(self, '_force_reference', False):
@@ -1169,6 +1482,7 @@ class TushareHistoryCollector:
         # Keep the original acquisition time and source identity even when a
         # later page or coverage validation fails. Reuse the existing receipt table.
         def record(offset, rows):
+            self._last_acquisition['rows'].extend(rows)
             self._count_product(api, parsed=len(rows))
             arrival = datetime.now()
             for row in rows:
@@ -1595,19 +1909,68 @@ class TushareHistoryCollector:
 
     def _query_date_batch(self, api: str, trade_date: str, fields: str, *, with_limit: bool = True) -> list[dict[str, Any]]:
         """One acquisition; page termination and coverage are independent checks."""
-        target = _iso(trade_date)
         params = {"trade_date": _ymd(trade_date)}
-        rows = self._read_rows(api, params, fields)
-        if any(not r.get("ts_code") or not r.get("trade_date") or
-               _iso(r["trade_date"]) != target for r in rows):
-            raise XiaodefaError("response contains wrong session or missing identity")
-        keys = [str(r["ts_code"]) for r in rows]
-        if len(keys) != len(set(keys)):
-            raise XiaodefaError("duplicate instrument in snapshot")
-        self._validate_stock_snapshot(api, rows, trade_date)
+        try:
+            rows = self._read_rows(api, params, fields)
+        except Exception as exc:
+            acquisition = getattr(self, '_last_acquisition', {})
+            rows = acquisition.get('rows', []) if (acquisition.get('api') == api
+                                                   and acquisition.get('params') == params) else []
+            self._market_batch_errors.append(str(exc))
         self._last_source_provider = self._provider_name(self.client)
         return rows
 
+    def _select_market_rows(self, dataset, rows, trade_date, *, scope=None):
+        """Quarantine ambiguity while retaining independently valid source facts."""
+        day = _iso(trade_date)
+        counts = {}
+        for row in rows:
+            key = row.get('ts_code') if isinstance(row, dict) else None
+            counts[key] = counts.get(key, 0) + 1
+        reference = self._reference_version(trade_date) or {}
+        forbidden = set(reference.get('not_listed', [])) if reference.get('membership_date') == day else set()
+        allowed = self._expected_stock_codes(trade_date) if self._is_production_source() and dataset != 'index_daily' else set()
+        valid, rejected = [], []
+        fields = MARKET_FIELDS[dataset].split(',')[2:]
+        for row in rows:
+            reason = None
+            try:
+                code = row['ts_code']
+                canonical = index_code_to_ts_code(code) if dataset == 'index_daily' else stock_code_to_ts_code(code)
+                if (code != canonical or _iso(row.get('trade_date', '')) != day
+                        or not re.fullmatch(r'\d{6}\.(?:SZ|SH|BJ)', code)
+                        or code in forbidden or (scope is not None and code not in scope)
+                        or (allowed and code not in allowed)):
+                    reason = 'unexpected_identity_or_session'
+                elif counts[code] != 1:
+                    reason = 'duplicate_identity'
+                elif any(row.get(field) not in (None, '', '-') and
+                         (isinstance(row.get(field), bool) or _num(row.get(field)) is None
+                          or not math.isfinite(_num(row.get(field)))) for field in fields):
+                    reason = 'invalid_nonfinite_numeric_field'
+                elif dataset == 'daily_basic':
+                    if not any(_num(row.get(field)) is not None and math.isfinite(_num(row.get(field)))
+                               for field in ('turnover_rate','volume_ratio','pe','pb','total_mv','circ_mv')):
+                        reason = 'daily_basic_contains_no_qualified_fields'
+                else:
+                    field = 'adj_factor' if dataset == 'adj_factor' else 'close'
+                    if _num(row.get(field)) is None or _num(row.get(field)) <= 0:
+                        reason = 'invalid_price_or_adjustment'
+            except (KeyError, TypeError, ValueError, AttributeError):
+                reason = 'missing_identity_or_session'
+            if reason:
+                rejected.append({'reason': reason, 'row': row})
+            else:
+                valid.append(row)
+        if rejected:
+            self._market_batch_errors.append(f'{len(rejected)} invalid or ambiguous source rows quarantined')
+            encoded = _json({'trade_date': day, 'dataset': dataset, 'rows': rejected,
+                             'acceptance': 'quarantined_not_canonical'})
+            self.store.conn.execute('INSERT INTO multi_source_observation '
+                '(data_type,asset_type,provider,status,payload_json,payload_hash) '
+                "VALUES ('market_row_quarantine','diagnostic',?,'quarantined',?,?)",
+                [self._provider_name(self.client), encoded, hashlib.sha256(encoded.encode()).hexdigest()])
+        return valid
 
 
     def ensure_calendar(self, start_date: str, end_date: str, *, allow_fetch: bool = True) -> list[str]:
@@ -1688,6 +2051,7 @@ class TushareHistoryCollector:
         return native
 
     def _collect_market(self, dataset, trade_date, *, codes=None, force=False):
+        self._market_batch_errors = []
         expected = None if codes is None else (set(codes) if dataset == "index_daily"
                                                else self._applicable_codes(codes, trade_date, dataset))
         if expected is None:
@@ -1697,30 +2061,25 @@ class TushareHistoryCollector:
             rows = []
             for code in sorted(missing):
                 if not self._budget_left():
-                    raise XiaodefaError("request budget exhausted; coverage incomplete")
-                batch = self._read_rows(dataset, {"ts_code": code, "trade_date": _ymd(trade_date)},
-                                        MARKET_FIELDS[dataset])
-                if any(r.get("ts_code") != code or _iso(r.get("trade_date")) != _iso(trade_date)
-                       for r in batch):
-                    raise XiaodefaError("scoped response identity/session mismatch")
-                if len(batch) > 1:
-                    raise XiaodefaError("duplicate instrument in scoped snapshot")
-                rows.extend(batch)
+                    self._market_batch_errors.append('request budget exhausted; coverage incomplete')
+                    break
+                params = {"ts_code": code, "trade_date": _ymd(trade_date)}
+                try:
+                    batch = self._read_rows(dataset, params, MARKET_FIELDS[dataset])
+                except Exception as exc:
+                    acquisition = getattr(self, '_last_acquisition', {})
+                    batch = acquisition.get('rows', []) if (acquisition.get('api') == dataset
+                        and acquisition.get('params') == params) else []
+                    self._market_batch_errors.append(str(exc))
+                    rows.extend(self._select_market_rows(dataset, batch, trade_date, scope={code}))
+                    break
+                rows.extend(self._select_market_rows(dataset, batch, trade_date, scope={code}))
             if self._is_production_source() and dataset == 'daily' and expected - {r['ts_code'] for r in rows}:
                 self._read_rows('suspend_d', {'trade_date': _ymd(trade_date)},
                                 'ts_code,trade_date,suspend_timing,suspend_type')
                 expected = self._applicable_codes(codes, trade_date, dataset)
-        value = "adj_factor" if dataset == "adj_factor" else "close"
-        if dataset != "daily_basic" and any(
-            _num(r.get(value)) is None or not math.isfinite(_num(r.get(value))) or _num(r.get(value)) <= 0
-            for r in rows
-        ):
-            raise XiaodefaError("invalid price or adjustment in response")
-        if dataset == "daily_basic" and any(not any(
-            _num(r.get(f)) is not None and math.isfinite(_num(r.get(f)))
-            for f in ("turnover_rate", "volume_ratio", "pe", "pb", "total_mv", "circ_mv")
-        ) for r in rows):
-            raise XiaodefaError("daily_basic contains no qualified fields")
+        if expected is None:
+            rows = self._select_market_rows(dataset, rows, trade_date)
         out, columns = market_batch(dataset, rows, self._provider_name(self.client))
         out = [(*row, self._input_received.get((dataset, row[0], _ymd(trade_date)), datetime.now()))
                for row in out]
@@ -1734,6 +2093,20 @@ class TushareHistoryCollector:
             raise
         # Coverage failure below does not undo this committed partial batch.
         self._count_product(dataset, written=count)
+        def incomplete(message):
+            if dataset in STOCK_SNAPSHOT_DATASETS:
+                self._certify_close_snapshot(dataset, trade_date, status='error', error_message=message,
+                                             provider=self._provider_name(self.client))
+            return XiaodefaError(message)
+        if self._market_batch_errors:
+            # Existing good values for a rejected/refreshed security cannot
+            # convert this failed acquisition into a certified new snapshot.
+            raise incomplete('partial batch; ' + '; '.join(self._market_batch_errors))
+        if expected is None:
+            try:
+                self._validate_stock_snapshot(dataset, rows, trade_date)
+            except XiaodefaError as exc:
+                raise incomplete(str(exc)) from exc
         if dataset == 'daily_basic':
             unresolved_valuation = (self._expected_stock_codes(trade_date, dataset) if expected is None else expected)
             unresolved_valuation = unresolved_valuation - self._covered_codes(dataset, trade_date)
@@ -1750,12 +2123,12 @@ class TushareHistoryCollector:
             if force:
                 unresolved |= expected - {r['ts_code'] for r in rows}
             if unresolved:
-                raise XiaodefaError(f"coverage incomplete: {len(unresolved)} missing instruments; "
-                                   "provider absence does not prove suspension")
+                raise incomplete(f"coverage incomplete: {len(unresolved)} missing instruments; "
+                                 "provider absence does not prove suspension")
         else:
             missing = self._expected_stock_codes(trade_date, dataset) - self._covered_codes(dataset, trade_date)
             if missing:
-                raise XiaodefaError(f"coverage incomplete: {len(missing)} instruments lack qualified fields")
+                raise incomplete(f"coverage incomplete: {len(missing)} instruments lack qualified fields")
             if dataset == 'daily_basic':
                 self._record_snapshot('daily_basic_gaps', {'trade_date': _iso(trade_date),
                     'missing_codes': [], 'supplemental_fields': {},

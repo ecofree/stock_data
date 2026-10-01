@@ -1214,15 +1214,25 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
     reviewed = gaps.get('reviewed_valuation') or {}
     if reviewed:
         parts.append("<div class='sec-title'><strong>经证据核验的派生估值</strong></div>"
-                     "<p>独立计算结果；原始供应商空值保留。市值单位为万元，PE 未知不填零。</p>")
+                     "<p>独立计算结果；原始供应商空值保留。市值单位为万元，PB/市值核心门禁与静态、TTM PE 分别核验，PE 未知不填零。</p>")
         for code, item in sorted(reviewed.items()):
             values = item.get('values') or {}
+            fields = item.get('field_status') or {}
+            earnings = item.get('earnings_evidence') or {}
             parts.append(f"<details><summary>{_e(code)}：PB {_e(values.get('pb'))}</summary>"
                 f"<p>总市值 {_e(values.get('total_mv'))}；流通市值 {_e(values.get('circ_mv'))}；"
+                f"静态 PE {_e(values.get('pe', '未知'))}（{_e(fields.get('pe', 'unknown'))}）；"
+                f"TTM PE {_e(values.get('pe_ttm', '未知'))}（{_e(fields.get('pe_ttm', 'unknown'))}）；"
                 f"最早输入到达 {_e(item.get('input_received_at_min'))}；"
                 f"最晚输入到达 {_e(item.get('input_received_at_max'))}；"
                 f"原价格日期 {_e(item.get('price_date') or item.get('trade_date'))}；"
-                f"核验记录 {_e(item.get('review_sha256'))}</p></details>")
+                f"核验记录 {_e(item.get('review_sha256'))}</p>"
+                f"<p>利润期间与修订证据 {_e(json.dumps(earnings, ensure_ascii=False, default=str))}；"
+                f"利润输入缺口 {_e(json.dumps(item.get('earnings_missing_inputs') or {}, ensure_ascii=False))}</p></details>")
+    if gaps.get('revoked_review_codes') or gaps.get('review_revalidation_error'):
+        parts.append("<p>估值资格已撤销或无法复核："
+            f"{_e(', '.join(gaps.get('revoked_review_codes') or []))}；"
+            f"{_e(gaps.get('review_revalidation_error') or '原始证据不再合格')}。</p>")
     if gaps.get('missing_codes'):
         parts.append("<div class='sec-title'><strong>基本面补充证据（未通过完整验收）</strong></div>"
             "<p>股本单位为万股，价格为前收盘价；动态 PE 不替代静态 PE，补充字段不代表市值已确认。</p>"

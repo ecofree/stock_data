@@ -84,6 +84,20 @@ def test_changed_provider_not_compared_and_partial_members_not_published(con):
     assert r['themes']==[] and r['membership_status']=='partial'
 
 
+def test_partial_receipts_stay_inline_without_turning_available_prices_into_coverage(con):
+    con.execute('CREATE TABLE history_fetch_checkpoint(dataset VARCHAR,trade_date DATE,status VARCHAR,rows_written INTEGER,last_error VARCHAR,updated_at TIMESTAMP)')
+    con.execute("INSERT INTO history_fetch_checkpoint VALUES ('daily','2026-09-11','partial',1,'missing expected identity','2026-09-11 16:01')")
+    con.execute('CREATE TABLE intraday_sector_flow_taxonomy(trade_date DATE,taxonomy VARCHAR,expected_rows INTEGER,fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,last_error VARCHAR)')
+    con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES ('2026-09-11','em_industry',0,496,100,'unverified','catalogue empty')")
+    result=project(con)
+    diagnostic=result['collection_diagnostics']
+    assert result['breadth']['samples']==1, 'valid prices remain visible'
+    assert diagnostic['status']=='gaps_present' and not diagnostic['full_market_certified']
+    assert diagnostic['products'][0]['committed_upserts']==1
+    assert diagnostic['taxonomies'][0]['expected_rows'] is None
+    assert diagnostic['taxonomies'][0]['coverage_pct'] is None
+
+
 def test_normalized_turnover_is_not_converted_twice_for_old_view_labels(con):
     con.execute('ALTER TABLE v_kline_daily ADD COLUMN turnover BIGINT')
     con.execute("UPDATE v_kline_daily SET turnover=12345000,amount_unit='thousand_yuan'")

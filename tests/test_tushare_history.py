@@ -39,6 +39,129 @@ def test_large_repeated_valuation_batch_preserves_keys_clocks_and_rollback(tmp_p
         assert con.execute('SELECT count(*) FROM tushare_daily_basic WHERE pb=-2').fetchone()[0] == 5600
 
 
+def test_partial_market_keeps_valid_facts_but_not_snapshot_success(tmp_path, monkeypatch):
+    import json
+    import trade_system.tushare_history as history
+    class Partial:
+        def query_rows(self, api, params=None, fields=''):
+            assert api == 'daily_basic'
+            code = params['ts_code']
+            if code == '000001.SZ':
+                return [dict(ts_code=code, trade_date='20260701', pb=-2, total_mv=100, circ_mv=50)]
+            return [dict(ts_code='600999.SH', trade_date='20260701', pb=3, total_mv=100, circ_mv=50)]
+    with TushareHistoryCollector(tmp_path/'partial.duckdb', client=Partial()) as c:
+        seed_calendar(c)
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000001.SZ'),('000002.SZ')")
+        c.store.conn.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv) "
+                             "VALUES ('000002.SZ','2026-07-01',9,100,50)")
+        for _ in range(2):
+            outcome = c.run('20260701','20260701',datasets=['daily_basic'],
+                stock_codes=['000001.SZ','000002.SZ'], force=True, retry_passes=0)
+            assert outcome['results'][0]['status'] == 'error'
+            assert c.store.conn.execute('SELECT status FROM history_fetch_checkpoint').fetchone()[0] == 'error'
+        assert c.store.conn.execute('SELECT ts_code,pb FROM tushare_daily_basic ORDER BY ts_code').fetchall() == [
+            ('000001.SZ',-2),('000002.SZ',9)]
+        assert c._product_counts['daily_basic']['rows_written'] == 2  # Two committed upserts, one unique key.
+        quarantine = c.store.conn.execute("SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='market_row_quarantine'").fetchall()
+        assert all(json.loads(row[0])['rows'][0]['reason'] == 'unexpected_identity_or_session' for row in quarantine)
+        assert c.store.conn.execute("SELECT count(*) FROM tushare_daily_basic WHERE ts_code='600999.SH'").fetchone()[0] == 0
+        original = history.bulk_replace
+        def failed_commit(con, table, *args):
+            original(con, table, *args)
+            raise RuntimeError('fixture failure before commit')
+        monkeypatch.setattr(history, 'bulk_replace', failed_commit)
+        with pytest.raises(RuntimeError,match='before commit'):
+            c._collect_market('daily_basic','20260701',codes=['000001.SZ'],force=True)
+        assert c._product_counts['daily_basic']['rows_written'] == 2
+        assert c.store.conn.execute('SELECT pb FROM tushare_daily_basic WHERE ts_code=?',['000001.SZ']).fetchone()[0] == -2
+
+
+def test_later_page_failure_retains_prior_valid_rows_without_certification(tmp_path, monkeypatch):
+    class Pages(XiaodefaClient):
+        def __init__(self):
+            super().__init__(token='fixture')
+        def query_all(self, api, *, on_page, **kwargs):
+            assert api == 'daily'
+            on_page(0,[dict(ts_code='000001.SZ',trade_date='20260701',close=10)])
+            raise XiaodefaError('fixture later page failed')
+    with TushareHistoryCollector(tmp_path/'page-partial.duckdb',client=Pages()) as c:
+        c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000001.SZ'),('000002.SZ')")
+        monkeypatch.setattr(c,'_is_production_source',lambda: True)
+        with pytest.raises(XiaodefaError,match='later page failed'):
+            c._collect_daily('20260701')
+        assert c.store.conn.execute('SELECT ts_code,close FROM tushare_daily').fetchall() == [('000001.SZ',10)]
+        assert c._product_counts['daily']['rows_written'] == 1
+        assert c.store.conn.execute("SELECT count(*) FROM close_snapshot_certification WHERE status='certified'").fetchone()[0] == 0
+
+
+def test_pdf_extraction_uses_exact_physical_page_and_bounded_range(tmp_path):
+    import hashlib
+    from copy import deepcopy
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    from trade_system.tushare_history import _validate_valuation_document
+    path = tmp_path/'pages.pdf'
+    writer = PdfWriter()
+    for text in ('other row 123.00','parent equity -6000000.00'):
+        page = writer.add_blank_page(width=200,height=200)
+        font = DictionaryObject({NameObject('/Type'):NameObject('/Font'),
+            NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'):
+            DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
+        stream = DecodedStreamObject()
+        stream.set_data(f'BT /F1 12 Tf 10 100 Td ({text}) Tj ET'.encode())
+        page[NameObject('/Contents')] = writer._add_object(stream)
+    writer.write(path)
+    source = dict(ts_code='000001.SZ',as_of='2026-07-01',document=dict(
+        path=str(path),url='https://static.cninfo.com.cn/pages.PDF',format='pdf',
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
+        fields={'equity':dict(value=-6000000,page=1,excerpt='parent equity -6000000')})
+    with pytest.raises(ValueError,match='absent from cited'):
+        _validate_valuation_document(source)
+    source['fields']['equity']['page'] = 2
+    _validate_valuation_document(source)
+    ranged = deepcopy(source)
+    ranged['fields']['equity'].update(page=1,page_range=[1,2])
+    _validate_valuation_document(ranged)
+    ranged['fields']['equity']['page_range'] = [1,5]
+    with pytest.raises(ValueError,match='bounded page range'):
+        _validate_valuation_document(ranged)
+    source['fields']['equity']['value'] = -123
+    with pytest.raises(ValueError,match='absent from cited'):
+        _validate_valuation_document(source)
+
+
+def test_static_and_ttm_profit_periods_and_allocations_remain_independent():
+    from copy import deepcopy
+    from trade_system.tushare_history import derive_earnings_valuation
+    code, day = '000001.SZ','2026-09-29'
+    def period(year,end,profit,allocation):
+        return dict(period_start=f'{year}-01-01',period_end=f'{year}-{end}',
+                    parent_profit=profit,other_equity_profit_distribution=allocation)
+    base = dict(qualified=True,ts_code=code,trade_date=day,definition='ordinary_shareholder_profit_v1')
+    earnings = {'static':dict(base,periods=[period(2025,'12-31',100000,10000)]),
+        'ttm':dict(base,selected_period='2026-06-30',periods=[period(2025,'12-31',100000,10000),
+            period(2026,'06-30',70000,7000),period(2025,'06-30',40000,4000)])}
+    calculate = lambda p: derive_earnings_valuation(100,p,ts_code=code,trade_date=day)
+    result = calculate(earnings)
+    assert result['values']['pe'] == pytest.approx(1000000/90000)
+    assert result['values']['pe_ttm'] == pytest.approx(1000000/117000)
+    changed = deepcopy(earnings)
+    changed['ttm']['periods'][2]['period_end']='2025-03-31'
+    assert 'pe_ttm' not in calculate(changed)['values'] and 'pe' in calculate(changed)['values']
+    changed = deepcopy(earnings)
+    changed['static']['periods'][0].pop('other_equity_profit_distribution')
+    assert calculate(changed)['field_status']['pe'] == 'unknown'
+    changed = deepcopy(earnings)
+    changed['static']['periods'][0]['parent_profit'] = -100
+    assert calculate(changed)['field_status']['pe'] == 'not_applicable_nonpositive_ordinary_profit'
+    assert 'pe' not in calculate(changed)['values']
+    changed = deepcopy(earnings)
+    changed['ttm']['qualified'] = False
+    assert calculate(changed)['field_status']['pe_ttm'] == 'unknown'
+
+
 def test_adj_factor_date_snapshot_is_persisted(tmp_path):
     db = tmp_path / "history.duckdb"
     with TushareHistoryCollector(db, client=FakeClient()) as collector:
@@ -336,9 +459,11 @@ def test_equal_count_with_wrong_instrument_cannot_certify_full_snapshot(tmp_path
         c.store.conn.execute("INSERT INTO tushare_stock_basic(ts_code,stock_code) "
             "SELECT '000' || lpad(CAST(i AS VARCHAR),3,'0') || '.SZ', "
             "'000' || lpad(CAST(i AS VARCHAR),3,'0') FROM range(1000) t(i)")
-        with pytest.raises(XiaodefaError, match="1 missing instruments"):
+        with pytest.raises(XiaodefaError, match="1 invalid or ambiguous source rows quarantined"):
             c._collect_daily("20260714")
-        assert c.store.conn.execute("SELECT count(*) FROM tushare_daily").fetchone()[0] == 0
+        assert c.store.conn.execute("SELECT count(*) FROM tushare_daily").fetchone()[0] == 999
+        assert c.store.conn.execute("SELECT count(*) FROM tushare_daily WHERE ts_code='600999.SH'").fetchone()[0] == 0
+        assert c.store.conn.execute('SELECT status FROM close_snapshot_certification').fetchone()[0] == 'error'
         assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='tushare_daily'").fetchone()[0] == 1
 
 
@@ -801,7 +926,7 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
     from trade_system.tushare_history import _json
     code, day = '000001.SZ','2026-07-01'
     document_path = tmp_path/'official-fixture.html'
-    document_path.write_text('fixture original consolidated equity and instrument disclosure',encoding='utf-8')
+    document_path.write_text('fixture original consolidated equity -6000000 and instrument disclosure',encoding='utf-8')
     with TushareHistoryCollector(tmp_path/'official-review.duckdb', client=ScopedFixture()) as c:
         def receipt(payload):
             encoded = _json(payload)
@@ -861,6 +986,26 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         assert result['input_received_at_min'] == '2026-07-01T16:00:00+08:00'
         assert result['input_received_at_max'] == catalogue['received_at']
         assert not result['value_screen_eligible'] and result['valuation_risk'] == 'negative_equity'
+        assert result['field_status']['pe'] == 'unknown' and result['field_status']['pe_ttm'] == 'unknown'
+        # A bare qualified assertion cannot make equity into annual earnings.
+        forged = deepcopy(review)
+        forged['earnings_reviews'] = {'static': dict(qualified=True,
+            definition='ordinary_shareholder_profit_v1',periods=[dict(period_start='2025-01-01',
+                period_end='2025-12-31',parent_profit=6000000,other_equity_profit_distribution=0)])}
+        forged_result = c._valuation_review(forged,day,'2026-07-02T17:00:00+08:00')
+        assert forged_result['valuation_eligible'] and forged_result['field_status']['pe'] == 'unknown'
+        calls_before = len(c.client.calls)
+        worklist = c.prepare_valuation_reviews('2026-07-02',[code,'002731.SZ'],
+                                               observed_at='2026-07-02T17:00:00+08:00')
+        assert worklist['market_requests'] == worklist['business_rows_written'] == 0
+        assert not worklist['permits_requests'] and not worklist['certifies_daily_basic']
+        assert not worklist['rows'][code]['qualified_core']
+        reusable = worklist['rows'][code]['reusable_financial_evidence']
+        assert reusable['previous_session'] == day
+        assert reusable['reusable_financial_inputs']['equity']['receipt_sha256'] == digest
+        assert reusable['input_received_at_min'] == '2026-07-01T16:00:00+08:00'
+        assert worklist['rows']['002731.SZ']['status'] == 'awaiting_inputs_and_review'
+        assert len(c.client.calls) == calls_before
         original = c.store.conn.execute('SELECT payload_json FROM multi_source_observation WHERE payload_hash=?',[digest]).fetchone()[0]
         assert json.loads(original)['fields']['other_equity']['value'] is None
         altered = deepcopy(review)
@@ -981,6 +1126,21 @@ def test_valuation_cli_is_scoped_and_holds_pipeline_lock(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main()
     assert len(calls) == 1
+    class Preparation:
+        def __init__(self, db, **kwargs):
+            assert kwargs == {'offline': True}
+            assert not (tmp_path/'cli.duckdb.pipeline.lock').exists()
+        def __enter__(self):
+            return self
+        def __exit__(self,*args):
+            pass
+        def prepare_valuation_reviews(self,day,codes):
+            return dict(rows={codes[0]:dict(qualified_core=False)},market_requests=0,business_rows_written=0)
+    monkeypatch.setattr(cli,'TushareHistoryCollector',Preparation)
+    monkeypatch.setattr(sys,'argv',[('--valuation-prepare' if value=='--valuation-diagnostic' else value) for value in args])
+    assert cli.main() == 2
+    assert json.loads((tmp_path/'diagnostic.json').read_text())['market_requests'] == 0
+    assert len(calls) == 1
 
 
 def test_dated_identity_allows_flow_publication_but_not_definition_shortcut(tmp_path, monkeypatch):
@@ -999,7 +1159,7 @@ def test_dated_identity_allows_flow_publication_but_not_definition_shortcut(tmp_
         monkeypatch.setattr(c,'_reference_version',lambda *args: reference)
         # Source acquisition is fixture-only; exercise validation and atomic raw/projection commit.
         monkeypatch.setattr(c,'_read_rows',lambda api,params,fields: c.client.query_rows(api,params,fields))
-        with pytest.raises(XiaodefaError,match='missing instruments'):
+        with pytest.raises(XiaodefaError,match='moneyflow coverage incomplete'):
             c._collect_moneyflow('20260701')
         assert c.store.conn.execute('SELECT count(*) FROM tushare_moneyflow').fetchone()[0] == 0
         reference['membership_date']='2026-07-01'

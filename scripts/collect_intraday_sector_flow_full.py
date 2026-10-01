@@ -577,10 +577,8 @@ def collect_full_sector_flow(
             ths_snap = ths_result["ths_membership_snapshot"]
             ths_age = ths_result["ths_membership_age_days"]
             ths_members_stale = ths_age is None or ths_age > THS_MEMBERSHIP_MAX_AGE_DAYS
-            retained_ths = con.execute("SELECT count(DISTINCT sector_code) FROM multi_source_sector_flow "
-                "WHERE source_date=CAST(? AS DATE) AND provider='derived_ths_stock_aggregate'", [trade_date]).fetchone()[0]
-            expected_taxonomies["ths_concept"] = ths_result["expected_rows"] or max(
-                expected_taxonomies["ths_concept"], retained_ths)
+            # Published facts are a numerator, never an independent catalogue.
+            expected_taxonomies["ths_concept"] = ths_result["expected_rows"]
             if ths_result["promoted"]:
                 provider_used = "+".join(filter(None, (provider_used, "derived_ths_stock_aggregate")))
 
@@ -600,10 +598,6 @@ def collect_full_sector_flow(
                 ).fetchone()[0])
                 expected = int(expected_taxonomies.get(taxonomy) or 0)
                 unverified = taxonomy == "em_industry" and not em_total
-                if taxonomy == "em_industry" and expected == 0 and observed:
-                    # Rows without an API total are observable, but not proof
-                    # of complete coverage.  Keep the state unverified.
-                    expected = observed
                 if taxonomy == "em_industry" and em_total:
                     expected = em_total
                 tax_coverage, tax_status = _taxonomy_coverage_status(
@@ -635,15 +629,21 @@ def collect_full_sector_flow(
             fetched_rows = sum(item[1] for item in taxonomy_rows.values())
             known_coverages = [item[2] for item in taxonomy_rows.values() if item[0]]
             coverage = min(known_coverages) if known_coverages else 0.0
+            required_names = {"em_industry", "ths_concept"}
             taxonomy_status = {
                 taxonomy: {"expected_rows": item[0], "fetched_rows": item[1],
-                           "coverage_pct": item[2], "status": item[3]}
+                           "coverage_pct": item[2] if item[0] else None,
+                           "denominator_known": item[0] > 0,
+                           "required_for_full_coverage": taxonomy in required_names,
+                           "qualified": item[0] > 0 and item[3] == "success",
+                           "status": item[3]}
                 for taxonomy, item in taxonomy_rows.items()
             }
-            required_taxonomies = [item for item in taxonomy_rows.values() if item[0] > 0]
-            optional_gap = any(item[0] == 0 and item[3] in {"missing", "unverified"} for item in taxonomy_rows.values())
+            required_taxonomies = [taxonomy_rows[name] for name in required_names]
+            optional_gap = any(name not in required_names and item[3] != "success"
+                               for name, item in taxonomy_rows.items())
             required_complete = bool(required_taxonomies) and all(
-                item[3] == "success"
+                item[0] > 0 and item[3] == "success"
                 and item[2] >= SECTOR_COVERAGE_SUCCESS_PCT
                 for item in required_taxonomies
             )
@@ -667,7 +667,8 @@ def collect_full_sector_flow(
             coverage = min(100.0, round(fetched_rows * 100.0 / expected_rows, 2)) if expected_rows else 0.0
             status = "partial" if fetched_rows else "error"
 
-        if status in {"success", "success_with_optional_gap"}:
+        # A qualified product stays available while other required products fail.
+        if pagination.get('promoted') or ths_result.get('promoted'):
             try:
                 store.sync_sector_capital(trade_date)
             except ValueError as exc:
@@ -692,6 +693,9 @@ def collect_full_sector_flow(
         "error": error,
         "reconciliation_pages": reconciliation_pages,
         "taxonomy_status": taxonomy_status,
+        "coverage_scope": "minimum_known_taxonomy_not_full_market",
+        "row_count_scope": "sum_product_rows_not_unique_industries",
+        "full_coverage": status in {"success", "success_with_optional_gap"},
         "ths_membership_snapshot": str(ths_snap) if ths_snap else None,
         "ths_membership_age_days": ths_age,
         "ths_members_stale": ths_members_stale,
@@ -708,7 +712,8 @@ def render_report(result: dict) -> str:
         f"- provider: `{result['provider']}`",
         f"- status: `{result['status']}`",
         f"- pages: `{result['fetched_pages']}/{result['expected_pages']}`",
-        f"- sector coverage: `{result['fetched_rows']}/{result['expected_rows']}` ({result['coverage_pct']}%)",
+        f"- product rows (separate classifications, not unique industries): `{result['fetched_rows']}/{result['expected_rows']}`",
+        f"- full required coverage: `{result.get('full_coverage', False)}`",
         f"- reverse-code reconciliation pages: `{result.get('reconciliation_pages', 0)}`",
         f"- error: `{result.get('error') or ''}`",
         f"- THS membership snapshot: `{result.get('ths_membership_snapshot') or 'none'}` "
@@ -716,10 +721,10 @@ def render_report(result: dict) -> str:
         "",
         "## Taxonomy coverage",
         "",
-        "| taxonomy | fetched / expected | coverage | status |",
-        "|---|---:|---:|---|",
+        "| taxonomy | fetched / independent expected | coverage | required | status |",
+        "|---|---:|---:|---|---|",
         *[
-            f"| {name} | {item.get('fetched_rows', 0)}/{item.get('expected_rows', 0)} | {item.get('coverage_pct', 0)}% | {item.get('status', '')} |"
+            f"| {name} | {item.get('fetched_rows', 0)}/{item.get('expected_rows') if item.get('denominator_known') else 'unknown'} | {str(item.get('coverage_pct'))+'%' if item.get('denominator_known') else 'unknown'} | {item.get('required_for_full_coverage', False)} | {item.get('status', '')} |"
             for name, item in sorted((result.get('taxonomy_status') or {}).items())
         ],
         "",

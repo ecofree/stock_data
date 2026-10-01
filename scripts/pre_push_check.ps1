@@ -3,9 +3,12 @@
 #   Copy-Item scripts\pre_push_check.ps1 ..\.git\hooks\pre-push -Force
 # (git runs hooks via sh; the shim below handles that.)
 param(
-    [string]$Python = "D:\anaconda\python.exe"
+    [string]$Python = ""
 )
 $ErrorActionPreference = "Stop"
+if (-not $Python) { $Python = $env:STOCKDATA_CHECK_PYTHON }
+if (-not $Python) { $Python = "D:\anaconda\python.exe" }
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Check runtime not found" }
 $Root = Split-Path -Parent $PSScriptRoot
 Push-Location $Root
 try {

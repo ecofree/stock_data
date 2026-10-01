@@ -132,6 +132,13 @@ window.addEventListener('hashchange',switchWorkspace);switchWorkspace();
 if(market){
 $('market-state').textContent='交易日 '+market.trade_date+' / 评估时点 '+market.as_of+' / 市场状态 '+market.regime+'。'+({closed:'今日休市',open_session:'今日为交易日',calendar_unknown:'今日日历尚未核对'}[market.session_state]||'日历状态未核对')+'；展示最近完整交易日，不冒充当前报价。';
 if(market.breadth_scope)$('market-state').append(' 广度仅覆盖可用标准价格记录，不冒充交易所全市场总数。');
+if(market.collection_diagnostics){const q=market.collection_diagnostics;
+ $('market-state').append(q.status==='gaps_present'?' 当前采集仍有缺口，已展示合格事实不代表整日验收通过。':' 当前事实尚未获得完整市场认证。');
+ const detail=el('details','');detail.append(el('summary','采集缺口与分产品覆盖'));
+ for(const p of q.products||[])detail.append(el('p',p.product+' · '+p.status+' · 已提交 upsert '+String(p.committed_upserts??'未知')+'（非唯一新增行）'+(p.reason?' · '+p.reason:'')));
+ for(const t of q.taxonomies||[])detail.append(el('p',t.taxonomy+' · '+t.status+' · '+String(t.observed_rows??'未知')+' / '+(t.denominator_known?String(t.expected_rows):'分母未知')+(t.reason?' · '+t.reason:'')));
+ $('market-state').append(detail);
+}
 if(market.matched_previous?.status==='matched'){const q=market.matched_previous;$('market-state').append(' 同股票、来源、复权与单位的 '+q.samples+' 只证券：上涨 '+q.previous.rise+' → '+q.current.rise+'，下跌 '+q.previous.fall+' → '+q.current.fall+'（对照 '+q.previous_date+'）。这是留存数据对照，不是历史到达时点认证。')}else $('market-state').append(' 同口径前日对照不可用，不推断升降。');
 [['上涨 / 下跌',String(market.breadth.rise??'—')+' / '+String(market.breadth.fall??'—')],['涨停 / 跌停',String(market.breadth.limit_up??'—')+' / '+String(market.breadth.limit_down??'—')],['炸板率',market.breadth.blown_rate==null?'—':Number(market.breadth.blown_rate).toFixed(2)+'%'],['当前判断记录',D.notes.length]].forEach(([name,value])=>{const a=el('article',name);a.append(el('b',value));$('market-metrics').append(a)});
 function themes(){

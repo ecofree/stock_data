@@ -43,13 +43,18 @@ def test_member_detail_uses_clock_formatter_not_raw_epoch():
     assert "timeZone: 'Asia/Shanghai'" in script
     from trade_system.review_web import _render_data_gates
     html = _render_data_gates({'data_sources': {'daily_basic_gaps': {'missing_codes': [],
+        'revoked_review_codes': ['002731.SZ'],
         'reviewed_valuation': {'000001.SZ': {'values': {'pb': -2,'total_mv': 100,'circ_mv': 50},
+            'field_status': {'pe':'unknown','pe_ttm':'unknown'},
+            'earnings_missing_inputs': {'pe':['ordinary_profit_missing']},
             'input_received_at_min': '2026-07-01T16:00:00+08:00',
             'input_received_at_max': '2026-07-01T16:10:00+08:00',
             'price_date': '2026-06-30','review_sha256': '<untrusted>'}}}}})
     assert 'PB -2' in html and '原始供应商空值保留' in html
     assert '2026-06-30' in html and '2026-07-01T16:00:00+08:00' in html
     assert '&lt;untrusted&gt;' in html and '<untrusted>' not in html
+    assert '静态 PE 未知' in html and 'TTM PE 未知' in html and 'ordinary_profit_missing' in html
+    assert '002731.SZ' in html and '资格已撤销' in html
 
 
 def test_server_clock_is_explicit_shanghai_time():

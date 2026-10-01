@@ -87,7 +87,8 @@ def collection_source_files(root):
     for folder in ('migrations', 'config'):
         selected.update(p for p in (root / folder).rglob('*') if p.is_file()
                         and p.suffix in ('.sql', '.json', '.toml', '.yaml', '.yml'))
-    selected.update(p for p in (root / 'requirements.lock', root / 'requirements-build.lock') if p.is_file())
+    selected.update(p for p in root.glob('requirements*.lock') if p.is_file())
+    selected.update(p for p in (root / 'pyproject.toml', root / 'setup.py') if p.is_file())
     return selected
 
 
@@ -128,11 +129,13 @@ def collection_contract(source_root, database, reports, python):
     runtime = subprocess.run([str(python), '-I', '-c',
         'import importlib.metadata as m,json,sys; print(json.dumps([list(sys.version_info[:3]),sorted((d.metadata["Name"],d.version) for d in m.distributions())]))'],
         capture_output=True, text=True, timeout=30, check=True)
+    from trade_system.pipeline_runtime import default_observation_policy
     return {'schema': 1, 'scope': 'transitional_market_collection_only', 'source_root': str(root),
         'database': str(database), 'reports': str(reports), 'python': str(python),
         'python_sha256': hashlib.sha256(python.read_bytes()).hexdigest(),
         'runtime_sha256': hashlib.sha256(json.dumps(json.loads(runtime.stdout), sort_keys=True).encode()).hexdigest(),
-        'files': digests, 'execution_ready': False, 'production_cutover': False}
+        'files': digests, 'observation_windows': default_observation_policy(),
+        'execution_ready': False, 'production_cutover': False}
 
 def verify_collection_contract(path, expected_sha256, database, reports):
     import hashlib

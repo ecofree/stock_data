@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta
 import os
+import hashlib
 
 import pytest
 
@@ -8,6 +9,11 @@ from trade_system.pipeline_runtime import (
     PipelineAlreadyRunning,
     PipelineLock,
     RunManifest,
+    all_manifests,
+    default_observation_policy,
+    latest_manifests,
+    load_observation_contract,
+    observation_windows,
 )
 
 
@@ -123,3 +129,45 @@ def test_pipeline_lock_does_not_delete_malformed_legacy_lock(tmp_path):
         with PipelineLock(db_path, "recovered-malformed"):
             pass
     assert lock_path.read_text(encoding='utf-8') == '{truncated'
+
+
+def test_observation_contract_expands_existing_cadence_and_never_invents_legacy_proof(tmp_path, monkeypatch):
+    policy = default_observation_policy()
+    assert [len(observation_windows(policy, '2026-09-29', phase))
+            for phase in ('auction', 'intraday', 'close')] == [5, 49, 1]
+    intraday = observation_windows(policy, '2026-09-29', 'intraday')
+    assert intraday[23]['window_id'] == 'intraday:11:25:00'
+    assert intraday[24]['window_id'] == 'intraday:13:00:00'
+    path = tmp_path / 'collector.json'
+    raw = json.dumps({'observation_windows': policy}).encode()
+    path.write_bytes(raw)
+    sha = hashlib.sha256(raw).hexdigest()
+    assert load_observation_contract(path, sha) == policy
+    monkeypatch.setattr('trade_system.pipeline_runtime.runtime_fingerprint', lambda: {'fixture': True})
+    manifest = RunManifest(tmp_path, 'bound', '2026-09-29', 'intraday')
+    manifest.bind_observation_contract(path, sha)
+    assert json.loads(manifest.path.read_text())['observation_contract_sha256'] == sha
+    path.write_bytes(b'{"version":"old"}')
+    with pytest.raises(ValueError, match='SHA256 mismatch'):
+        load_observation_contract(path, sha)
+    with pytest.raises(ValueError, match='missing or unsupported'):
+        load_observation_contract(path, hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize('field,value', [('first_start', '08:50:00'), ('completion_budget_seconds', 91),
+                                      ('interval_seconds', 30), ('start_tolerance_seconds', True)])
+def test_observation_contract_rejects_preparation_or_renewed_budgets(field, value):
+    policy = default_observation_policy()
+    policy['phases']['auction'][0][field] = value
+    with pytest.raises(ValueError):
+        observation_windows(policy, '2026-09-29', 'auction')
+
+
+def test_all_receipts_preserve_failures_when_latest_is_green(tmp_path):
+    for run_id, status, at in (('failed', 'failed', '09:30:00'), ('late-green', 'completed', '10:00:00')):
+        folder = tmp_path / 'runs' / run_id
+        folder.mkdir(parents=True)
+        (folder / 'run.json').write_text(json.dumps({'run_id': run_id, 'trade_date': '2026-09-29',
+            'phase': 'intraday', 'started_at': '2026-09-29T' + at, 'status': status}))
+    assert {item['status'] for item in all_manifests(tmp_path)} == {'failed', 'completed'}
+    assert latest_manifests(tmp_path)[('2026-09-29', 'intraday')]['run_id'] == 'late-green'

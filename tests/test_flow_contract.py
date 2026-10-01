@@ -356,6 +356,18 @@ def test_sina_pc_net_units_and_main_keep_precision_without_canonical_promotion(t
     assert result['canonical_writes'] == result['production_writes'] == result['new_market_requests'] == 0
     assert not result['independent_comparison_eligible'] and not result['full_sh_sz_bj_scope_verified']
     assert not result['six_axis_definition_verified'] and not VERIFIED_FLOW_COMPARISONS
+    auxiliary = result['auxiliary_research']
+    assert auxiliary['eligible'] and auxiliary['observed_security_codes'] == ['000001.SZ']
+    assert auxiliary['original_received_at'] == kwargs['received_at']
+    assert not any(auxiliary[key] for key in ('gross_fields_eligible', 'same_definition_comparison_eligible',
+        'global_scope_complete', 'canonical_promotion_allowed', 'p0_or_five_day_certification'))
+    axes = result['definition_evidence_by_axis']
+    assert 'neutral' in axes['trade_side']['documented_product_statement']
+    assert '200000' in axes['size_buckets']['documented_product_statement']
+    assert axes['net_formula']['current_response_binding'] == 'reported_net_arithmetic_checked'
+    assert all(axis['cross_source_alignment'] == 'unverified' for axis in axes.values())
+    assert 'trade_side' not in result['missing_evidence']
+    assert 'cross_source_alignment:trade_side' in result['missing_evidence']
 
 
 def test_sina_rejects_source_hash_response_identity_query_and_date_fallback(tmp_path, monkeypatch):
@@ -395,12 +407,18 @@ def test_sina_null_mismatch_numeric_json_and_precision_fail_closed(tmp_path, mon
     item, raw, kwargs, _ = _sina_fixture(tmp_path, monkeypatch)
     result = parse_sina_flow_response(json.dumps([dict(item, r0_net=None)]).encode(), **kwargs)
     assert result['rows'][0]['candidate_main_net_yuan'] is None and not result['net_arithmetic_qualified']
+    assert not result['auxiliary_research']['eligible']
     assert 'missing_value:r0_net' in result['rows'][0]['quality_issues']
     result = parse_sina_flow_response(json.dumps([dict(item, netamount='0')]).encode(), **kwargs)
     assert 'net_bucket_sum_differs' in result['rows'][0]['quality_issues']
     assert not result['arithmetic_qualified'] and not result['independent_comparison_eligible']
+    assert not result['auxiliary_research']['eligible']
     result = parse_sina_flow_response(json.dumps([dict(item, r0=None)]).encode(), **kwargs)
     assert result['rows'][0]['gross_raw']['r0'] is None and result['net_arithmetic_qualified']
+    assert result['auxiliary_research']['eligible'] and not result['rows'][0]['gross_auxiliary_eligible']
+    result = parse_sina_flow_response(json.dumps([dict(item, r0='-1')]).encode(), **kwargs)
+    assert result['auxiliary_research']['eligible'] and not result['arithmetic_qualified']
+    assert 'negative_gross' in result['rows'][0]['quality_issues']
     for invalid in ('NaN', 'Infinity', '1e1000', '1e-1000', True, {}, ' ', 'bad'):
         with pytest.raises(ValueError):
             parse_sina_flow_response(json.dumps([dict(item, r0_net=invalid)]).encode(), **kwargs)
@@ -458,3 +476,102 @@ def test_sina_file_audit_and_cli_require_hashes_and_never_open_db_or_network(tmp
     monkeypatch.setattr(sys, 'argv', ['audit', '--candidate-provider', 'sina'])
     with pytest.raises(SystemExit):
         entry.main()
+
+
+def _flow_selection_fixture():
+    """Synthetic reviewed observations do not authorize any real vendor or request."""
+    stages = ('product_access', 'original_source', 'required_security_scope',
+              'complete_session', 'definition_alignment', 'original_receipt')
+    candidate = {stage: dict(status='reviewed', evidence_sha256='a'*64,
+        valid_from='2026-09-29', valid_through='2026-09-29', reason='synthetic review') for stage in stages}
+    candidate['product_id'] = 'synthetic_other_product'
+    candidate['original_source']['origin'] = 'synthetic_compute_vendor'
+    candidate['required_security_scope']['required_scope_sha256'] = 'c'*64
+    specifications = dict(order_grouping='original_order', trade_side='aggressor',
+        size_buckets='fixture_same_buckets', session='fixture_complete_session',
+        security_scope='fixture_same_scope', net_formula='fixture_main_buy-minus-sell')
+    candidate['definition_alignment']['comparison_evidence'] = dict(valid_from='2026-09-29',
+        valid_through='2026-09-29', source_specification_sha256=['a'*64, 'b'*64],
+        canonical_definition='fixture_definition', specifications=[specifications.copy(), specifications.copy()])
+    return candidate
+
+
+def test_flow_product_selection_stops_at_missing_rights_source_scope_and_definition():
+    from copy import deepcopy
+    from trade_system.flow_contract import select_flow_product_candidate, VERIFIED_FLOW_COMPARISONS
+    kwargs = dict(trade_date='2026-09-29', primary_origin='eastmoney', required_scope_sha256='c'*64)
+    candidate = _flow_selection_fixture()
+    ready = select_flow_product_candidate(candidate, **kwargs)
+    assert ready['screening_complete'] and ready['next_action'] == 'existing_comparison_contract_review'
+    assert not ready['independent_comparison_eligible'] and not ready['requests_authorized']
+    assert not VERIFIED_FLOW_COMPARISONS and not ready['original_certification_gate_changed']
+    assert ready['new_market_requests'] == ready['production_writes'] == 0
+    missing = select_flow_product_candidate({'product_id': 'unknown_product'}, **kwargs)
+    assert len(missing['blocking_reasons']) == 6 and missing['first_blocker'].startswith('product_access:')
+    assert missing['next_action'] == 'stop_and_resolve_first_missing_precondition'
+    unknown_scope = select_flow_product_candidate(candidate, '2026-09-29', primary_origin='eastmoney')
+    assert not unknown_scope['required_scope_known'] and not unknown_scope['screening_complete']
+    assert unknown_scope['first_blocker'] == 'required_security_scope:required_scope_unknown'
+    for stage in ('product_access', 'original_source', 'required_security_scope',
+                  'complete_session', 'definition_alignment'):
+        changed = deepcopy(candidate)
+        changed[stage]['status'] = 'unknown'
+        result = select_flow_product_candidate(changed, **kwargs)
+        assert not result['screening_complete'] and result['first_blocker'].startswith(stage + ':')
+        assert result['next_action'] == 'stop_and_resolve_first_missing_precondition'
+    same_source = deepcopy(candidate)
+    same_source['original_source']['origin'] = ' EastMoney '
+    assert 'same_or_unverified_original_compute_source' in select_flow_product_candidate(same_source, **kwargs)['first_blocker']
+    shrunk = deepcopy(candidate)
+    shrunk['required_security_scope']['required_scope_sha256'] = 'd'*64
+    assert 'fingerprint_differs' in select_flow_product_candidate(shrunk, **kwargs)['first_blocker']
+    mismatch = deepcopy(candidate)
+    mismatch['definition_alignment']['comparison_evidence']['specifications'][1]['order_grouping'] = 'trade_print'
+    assert 'order_grouping' in select_flow_product_candidate(mismatch, **kwargs)['first_blocker']
+    no_receipt = deepcopy(candidate)
+    no_receipt['original_receipt']['status'] = 'missing'
+    observed = select_flow_product_candidate(no_receipt, **kwargs)
+    assert observed['next_action'] == 'separate_bounded_request_budget_review' and not observed['requests_authorized']
+    stale = deepcopy(candidate)
+    stale['product_access']['valid_through'] = '2026-09-28'
+    assert 'missing_hash_date' in select_flow_product_candidate(stale, **kwargs)['first_blocker']
+
+
+def test_product_selection_cli_is_hash_bound_offline_and_cannot_escape_or_overwrite(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import sys
+    import pytest
+    import trade_system.http_transport as transport
+    from scripts import audit_stock_flow_contract as entry
+    source = tmp_path/'reviewed-selection.json'
+    raw = json.dumps({'product_id': 'existing_but_unqualified_product'}).encode()
+    source.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(entry, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(entry.duckdb, 'connect', lambda *a, **k: pytest.fail('selection opened DB'))
+    monkeypatch.setattr(transport, 'read_verified_once', lambda *a, **k: pytest.fail('selection sent request'))
+    args = ['audit', '--candidate-selection', str(source), '--selection-sha256', digest,
+            '--date', '2026-09-29', '--primary-origin', 'eastmoney', '--required-scope-sha256', 'c'*64,
+            '--db', 'production-must-not-open.duckdb']
+    output = tmp_path/'reports'/'selection.json'
+    monkeypatch.setattr(sys, 'argv', args + ['--out', str(output)])
+    assert entry.main() == 0
+    result = json.loads(output.read_text(encoding='utf-8'))
+    assert result['selection_evidence_sha256'] == digest and len(result['blocking_reasons']) == 6
+    assert not result['independent_comparison_eligible'] and result['new_market_requests'] == result['production_writes'] == 0
+    original = output.read_bytes()
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert output.read_bytes() == original
+    monkeypatch.setattr(sys, 'argv', args + ['--out', str(tmp_path/'escape.json')])
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert not (tmp_path/'escape.json').exists()
+    source.write_bytes(raw + b' ')
+    with pytest.raises(ValueError, match='SHA256 differs'):
+        entry.audit_product_selection_file(source, digest, '2026-09-29', 'eastmoney', 'c'*64)
+    duplicate = b'{"product_id":"first","product_id":"second"}'
+    source.write_bytes(duplicate)
+    with pytest.raises(ValueError, match='duplicate'):
+        entry.audit_product_selection_file(source, hashlib.sha256(duplicate).hexdigest(), '2026-09-29', 'eastmoney', 'c'*64)

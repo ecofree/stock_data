@@ -22,6 +22,8 @@ def main() -> int:
     parser.add_argument("--required-days", type=int, default=5)
     parser.add_argument("--workspace", required=True, help="Independent research publication workspace")
     parser.add_argument("--collector-contract-sha256", required=True, help="Exact accepted collection version")
+    parser.add_argument("--collector-contract", required=True,
+        help="Exact accepted contract file, including the required observation windows")
     parser.add_argument(
         "--minimum-ths-concepts", type=int, default=0,
         help="Optional legacy lower bound; the normal gate uses the recorded source expectation.",
@@ -37,6 +39,7 @@ def main() -> int:
         minimum_ths_concepts=args.minimum_ths_concepts or None,
         workspace=args.workspace,
         collector_contract_sha256=args.collector_contract_sha256,
+        collector_contract_path=args.collector_contract,
     )
     content = render_observation(result)
     out = Path(args.out)

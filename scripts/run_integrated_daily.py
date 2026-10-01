@@ -162,12 +162,16 @@ def main() -> int:
     artifact_dir = Path(args.reports_dir).resolve() / "runs" / run_id
     budget = {'auction': 90, 'intraday': 240, 'close': 3600, 'supplemental': 3600, 'history': 3600}[selected_phase]
     phase_deadline = time.time() + budget
-    inherited_deadline = os.environ.get('STOCKDATA_PHASE_DEADLINE_EPOCH')
-    if inherited_deadline:
-        supplied = float(inherited_deadline)
-        if not math.isfinite(supplied):
-            parser.error('invalid phase deadline')
-        phase_deadline = min(phase_deadline, supplied)
+    for deadline_name in ('STOCKDATA_PHASE_DEADLINE_EPOCH', 'STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH'):
+        inherited_deadline = os.environ.get(deadline_name)
+        if inherited_deadline:
+            try:
+                supplied = float(inherited_deadline)
+            except ValueError:
+                parser.error('invalid phase/window deadline')
+            if not math.isfinite(supplied):
+                parser.error('invalid phase/window deadline')
+            phase_deadline = min(phase_deadline, supplied)
     plan = command_plan(args.db, args.trade_date, include_collection=not args.skip_collect,
         signal_limit=args.signal_limit, reports_dir=str(artifact_dir), phase=selected_phase,
         as_of_time=args.as_of or None, collection_profile=args.collection_profile,
@@ -199,6 +203,8 @@ def main() -> int:
                          collector_contract_sha256=args.collector_contract_sha256, execution_ready=False)
     if args.prepare_reference:
         manifest.data['scope'] = 'pre_session_reference_preparation_only'
+    elif args.collector_contract:
+        manifest.bind_observation_contract(args.collector_contract, args.collector_contract_sha256)
     from trade_system.http_transport import ssl_context_note
     import urllib.request
     from urllib.parse import urlsplit
