@@ -312,6 +312,55 @@ def test_orchestrator_budget_reaches_nested_transport(monkeypatch):
         assert budget['attempts']==0
 
 
+def test_wire_budget_counts_failed_sends_and_nested_consumers(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from trade_system.http_transport import (read_verified_once, wire_request_budget,
+        WireRequestBudgetExceeded, diagnostic_budget, stop_diagnostic, measure_requests)
+    sends = []
+    def run(*args, **kwargs):
+        sends.append(1)
+        if len(sends) == 1:
+            raise subprocess.TimeoutExpired('transport fixture', 0.1)
+        return SimpleNamespace(returncode=0, stdout=b'{"ok":true}\n{}')
+    monkeypatch.setattr(subprocess, 'run', run)
+    request = urllib.request.Request('https://example.invalid/fixture')
+    with wire_request_budget(2) as outer, measure_requests() as all_receipts:
+        with pytest.raises(TimeoutError):
+            read_verified_once(request, timeout=1, max_bytes=100)
+        with wire_request_budget(2) as inner, measure_requests() as inner_receipts:
+            assert read_verified_once(request, timeout=1, max_bytes=100) == b'{}'
+            with pytest.raises(WireRequestBudgetExceeded):
+                read_verified_once(request, timeout=1, max_bytes=100)
+            assert inner['attempts'] == 1
+        assert outer['attempts'] == len(sends) == 2
+        assert len(all_receipts) == 2 and len(inner_receipts) == 1
+    with wire_request_budget(1) as no_send, diagnostic_budget():
+        stop_diagnostic('cooldown')
+        with pytest.raises(RuntimeError, match='stopped'):
+            read_verified_once(request, timeout=1, max_bytes=100)
+        assert no_send['attempts'] == 0 and len(sends) == 2
+
+
+def test_legacy_open_api_cannot_escape_wire_limit_or_measurement(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from trade_system import http_transport as transport
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(returncode=0, stdout=b'{"ok":true}\n{}')
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(transport, '_verified_opener', lambda *a: pytest.fail('unbudgeted route escaped'))
+    request = urllib.request.Request('https://example.invalid/fixture')
+    with transport.wire_request_budget(1) as budget, transport.measure_requests() as receipts:
+        with transport.open_verified(request, timeout=1) as response:
+            assert response.read() == b'{}'
+        with pytest.raises(transport.WireRequestBudgetExceeded):
+            transport.open_verified(request, timeout=1)
+        assert budget['attempts'] == len(calls) == len(receipts) == 1
+
+
 def test_blocked_transport_worker_is_reaped_at_deadline(monkeypatch):
     import subprocess
     import sys

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 import hashlib
+import gzip
 import json
+import math
 import os
 import platform
 from pathlib import Path
 import subprocess
 import sys
+import time as clock
+import uuid
 from zoneinfo import ZoneInfo
 
 from trade_system.file_lock import FileLock, FileLockBusy
@@ -95,6 +99,7 @@ class PipelineLock:
         self.path = db.with_name(f"{db.name}.pipeline.lock")
         self.run_id = run_id
         self._guard = FileLock(self.path.with_suffix(self.path.suffix + '.guard'))
+        self.recovered_owner = None
 
     def __enter__(self) -> "PipelineLock":
         try:
@@ -104,13 +109,21 @@ class PipelineLock:
         try:
             if self.path.exists():
                 try:
-                    previous = json.loads(self.path.read_text(encoding='utf-8'))
+                    raw = self.path.read_bytes()
+                    if len(raw) > 256_000:
+                        raise ValueError('owner metadata exceeds read budget')
+                    previous = json.loads(raw.decode('utf-8'))
                 except (OSError, ValueError):
                     previous = {}
                 if not isinstance(previous, dict) or previous.get('lock_protocol') != 'os_handle_v2':
                     raise PipelineAlreadyRunning(
                         f"Legacy/unknown lock requires coordinated maintenance: {self.path}"
                     )
+                # The acquired OS handle, never a PID or elapsed age, proves
+                # that this v2 owner is no longer holding the shared guard.
+                self.recovered_owner = {key: previous.get(key) for key in
+                    ('run_id', 'pid', 'started_at', 'host', 'lock_protocol')}
+                self.recovered_owner['metadata_sha256'] = hashlib.sha256(raw).hexdigest()
             return self._write_owner()
         except BaseException:
             self._guard.__exit__(None, None, None)
@@ -146,6 +159,196 @@ class PipelineLock:
                     self.path.unlink()
         finally:
             self._guard.__exit__(exc_type, exc, tb)
+
+
+def _before_deadline(deadline_epoch):
+    if deadline_epoch is not None:
+        if not math.isfinite(deadline_epoch):
+            raise ValueError('finite backup deadline required')
+        if clock.time() >= deadline_epoch:
+            raise TimeoutError('backup deadline exhausted; incomplete files are not qualified')
+
+
+def _runtime_json(path: Path, value):
+    """Commit evidence atomically; never expose an incomplete qualification."""
+    temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.partial')
+    with temp.open('x', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temp.replace(path)
+
+
+def _stream_digest(stream, deadline_epoch=None):
+    digest, size = hashlib.sha256(), 0
+    while True:
+        _before_deadline(deadline_epoch)
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            return digest.hexdigest(), size
+        digest.update(chunk)
+        size += len(chunk)
+
+
+def prepare_daily_backup(db_path, backup_dir, run_id, *, deadline_epoch=None):
+    """Copy a closed database under the same owner protocol as collection.
+
+    Deadline checks are cooperative between I/O chunks. A blocked filesystem
+    call is not forcibly interrupted; the supervising runner exposes its owner.
+    """
+    import duckdb
+    db = Path(db_path).resolve(strict=True)
+    folder = Path(backup_dir).resolve()
+    if not run_id or any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for ch in run_id):
+        raise ValueError('safe backup run id required')
+    folder.mkdir(parents=True, exist_ok=True)
+    raw = folder / ('kpl_data_pre_daily_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + run_id + '.duckdb')
+    partial = Path(str(raw) + '.partial')
+    with PipelineLock(db, 'backup_' + run_id) as owner:
+        # Even an interrupted or failed copy retains the prior-owner recovery
+        # boundary. This receipt cannot qualify a restoration point.
+        _runtime_json(Path(str(raw) + '.raw.json'), {'schema': 1, 'status': 'preparing',
+            'raw': str(raw), 'source_database': str(db), 'run_id': run_id,
+            'prepared_at': datetime.now().isoformat(), 'recovered_owner': owner.recovered_owner,
+            'qualified_recovery_point': False})
+        _before_deadline(deadline_epoch)
+        wal = Path(str(db) + '.wal')
+        if wal.exists() and wal.stat().st_size:
+            raise ValueError('nonempty source WAL requires coordinated backup; no incomplete database copy')
+        # Read-only DuckDB ownership also refuses an incompatible live writer.
+        with duckdb.connect(str(db), read_only=True) as source:
+            tables = source.execute('SELECT table_schema,table_name FROM information_schema.tables ORDER BY 1,2').fetchall()
+            before = db.stat()
+            digest, size = hashlib.sha256(), 0
+            with db.open('rb') as src, partial.open('xb') as dst:
+                while True:
+                    _before_deadline(deadline_epoch)
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            after = db.stat()
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != before.st_size:
+                raise ValueError('source changed during guarded copy; raw remains unqualified')
+        _before_deadline(deadline_epoch)
+        with duckdb.connect(str(partial), read_only=True) as copy:
+            copied_tables = copy.execute('SELECT table_schema,table_name FROM information_schema.tables ORDER BY 1,2').fetchall()
+            if copied_tables != tables:
+                raise ValueError('copied database catalogue differs')
+        partial.replace(raw)
+        receipt = {'schema': 1, 'status': 'raw_verified_not_compressed', 'raw': str(raw),
+            'raw_sha256': digest.hexdigest(), 'raw_size': size, 'source_database': str(db),
+            'source_size': before.st_size, 'source_mtime_ns': before.st_mtime_ns,
+            'catalogue': tables, 'prepared_at': datetime.now().isoformat(),
+            'recovered_owner': owner.recovered_owner,
+            'deadline_is_cooperative': True, 'qualified_recovery_point': False}
+        _runtime_json(Path(str(raw) + '.raw.json'), receipt)
+        return receipt
+
+
+def finalize_daily_backup(raw_path, *, deadline_epoch=None):
+    """Qualify only a gzip whose complete decompressed bytes match the raw."""
+    raw = Path(raw_path).resolve(strict=True)
+    receipt = json.loads(Path(str(raw) + '.raw.json').read_text(encoding='utf-8'))
+    if receipt.get('schema') != 1 or receipt.get('status') != 'raw_verified_not_compressed' or receipt.get('raw') != str(raw):
+        raise ValueError('bound verified raw receipt required')
+    archive = Path(str(raw) + '.gz')
+    qualified = Path(str(archive) + '.qualified.json')
+    if archive.exists() or qualified.exists():
+        raise ValueError('new final archive required; retained recovery evidence cannot be overwritten')
+    partial = Path(str(archive) + '.partial')
+    # Keep the verified raw on every failure, including qualification writes.
+    with raw.open('rb') as src, partial.open('xb') as dst:
+        digest, size = hashlib.sha256(), 0
+        with gzip.GzipFile(fileobj=dst, mode='wb', mtime=0) as compressed:
+            while True:
+                _before_deadline(deadline_epoch)
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                compressed.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+    if digest.hexdigest() != receipt['raw_sha256'] or size != receipt['raw_size']:
+        raise ValueError('verified raw changed before compression; archive unqualified')
+    with gzip.open(partial, 'rb') as decompressed:
+        restored_sha, restored_size = _stream_digest(decompressed, deadline_epoch)
+    if restored_sha != receipt['raw_sha256'] or restored_size != receipt['raw_size']:
+        raise ValueError('compressed roundtrip differs; raw retained')
+    with partial.open('rb') as stream:
+        archive_sha, archive_size = _stream_digest(stream, deadline_epoch)
+    partial.replace(archive)
+    result = dict(receipt, status='qualified', archive=str(archive), archive_sha256=archive_sha,
+                  archive_size=archive_size, decompressed_sha256=restored_sha,
+                  qualified_at=datetime.now().isoformat(), qualified_recovery_point=True)
+    _runtime_json(qualified, result)
+    # Qualification is already durable. Cleanup failure cannot revoke it or
+    # silently discard the remaining raw restoration input.
+    cleanup_errors = []
+    for path in (raw, Path(str(raw) + '.raw.json')):
+        try:
+            path.unlink()
+        except OSError as exc:
+            cleanup_errors.append(type(exc).__name__)
+    return dict(result, cleanup_errors=cleanup_errors)
+
+
+def retain_qualified_backups(backup_dir, keep=7, weekly_keep=4, *, deadline_epoch=None):
+    """Unknown, partial or changed archives never consume a retention slot."""
+    if type(keep) is not int or keep < 1 or type(weekly_keep) is not int or weekly_keep < 0:
+        raise ValueError('positive daily and nonnegative weekly retention required')
+    folder = Path(backup_dir).resolve()
+    eligible, ignored = [], []
+    try:
+        for record in sorted(folder.glob('kpl_data_pre_daily_*.duckdb.gz.qualified.json'), reverse=True):
+            _before_deadline(deadline_epoch)
+            try:
+                item = json.loads(record.read_text(encoding='utf-8'))
+                archive = Path(item['archive']).resolve(strict=True)
+                if archive.parent != folder or record.resolve() != Path(str(archive) + '.qualified.json'):
+                    raise ValueError('qualification path escapes backup directory')
+                if item.get('schema') != 1 or item.get('status') != 'qualified' or item.get('qualified_recovery_point') is not True:
+                    raise ValueError('not qualified')
+                with archive.open('rb') as stream:
+                    sha, size = _stream_digest(stream, deadline_epoch)
+                if sha != item['archive_sha256'] or size != item['archive_size']:
+                    raise ValueError('qualified archive changed')
+                eligible.append((record, archive))
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError):
+                ignored.append(record.name)
+    except TimeoutError:
+        return {'status': 'deferred', 'deleted': [], 'reason': 'retention verification deadline exhausted'}
+    kept, deleted, anchors = set(), [], 0
+    for index, (_, archive) in enumerate(eligible):
+        stamp = archive.name[len('kpl_data_pre_daily_'):][:8]
+        try:
+            monday = datetime.strptime(stamp, '%Y%m%d').weekday() == 0
+        except ValueError:
+            # Malformed external names are not automatically removable.
+            kept.add(archive)
+            continue
+        if index < keep or (monday and anchors < weekly_keep):
+            kept.add(archive)
+            if index >= keep:
+                anchors += 1
+    for record, archive in eligible:
+        if archive not in kept:
+            _before_deadline(deadline_epoch)
+            # Paths were resolved, bound to their qualification, and verified
+            # within this one folder before any deletion.
+            archive.unlink()
+            record.unlink()
+            deleted.append(archive.name)
+    return {'status': 'completed', 'qualified_count': len(eligible), 'deleted': deleted,
+            'kept': len(kept), 'ignored_qualification': ignored}
 
 
 def all_manifests(reports_dir: str | Path) -> list[dict]:

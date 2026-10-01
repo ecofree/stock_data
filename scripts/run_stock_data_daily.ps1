@@ -20,14 +20,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# Keep -Db usable; advanced parameters reserve that alias for -Debug.
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$OutputEncoding=[Console]::OutputEncoding
+# Missing/unbound targets are rejected before any side effects.
 if (-not $CollectorContract -or -not $CollectorContractSha256 -or -not $ReportsDirectory) { throw 'Explicit collector contract, hash and reports directory required' }
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[Console]::InputEncoding = $utf8NoBom
-[Console]::OutputEncoding = $utf8NoBom
-$OutputEncoding = $utf8NoBom
-$env:PYTHONUTF8 = "1"
-$env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $PSScriptRoot
 if (-not $Python) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
@@ -35,178 +31,123 @@ $BackupDir = Join-Path (Split-Path -Parent $DbPath) "backups"
 $ReportDir = $ReportsDirectory
 $LogDir = Join-Path $ReportsDirectory "scheduled-logs"
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
-
 $NotifyHelper = Join-Path $Root "scripts\pipeline_notify.py"
-
-if (-not (Test-Path -LiteralPath $DbPath)) {
-    throw "Database not found: $DbPath"
-}
-if (-not (Test-Path -LiteralPath $Python)) {
-    throw "Python runtime not found: $Python"
-}
-if (-not (Test-Path -LiteralPath $IntegratedRunner)) {
-    throw "Integrated runner not found: $IntegratedRunner"
-}
-if (Test-Path -LiteralPath "$DbPath.pipeline.lock") {
-    throw "Refusing to copy a database while the pipeline lock exists: $DbPath.pipeline.lock"
-}
-. (Join-Path $PSScriptRoot 'native_process.ps1')
-$preflight=Invoke-StockDataProcess -Executable $Python -Arguments @($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') -WorkingDirectory $Root
-if ($preflight.ExitCode -ne 0) { throw ('Collection contract rejected before backup: '+$preflight.Stderr) }
-if (-not (Test-Path -LiteralPath $BackupDir)) {
-    New-Item -ItemType Directory -Path $BackupDir | Out-Null
-}
-if (-not (Test-Path -LiteralPath $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir | Out-Null
-}
-
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$backup = Join-Path $BackupDir ("kpl_data_pre_daily_{0}.duckdb" -f $stamp)
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+$backupRunId='close_'+$stamp+'_'+[Guid]::NewGuid().ToString('N')
 $Log = Join-Path $LogDir ("scheduled_close_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
-$backupStatus = "not_attempted"
-$backupError = ""
-$compressed = ""
-
-function Compress-VerifiedBackup {
-    param([string]$Path)
-    # gzip the verified raw copy and remove it.  A DuckDB file is highly
-    # compressible, so this cuts backup disk usage by roughly 4x.  Restore
-    # with: python -c "import gzip,shutil; gzip.open(r'<file>','rb') ..."
-    $gz = "$Path.gz"
-    $src = [System.IO.File]::OpenRead($Path)
-    $dst = [System.IO.File]::Create($gz)
-    try {
-        $stream = New-Object System.IO.Compression.GZipStream(
-            $dst, [System.IO.Compression.CompressionLevel]::Optimal)
+$processState=Join-Path $LogDir ('close_'+$backupRunId+'_process.json')
+$backupStatus='not_attempted'; $backupReceipt=$null; $compressed=''; $code=1
+$previousDeadline=$env:STOCKDATA_PHASE_DEADLINE_EPOCH
+function Write-CloseLog {
+    param([Parameter(ValueFromPipeline=$true)][string]$Message)
+    process {
+        # New logs are UTF-8. Preserve the encoding of any legacy same-day log
+        # when appending; never silently rewrite existing failure evidence.
+        $encoding=[Text.UTF8Encoding]::new($false)
+        if ([IO.File]::Exists($Log)) {
+            $stream=[IO.File]::OpenRead($Log)
+            try {if($stream.ReadByte() -eq 255 -and $stream.ReadByte() -eq 254){$encoding=[Text.Encoding]::Unicode}} finally {$stream.Dispose()}
+        }
+        [IO.File]::AppendAllText($Log,$Message+[Environment]::NewLine,$encoding)
+        Write-Output $Message
+    }
+}
+function Invoke-CloseNotification([string]$Event,[string]$Message='') {
+    if (Test-Path -LiteralPath $NotifyHelper -PathType Leaf) {
         try {
-            $src.CopyTo($stream)
-        } finally {
-            $stream.Dispose()
-        }
-    } finally {
-        $src.Dispose()
-        $dst.Dispose()
-    }
-    Remove-Item -LiteralPath $Path -Force
-    return $gz
-}
-
-function Remove-OldBackups {
-    # Retention over both legacy raw copies and compressed .gz backups.
-    # Newest $BackupKeep files are always kept; Monday-stamped files are
-    # treated as weekly anchors and kept up to $WeeklyKeep on top of that,
-    # so a bad week cannot destroy every pre-week rollback point.
-    $files = @(Get-ChildItem -LiteralPath $BackupDir -File |
-        Where-Object {
-            $_.Name -like "kpl_data_pre_daily_*.duckdb" -or
-            $_.Name -like "kpl_data_pre_daily_*.duckdb.gz"
-        } |
-        # Copy-Item preserves the DuckDB source timestamp, so the timestamped
-        # filename is the durable creation order for retention.
-        Sort-Object Name -Descending)
-    if ($files.Count -le $BackupKeep) { return }
-    $keptWeekly = 0
-    for ($i = $BackupKeep; $i -lt $files.Count; $i++) {
-        $name = $files[$i].Name
-        if ($name -match "_\d{8}_") {
-            $stamp = $Matches[0].Trim("_")
-            try {
-                if ([datetime]::ParseExact($stamp, "yyyyMMdd", $null).DayOfWeek -eq [System.DayOfWeek]::Monday) {
-                    if ($keptWeekly -lt $WeeklyKeep) { $keptWeekly++; continue }
-                }
-            } catch { }
-        }
-        Remove-Item -LiteralPath $files[$i].FullName -Force
+            $notice=Invoke-StockDataProcess -Executable $Python -Arguments @($NotifyHelper,'--event',$Event,'--message',$Message) -WorkingDirectory $Root -TimeoutSeconds 15 -ProgressPath $processState
+            ($notice.Stdout+$notice.Stderr) | Write-CloseLog
+            if ($notice.ExitCode -ne 0) {throw 'Notification process did not complete within its cooperative budget'}
+        } catch {"NOTIFICATION_DEFERRED event=$Event error=$($_.Exception.Message)" | Write-CloseLog}
     }
 }
-
-Push-Location $Root
+# The startup failure path must have durable evidence before DB/lock/runtime checks.
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+"DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath" | Write-CloseLog
 try {
-    "DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath" |
-        Tee-Object -FilePath $Log -Append
-    $prevEAP0 = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & $Python $NotifyHelper --event start 2>&1 | Tee-Object -FilePath $Log -Append
-    $ErrorActionPreference = $prevEAP0
-    # A rollback backup is valuable, but it must not prevent the close pipeline
-    # from publishing the review. Windows may reject a large Copy-Item with
-    # ERROR_NOT_ENOUGH_QUOTA even when the volume has plenty of free space.
-    # Record the failure and continue; the integrated runner is the source of
-    # truth for the close result.
+    if ($BackupKeep -lt 1 -or $WeeklyKeep -lt 0) {throw 'Positive daily and nonnegative weekly backup retention required'}
+    foreach ($path in @($Python,$DbPath,$IntegratedRunner)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {throw "Required runtime/database/runner not found: $path"}
+    }
+    $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
+    . (Join-Path $PSScriptRoot 'native_process.ps1')
+    if (-not $TradeDate) {$TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')}
+    # Contract verification is read-only. Backup and collection use its same
+    # original close deadline; preflight/copy may never renew the phase budget.
+    $preflight=Invoke-StockDataProcess -Executable $Python -Arguments @($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
+    if ($preflight.ExitCode -ne 0) {throw ('Collection contract rejected before backup: '+$preflight.Stderr)}
+    $windowCode="import json,sys; from trade_system.pipeline_runtime import load_observation_contract,observation_windows; print(json.dumps(observation_windows(load_observation_contract(sys.argv[1],sys.argv[2]),sys.argv[3],'close')[0]))"
+    $windowResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$windowCode,$CollectorContract,$CollectorContractSha256,$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 30 -ProgressPath $processState
+    if ($windowResult.ExitCode -ne 0) {throw ('Accepted close observation window unavailable: '+$windowResult.Stderr)}
+    $window=$windowResult.Stdout | ConvertFrom-Json
+    $closeDeadline=[DateTimeOffset]::Parse($window.deadline_at).ToUnixTimeSeconds()
+    if ($previousDeadline) {
+        $parsed=[double]::Parse($previousDeadline,[Globalization.CultureInfo]::InvariantCulture)
+        if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {throw 'Finite inherited close deadline required'}
+        $closeDeadline=[Math]::Min($closeDeadline,$parsed)
+    }
+    $env:STOCKDATA_PHASE_DEADLINE_EPOCH=$closeDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)
+    Invoke-CloseNotification 'start'
+    # Copy is guarded with PipelineLock's owner protocol. No metadata-only
+    # Test-Path refusal, PID probing, deletion, or separate incompatible lock.
+    # Reserve 90s before the latest start for the actual collector preflight.
+    $copyDeadline=[Math]::Min($closeDeadline,[DateTimeOffset]::Parse($window.start_latest_at).ToUnixTimeSeconds()-90)
+    $prepareCode="import json,sys; from trade_system.pipeline_runtime import prepare_daily_backup; print(json.dumps(prepare_daily_backup(sys.argv[1],sys.argv[2],sys.argv[3],deadline_epoch=float(sys.argv[4]))))"
     try {
-        # Shared permanent guard protects the copy; metadata alone is not a lock.
-        $backupGuard=[IO.File]::Open($DbPath+'.pipeline.lock.guard',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)
-        try {
-            $backupGuard.Lock(0,1)
-            if (Test-Path -LiteralPath ($DbPath+'.pipeline.lock')) { throw 'Pipeline owner appeared before backup; defer safely' }
-            Copy-Item -LiteralPath $DbPath -Destination $backup
-        } finally { $backupGuard.Dispose() }
-        # Python writes its logging to stderr. Under $ErrorActionPreference='Stop'
-        # that stderr becomes a terminating NativeCommandError even when the
-        # process exits 0, so judge verification by the real process exit code.
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        $verifyOutput = & $Python -c "import duckdb; c=duckdb.connect(r'$backup', read_only=True); c.execute('select 1').fetchone(); c.close()" 2>&1
-        $verifyCode = $LASTEXITCODE
-        $ErrorActionPreference = $prevEAP
-        $verifyOutput | Tee-Object -FilePath $Log -Append
-        if ($verifyCode -ne 0) {
-            throw "Backup verification failed: $backup"
-        }
-        $compressed = Compress-VerifiedBackup -Path $backup
-        $backupStatus = "ok"
-        "BACKUP_COMPLETE path=$compressed" | Tee-Object -FilePath $Log -Append
+        $prepared=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$prepareCode,$DbPath,$BackupDir,$backupRunId,$copyDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) -WorkingDirectory $Root -DeadlineEpoch $copyDeadline -TimeoutSeconds 120 -ProgressPath $processState
+        if ($prepared.ExitCode -ne 0) {throw ('Guarded raw backup failed: '+$prepared.Stderr)}
+        $backupReceipt=$prepared.Stdout | ConvertFrom-Json
+        $backupStatus='raw_verified_not_compressed'
+        "BACKUP_RAW_VERIFIED path=$($backupReceipt.raw) qualified_recovery_point=false" | Write-CloseLog
     } catch {
-        $backupStatus = "failed"
-        $backupError = $_.Exception.Message
-        if (Test-Path -LiteralPath $backup) {
-            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        $backupStatus='failed_or_deferred'
+        "BACKUP_FAILED error=$($_.Exception.Message); raw/partial retained, no retention credit; continuing collection under original deadline" | Write-CloseLog
+    }
+    $args = @($IntegratedRunner,"--db",$DbPath,"--reports-dir",$ReportDir,
+        "--collector-contract",$CollectorContract,"--collector-contract-sha256",$CollectorContractSha256,
+        "--collection-profile",$CollectionProfile,"--phase",$Phase,"--trade-date",$TradeDate)
+    if ($SkipCollection) {$args+='--skip-collect'}
+    Push-Location $Root
+    try {
+        $result=Invoke-StockDataProcess -Executable $Python -Arguments $args -WorkingDirectory $Root -DeadlineEpoch $closeDeadline -TimeoutSeconds 3600 -ProgressPath $processState
+        $code=$result.ExitCode
+        ($result.Stdout+$result.Stderr) | Write-CloseLog
+    } finally {Pop-Location}
+    # Compression is deliberately after collection. It cannot move the actual
+    # close manifest outside its start window, and it keeps the verified raw if
+    # its own cooperative budget or filesystem operation fails.
+    if ($backupReceipt) {
+        $finishCode="import json,sys; from trade_system.pipeline_runtime import finalize_daily_backup; print(json.dumps(finalize_daily_backup(sys.argv[1],deadline_epoch=float(sys.argv[2]))))"
+        try {
+            $finished=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$finishCode,$backupReceipt.raw,$closeDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) -WorkingDirectory $Root -DeadlineEpoch $closeDeadline -TimeoutSeconds 3600 -ProgressPath $processState
+            if ($finished.ExitCode -ne 0) {throw ('Archive qualification failed: '+$finished.Stderr)}
+            $qualified=$finished.Stdout | ConvertFrom-Json
+            if ($qualified.status -ne 'qualified' -or $qualified.qualified_recovery_point -ne $true) {throw 'Qualified recovery receipt required'}
+            $compressed=$qualified.archive; $backupStatus='qualified'
+            "BACKUP_COMPLETE path=$compressed qualified_recovery_point=true cleanup_errors=$($qualified.cleanup_errors -join ',')" | Write-CloseLog
+        } catch {
+            $backupStatus='raw_retained_unqualified_archive'
+            "BACKUP_FAILED error=$($_.Exception.Message); verified raw retained; partial archive cannot consume retention quota" | Write-CloseLog
         }
-        "BACKUP_FAILED error=$backupError; continuing close pipeline" |
-            Tee-Object -FilePath $Log -Append
     }
-
-    $args = @(
-        $IntegratedRunner,
-        "--db", $DbPath,
-        "--reports-dir", $ReportDir,
-        "--collector-contract", $CollectorContract,
-        "--collector-contract-sha256", $CollectorContractSha256,
-        "--collection-profile", $CollectionProfile,
-        "--phase", $Phase
-    )
-    if ($TradeDate) { $args += @("--trade-date", $TradeDate) }
-    if ($SkipCollection) { $args += "--skip-collect" }
-
-    # Same reasoning as the backup-verify call: scope to 'Continue' so Python's stderr
-    # logging does not abort the close run; success is judged by $code below.
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $output = & $Python @args 2>&1
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
-    $output | Tee-Object -FilePath $Log -Append
-    if ($code -ne 0) {
-        throw "Integrated daily run failed with exit code $code. backup_status=$backupStatus"
-    }
-    "DAILY_RUN_COMPLETE backup_status=$backupStatus backup=$compressed" |
-        Tee-Object -FilePath $Log -Append
-    $prevEAP0 = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & $Python $NotifyHelper --event success --message "close run ok; backup_status=$backupStatus; backup=$compressed" 2>&1 |
-        Tee-Object -FilePath $Log -Append
-    $ErrorActionPreference = $prevEAP0
+    if ($code -ne 0) {throw "Integrated daily run failed with exit code $code. backup_status=$backupStatus"}
+    "DAILY_RUN_COMPLETE collection_only=true acceptance_verified=false backup_status=$backupStatus backup=$compressed" | Write-CloseLog
+    Invoke-CloseNotification 'success' "collection run completed; acceptance_verified=false; backup_status=$backupStatus; backup=$compressed"
 } catch {
-    "DAILY_RUN_FAILED time=$(Get-Date -Format o) error=$($_.Exception.Message)" |
-        Tee-Object -FilePath $Log -Append
-    $prevEAP0 = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & $Python $NotifyHelper --event failure --message $_.Exception.Message 2>&1 |
-        Tee-Object -FilePath $Log -Append
-    $ErrorActionPreference = $prevEAP0
+    "DAILY_RUN_FAILED time=$(Get-Date -Format o) error=$($_.Exception.Message) backup_status=$backupStatus" | Write-CloseLog
+    Invoke-CloseNotification 'failure' $_.Exception.Message
     throw
 } finally {
-    # Five-session product acceptance no longer calls the retired signal-based audit.
-    Remove-OldBackups
-    Pop-Location
+    # Only qualified, hash-verified archives can be pruned. Never clean failed
+    # raw/partial files as an automatic side effect of a collection failure.
+    if ($compressed) {
+        $retentionCode="import json,sys; from trade_system.pipeline_runtime import retain_qualified_backups; print(json.dumps(retain_qualified_backups(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),deadline_epoch=float(sys.argv[4]))))"
+        try {
+            $retained=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$retentionCode,$BackupDir,[string]$BackupKeep,[string]$WeeklyKeep,$closeDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) -WorkingDirectory $Root -DeadlineEpoch $closeDeadline -TimeoutSeconds 120 -ProgressPath $processState
+            if ($retained.ExitCode -ne 0) {throw $retained.Stderr}
+            "BACKUP_RETENTION $($retained.Stdout.Trim())" | Write-CloseLog
+        } catch {"BACKUP_RETENTION_DEFERRED error=$($_.Exception.Message); no unqualified recovery points pruned" | Write-CloseLog}
+    }
+    $env:STOCKDATA_PHASE_DEADLINE_EPOCH=$previousDeadline
 }
+exit $code

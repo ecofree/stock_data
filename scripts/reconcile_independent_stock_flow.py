@@ -74,7 +74,7 @@ def reconcile(
     trade_date: str,
     *,
     primary_provider: str | None = None,
-    reference_provider: str = "tushare",
+    reference_provider: str | None = None,
 ) -> dict:
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(db_path))
@@ -86,9 +86,19 @@ def reconcile(
                 [trade_date]).fetchone() if table_exists(con,'intraday_stock_flow_batch') else None
             primary_provider = batch[0] if batch else 'eastmoney_intraday_clist_delay'
         primary = _rows(con, trade_date, primary_provider)
+        from trade_system.readiness import qualified_stock_flow_scope
+        scope = qualified_stock_flow_scope(con, trade_date)
+        universe = set(scope['codes']) if scope['passed'] else set()
+        from trade_system.flow_contract import independent_comparison_contract, stock_flow_evidence_fingerprint
+        selection_reason = None
+        if not reference_provider:
+            providers = [r[0] for r in con.execute('SELECT DISTINCT provider FROM multi_source_stock_flow '
+                'WHERE source_date=? AND provider<>? AND is_stale=FALSE', [trade_date, primary_provider]).fetchall()]
+            qualified = [p for p in providers if independent_comparison_contract(con, trade_date, primary_provider, p)['eligible']]
+            reference_provider = qualified[0] if len(qualified) == 1 else ''
+            selection_reason = ('no_reviewed_reference_product' if not qualified else
+                                'ambiguous_reviewed_reference_products' if len(qualified) > 1 else None)
         reference = _rows(con, trade_date, reference_provider)
-        from scripts.collect_intraday_stock_flow_market import _a_share_universe_by_exchange
-        universe = set(_a_share_universe_by_exchange(con, trade_date))
         overlap_codes = sorted(set(primary) & set(reference) & universe)
         primary_only = set(primary) - set(reference)
         reference_only = set(reference) - set(primary)
@@ -107,8 +117,9 @@ def reconcile(
             sign_agreement = sum(1 for p, r in pairs if (p > 0)-(p < 0) == (r > 0)-(r < 0)) * 100.0 / n
             mean_abs_diff = sum(abs(p - r) / max(abs(p), abs(r), 1_000_000.0) for p, r in pairs) * 100.0 / n
         overlap_pct = len(overlap_codes) * 100.0 / len(universe) if universe else 0.0
-        from trade_system.flow_contract import independent_comparison_contract, stock_flow_evidence_fingerprint
         comparison = independent_comparison_contract(con, trade_date, primary_provider, reference_provider)
+        if selection_reason:
+            comparison.update(eligible=False, reason=selection_reason)
         policy = comparison.get('definition_evidence', {}).get('amount_precision', {})
         quantums = [policy.get(k) for k in ('primary_quantum_yuan', 'reference_quantum_yuan')]
         precision_valid = all(isinstance(v, (int,float)) and not isinstance(v,bool)
@@ -124,7 +135,7 @@ def reconcile(
                 count(*) FILTER (WHERE fetched_at IS NULL) FROM multi_source_stock_flow
                 WHERE source_date=? AND provider=? AND is_stale=FALSE''', [trade_date,provider]).fetchone()
             clocks[provider] = {'min':str(minimum), 'max':str(maximum), 'missing':absent}
-            if absent or minimum is None or minimum < close_at or maximum > datetime.now():
+            if not selection_reason and (absent or minimum is None or minimum < close_at or maximum > datetime.now()):
                 comparison.update(eligible=False, reason='close_input_time_unqualified')
         status = 'warning'
         if not comparison['eligible']:
@@ -232,16 +243,17 @@ def main() -> int:
     parser.add_argument("--db", default="kpl_data.duckdb")
     parser.add_argument("--date", dest="trade_date", action="append", help="Trade date; repeat for multiple dates.")
     parser.add_argument("--out", default="reports/independent_stock_flow_reconciliation_latest.md")
+    parser.add_argument("--reference-provider", help="Explicit product; absent selects only one already-reviewed stored pair.")
     args = parser.parse_args()
     dates = args.trade_date or [date.today().isoformat()]
-    results = [reconcile(args.db, d) for d in dates]
+    results = [reconcile(args.db, d, reference_provider=args.reference_provider) for d in dates]
     path = Path(args.out)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_report(results), encoding="utf-8")
     for r in results:
         print(
             f"date={r['trade_date']} status={r['status']} primary={r['primary_rows']} "
-            f"tushare={r['reference_rows']} overlap={r['overlap_reference_pct']:.2f}% "
+            f"reference={r['reference_provider'] or 'unqualified'}:{r['reference_rows']} overlap={r['overlap_reference_pct']:.2f}% "
             f"corr={r['correlation_main_net']} sign={r['sign_agreement_pct']}%"
         )
     print(f"out={path}")

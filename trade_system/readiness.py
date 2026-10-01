@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import math
+import hashlib
+import json
 from pathlib import Path
 from typing import Iterable
 
@@ -59,21 +61,23 @@ def required_sector_taxonomy_coverage(con, trade_date, *, now=None):
         return {"passed": False, "taxonomies": {}, "reason": "required_taxonomy_evidence_missing"}
     timestamp = _timestamp_column(con, table)
     time_sql = f', TRY_CAST("{timestamp}" AS TIMESTAMP)' if timestamp else ', NULL'
+    provider_sql = ', provider' if 'provider' in table_columns(con, table) else ', NULL'
     try:
         rows = con.execute(
-            "SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status" + time_sql
+            "SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status" + time_sql + provider_sql
             + " FROM intraday_sector_flow_taxonomy WHERE trade_date=CAST(? AS DATE)",
             [_normalize_trade_date(trade_date)],
         ).fetchall()
     except duckdb.Error:
         return {"passed": False, "taxonomies": {}, "reason": "required_taxonomy_evidence_invalid"}
     facts = {}
-    for name, expected, observed, coverage, status, updated_at in rows:
+    for name, expected, observed, coverage, status, updated_at, provider in rows:
         if name not in required:
             continue
         if name in facts:
             return {"passed": False, "taxonomies": facts, "reason": "duplicate_taxonomy_evidence"}
         fact = _coverage_fact(expected, observed, coverage, status, {"success"})
+        fact['provider'] = provider
         if now is not None and timestamp and (updated_at is None or updated_at > as_local_naive(now)):
             fact.update(passed=False, reason="taxonomy_evidence_not_available_as_of")
         facts[name] = fact
@@ -82,7 +86,136 @@ def required_sector_taxonomy_coverage(con, trade_date, *, now=None):
             "reason": None if passed else "required_taxonomy_missing_unknown_or_partial"}
 
 
-def _actual_flow_coverage(con, trade_date, kind, evidence, *, max_age_seconds=None, now=None):
+def qualified_stock_flow_scope(con, trade_date, *, now=None):
+    """Read the dated, hash-bound L/D inventory without constructing a writer."""
+    from trade_system.ths_quality import qualified_stock_reference
+    day = _normalize_trade_date(trade_date)
+    clock = as_local_naive(now) or datetime.now()
+    # Historical membership is evaluated at that session's end, not relabelled
+    # as a newly arrived current inventory. Canonical flow freshness is separate.
+    scope_clock = min(clock, datetime.fromisoformat(day + "T23:59:59.999999"))
+    result = {"passed": False, "codes": {}, "reason": "dated_stock_reference_unqualified"}
+    try:
+        reference = qualified_stock_reference(con, now=scope_clock, membership_date=day)
+        if not reference or reference.get("membership_date") != day:
+            return result
+        rows = con.execute("SELECT DISTINCT ts_code,list_date FROM tushare_stock_basic "
+                           "WHERE ts_code IS NOT NULL AND (list_date IS NULL OR list_date<=CAST(? AS DATE)) "
+                           "AND (delist_date IS NULL OR delist_date>CAST(? AS DATE))", [day, day]).fetchall()
+        excluded = set(reference.get("not_listed", []))
+        codes = {}
+        for identity, listed_at in rows:
+            if identity in excluded:
+                continue
+            if (not isinstance(identity, str) or len(identity) != 9 or not identity[:6].isascii()
+                    or not identity[:6].isdigit() or identity[6:] not in {".SH", ".SZ", ".BJ"}
+                    or identity[:6] in codes):
+                return {**result, "reason": "dated_stock_identity_invalid_or_ambiguous"}
+            if listed_at is None and identity not in reference.get('membership_only', []):
+                return {**result, "reason": "dated_stock_listing_applicability_unqualified"}
+            codes[identity[:6]] = identity[-2:]
+        if not codes:
+            return result
+        return {"passed": True, "codes": codes, "reason": None,
+                "version": reference["version"], "received_at": reference["known_at"],
+                "membership_date": day,
+                "codes_sha256": hashlib.sha256(json.dumps(sorted(codes)).encode()).hexdigest()}
+    except (duckdb.Error, ValueError, TypeError, KeyError):
+        return result
+
+
+def _qualified_sector_scopes(con, trade_date, *, now=None):
+    from trade_system.ths_quality import canonical_ths_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
+    day = _normalize_trade_date(trade_date)
+    clock = as_local_naive(now) or datetime.now()
+    result = {}
+    if table_exists(con, "multi_source_observation"):
+        try:
+            row = con.execute("SELECT observed_at,payload_json,payload_hash,status "
+                "FROM multi_source_observation WHERE data_type='em_industry_catalogue' "
+                "AND provider='xiaodefa' AND source_date=CAST(? AS DATE) AND observed_at<=? "
+                "ORDER BY observed_at DESC LIMIT 1", [day, clock]).fetchone()
+            if row and row[3] == "qualified" and hashlib.sha256(row[1].encode()).hexdigest() == row[2]:
+                payload = json.loads(row[1])
+                rows = payload["rows"]
+                codes = [r["ts_code"] for r in rows]
+                if (payload.get("api") == "dc_index" and payload.get("params", {}).get("trade_date") == day.replace("-", "")
+                        and 0 < len(codes) < 5000 and len(set(codes)) == len(codes)
+                        and all(isinstance(c, str) and c.startswith("BK") and c.endswith(".DC")
+                                and c[2:-3].isascii() and c[2:-3].isdigit()
+                                and r.get("trade_date") == day.replace("-", "")
+                                and r.get("idx_type") == "行业板块" for r, c in zip(rows, codes))):
+                    result["em_industry"] = {"codes": set(c.removesuffix(".DC") for c in codes),
+                                             "version": row[2], "received_at": str(row[0])}
+        except (duckdb.Error, ValueError, KeyError, TypeError, AttributeError):
+            pass
+    try:
+        snapshot = canonical_ths_snapshot(con, day)
+        if snapshot and 0 <= snapshot["age_days"] <= THS_MEMBERSHIP_MAX_AGE_DAYS:
+            codes = {r[0] for r in con.execute("SELECT DISTINCT concept_code FROM ths_concept_daily "
+                                              "WHERE trade_date=CAST(? AS DATE)", [snapshot["snapshot_date"]]).fetchall()}
+            if codes and all(isinstance(c, str) and c.strip() for c in codes):
+                result["ths_concept"] = {"codes": codes, "version": snapshot["snapshot_date"]}
+    except (duckdb.Error, ValueError, TypeError, KeyError):
+        pass
+    return result
+
+
+def _stock_product_qualified(provider, origin, api, definition, version, exchange, trade_date):
+    from trade_system.flow_contract import FLOW_MAPPING_VERSION, VERIFIED_FLOW_COMPARISONS, flow_definition_evidence
+    if not all((origin, api, definition, version)):
+        return False
+    native = {"xiaodefa_moneyflow_dc": {"moneyflow_dc"}, "eastmoney_market": {"RPT_DMSK_TS_STOCKNEW"},
+              "eastmoney_intraday_clist": {"push2_clist"}, "eastmoney_intraday_clist_delay": {"push2_clist"}}
+    if (version == FLOW_MAPPING_VERSION and origin == "eastmoney" and api in native.get(provider, set())
+            and definition in {"provider_main_net", "provider_main_orders_net", "main_orders_net"}):
+        return True
+    if (version == FLOW_MAPPING_VERSION and provider in {"tushare", "tushare_relay", "xiaodefa"}
+            and origin == "tushare" and api == "moneyflow" and definition == "main_orders_net"):
+        return exchange in {"SH", "SZ"}
+    signature = (origin, api, definition, version)
+    return any(signature in signatures and not flow_definition_evidence(spec, trade_date)
+               for signatures, spec in VERIFIED_FLOW_COMPARISONS.items())
+
+
+def _sector_product_qualified(row, scope, clock):
+    """Admit explicit native/derived semantics; an amount label alone is insufficient."""
+    try:
+        encoded = json.loads(row["raw_json"] or "{}")
+        contract = encoded.get("canonical_contract", {})
+        kind, provider = row["sector_type"], row["provider"]
+        if provider == "tushare_sector_full" and kind == "em_industry":
+            raw_amount = encoded.get('net_amount')
+            return (encoded.get("source_api", encoded.get("source")) == "moneyflow_ind_dc"
+                    and encoded.get("content_type") == "行业" and encoded.get("ts_code") == row["sector_code"]
+                    and str(encoded.get("trade_date", "")).replace("-", "") == str(row["source_date"]).replace("-", "")
+                    and encoded.get("unit") == "yuan" and _finite_number(raw_amount)
+                    and math.isclose(raw_amount, row['main_net'], rel_tol=1e-9, abs_tol=0.01))
+        from trade_system.flow_contract import SECTOR_TAXONOMIES
+        identity = SECTOR_TAXONOMIES.get(kind)
+        if (not identity or contract.get("mapping_version") != "sector-flow-contract-v1"
+                or contract.get("quality_reason") is not None or contract.get("amount_unit") != "yuan"
+                or not _finite_number(contract.get('main_net'))
+                or not math.isclose(contract['main_net'], row['main_net'], rel_tol=1e-9, abs_tol=0.01)
+                or tuple(contract.get(k) for k in ("taxonomy_namespace", "aggregation_kind", "flow_definition")) != identity):
+            return False
+        if kind == "em_industry":
+            return (provider in {"eastmoney", "eastmoney_sector_full"}
+                    and contract.get("catalogue_version") == scope["version"])
+        if kind != "ths_concept_derived" or provider != "derived_ths_stock_aggregate":
+            return False
+        raw = encoded.get("raw", {})
+        minimum = as_local_naive(raw.get("input_received_min"))
+        maximum = as_local_naive(raw.get("input_received_max"))
+        return (raw.get("membership_snapshot_date") == scope["version"]
+                and minimum is not None and maximum is not None and minimum == row["received_at"]
+                and minimum <= maximum <= clock)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _actual_flow_coverage(con, trade_date, kind, evidence, *, max_age_seconds=None, now=None,
+                          collected_after=None):
     """Compare a checkpoint with usable canonical facts, never a bounded fallback."""
     relation = "multi_source_stock_flow" if kind == "stock" else "multi_source_sector_flow"
     result = {"passed": False, "relation": relation, "reason": "canonical_flow_evidence_missing"}
@@ -90,11 +223,15 @@ def _actual_flow_coverage(con, trade_date, kind, evidence, *, max_age_seconds=No
         return result
     columns = set(table_columns(con, relation))
     code = "stock_code" if kind == "stock" else "sector_code"
-    if not {"source_date", code, "main_net"} <= columns:
+    required = {"source_date", code, "main_net", "provider", "amount_unit"}
+    required |= ({"origin_provider", "source_api", "flow_definition", "field_mapping_version"}
+                 if kind == "stock" else {"sector_type", "raw_json"})
+    if not required <= columns:
         return {**result, "reason": "canonical_flow_schema_invalid"}
     filters = ['source_date=CAST(? AS DATE)', 'isfinite(TRY_CAST(main_net AS DOUBLE))',
                f'nullif(trim("{code}"),\'\') IS NOT NULL']
     params = [_normalize_trade_date(trade_date)]
+    clock = as_local_naive(now) or datetime.now()
     if "is_stale" in columns:
         filters.append("coalesce(is_stale,false)=false")
     if "is_fallback" in columns:
@@ -110,40 +247,70 @@ def _actual_flow_coverage(con, trade_date, kind, evidence, *, max_age_seconds=No
             filters.append(f"{time_expr}>=?")
             params.append((as_local_naive(now) or datetime.now())
                           - timedelta(seconds=max(0, int(max_age_seconds))))
+        if collected_after is not None:
+            filters.append(f"{time_expr}>=?")
+            params.append(as_local_naive(collected_after))
     else:
         return {**result, "reason": "canonical_flow_timestamp_missing"}
     if kind == "stock":
         provider = evidence.get("provider")
-        if provider:
-            if "provider" not in columns:
-                return {**result, "reason": "canonical_flow_provider_missing"}
-            filters.append("provider=?")
-            params.append(provider)
-        rows = con.execute(f'SELECT count(DISTINCT "{code}") FROM "{relation}" WHERE '
-                           + " AND ".join(filters), params).fetchone()[0]
+        if not provider:
+            return {**result, "reason": "canonical_flow_provider_missing"}
+        filters.append("provider=?")
+        params.append(provider)
+        scope = qualified_stock_flow_scope(con, trade_date, now=clock)
+        if not scope["passed"]:
+            return {**result, "scope": {k: v for k, v in scope.items() if k != "codes"}, "reason": scope["reason"]}
+        data = con.execute('SELECT stock_code,amount_unit,origin_provider,source_api,flow_definition,field_mapping_version '
+                           f'FROM "{relation}" WHERE ' + " AND ".join(filters), params).fetchall()
+        unexpected = sorted({r[0] for r in data} - set(scope["codes"]))
+        usable = {r[0] for r in data if r[0] in scope["codes"] and r[1] == "yuan"
+                  and _stock_product_qualified(provider, *r[2:], scope["codes"][r[0]], trade_date)}
+        signatures = {r[2:] for r in data if r[0] in usable}
+        rows = len(usable)
         expected = evidence.get("expected_rows")
         pct = rows * 100.0 / expected if expected else None
-        passed = bool(expected and 99.5 <= pct <= 100)
+        passed = bool(expected == len(scope["codes"]) and 99.5 <= pct <= 100 and not unexpected
+                      and len(signatures) == 1)
         return {**result, "passed": passed, "observed_codes": rows, "coverage_pct": pct,
+                "scope_sha256": scope["codes_sha256"], "scope_rows": len(scope["codes"]),
+                "unexpected_codes": unexpected, "unqualified_rows": len(data) - sum(r[0] in usable for r in data),
                 "reason": None if passed else "canonical_flow_scope_incomplete"}
     if "sector_type" not in columns:
         return {**result, "reason": "canonical_taxonomy_identity_missing"}
     actual = {}
+    scopes = _qualified_sector_scopes(con, trade_date, now=clock)
     for name, fact in evidence.get("taxonomies", {}).items():
         types = ("ths_concept", "ths_concept_derived") if name == "ths_concept" else (name,)
-        rows = con.execute(f'SELECT count(DISTINCT "{code}") FROM "{relation}" WHERE '
+        provider = fact.get('provider')
+        cursor = con.execute(f'SELECT source_date,sector_code,sector_type,provider,main_net,amount_unit,raw_json,'
+                           f'{time_expr} AS received_at FROM "{relation}" WHERE '
                            + " AND ".join(filters) + " AND sector_type IN ("
-                           + ",".join("?" for _ in types) + ")", params + list(types)).fetchone()[0]
+                           + ",".join("?" for _ in types) + ") AND provider=?", params + list(types) + [provider])
+        data = [dict(zip([d[0] for d in cursor.description], r)) for r in cursor.fetchall()]
+        scope = scopes.get(name, {})
+        expected_codes = scope.get("codes", set())
+        identity = lambda row: row["sector_code"].removesuffix(".DC") if name == "em_industry" else row["sector_code"]
+        unexpected = sorted({identity(r) for r in data} - expected_codes)
+        usable = {identity(r) for r in data if identity(r) in expected_codes and r["amount_unit"] == "yuan"
+                  and _sector_product_qualified(r, scope, clock)}
+        rows = len(usable)
         expected = fact.get("expected_rows")
         pct = rows * 100.0 / expected if expected else None
         actual[name] = {"observed_codes": rows, "coverage_pct": pct,
-                        "passed": bool(expected and 99.5 <= pct <= 100)}
+                        "provider": provider,
+                        "scope_rows": len(expected_codes), "unexpected_codes": unexpected,
+                        "passed": bool(provider and expected == len(expected_codes) and expected and 99.5 <= pct <= 100
+                                       and not unexpected),
+                        "reason": "canonical_taxonomy_provider_missing" if not provider else
+                                  None if expected_codes else "dated_taxonomy_scope_unqualified"}
     passed = all(name in actual and actual[name]["passed"] for name in ("em_industry", "ths_concept"))
     return {**result, "passed": passed, "taxonomies": actual,
             "reason": None if passed else "canonical_taxonomy_scope_incomplete"}
 
 
-def capital_flow_coverage(con, trade_date, kind, *, require_actual=False, max_age_seconds=None, now=None):
+def capital_flow_coverage(con, trade_date, kind, *, require_actual=False, max_age_seconds=None, now=None,
+                          collected_after=None):
     """Single gate shared by relation and group: missing metadata is unknown."""
     if kind not in {"stock", "sector"}:
         raise ValueError("unknown capital flow kind")
@@ -178,7 +345,7 @@ def capital_flow_coverage(con, trade_date, kind, *, require_actual=False, max_ag
             result.update(passed=False, reason=required["reason"])
     if require_actual:
         actual = _actual_flow_coverage(con, trade_date, kind, result,
-                                       max_age_seconds=max_age_seconds, now=now)
+                                       max_age_seconds=max_age_seconds, now=now, collected_after=collected_after)
         result["actual"] = actual
         if not actual["passed"]:
             result["passed"] = False

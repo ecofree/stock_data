@@ -178,8 +178,8 @@ def test_static_and_ttm_profit_periods_and_allocations_remain_independent():
         return dict(period_start=f'{year}-01-01',period_end=f'{year}-{end}',
                     parent_profit=profit,other_equity_profit_distribution=allocation)
     base = dict(qualified=True,ts_code=code,trade_date=day,definition='ordinary_shareholder_profit_v1')
-    earnings = {'static':dict(base,periods=[period(2025,'12-31',100000,10000)]),
-        'ttm':dict(base,selected_period='2026-06-30',periods=[period(2025,'12-31',100000,10000),
+    earnings = {'static':dict(base,latest_applicable_period='2025-12-31',periods=[period(2025,'12-31',100000,10000)]),
+        'ttm':dict(base,selected_period='2026-06-30',latest_applicable_period='2026-06-30',periods=[period(2025,'12-31',100000,10000),
             period(2026,'06-30',70000,7000),period(2025,'06-30',40000,4000)])}
     calculate = lambda p: derive_earnings_valuation(100,p,ts_code=code,trade_date=day)
     result = calculate(earnings)
@@ -198,6 +198,167 @@ def test_static_and_ttm_profit_periods_and_allocations_remain_independent():
     changed = deepcopy(earnings)
     changed['ttm']['qualified'] = False
     assert calculate(changed)['field_status']['pe_ttm'] == 'unknown'
+    changed = deepcopy(earnings)
+    changed['ttm'].update(selected_period='2024-06-30',latest_applicable_period='2024-06-30',
+        periods=[period(2023,'12-31',100000,0),period(2024,'06-30',50000,0),period(2023,'06-30',20000,0)])
+    assert calculate(changed)['field_status']['pe_ttm'] == 'unknown'
+    changed = deepcopy(earnings)
+    changed['ttm']['latest_applicable_period'] = '2026-09-30'
+    assert calculate(changed)['field_status']['pe_ttm'] == 'unknown'
+    changed = deepcopy(earnings)
+    changed['static']['periods'] = [dict(period_start='2025-01-01',period_end='2025-12-31',ordinary_profit=90000)]
+    assert calculate(changed)['values']['pe'] == result['values']['pe']
+    changed['static']['periods'][0].update(parent_profit=100000,other_equity_profit_distribution=10000)
+    assert calculate(changed)['values']['pe'] == result['values']['pe']
+    changed['static']['periods'][0]['ordinary_profit'] = 90001
+    assert calculate(changed)['field_status']['pe'] == 'unknown'
+    for code_value,loss in [('000972.SZ',-65919041.30),('920575.BJ',-95296108.60)]:
+        direct = dict(earnings,static=dict(base,latest_applicable_period='2025-12-31',periods=[dict(
+            period_start='2025-01-01',period_end='2025-12-31',ordinary_profit=loss,parent_profit=loss)]))
+        # Synthetic annual-period arithmetic only; these actual retained losses
+        # are interim facts and are not promoted to annual evidence.
+        assert calculate(direct)['field_status']['pe'] == 'not_applicable_nonpositive_ordinary_profit', code_value
+        assert 'other_equity_profit_distribution' not in direct['static']['periods'][0]
+    changed = deepcopy(earnings)
+    changed['ttm']['periods'] = [period(2025,'12-31',1e308,0),
+        period(2026,'06-30',1e308,0),period(2025,'06-30',1,0)]
+    assert calculate(changed)['missing_inputs']['pe_ttm'] == ['nonfinite_ordinary_profit']
+    assert 'pe_ttm' not in calculate(changed)['values']
+    changed = deepcopy(earnings)
+    changed['ttm'].update(selected_period='2025-12-31',latest_applicable_period='2025-12-31',
+        periods=[period(2025,'12-31',100000,10000)])
+    assert calculate(changed)['values']['pe_ttm'] == result['values']['pe']
+
+
+def test_financial_row_columns_parentheses_and_source_units_are_bound(tmp_path):
+    import hashlib
+    from copy import deepcopy
+    from trade_system.tushare_history import _validate_valuation_document, _official_field_binding
+    path = tmp_path/'signed.html'
+    path.write_text('consolidated income yuan 2026-06-30 2025-06-30\n'
+        'ordinary profit (95,296,108.60) 100.00\n',encoding='utf-8')
+    location = dict(label='ordinary profit',row_excerpt='ordinary profit (95,296,108.60) 100.00',
+        header_excerpt='2026-06-30 2025-06-30',column_headers=['2026-06-30','2025-06-30'],
+        column_index=0,column_header='2026-06-30',basis='consolidated',basis_label='consolidated income',
+        unit_header='yuan',period_end='2026-06-30',period_header='2026-06-30')
+    source = dict(ts_code='920575.BJ',as_of='2026-09-29',extraction_review={'unit':'yuan'},
+        statement=dict(basis='consolidated',period='2026-06-30'),
+        document=dict(url='https://static.cninfo.com.cn/signed.html',path=str(path),format='html',
+                      sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
+        fields={'ordinary_profit':dict(value=-95296108.60,page=1,excerpt='retained signed row',location=location)})
+    item = dict(unit='yuan',value=-95296108.60)
+    _validate_valuation_document(source)
+    _official_field_binding(source,'ordinary_profit',item)
+    wrong = deepcopy(source)
+    wrong['fields']['ordinary_profit']['value']=95296108.60
+    with pytest.raises(ValueError,match='absent from cited'):
+        _validate_valuation_document(wrong)
+    wrong = deepcopy(source)
+    wrong['fields']['ordinary_profit'].update(value=100)
+    wrong['fields']['ordinary_profit']['location'].update(column_index=1,column_header='2025-06-30')
+    _validate_valuation_document(wrong)  # A real comparison-period amount is present.
+    with pytest.raises(ValueError,match='period column'):
+        _official_field_binding(wrong,'ordinary_profit',dict(unit='yuan',value=100))
+    wrong = deepcopy(source)
+    wrong['extraction_review']['unit']='10000_yuan'
+    with pytest.raises(ValueError,match='unit mismatch'):
+        _official_field_binding(wrong,'ordinary_profit',item)
+    wrong = deepcopy(source)
+    wrong['fields']['ordinary_profit']['location'].pop('unit_header')
+    with pytest.raises(ValueError,match='unit or period anchor'):
+        _validate_valuation_document(wrong)
+
+
+def test_direct_income_intake_latest_catalogue_and_known_at_corrections(tmp_path):
+    import hashlib
+    from copy import deepcopy
+    from datetime import datetime
+    from trade_system.tushare_history import _json, derive_earnings_valuation
+    code, day, arrival = '000001.SZ','2026-09-29','2026-09-29T16:00:00+08:00'
+    with TushareHistoryCollector(tmp_path/'income.duckdb', client=ScopedFixture()) as c:
+        documents = {}
+        def retain(payload, at=arrival):
+            raw = _json(payload)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            c.store.conn.execute('INSERT INTO multi_source_observation '
+                '(data_type,asset_code,provider,status,payload_json,payload_hash,observed_at) '
+                "VALUES ('valuation_source_document',?,'reviewed_official_document','reviewed',?,?,?)",
+                [code,raw,digest,datetime.fromisoformat(at).replace(tzinfo=None)])
+            documents[digest] = (payload,at)
+            return digest
+        def source(name,end,ann,profit):
+            prior = f'{int(end[:4])-1}'+end[4:]
+            lines = [('ordinary profit',profit),('parent profit',profit+100),('other equity profit distribution',100)]
+            path = tmp_path/f'{name}.html'
+            path.write_text(f'consolidated income yuan {end} {prior}\n'+
+                '\n'.join(f'{label} {amount} 999' for label,amount in lines),encoding='utf-8')
+            fields = {}
+            for field,(label,amount) in zip(('ordinary_profit','parent_profit','other_equity_profit_distribution'),lines):
+                fields[field] = dict(value=amount,page=1,excerpt=f'{label} {amount}',location=dict(
+                    label=label,row_excerpt=f'{label} {amount} 999',column_headers=[end,prior],
+                    column_header=end,column_index=0,header_excerpt=f'{end} {prior}',basis='consolidated',
+                    basis_label='consolidated income',unit_header='yuan',period_end=end,period_header=end))
+            return dict(schema='official_valuation_document_v1',ts_code=code,as_of=day,received_at=arrival,
+                statement=dict(period_start=end[:4]+'-01-01',period=end,announcement_date=ann,basis='consolidated'),
+                extraction_review={'unit':'yuan'},fields=fields,document=dict(format='html',path=str(path),
+                    url=f'https://static.cninfo.com.cn/{name}.html',sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+        sources = [source('annual','2025-12-31','2026-04-30',1000),
+            source('current','2026-06-30','2026-08-30',700),source('prior','2025-06-30','2025-08-30',400)]
+        receipts = [retain(p) for p in sources]
+        page = tmp_path/'catalogue-page.json'
+        page.write_text(_json(dict(totalAnnouncement=3,hasMore=False,announcements=[
+            dict(secCode='000001',orgId='fixture-org',announcementId=str(i),announcementTitle=title,
+                 announcementTime=int(datetime.fromisoformat(ann+'T00:00:00+08:00').timestamp()*1000))
+            for i,(title,ann) in enumerate([('2025年年度报告','2026-04-30'),
+                ('2026年半年度报告','2026-08-30'),('2025年半年度报告','2025-08-30')])])),encoding='utf-8')
+        manifest = tmp_path/'catalogue.json'
+        manifest.write_text(_json(dict(schema='official_disclosure_page_set_v1',ts_code=code,source_pages=[dict(
+            path=str(page),sha256=hashlib.sha256(page.read_bytes()).hexdigest(),http_status=200,
+            params=dict(stock='000001,fixture-org',tabName='fulltext',pageNum='1',seDate='2025-01-01~'+day))])),encoding='utf-8')
+        catalogue = dict(schema='official_valuation_document_v1',kind='disclosure_inventory',ts_code=code,
+            as_of=day,received_at=arrival,window_from='2025-01-01',window_through=day,catalogue_complete=True,
+            document=dict(path=str(manifest),format='json',url='https://www.cninfo.com.cn/new/hisAnnouncement/query',
+                          sha256=hashlib.sha256(manifest.read_bytes()).hexdigest()))
+        catalogue_hash = retain(catalogue)
+        components = [dict(period_start=p['statement']['period_start'],period_end=p['statement']['period'],inputs={
+            'ordinary_profit':dict(receipt_sha256=h,value=p['fields']['ordinary_profit']['value'],unit='yuan',semantic='ordinary_profit'),
+            'parent_profit':dict(receipt_sha256=h,value=p['fields']['parent_profit']['value'],unit='yuan',semantic='parent_profit')})
+            for p,h in zip(sources,receipts)]
+        base = dict(definition='ordinary_shareholder_profit_v1',revision_inventory=dict(as_of=day,
+            scope='all_published_consolidated_income_revisions',selection_reason='fixture complete original catalogue',
+            statement_receipts=receipts,document_receipts=[catalogue_hash]))
+        proofs = {'static':dict(base,periods=components[:1]),'ttm':dict(base,periods=components,selected_period='2026-06-30')}
+        def read(value=proofs,at='2026-09-29T17:00:00+08:00'):
+            return c._reviewed_earnings(value,documents,code,day,observed_at=at)
+        result = read()
+        assert result['static']['qualified'] and result['ttm']['qualified']
+        assert result['ttm']['periods'][1]['ordinary_profit_reconciliation']['difference_yuan'] == 100
+        assert result['ttm']['periods'][1]['ordinary_profit_reconciliation']['is_raw_distribution'] is False
+        assert 'other_equity_profit_distribution' not in result['ttm']['periods'][1]
+        calculated = derive_earnings_valuation(1000,result,ts_code=code,trade_date=day)
+        assert calculated['values']['pe'] == 10000
+        assert calculated['values']['pe_ttm'] == pytest.approx(10000000/1300)
+        missing = deepcopy(proofs)
+        missing['static']['periods'][0]['inputs'] = {'parent_profit':dict(receipt_sha256=receipts[0],value=1100,unit='yuan',semantic='parent_profit')}
+        assert not read(missing)['static']['qualified']
+        parent_only = deepcopy(sources[1])
+        parent_only['statement']['basis']='parent_company'
+        retain(parent_only)
+        assert read()['ttm']['qualified']  # Not a consolidated correction.
+        correction = source('correction','2026-06-30','2026-09-28',750)
+        correction_hash = retain(correction,'2026-09-30T16:00:00+08:00')
+        assert read()['ttm']['qualified']  # Future arrival cannot rewrite this historical cutoff.
+        late = read(at='2026-10-01T17:00:00+08:00')
+        assert not late['ttm']['qualified'] and 'omits retained' in late['ttm']['qualification_error']
+        amended = deepcopy(proofs)
+        for mode in amended:
+            amended[mode]['revision_inventory']['statement_receipts'] = receipts+[correction_hash]
+        stale = read(amended,at='2026-10-01T17:00:00+08:00')
+        assert not stale['ttm']['qualified'] and 'superseded' in stale['ttm']['qualification_error']
+        amended['ttm']['periods'][1]['inputs']['ordinary_profit'].update(receipt_sha256=correction_hash,value=750)
+        amended['ttm']['periods'][1]['inputs']['parent_profit'].update(receipt_sha256=correction_hash,value=850)
+        assert read(amended,at='2026-10-01T17:00:00+08:00')['ttm']['qualified']
+        assert c.client.calls == []
 
 
 def test_adj_factor_date_snapshot_is_persisted(tmp_path):
@@ -855,9 +1016,9 @@ def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_p
             c.store.conn.execute("INSERT INTO multi_source_observation(data_type,provider,payload_json,payload_hash,observed_at) "
                 "VALUES ('test_source','custom',?,?,TIMESTAMP '2026-07-01 16:00:00')", [raw,digest])
             return digest
-        statement = retain(dict(rows=[dict(ts_code=code,report_type='1',end_date='20260331',ann_date='20260430',
+        statement = retain(dict(api='balancesheet',rows=[dict(ts_code=code,report_type='1',end_date='20260331',ann_date='20260430',
                                            total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=1000000)]))
-        market = retain(dict(rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
+        market = retain(dict(api='daily_basic',rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
         inventory = retain(dict(ts_code=code,as_of='2026-07-01',statements=[statement],review_scope='fixture only'))
         review = dict(schema='reviewed_valuation_inputs_v1',ts_code=code,trade_date='2026-07-01',
             reviewed_by='fixture-reviewer',reviewed_at='2026-07-01T16:30:00+08:00',
@@ -892,11 +1053,20 @@ def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_p
         assert report['rows'][code]['valuation_eligible']
         assert report['rows'][code]['native_pb_status'] == 'row_absent'  # Raw receipt not manufactured by intake.
         assert not report['certifies_daily_basic']
+        for field, native, value in [('total_mv','circ_mv',500),('circ_mv','total_mv',1000)]:
+            altered = deepcopy(review)
+            altered['inputs'][field].update(value_path=['rows',0,native],value=value)
+            with pytest.raises(ValueError,match='native product, field or unit'):
+                c._valuation_review(altered,'20260701','2026-07-01T17:00:00+08:00')
+        altered = deepcopy(review)
+        altered['inputs']['total_mv']['unit']='yuan'
+        with pytest.raises(ValueError,match='native product, field or unit'):
+            c._valuation_review(altered,'20260701','2026-07-01T17:00:00+08:00')
         suspended = deepcopy(review)
         suspended['inputs'].pop('total_mv')
         suspended['inputs'].pop('circ_mv')
-        quote = retain({'rows':[dict(ts_code=code,trade_date='20260630',close=10)]})
-        shares = retain({'rows':[dict(ts_code=code,trade_date='20260701',total_share=100,float_share=50)]})
+        quote = retain({'api':'daily','rows':[dict(ts_code=code,trade_date='20260630',close=10)]})
+        shares = retain({'api':'stk_premarket','rows':[dict(ts_code=code,trade_date='20260701',total_share=100,float_share=50)]})
         c._record_snapshot('suspend_d',{'params':{'trade_date':'20260701'},'rows':[
             dict(ts_code=code,trade_date='20260701',suspend_type='S',suspend_timing='')]})
         c.store.conn.execute("UPDATE multi_source_observation SET observed_at=TIMESTAMP '2026-07-01 16:00:00' "
@@ -921,7 +1091,7 @@ def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_p
         no_actions['inputs'].pop('corporate_actions')
         assert not c._valuation_review(no_actions,'20260701','2026-07-01T17:00:00+08:00')['valuation_eligible']
         bypass = deepcopy(no_actions)
-        zero_quote = retain({'rows':[dict(ts_code=code,trade_date='20260701',close=10,vol=0)]})
+        zero_quote = retain({'api':'daily','rows':[dict(ts_code=code,trade_date='20260701',close=10,vol=0)]})
         bypass['source_receipts'].append(zero_quote)
         bypass['inputs']['price'].update(semantic='official_close',receipt_sha256=zero_quote)
         with pytest.raises(ValueError,match='requires explicit reference price policy'):
@@ -964,7 +1134,8 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
     from trade_system.tushare_history import _json
     code, day = '000001.SZ','2026-07-01'
     document_path = tmp_path/'official-fixture.html'
-    document_path.write_text('fixture original consolidated equity -6000000 and instrument disclosure',encoding='utf-8')
+    document_path.write_text('consolidated balance sheet yuan 2026-03-31 2025-12-31\n'
+        'parent equity -6000000 -5000000\nother equity \n',encoding='utf-8')
     with TushareHistoryCollector(tmp_path/'official-review.duckdb', client=ScopedFixture()) as c:
         def receipt(payload):
             encoded = _json(payload)
@@ -977,11 +1148,21 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
             document=dict(url='https://static.cninfo.com.cn/fixture.html',path=str(document_path),format='html',
                           sha256=hashlib.sha256(document_path.read_bytes()).hexdigest()),
             statement=dict(period='20260331',announcement_date='20260430',basis='consolidated'),
+            extraction_review=dict(unit='yuan'),
             fields=dict(equity=dict(value=-6000000,page=1,excerpt='fixture parent equity -6000000'),
                         other_equity=dict(value=None,page=1,excerpt='fixture blank instrument cell')),
             other_equity_absence_review=dict(no_instrument_disclosure='fixture explicit no instruments note',
                 equity_changes_review='fixture complete instruments and equity changes',
                 equity_components=[dict(value=-6000000,page=1,excerpt='fixture full equity breakdown')]))
+        def location(label, row):
+            return dict(label=label,row_excerpt=row,column_headers=['2026-03-31','2025-12-31'],
+                column_index=0,column_header='2026-03-31',header_excerpt='2026-03-31 2025-12-31',
+                basis='consolidated',basis_label='consolidated balance sheet',unit_header='yuan',
+                period_end='2026-03-31',period_header='2026-03-31')
+        equity_location = location('parent equity','parent equity -6000000 -5000000')
+        source['fields']['equity']['location'] = equity_location
+        source['fields']['other_equity']['location'] = location('other equity','other equity')
+        source['other_equity_absence_review']['equity_components'][0]['location'] = equity_location
         digest = hashlib.sha256(_json(source).encode()).hexdigest()
         catalogue_pages = []
         for number in (1,2):
@@ -1001,7 +1182,7 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
             document=dict(url='https://www.cninfo.com.cn/new/hisAnnouncement/query',path=str(catalogue_path),
                 format='json',sha256=hashlib.sha256(catalogue_path.read_bytes()).hexdigest()))
         catalogue_digest = hashlib.sha256(_json(catalogue).encode()).hexdigest()
-        market = receipt(dict(rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
+        market = receipt(dict(api='daily_basic',rows=[dict(ts_code=code,trade_date='20260701',total_mv=1000,circ_mv=500)]))
         review = dict(schema='reviewed_valuation_inputs_v2',ts_code=code,trade_date=day,
             reviewed_by='fixture_review_not_real_financial_evidence',reviewed_at='2026-07-01T16:30:00+08:00',
             source_receipts=[digest,catalogue_digest,market],financial_inventory=dict(as_of=day,

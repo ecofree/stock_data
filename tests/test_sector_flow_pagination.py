@@ -512,8 +512,79 @@ def test_atomic_publication_rollback_keeps_previous_rows(tmp_path, monkeypatch):
         monkeypatch.setattr(store, 'store', lambda *a, **k: {'rows_written':0})
         pagination = {'status':'complete','expected_total':1,'catalogue_version':'fixture','promoted':False}
         with pytest.raises(ValueError, match='changed'):
-            collector._replace_sector_snapshot(store,'2026-07-24',[_row('NEW')],pagination)
+            collector._replace_sector_snapshot(store,'2026-07-24',
+                [dict(_row('NEW'), input_received_at='2026-07-24T10:00:00')],pagination)
         assert store.con.execute('SELECT sector_code FROM multi_source_sector_flow').fetchall() == [('OLD',)]
+
+
+def test_pages_keep_distinct_arrival_times_through_publication_and_reuse(tmp_path, monkeypatch):
+    from datetime import timedelta
+    clock = [datetime(2026, 9, 29, 9, 30)]
+    class PageClock:
+        @staticmethod
+        def now():
+            value = clock[0]
+            clock[0] += timedelta(minutes=5)
+            return value
+    monkeypatch.setattr(collector, 'datetime', PageClock)
+    monkeypatch.setattr(collector.shared_host_limiter, 'acquire', lambda *a: None)
+    monkeypatch.setattr(collector, '_from_em_sector_flow_page', lambda page, **kw:
+        ([_row(code) for code in (['A', 'B'] if page == 1 else ['C', 'D'])], {'total':4}))
+    with MultiSourceStore(tmp_path/'clocks.duckdb') as store:
+        rows, pagination = collector._collect_sector_pages(store, '2026-09-29', 2, 2, 0,
+            ['A','B','C','D'], 'fixture')
+        assert pagination['logical_calls'] == 2 and pagination['wire_requests'] == 0
+        assert pagination['input_received_min'] == '2026-09-29T09:30:00'
+        assert pagination['input_received_max'] == '2026-09-29T09:35:00'
+        collector._replace_sector_snapshot(store, '2026-09-29', rows, pagination)
+        original = store.con.execute('SELECT sector_code,fetched_at FROM multi_source_sector_flow ORDER BY 1').fetchall()
+        assert original[0][1] == datetime(2026,9,29,9,30)
+        assert original[3][1] == datetime(2026,9,29,9,35)
+        collector._replace_sector_snapshot(store, '2026-09-29', rows, pagination)
+        assert store.con.execute('SELECT sector_code,fetched_at FROM multi_source_sector_flow ORDER BY 1').fetchall() == original
+        newer = [dict(row, input_received_at='2026-09-29T09:40:00') for row in rows]
+        collector._replace_sector_snapshot(store, '2026-09-29', newer, pagination)
+        with pytest.raises(ValueError, match='older sector-flow'):
+            collector._replace_sector_snapshot(store, '2026-09-29', rows, pagination)
+        assert store.con.execute('SELECT min(fetched_at) FROM multi_source_sector_flow').fetchone()[0] == datetime(2026,9,29,9,40)
+
+
+def test_wire_limit_stops_multi_route_page_without_retry_or_promotion(tmp_path, monkeypatch):
+    import subprocess
+    import urllib.request
+    from types import SimpleNamespace
+    from trade_system.http_transport import read_verified_once
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(returncode=0, stdout=b'{"ok":true}\n{}')
+    def page(**kwargs):
+        for route in ('primary','fallback'):
+            read_verified_once(urllib.request.Request('https://example.invalid/'+route), timeout=1, max_bytes=100)
+        return [_row('A')], {'total':1}
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(collector, '_from_em_sector_flow_page', page)
+    monkeypatch.setattr(collector.shared_host_limiter, 'acquire', lambda *a: None)
+    with MultiSourceStore(tmp_path/'budget.duckdb') as store:
+        rows, pagination = collector._collect_sector_pages(store,'2026-09-29',2,2,0,
+            ['A'],'fixture',max_wire_requests=1)
+        assert not rows and not pagination['promoted']
+        assert pagination['logical_calls'] == pagination['wire_requests'] == len(calls) == 1
+        assert pagination['max_wire_requests'] == 1
+        assert 'wire request budget exhausted' in pagination['errors']
+        assert store.con.execute('SELECT count(*) FROM multi_source_sector_flow').fetchone()[0] == 0
+
+
+def test_distinct_derived_input_times_are_not_compared_with_batch_minimum(tmp_path):
+    first, second = datetime(2026,9,29,10), datetime(2026,9,29,10,1)
+    rows = [dict(_row(code), sector_type='ths_concept_derived', fetched_at=clock.isoformat())
+            for code, clock in [('A',first),('B',second)]]
+    with MultiSourceStore(tmp_path/'derived-clocks.duckdb') as store:
+        result = store.store('sector_flow',None,rows,
+            {'source':'derived_ths_stock_aggregate','status':'live','received_at':first.timestamp()},
+            trade_date='2026-09-29')
+        assert result['rows_written'] == 2
+        assert store.con.execute('SELECT fetched_at FROM multi_source_sector_flow ORDER BY sector_code').fetchall() == [(first,),(second,)]
 
 
 def test_sector_contract_keeps_namespace_measure_and_raw_type(tmp_path):

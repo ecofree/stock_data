@@ -19,8 +19,31 @@ from contextlib import contextmanager
 
 request_deadline = ContextVar('request_deadline', default=None)
 diagnostic_state = ContextVar('diagnostic_state', default=None)
+wire_budget_states = ContextVar('wire_budget_states', default=())
 
 from trade_system.config import SETTINGS
+
+
+class WireRequestBudgetExceeded(RuntimeError):
+    """A shared send boundary refused another actual transport attempt."""
+
+
+@contextmanager
+def wire_request_budget(max_attempts):
+    """Bound sends, including adapter fallbacks; cache/cooldown work costs zero.
+
+    Every nested budget is debited, so a nested consumer cannot reset a parent
+    allowance. An attempt means one launched transport, including failed sends;
+    it does not claim that the remote server received the request.
+    """
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 1000:
+        raise ValueError('wire request budget must be one to 1000 attempts')
+    state = {'attempts': 0, 'max_attempts': max_attempts}
+    token = wire_budget_states.set((*wire_budget_states.get(), state))
+    try:
+        yield state
+    finally:
+        wire_budget_states.reset(token)
 
 
 @contextmanager
@@ -42,17 +65,23 @@ def diagnostic_budget():
 def _diagnostic_attempt(request):
     from urllib.parse import urlsplit
     state = diagnostic_state.get()
-    if state is None:
-        return
     url = urlsplit(request.full_url)
     endpoint = (url.hostname, url.path)  # Never retain query credentials.
-    if state['stopped']:
-        raise RuntimeError('diagnostic stopped: ' + state['stopped'])
-    if state['attempts'] >= 6 or state['endpoints'].get(endpoint, 0) >= 2:
-        state['stopped'] = 'request_budget_exhausted'
-        raise RuntimeError('diagnostic request budget exhausted')
-    state['attempts'] += 1
-    state['endpoints'][endpoint] = state['endpoints'].get(endpoint, 0) + 1
+    if state is not None:
+        if state['stopped']:
+            raise RuntimeError('diagnostic stopped: ' + state['stopped'])
+        if state['attempts'] >= 6 or state['endpoints'].get(endpoint, 0) >= 2:
+            state['stopped'] = 'request_budget_exhausted'
+            raise RuntimeError('diagnostic request budget exhausted')
+    budgets = wire_budget_states.get()
+    if any(b['attempts'] >= b['max_attempts'] for b in budgets):
+        raise WireRequestBudgetExceeded('wire request budget exhausted')
+    # Check all limits before any debit. A refused send consumes no request.
+    if state is not None:
+        state['attempts'] += 1
+        state['endpoints'][endpoint] = state['endpoints'].get(endpoint, 0) + 1
+    for budget in budgets:
+        budget['attempts'] += 1
 
 
 def stop_diagnostic(reason):
@@ -101,9 +130,13 @@ request_observer = ContextVar('request_observer', default=None)
 @contextmanager
 def measure_requests():
     """Observe the shared real transport in this context, without initiating I/O."""
+    parent=request_observer.get()
     records=[];token=request_observer.set(records)
     try:yield records
-    finally:request_observer.reset(token)
+    finally:
+        request_observer.reset(token)
+        if parent is not None:
+            parent.extend(records)
 
 
 @contextmanager
@@ -313,7 +346,9 @@ def open_verified(request: urllib.request.Request, *, timeout: float):
     the environment-configured proxy.  HTTP responses are never retried
     across transports, and neither path permits certificate bypass.
     """
-    if os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH') is not None or diagnostic_state.get() is not None:
+    if (os.environ.get('STOCKDATA_REQUEST_DEADLINE_EPOCH') is not None
+            or request_deadline.get() is not None or diagnostic_state.get() is not None
+            or wire_budget_states.get() or request_observer.get() is not None):
         # Scheduled phases select one verified route and use a bounded network
         # child. A DNS/body stall must not strand the database writer.
         import io

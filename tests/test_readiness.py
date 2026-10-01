@@ -1,5 +1,7 @@
 import duckdb
 import pytest
+import json
+import hashlib
 from datetime import datetime
 
 from trade_system.readiness import assess_trade_date_readiness, capital_flow_coverage, relation_freshness
@@ -14,25 +16,74 @@ def _batch_evidence(con, kind, day, expected=1, observed=1, coverage=100, status
 
 def _qualified_stock(con, day, codes=("000001",)):
     con.execute("CREATE TABLE multi_source_stock_flow(source_date DATE,stock_code VARCHAR,"
-                "main_net DOUBLE,fetched_at TIMESTAMP)")
+                "main_net DOUBLE,fetched_at TIMESTAMP,provider VARCHAR,amount_unit VARCHAR,"
+                "origin_provider VARCHAR,source_api VARCHAR,flow_definition VARCHAR,field_mapping_version VARCHAR)")
     for code in codes:
-        con.execute("INSERT INTO multi_source_stock_flow VALUES (?,?,100,?)", [day, code, day + " 10:00:00"])
+        con.execute("INSERT INTO multi_source_stock_flow VALUES (?,?,100,?,'xiaodefa_moneyflow_dc',"
+                    "'yuan','eastmoney','moneyflow_dc','provider_main_orders_net','stock_flow_v3_explicit_units')",
+                    [day, code, day + " 10:00:00"])
     _batch_evidence(con, "stock", day, len(codes), len(codes))
+    con.execute("ALTER TABLE intraday_stock_flow_batch ADD COLUMN provider VARCHAR")
+    con.execute("UPDATE intraday_stock_flow_batch SET provider='xiaodefa_moneyflow_dc'")
+    expected = set(codes)
+    while len(expected) < len(codes):
+        expected.add(f"{len(expected)+1:06d}")
+    con.execute("CREATE TABLE tushare_stock_basic(ts_code VARCHAR,stock_code VARCHAR,stock_name VARCHAR,"
+                "area VARCHAR,industry VARCHAR,market VARCHAR,list_date DATE,delist_date DATE)")
+    for code in sorted(expected):
+        con.execute("INSERT INTO tushare_stock_basic VALUES (?,?,'fixture',NULL,NULL,NULL,'2000-01-01',NULL)",
+                    [code + ".SZ", code])
+    _seal_stock_reference(con, day)
+
+
+def _receipt(con, day, kind, payload, *, observed=None):
+    con.execute("CREATE TABLE IF NOT EXISTS multi_source_observation(source_date DATE,data_type VARCHAR,"
+                "provider VARCHAR,status VARCHAR,observed_at TIMESTAMP,payload_json VARCHAR,payload_hash VARCHAR)")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    con.execute("INSERT INTO multi_source_observation VALUES (?,?,'xiaodefa','qualified',?,?,?)",
+                [day, kind, observed or day + " 09:00:00", encoded, digest])
+    return digest
+
+
+def _seal_stock_reference(con, day):
+    rows = con.execute("SELECT ts_code,stock_code,stock_name,area,industry,market,list_date,delist_date "
+                       "FROM tushare_stock_basic ORDER BY ts_code").fetchall()
+    version = hashlib.sha256(json.dumps(rows, ensure_ascii=False, default=str, separators=(",", ":")).encode()).hexdigest()
+    _receipt(con, day, "tushare_stock_basic_snapshot", dict(version=version, scope=["L", "D"],
+             listing_membership=dict(as_of=day, not_listed=[], membership_only=[])))
 
 
 def _qualified_sector(con, day):
     con.execute("CREATE TABLE multi_source_sector_flow(source_date DATE,sector_code VARCHAR,"
-                "sector_type VARCHAR,main_net DOUBLE,amount_unit VARCHAR,fetched_at TIMESTAMP)")
-    con.execute("INSERT INTO multi_source_sector_flow VALUES (?, '801001', 'em_industry', 100, 'yuan', ?),"
-                "(?, 'THS-1', 'ths_concept_derived', 100, 'yuan', ?)",
-                [day, day + " 10:00:00", day, day + " 10:00:00"])
+                "sector_type VARCHAR,main_net DOUBLE,amount_unit VARCHAR,fetched_at TIMESTAMP,provider VARCHAR,raw_json VARCHAR)")
+    version = _receipt(con, day, "em_industry_catalogue", dict(api="dc_index", params=dict(trade_date=day.replace("-", "")),
+        rows=[dict(ts_code="BK0001.DC", trade_date=day.replace("-", ""), idx_type="行业板块")]))
+    from trade_system.flow_contract import normalize_sector_flow_row
+    for code, kind, provider in [("BK0001", "em_industry", "eastmoney_sector_full"),
+                                 ("THS-1", "ths_concept_derived", "derived_ths_stock_aggregate")]:
+        row = dict(sector_type=kind, main_net=100, amount_unit="yuan", catalogue_version=version if kind == "em_industry" else day,
+                   raw=dict(membership_snapshot_date=day, input_received_min=day + " 10:00:00", input_received_max=day + " 10:00:00"))
+        encoded = json.dumps(dict(row, canonical_contract=normalize_sector_flow_row(row, provider)))
+        con.execute("INSERT INTO multi_source_sector_flow VALUES (?,?,?,100,'yuan',?,?,?)",
+                    [day, code, kind, day + " 10:00:00", provider, encoded])
+    con.execute("CREATE TABLE ths_concept_daily(trade_date DATE,concept_code VARCHAR,stock_count INTEGER,date_verified BOOLEAN,raw_json VARCHAR)")
+    con.execute("CREATE TABLE ths_concept_stock_history(trade_date DATE,concept_code VARCHAR,stock_code VARCHAR,date_verified BOOLEAN,raw_json VARCHAR)")
+    con.execute("CREATE TABLE ths_concept_member_checkpoint(trade_date DATE,concept_code VARCHAR,status VARCHAR)")
+    con.execute("CREATE TABLE ths_concept_snapshot_expectation(trade_date DATE,expected_concepts INTEGER,status VARCHAR)")
+    encoded = json.dumps(dict(fetched_date=day))
+    con.execute("INSERT INTO ths_concept_daily VALUES (?,'THS-1',2,true,?)", [day, encoded])
+    con.execute("INSERT INTO ths_concept_stock_history VALUES (?,'THS-1','000001',true,?),"
+                "(?,'THS-1','000002',true,?)", [day, encoded, day, encoded])
+    con.execute("INSERT INTO ths_concept_member_checkpoint VALUES (?,'THS-1','success')", [day])
+    con.execute("INSERT INTO ths_concept_snapshot_expectation VALUES (?,1,'success')", [day])
     con.execute("CREATE VIEW v_sector_capital AS SELECT source_date trade_date,sector_code,"
                 "main_net main_net_inflow,fetched_at FROM multi_source_sector_flow")
     _batch_evidence(con, "sector", day, 2, 2)
     con.execute("CREATE TABLE intraday_sector_flow_taxonomy(trade_date DATE,taxonomy VARCHAR,"
-                "expected_rows INTEGER,fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR)")
-    con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES (?, 'em_industry',1,1,100,'success'),"
-                "(?, 'ths_concept',1,1,100,'success')", [day, day])
+                "expected_rows INTEGER,fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,provider VARCHAR,last_error VARCHAR)")
+    con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES (?, 'em_industry',1,1,100,'success','eastmoney_sector_full',NULL),"
+                "(?, 'ths_concept',1,1,100,'success','derived_ths_stock_aggregate',NULL)", [day, day])
 
 
 def test_unknown_required_sector_denominator_never_borrows_other_product_coverage():
@@ -99,15 +150,9 @@ def test_readiness_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
 def test_relation_freshness_casts_legacy_varchar_timestamp(tmp_path):
     db_path = tmp_path / "varchar-time.duckdb"
     con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE multi_source_stock_flow("
-        "source_date DATE,stock_code VARCHAR,main_net DOUBLE,fetched_at VARCHAR)"
-    )
-    con.execute(
-        "INSERT INTO multi_source_stock_flow VALUES "
-        "('2026-07-31','000001',100,'2026-07-31 17:45:00')"
-    )
-    _batch_evidence(con, "stock", "2026-07-31")
+    _qualified_stock(con, "2026-07-31")
+    con.execute("ALTER TABLE multi_source_stock_flow ALTER fetched_at TYPE VARCHAR")
+    con.execute("UPDATE multi_source_stock_flow SET fetched_at='2026-07-31 17:45:00'")
     result = relation_freshness(
         con,
         "multi_source_stock_flow",
@@ -142,9 +187,10 @@ def test_close_readiness_requires_same_date_capital_flows(tmp_path):
     assert result["ready"] is False
     assert result["missing_groups"] == ["sector_capital_flow"]
     with duckdb.connect(str(db_path)) as con:
-        con.execute('CREATE TABLE tushare_stock_basic(ts_code VARCHAR,list_date DATE,delist_date DATE)')
-        con.execute("INSERT INTO tushare_stock_basic SELECT 'old'||i,'2000-01-01','2026-07-01' FROM range(2000) t(i)")
-        con.execute("INSERT INTO tushare_stock_basic VALUES ('000001.SZ','2000-01-01',NULL),('new','2026-07-10',NULL)")
+        con.execute("INSERT INTO tushare_stock_basic(ts_code,list_date,delist_date) SELECT 'old'||i,'2000-01-01','2026-07-01' FROM range(2000) t(i)")
+        con.execute("INSERT INTO tushare_stock_basic(ts_code,list_date) VALUES ('new','2026-07-10')")
+        con.execute("DELETE FROM multi_source_observation WHERE data_type='tushare_stock_basic_snapshot'")
+        _seal_stock_reference(con, "2026-07-09")
     result = assess_trade_date_readiness(db_path, '2026-07-09', 'close')
     assert result['missing_groups'] == ['sector_capital_flow']
 
@@ -368,15 +414,81 @@ def test_actual_sector_scope_is_per_classification_and_cannot_borrow_or_duplicat
 def test_canonical_stock_scope_must_match_the_checkpoint_provider():
     con = duckdb.connect(":memory:")
     _qualified_stock(con, "2026-09-29")
-    con.execute("ALTER TABLE intraday_stock_flow_batch ADD COLUMN provider VARCHAR")
     con.execute("UPDATE intraday_stock_flow_batch SET provider='primary'")
-    con.execute("ALTER TABLE multi_source_stock_flow ADD COLUMN provider VARCHAR")
     con.execute("UPDATE multi_source_stock_flow SET provider='other'")
     result = assess_trade_date_readiness(con, "2026-09-29", "intraday",
                                          required_groups=["stock_capital_flow"],
                                          now=datetime(2026, 9, 29, 10, 1))
     assert not result["source_ready"]
     assert result["groups"][0]["coverage"]["actual"]["observed_codes"] == 0
+    con.close()
+
+
+@pytest.mark.parametrize("field,value", [("amount_unit", "unknown"), ("amount_unit", "10000_yuan"),
+    ("flow_definition", "total_net_only"), ("origin_provider", "unknown"),
+    ("source_api", "moneyflow"), ("field_mapping_version", "unreviewed")])
+def test_same_count_does_not_certify_unknown_stock_measure(field, value):
+    con = duckdb.connect(":memory:")
+    _qualified_stock(con, "2026-09-29")
+    con.execute(f'UPDATE multi_source_stock_flow SET "{field}"=?', [value])
+    gate = capital_flow_coverage(con, "2026-09-29", "stock", require_actual=True, now=datetime(2026,9,29,10,1))
+    assert not gate['passed'] and gate['actual']['observed_codes'] == 0
+    con.close()
+
+
+def test_same_count_wrong_security_and_changed_reference_fail_closed():
+    con = duckdb.connect(":memory:")
+    _qualified_stock(con, "2026-09-29")
+    con.execute("UPDATE multi_source_stock_flow SET stock_code='000002'")
+    gate = capital_flow_coverage(con, "2026-09-29", "stock", require_actual=True, now=datetime(2026,9,29,10,1))
+    assert not gate['passed'] and gate['actual']['unexpected_codes'] == ['000002']
+    con.execute("UPDATE multi_source_stock_flow SET stock_code='000001'")
+    con.execute("UPDATE tushare_stock_basic SET stock_name='changed'")
+    gate = capital_flow_coverage(con, "2026-09-29", "stock", require_actual=True, now=datetime(2026,9,29,10,1))
+    assert not gate['passed'] and gate['actual']['reason'] == 'dated_stock_reference_unqualified'
+    con.close()
+
+
+@pytest.mark.parametrize("damage", ['unknown_unit', 'wrong_identity', 'wrong_definition', 'changed_catalogue', 'refreshed_derived_clock'])
+def test_sector_count_cannot_replace_dated_scope_and_measure_evidence(damage):
+    con = duckdb.connect(":memory:")
+    _qualified_sector(con, "2026-09-29")
+    if damage == 'unknown_unit':
+        con.execute("UPDATE multi_source_sector_flow SET amount_unit='unknown' WHERE sector_type='em_industry'")
+    elif damage == 'wrong_identity':
+        con.execute("UPDATE multi_source_sector_flow SET sector_code='BK0002' WHERE sector_type='em_industry'")
+    elif damage == 'wrong_definition':
+        raw = json.loads(con.execute("SELECT raw_json FROM multi_source_sector_flow WHERE sector_type='em_industry'").fetchone()[0])
+        raw['canonical_contract']['flow_definition'] = 'sector_total_net'
+        con.execute("UPDATE multi_source_sector_flow SET raw_json=? WHERE sector_type='em_industry'", [json.dumps(raw)])
+    elif damage == 'changed_catalogue':
+        con.execute("UPDATE multi_source_observation SET payload_hash='changed' WHERE data_type='em_industry_catalogue'")
+    else:
+        con.execute("UPDATE multi_source_sector_flow SET fetched_at='2026-09-29 10:01:00' WHERE sector_type='ths_concept_derived'")
+    gate = capital_flow_coverage(con, "2026-09-29", "sector", require_actual=True, now=datetime(2026,9,29,10,1))
+    assert not gate['passed']
+    con.close()
+
+
+def test_sector_half_products_cannot_be_unioned_into_full_taxonomy():
+    con = duckdb.connect(":memory:")
+    day = '2026-09-29'
+    _qualified_sector(con, day)
+    con.execute("DELETE FROM multi_source_observation WHERE data_type='em_industry_catalogue'")
+    version = _receipt(con, day, 'em_industry_catalogue', dict(api='dc_index',params=dict(trade_date='20260929'),
+        rows=[dict(ts_code=c+'.DC',trade_date='20260929',idx_type='行业板块') for c in ['BK0001','BK0002']]))
+    raw = json.loads(con.execute("SELECT raw_json FROM multi_source_sector_flow WHERE sector_type='em_industry'").fetchone()[0])
+    raw['canonical_contract']['catalogue_version'] = version
+    con.execute("UPDATE multi_source_sector_flow SET raw_json=? WHERE sector_type='em_industry'", [json.dumps(raw)])
+    relay = dict(source_api='moneyflow_ind_dc',content_type='行业',ts_code='BK0002.DC',trade_date='20260929',unit='yuan',net_amount=100)
+    con.execute("INSERT INTO multi_source_sector_flow VALUES (?,'BK0002.DC','em_industry',100,'yuan',?,'tushare_sector_full',?)",
+                [day, day+' 10:00:00', json.dumps(relay)])
+    con.execute("UPDATE intraday_sector_flow_taxonomy SET expected_rows=2,fetched_rows=2 WHERE taxonomy='em_industry'")
+    con.execute("UPDATE intraday_sector_flow_batch SET expected_rows=3,fetched_rows=3")
+    gate = capital_flow_coverage(con, day, 'sector', require_actual=True, now=datetime(2026,9,29,10,1))
+    assert not gate['passed']
+    assert gate['actual']['taxonomies']['em_industry']['observed_codes'] == 1
+    assert gate['actual']['taxonomies']['em_industry']['coverage_pct'] == 50
     con.close()
 
 

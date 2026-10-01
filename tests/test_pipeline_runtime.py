@@ -112,9 +112,11 @@ def test_pipeline_lock_recovers_abandoned_handle_protocol_without_pid_probe(tmp_
         raise ProcessLookupError("dead scheduler child")
 
     monkeypatch.setattr(os, "kill", dead_kill)
-    with PipelineLock(db_path, "recovered-after-reboot"):
+    with PipelineLock(db_path, "recovered-after-reboot") as owner:
         payload = json.loads(lock_path.read_text(encoding="utf-8"))
         assert payload["run_id"] == "recovered-after-reboot"
+        assert owner.recovered_owner['run_id'] == 'abandoned-after-reboot'
+        assert len(owner.recovered_owner['metadata_sha256']) == 64
 
 
 def test_pipeline_lock_does_not_delete_malformed_legacy_lock(tmp_path):
@@ -129,6 +131,104 @@ def test_pipeline_lock_does_not_delete_malformed_legacy_lock(tmp_path):
         with PipelineLock(db_path, "recovered-malformed"):
             pass
     assert lock_path.read_text(encoding='utf-8') == '{truncated'
+
+
+def _backup_source(tmp_path):
+    import duckdb
+    path = tmp_path/'source.duckdb'
+    with duckdb.connect(str(path)) as con:
+        con.execute('CREATE TABLE retained_values(id INT, value VARCHAR)')
+        con.execute("INSERT INTO retained_values VALUES (1,'original evidence')")
+    return path
+
+
+def test_guarded_backup_recovers_released_v2_and_qualifies_exact_roundtrip(tmp_path):
+    import duckdb
+    import gzip
+    from pathlib import Path
+    from trade_system.pipeline_runtime import prepare_daily_backup, finalize_daily_backup, retain_qualified_backups
+    db = _backup_source(tmp_path)
+    metadata = Path(str(db)+'.pipeline.lock')
+    metadata.write_text(json.dumps({'lock_protocol':'os_handle_v2', 'run_id':'interrupted-owner', 'pid':999999}))
+    raw = prepare_daily_backup(db, tmp_path/'backups', 'b_new')
+    assert raw['recovered_owner']['run_id'] == 'interrupted-owner'
+    assert not raw['qualified_recovery_point']
+    assert Path(raw['raw']).exists() and not metadata.exists()
+    result = finalize_daily_backup(raw['raw'])
+    archive = Path(result['archive'])
+    assert result['qualified_recovery_point'] and not Path(raw['raw']).exists()
+    with gzip.open(archive, 'rb') as stream:
+        restored = stream.read()
+    assert hashlib.sha256(restored).hexdigest() == result['raw_sha256'] == result['decompressed_sha256']
+    copy = tmp_path/'restored.duckdb';copy.write_bytes(restored)
+    with duckdb.connect(str(copy), read_only=True) as con:
+        assert con.execute('SELECT value FROM retained_values').fetchone()[0] == 'original evidence'
+    assert retain_qualified_backups(tmp_path/'backups', 1, 0)['qualified_count'] == 1
+    assert Path(str(db)+'.pipeline.lock.guard').exists()
+
+
+@pytest.mark.parametrize('failure', ['compression', 'roundtrip', 'qualification'])
+def test_failed_archive_keeps_raw_and_cannot_evict_good_recovery(tmp_path, monkeypatch, failure):
+    import io
+    from pathlib import Path
+    from trade_system import pipeline_runtime as runtime
+    db = _backup_source(tmp_path);folder = tmp_path/'backups'
+    old = runtime.finalize_daily_backup(runtime.prepare_daily_backup(db, folder, 'a_old')['raw'])
+    old_bytes = Path(old['archive']).read_bytes()
+    raw = runtime.prepare_daily_backup(db, folder, 'z_failed')
+    if failure == 'compression':
+        monkeypatch.setattr(runtime.gzip, 'GzipFile', lambda **k: (_ for _ in ()).throw(OSError('synthetic disk failure')))
+    elif failure == 'roundtrip':
+        monkeypatch.setattr(runtime.gzip, 'open', lambda *a, **k: io.BytesIO(b'corrupted restoration bytes'))
+    else:
+        original = runtime._runtime_json
+        def broken(path, value):
+            if str(path).endswith('.qualified.json'):
+                raise OSError('synthetic qualification flush failure')
+            original(path, value)
+        monkeypatch.setattr(runtime, '_runtime_json', broken)
+    with pytest.raises((ValueError, OSError)):
+        runtime.finalize_daily_backup(raw['raw'])
+    assert Path(raw['raw']).exists()
+    kept = runtime.retain_qualified_backups(folder, 1, 0)
+    assert kept['qualified_count'] == 1 and kept['deleted'] == []
+    assert Path(old['archive']).read_bytes() == old_bytes
+    assert not Path(raw['raw']+'.gz.qualified.json').exists()
+
+
+def test_retention_ignores_tampered_or_partial_archives_and_deferred_validation(tmp_path):
+    from pathlib import Path
+    from trade_system import pipeline_runtime as runtime
+    db = _backup_source(tmp_path);folder = tmp_path/'backups'
+    old = runtime.finalize_daily_backup(runtime.prepare_daily_backup(db, folder, 'a_old')['raw'])
+    newer = runtime.finalize_daily_backup(runtime.prepare_daily_backup(db, folder, 'z_new')['raw'])
+    Path(newer['archive']).write_bytes(b'tampered')
+    (folder/'kpl_data_pre_daily_20990101_000000_unqualified.duckdb.gz').write_bytes(b'not a qualified gzip')
+    assert runtime.retain_qualified_backups(folder, 1, 0)['deleted'] == []
+    assert Path(old['archive']).exists()
+    deferred = runtime.retain_qualified_backups(folder, 1, 0, deadline_epoch=0)
+    assert deferred['status'] == 'deferred' and deferred['deleted'] == []
+
+
+def test_backup_rejects_active_guard_unknown_metadata_and_source_wal(tmp_path):
+    from pathlib import Path
+    from trade_system.pipeline_runtime import prepare_daily_backup
+    db = _backup_source(tmp_path);folder = tmp_path/'backups'
+    with PipelineLock(db, 'active'):
+        with pytest.raises(PipelineAlreadyRunning):
+            prepare_daily_backup(db, folder, 'blocked')
+    metadata = Path(str(db)+'.pipeline.lock')
+    metadata.write_text('{unknown')
+    with pytest.raises(PipelineAlreadyRunning, match='maintenance'):
+        prepare_daily_backup(db, folder, 'unknown')
+    assert metadata.read_text() == '{unknown'
+    # Replace only this isolated fixture's metadata with an explicitly known
+    # released protocol; production recovery never deletes unknown ownership.
+    metadata.write_text(json.dumps({'lock_protocol':'os_handle_v2','run_id':'released'}))
+    Path(str(db)+'.wal').write_bytes(b'uncheckpointed fixture')
+    with pytest.raises(ValueError, match='WAL'):
+        prepare_daily_backup(db, folder, 'wal')
+    assert not list(folder.glob('*.duckdb'))
 
 
 def test_observation_contract_expands_existing_cadence_and_never_invents_legacy_proof(tmp_path, monkeypatch):

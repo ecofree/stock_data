@@ -55,6 +55,63 @@ _VALUATION_PDF_LOCK = RLock()
 _PDF_MAX_BYTES = 32 * 1024 * 1024
 _PDF_MAX_PAGE_BYTES = 4 * 1024 * 1024
 _PDF_MAX_PAGE_TEXT = 300_000
+_VALUATION_UNITS = {'price': 'yuan', 'total_share': '10000_shares',
+    'float_share': '10000_shares', 'equity': 'yuan', 'other_equity': 'yuan',
+    'total_mv': '10000_yuan', 'circ_mv': '10000_yuan', 'parent_profit': 'yuan',
+    'ordinary_profit': 'yuan', 'other_equity_profit_distribution': 'yuan'}
+# Native field meanings belong to the product, not to the caller's value_path.
+_VALUATION_NATIVE_FIELDS = {
+    'daily': {'price': 'close'},
+    'daily_basic': {'price': 'close', 'total_share': 'total_share',
+        'float_share': 'float_share', 'total_mv': 'total_mv', 'circ_mv': 'circ_mv'},
+    'stk_premarket': {'total_share': 'total_share', 'float_share': 'float_share'},
+    'balancesheet': {'equity': 'total_hldr_eqy_exc_min_int', 'other_equity': 'oth_eqt_tools'},
+}
+_FINANCIAL_LABELS = {
+    'equity': ('归属于母公司所有者权益合计', '归属于母公司股东权益合计', 'parent equity'),
+    'other_equity': ('其他权益工具', 'other equity'),
+    'parent_profit': ('归属于母公司所有者的净利润', '归属于母公司股东的净利润', 'parent profit'),
+    'ordinary_profit': ('归属于公司普通股股东的净利润', '归属于母公司普通股股东的净利润',
+        '归属于普通股股东的净利润', 'ordinary profit'),
+    'other_equity_profit_distribution': ('归属于其他权益工具持有者的净利润',
+        '其他权益工具利润分配', 'other equity profit distribution'),
+}
+
+
+def _page_amounts(text):
+    """Preserve accounting parentheses; never find a positive number inside a loss."""
+    normalized = text.replace('，', ',').replace('−', '-').replace('（', '(').replace('）', ')')
+    pattern = r'(?<![\d.,(])(?:\(\s*\d[\d,]*(?:\.\d+)?\s*\)|-?\d[\d,]*(?:\.\d+)?)(?![\d.,)])'
+    values = []
+    for token in re.findall(pattern, normalized):
+        token = token.strip()
+        negative = token.startswith('(')
+        value = Decimal(token.strip('() ').replace(',', ''))
+        values.append(-value if negative else value)
+    return values
+
+
+def _compact_text(text):
+    return re.sub(r'\s+', '', str(text)).replace('，', ',').replace('−', '-').replace('（', '(').replace('）', ')')
+
+
+def _column_period(header, statement_period):
+    end = date.fromisoformat(_iso(statement_period))
+    text = _compact_text(header)
+    if text in {'期末余额', '本期发生额', '本期金额', '本报告期'}:
+        return end.isoformat()
+    if text == '期初余额':
+        return f'{end.year-1}-12-31'
+    if text in {'上期发生额', '上期金额', '上年同期'}:
+        return end.replace(year=end.year-1).isoformat()
+    exact = re.fullmatch(r'((?:19|20)\d{2})[-年](\d{1,2})[-月](\d{1,2})日?', text)
+    if exact:
+        return date(*(int(p) for p in exact.groups())).isoformat()
+    period = re.fullmatch(r'((?:19|20)\d{2})年(?:1[-—至](3|6|9|12)月|(?:度|全年))', text)
+    if period:
+        month = int(period[2] or 12)
+        return f'{period[1]}-{month:02d}-{31 if month in {3,12} else 30}'
+    raise ValueError('financial period column meaning unproved')
 
 
 def _document_pages(raw, digest, field, document_format):
@@ -116,6 +173,29 @@ def _validate_page_value(raw, digest, field, document_format, *, subtraction=Fal
     text = _document_pages(raw, digest, field, document_format)
     if not str(field.get('excerpt', '')).strip():
         raise ValueError('dated page extraction required')
+    location = field.get('location')
+    row_text = text
+    if location is not None:
+        label = str(location.get('label', '')).strip()
+        row_text = str(location.get('row_excerpt', '')).strip()
+        headers = location.get('column_headers', [])
+        header_row = str(location.get('header_excerpt', '')).strip()
+        index = location.get('column_index')
+        compact = _compact_text(text)
+        if (not label or not row_text or _compact_text(label) not in _compact_text(row_text)
+                or _compact_text(row_text) not in compact or not header_row
+                or _compact_text(header_row) not in compact or not isinstance(headers, list)
+                or not headers or any(not str(h).strip() for h in headers)
+                or isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(headers)
+                or location.get('column_header') != headers[index]):
+            raise ValueError('financial row and period column binding missing or mismatched')
+        positions = [_compact_text(header_row).find(_compact_text(h)) for h in headers]
+        if any(p < 0 for p in positions) or positions != sorted(set(positions)):
+            raise ValueError('financial column order unproved')
+        for anchor in ('basis_label', 'unit_header', 'period_header'):
+            if not str(location.get(anchor, '')).strip() or _compact_text(location[anchor]) not in compact:
+                raise ValueError('financial basis, unit or period anchor absent from cited pages')
+        row_text = row_text.split(label, 1)[1] if label in row_text else row_text
     value = field.get('value')
     if value is None:
         # An empty cell remains unknown. Separate absence reviews own any zero.
@@ -124,14 +204,40 @@ def _validate_page_value(raw, digest, field, document_format, *, subtraction=Fal
         wanted = Decimal(str(value))
         if not wanted.is_finite() or isinstance(value, bool):
             raise InvalidOperation
-        normalized = text.replace('，', ',').replace('−', '-')
-        tokens = re.findall(r'(?<![\d.])-?\d[\d,]*(?:\.\d+)?(?![\d.])', normalized)
-        amounts = [Decimal(token.replace(',', '')) for token in tokens]
-    except (InvalidOperation, ValueError, TypeError) as exc:
+        amounts = _page_amounts(row_text)
+        if location is not None:
+            amounts = [amounts[location['column_index']]]
+    except (InvalidOperation, ValueError, TypeError, IndexError) as exc:
         raise ValueError('valuation extraction amount invalid') from exc
     if not any(abs(amount-wanted) < Decimal('0.000001') or
                (subtraction and abs(amount+wanted) < Decimal('0.000001')) for amount in amounts):
         raise ValueError('valuation amount absent from cited physical page range')
+
+
+def _official_field_binding(source, field, item):
+    """Check declarations against each other and the cited row, not financial truth."""
+    extracted = source.get('fields', {}).get(field, {})
+    unit = extracted.get('unit') or source.get('extraction_review', {}).get('unit')
+    declared = source.get('extraction_review', {}).get('unit')
+    if (unit != _VALUATION_UNITS[field] or item.get('unit') != unit
+            or (declared is not None and declared != unit)):
+        raise ValueError('official source and valuation input unit mismatch')
+    if extracted.get('semantic', field) != field:
+        raise ValueError('official source field semantic mismatch')
+    if field in {'equity', 'other_equity', 'parent_profit', 'ordinary_profit', 'other_equity_profit_distribution'}:
+        location = extracted.get('location', {})
+        statement = source.get('statement', {})
+        label = _compact_text(location.get('label', ''))
+        if (not location or not any(label.startswith(_compact_text(s)) for s in _FINANCIAL_LABELS[field])
+                or location.get('basis') != 'consolidated'
+                or statement.get('basis') != 'consolidated'
+                or _iso(location.get('period_end', '')) != _iso(statement.get('period', ''))
+                or _column_period(location.get('column_header', ''), statement['period']) != _iso(statement['period'])):
+            raise ValueError('explicit consolidated financial field and period column required')
+        if _compact_text(location.get('unit_header', '')).replace('：', ':') not in {
+                '单位:元', '单位:人民币元', 'yuan'}:
+            raise ValueError('financial column yuan unit anchor required')
+    return extracted
 
 
 def _iso(value: str | date) -> str:
@@ -161,7 +267,8 @@ def derive_earnings_valuation(total_mv, earnings, *, ts_code, trade_date):
         proof = earnings.get(mode, {})
         failures = []
         periods = proof.get('periods', [])
-        expected_count = 1 if mode == 'static' else 3
+        annual_ttm = mode == 'ttm' and str(proof.get('selected_period', '')).endswith('-12-31')
+        expected_count = 1 if mode == 'static' or annual_ttm else 3
         if (proof.get('definition') != 'ordinary_shareholder_profit_v1'
                 or proof.get('qualified') is not True or proof.get('ts_code') != ts_code
                 or proof.get('trade_date') != day.isoformat() or len(periods) != expected_count):
@@ -171,13 +278,25 @@ def derive_earnings_valuation(total_mv, earnings, *, ts_code, trade_date):
         for component in periods:
             try:
                 start, end = (date.fromisoformat(component[key]) for key in ('period_start', 'period_end'))
-                parent, allocation = (_num(component.get(key)) for key in
-                                      ('parent_profit', 'other_equity_profit_distribution'))
+                parent, allocation, ordinary = (_num(component.get(key)) for key in
+                    ('parent_profit', 'other_equity_profit_distribution', 'ordinary_profit'))
+                has_direct = ordinary is not None and math.isfinite(ordinary)
+                has_subtraction = (parent is not None and allocation is not None
+                    and math.isfinite(parent) and math.isfinite(allocation) and allocation >= 0)
                 if (start.month != 1 or start.day != 1 or start > end or end >= day
-                        or parent is None or allocation is None or not math.isfinite(parent)
-                        or not math.isfinite(allocation) or allocation < 0):
+                        or not (has_direct or has_subtraction)):
                     raise ValueError('incomplete income component')
-                values.append(parent-allocation)
+                calculated = parent-allocation if has_subtraction else ordinary
+                if not math.isfinite(calculated) or (has_direct and has_subtraction
+                        and not math.isclose(calculated, ordinary, rel_tol=0, abs_tol=0.01)):
+                    raise ValueError('ordinary profit paths disagree or overflow')
+                # Parent profit may accompany a direct ordinary disclosure as
+                # an audit fact. It does not manufacture a distribution input.
+                if (('ordinary_profit' in component and not has_direct)
+                        or ('parent_profit' in component and (parent is None or not math.isfinite(parent)))
+                        or ('other_equity_profit_distribution' in component and not has_subtraction)):
+                    raise ValueError('incomplete alternative ordinary profit path')
+                values.append(ordinary if has_direct else calculated)
                 spans.append((start, end))
             except (KeyError, TypeError, ValueError):
                 failures.append('dated_profit_or_other_equity_distribution_missing')
@@ -185,15 +304,21 @@ def derive_earnings_valuation(total_mv, earnings, *, ts_code, trade_date):
             annual = spans[0]
             if annual[1].month != 12 or annual[1].day != 31 or annual[0].year != annual[1].year:
                 failures.append('full_annual_profit_required')
-            if mode == 'static' and annual[1].year != day.year-1:
+            if mode == 'static' and (proof.get('latest_applicable_period') != annual[1].isoformat()
+                    or annual[1].year not in {day.year-1, day.year-2}):
                 failures.append('latest_closed_annual_period_required')
-            if mode == 'ttm':
+            if annual_ttm and (proof.get('latest_applicable_period') != annual[1].isoformat()
+                    or annual[1].year not in {day.year-1, day.year-2}):
+                failures.append('latest_applicable_annual_ttm_required')
+            if mode == 'ttm' and not annual_ttm:
                 current, prior = spans[1:]
                 if (current[1].year != annual[1].year+1 or current[0].year != current[1].year
                         or prior[0].year != annual[1].year or prior[1].year != annual[1].year
                         or (current[1].month, current[1].day) != (prior[1].month, prior[1].day)
                         or (current[1].month, current[1].day) not in {(3,31),(6,30),(9,30)}
-                        or proof.get('selected_period') != current[1].isoformat()):
+                        or proof.get('selected_period') != current[1].isoformat()
+                        or proof.get('latest_applicable_period') != current[1].isoformat()
+                        or (day-current[1]).days > 366):
                     failures.append('matched_annual_and_current_prior_ytd_required')
         if _num(total_mv) is None or not math.isfinite(total_mv) or total_mv <= 0:
             failures.append('same_session_market_value_required')
@@ -203,13 +328,17 @@ def derive_earnings_valuation(total_mv, earnings, *, ts_code, trade_date):
             result['field_status'][field] = 'unknown'
             result['missing_inputs'][field] = sorted(set(failures))
             continue
-        profit = values[0] if mode == 'static' else values[0] + values[1] - values[2]
+        profit = values[0] if expected_count == 1 else values[0] + values[1] - values[2]
+        if not math.isfinite(profit):
+            result['field_status'][field] = 'unknown'
+            result['missing_inputs'][field] = ['nonfinite_ordinary_profit']
+            continue
         result['earnings_evidence'][mode]['ordinary_profit_yuan'] = profit
         if profit <= 0:
             result['field_status'][field] = 'not_applicable_nonpositive_ordinary_profit'
         else:
             value = total_mv*10000/profit
-            if math.isfinite(value):
+            if math.isfinite(value) and value > 0:
                 result['values'][field] = value
                 result['field_status'][field] = 'derived_static_annual' if mode == 'static' else 'derived_ttm'
             else:
@@ -649,6 +778,106 @@ class TushareHistoryCollector:
                 'completion': self.valuation_completion_report(trade_date, results),
                 'certifies_daily_basic': False}
 
+    def _retained_financial_sources(self, code, day, observed_at, kind):
+        """Only already-arrived, applicable consolidated facts may revoke a review."""
+        from zoneinfo import ZoneInfo
+        cutoff = datetime.fromisoformat(observed_at)
+        if cutoff.tzinfo is None:
+            raise ValueError('explicit revision observation timezone required')
+        native = 'tushare_balancesheet' if kind == 'balance' else 'tushare_income'
+        fields = {'equity', 'other_equity'} if kind == 'balance' else {
+            'parent_profit', 'ordinary_profit', 'other_equity_profit_distribution'}
+        rows = self.store.conn.execute('SELECT data_type,payload_json,payload_hash,observed_at '
+            'FROM multi_source_observation WHERE data_type IN (?,\'valuation_source_document\') '
+            'AND observed_at<=?', [native, cutoff.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)]).fetchall()
+        for data_type, raw, digest, arrival in rows:
+            if hashlib.sha256(raw.encode()).hexdigest() != digest:
+                continue
+            payload = json.loads(raw)
+            if data_type == native:
+                for row in payload.get('rows', []):
+                    if row.get('ts_code') != code or str(row.get('report_type')) not in {'1', '4'}:
+                        continue  # A parent-company or unknown-basis row is not a consolidated revision.
+                    announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
+                    period = _iso(row['end_date'])
+                    if period <= announcement <= day:
+                        yield dict(digest=digest, period=period, announcement=announcement,
+                                   document_sha=None, arrival=str(arrival))
+            elif (payload.get('schema') == 'official_valuation_document_v1'
+                    and payload.get('ts_code') == code and fields.intersection(payload.get('fields', {}))):
+                statement = payload.get('statement', {})
+                if statement.get('basis') != 'consolidated':
+                    continue
+                announcement = _iso(statement['announcement_date'])
+                period = _iso(statement['period'])
+                if period <= announcement <= day:
+                    _validate_valuation_document(payload)
+                    yield dict(digest=digest, period=period, announcement=announcement,
+                               document_sha=payload['document']['sha256'], arrival=str(arrival))
+
+    def _assert_revision_inventory(self, code, day, observed_at, kind, inventory, documents, oldest, selected=()):
+        receipts = inventory.get('statement_receipts', [])
+        # Re-extraction of one immutable PDF is not another issuer revision.
+        original_files = {documents[h][0].get('document', {}).get('sha256')
+            for h in receipts if h in documents}
+        sources = list(self._retained_financial_sources(code, day, observed_at, kind))
+        for source in sources:
+            if source['period'] >= oldest and source['digest'] not in receipts:
+                if source['document_sha'] and source['document_sha'] in original_files:
+                    continue
+                raise ValueError('financial revision inventory omits retained applicable consolidated statement')
+        for period, announcement in selected:
+            if any(s['period'] == period and s['announcement'] > announcement for s in sources):
+                raise ValueError('financial inputs superseded by retained consolidated revision')
+        if kind == 'balance' and selected and any(s['period'] > max(p for p, _ in selected) for s in sources):
+            raise ValueError('latest known applicable financial period not selected')
+
+    @staticmethod
+    def _latest_income_period(catalogues, day, mode):
+        """Derive reported periods from the hash-checked, complete original catalogue."""
+        from zoneinfo import ZoneInfo
+        periods = []
+        for catalogue in catalogues:
+            body = json.loads(Path(catalogue['document']['path']).read_text(encoding='utf-8'))
+            pages = [body]
+            if body.get('schema') == 'official_disclosure_page_set_v1':
+                pages = [json.loads(Path(p['path']).read_text(encoding='utf-8'))
+                         for p in body['source_pages']]
+            for page in pages:
+                for row in page.get('announcements', []):
+                    title = str(row.get('announcementTitle', ''))
+                    year = re.search(r'((?:19|20)\d{2})\s*年?', title)
+                    if not year:
+                        continue
+                    announcement = row.get('announcementTime')
+                    if isinstance(announcement, (int, float)) and not isinstance(announcement, bool):
+                        if not math.isfinite(announcement):
+                            raise ValueError('disclosure announcement time invalid')
+                        announced = datetime.fromtimestamp(announcement / 1000, timezone.utc).astimezone(
+                            ZoneInfo('Asia/Shanghai')).date().isoformat()
+                    else:
+                        announced = _iso(row.get('announcement_date') or announcement or '')
+                    if announced > day:
+                        continue
+                    if '半年度报告' in title:
+                        end = '06-30'
+                    elif '第一季度报告' in title or '一季度报告' in title:
+                        end = '03-31'
+                    elif '第三季度报告' in title or '三季度报告' in title:
+                        end = '09-30'
+                    elif '年度报告' in title:
+                        end = '12-31'
+                    else:
+                        continue
+                    if mode == 'static' and end != '12-31':
+                        continue
+                    period = f'{year[1]}-{end}'
+                    if period < announced:
+                        periods.append(period)
+        if not periods:
+            raise ValueError('latest applicable income period not evidenced by disclosure catalogue')
+        return max(periods)
+
     def _valuation_review(self, review, trade_date, observed_at):
         """Validate an explicitly reviewed bundle against retained source bytes.
 
@@ -722,7 +951,7 @@ class TushareHistoryCollector:
             if payload.get('schema') == 'official_valuation_document_v1':
                 if payload['ts_code'] != code:
                     raise ValueError('official extraction identity mismatch')
-                extracted = payload.get('fields', {}).get(field, {})
+                extracted = _official_field_binding(payload, field, item)
                 if item.get('evidence_kind') == 'evidenced_absence_zero':
                     absence = payload.get('other_equity_absence_review', {})
                     components = absence.get('equity_components', [])
@@ -734,6 +963,11 @@ class TushareHistoryCollector:
                         or parent_value is None or abs(sum(amounts)-parent_value) > 0.01
                         or any(not c.get('page') or not c.get('excerpt') for c in components)):
                         raise ValueError('blank field is not evidenced absence zero')
+                    for component in components:
+                        location = component.get('location', {})
+                        if (not location or location.get('basis') != 'consolidated'
+                                or _iso(location.get('period_end', '')) != _iso(payload['statement']['period'])):
+                            raise ValueError('absence component financial row and period binding required')
                 elif (_num(extracted.get('value')) is None or
                       _num(extracted['value']) != _num(item.get('value'))):
                     raise ValueError('valuation value does not match official extraction')
@@ -758,8 +992,13 @@ class TushareHistoryCollector:
                 raise ValueError('valuation value does not match retained source')
             if not isinstance(parent, dict) or parent.get('ts_code') != code:
                 raise ValueError('valuation source row identity required')
+            product = payload.get('api')
+            native = _VALUATION_NATIVE_FIELDS.get(product, {}).get(field)
+            if (native is None or item['value_path'][-1] != native
+                    or item.get('unit') != _VALUATION_UNITS[field]
+                    or (item.get('source_product') is not None and item['source_product'] != product)):
+                raise ValueError('valuation native product, field or unit mapping mismatch')
             if field in {'equity', 'other_equity'}:
-                native = {'equity': 'total_hldr_eqy_exc_min_int', 'other_equity': 'oth_eqt_tools'}[field]
                 announcement = _iso(parent.get('f_ann_date') or parent['ann_date'])
                 if (item['value_path'][-1] != native or str(parent.get('report_type')) not in {'1', '4'}
                         or _iso(parent['end_date']) > announcement or announcement > day
@@ -785,19 +1024,12 @@ class TushareHistoryCollector:
                 or any(inputs.get(f,{}).get('receipt_sha256') not in inventory['statement_receipts']
                        for f in ('equity','other_equity'))):
                 raise ValueError('financial inputs differ from reviewed statement')
-        # A newer retained revision invalidates an earlier review inventory.
-        for raw, digest in self.store.conn.execute(
-                "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_balancesheet'").fetchall():
-            if hashlib.sha256(raw.encode()).hexdigest() != digest:
-                continue
-            for row in json.loads(raw).get('rows', []):
-                if row.get('ts_code') != code:
-                    continue
-                announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
-                relevant = (inventory.get('scope') == 'all_published_consolidated_revisions'
-                            or _iso(row['end_date']) >= _iso(inventory['selected_period']))
-                if announcement <= day and relevant and digest not in inventory.get('statement_receipts', []):
-                    raise ValueError('financial revision inventory omits retained statement')
+        # Later known originals revoke qualification; future arrivals do not
+        # rewrite what was known at a historical observation.
+        oldest = (_iso(inventory['selected_period']) if inventory.get('selected_period')
+                  else min(identity[1] for identity in statement_identities.values()))
+        self._assert_revision_inventory(code, day, observed_at, 'balance', inventory, documents, oldest,
+                                        selected=[identity[1:] for identity in statement_identities.values()])
         # A same-day zero-volume vendor quote is not proof of a same-day
         # traded close. Calling it official_close cannot bypass the suspension
         # reference/corporate-action policy. Native same-day market values
@@ -834,7 +1066,8 @@ class TushareHistoryCollector:
             if traded:
                 raise ValueError('suspension conflicts with retained trading')
         result = derive_valuation(code, day, inputs, observed_at=observed_at)
-        earnings = self._reviewed_earnings(review.get('earnings_reviews', {}), documents, code, day)
+        earnings = self._reviewed_earnings(review.get('earnings_reviews', {}), documents, code, day,
+                                          observed_at=observed_at)
         earnings_result = derive_earnings_valuation(result['values'].get('total_mv'), earnings,
                                                   ts_code=code, trade_date=day)
         result['values'].update(earnings_result['values'])
@@ -850,6 +1083,8 @@ class TushareHistoryCollector:
             result['pb_applicability'] = 'known_undefined_zero_equity'
         result['reviewed_by'] = review['reviewed_by']
         result['reviewed_at'] = review['reviewed_at']
+        result['as_known_at'] = observed_at
+        result['historical_recalculation'] = cutoff.astimezone(zone).date().isoformat() > day
         result['financial_inventory'] = inventory
         result['source_receipts'] = sorted(documents)
         # Revision and action evidence is also an input. Its actual arrival
@@ -862,7 +1097,7 @@ class TushareHistoryCollector:
         result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'
         return result
 
-    def _reviewed_earnings(self, proofs, documents, code, day):
+    def _reviewed_earnings(self, proofs, documents, code, day, *, observed_at=None):
         """Bind profit, allocation and every period's corrections independently.
 
         Missing PE evidence does not discard qualified PB. Malformed evidence is
@@ -874,6 +1109,10 @@ class TushareHistoryCollector:
             proof = proofs.get(mode, {})
             out = dict(proof, qualified=False, ts_code=code, trade_date=day)
             try:
+                known_at = observed_at or max(arrival for _, arrival in documents.values())
+                cutoff = datetime.fromisoformat(known_at)
+                if cutoff.tzinfo is None:
+                    raise ValueError('explicit earnings observation timezone required')
                 inventory = proof['revision_inventory']
                 components = proof['periods']
                 if (proof.get('definition') != 'ordinary_shareholder_profit_v1'
@@ -883,6 +1122,11 @@ class TushareHistoryCollector:
                     raise ValueError('dated income revision inventory missing')
                 receipts = inventory['statement_receipts']
                 catalogues = [documents[h][0] for h in inventory['document_receipts']]
+                for digest in inventory['document_receipts']:
+                    arrival = datetime.fromisoformat(documents[digest][1])
+                    if arrival.tzinfo is None or arrival > cutoff:
+                        raise ValueError('income catalogue received after observation')
+                    _validate_valuation_document(documents[digest][0])
                 oldest = min(component['period_start'] for component in components)
                 if (any(h not in documents for h in receipts) or not any(
                     p.get('kind') == 'disclosure_inventory' and p.get('ts_code') == code
@@ -895,10 +1139,23 @@ class TushareHistoryCollector:
                     values = {}
                     identity = None
                     hashes = []
-                    for field in ('parent_profit', 'other_equity_profit_distribution'):
+                    supplied = component['inputs']
+                    direct = 'ordinary_profit' in supplied
+                    subtraction = 'other_equity_profit_distribution' in supplied or not direct
+                    if not direct and not subtraction:
+                        raise ValueError('ordinary profit source path required')
+                    if subtraction and not all(f in supplied for f in ('parent_profit', 'other_equity_profit_distribution')):
+                        raise ValueError('complete parent profit and distribution path required')
+                    fields = (['ordinary_profit'] if direct else []) + (
+                        ['parent_profit', 'other_equity_profit_distribution'] if subtraction else
+                        ['parent_profit'] if 'parent_profit' in supplied else [])
+                    for field in fields:
                         item = component['inputs'][field]
                         digest = item['receipt_sha256']
                         source, arrival = documents[digest]
+                        received = datetime.fromisoformat(arrival)
+                        if received.tzinfo is None or received > cutoff:
+                            raise ValueError('income source received after observation')
                         statement = source['statement']
                         announcement = _iso(statement['announcement_date'])
                         current_identity = (statement.get('period_start'), _iso(statement['period']), announcement)
@@ -910,7 +1167,7 @@ class TushareHistoryCollector:
                                 or item.get('unit') != 'yuan' or item.get('semantic') != field
                                 or (identity is not None and identity != current_identity)):
                             raise ValueError('income identity, period or definition mismatch')
-                        extracted = source['fields'][field]
+                        extracted = _official_field_binding(source, field, item)
                         number = _num(extracted.get('value'))
                         if (number is None or not math.isfinite(number) or isinstance(item.get('value'), bool)
                                 or number != _num(item.get('value'))):
@@ -920,20 +1177,29 @@ class TushareHistoryCollector:
                         hashes.append(digest)
                         values[field] = number
                         values[field+'_received_at'] = arrival
+                    if direct and subtraction and not math.isclose(values['ordinary_profit'],
+                            values['parent_profit']-values['other_equity_profit_distribution'],
+                            rel_tol=0, abs_tol=0.01):
+                        raise ValueError('direct ordinary profit and subtraction path disagree')
+                    if direct and 'parent_profit' in values:
+                        difference = values['parent_profit']-values['ordinary_profit']
+                        if not math.isfinite(difference):
+                            raise ValueError('parent and ordinary profit reconciliation overflow')
+                        values['ordinary_profit_reconciliation'] = dict(
+                            method='parent_minus_explicit_ordinary_profit',difference_yuan=difference,
+                            is_raw_distribution=False,statement_receipts=hashes[:])
                     periods.append(dict(values, period_start=component['period_start'],
-                                        period_end=component['period_end'], statement_receipts=hashes))
-                # Any later retained applicable income revision must appear in
-                # this inventory, even when the caller selected another PDF.
-                for raw, digest in self.store.conn.execute(
-                        "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='tushare_income'").fetchall():
-                    if hashlib.sha256(raw.encode()).hexdigest() != digest:
-                        continue
-                    for row in json.loads(raw).get('rows', []):
-                        if (row.get('ts_code') == code and _iso(row.get('f_ann_date') or row['ann_date']) <= day
-                                and _iso(row['end_date']) >= oldest and digest not in receipts):
-                            raise ValueError('retained income revision omitted')
-                out.update(qualified=True, periods=periods)
-            except (KeyError, ValueError, TypeError, IndexError, OSError) as exc:
+                                        period_end=component['period_end'], announcement_date=identity[2],
+                                        statement_receipts=hashes))
+                self._assert_revision_inventory(code, day, known_at, 'income', inventory, documents, oldest,
+                    selected=[(p['period_end'], p['announcement_date']) for p in periods])
+                latest = self._latest_income_period(catalogues, day, mode)
+                selected = periods[0]['period_end'] if mode == 'static' else proof.get('selected_period')
+                if selected != latest:
+                    raise ValueError('selected earnings period is not latest applicable disclosed period')
+                out.update(qualified=True, periods=periods, latest_applicable_period=latest,
+                           as_known_at=known_at)
+            except (KeyError, ValueError, TypeError, IndexError, OSError, OverflowError) as exc:
                 out['qualification_error'] = str(exc)
             results[mode] = out
         return results

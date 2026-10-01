@@ -63,14 +63,9 @@ def test_capital_flow_historical_as_of_rejects_future_writes(tmp_path):
 def test_capital_flow_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
     db_path = tmp_path / "aware.duckdb"
     con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE multi_source_stock_flow("
-        "source_date DATE, stock_code VARCHAR, main_net DOUBLE, fetched_at TIMESTAMP)"
-    )
-    con.execute(
-        "INSERT INTO multi_source_stock_flow VALUES "
-        "('2026-07-31','000001',100,'2026-07-31 17:45:00')"
-    )
+    from test_readiness import _qualified_stock
+    _qualified_stock(con, "2026-07-31")
+    con.execute("UPDATE multi_source_stock_flow SET fetched_at='2026-07-31 17:45:00'")
     con.close()
     result = assess_capital_flow_health(
         db_path,
@@ -158,22 +153,9 @@ def test_capital_flow_health_enforces_expected_coverage(tmp_path):
 def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path, monkeypatch):
     db_path = tmp_path / "migrated-flow.duckdb"
     con = duckdb.connect(str(db_path))
-    con.execute(
-        "CREATE TABLE multi_source_stock_flow(source_date DATE, stock_code VARCHAR, fetched_at TIMESTAMP, is_stale BOOLEAN)"
-    )
-    con.execute(
-        "INSERT INTO multi_source_stock_flow VALUES "
-        "('2026-07-14','000001','2026-07-14 10:00:00',FALSE),"
-        "('2026-07-14','000002','2026-07-14 10:00:00',FALSE)"
-    )
-    con.execute(
-        "CREATE TABLE multi_source_sector_flow(source_date DATE, sector_code VARCHAR, fetched_at TIMESTAMP, is_stale BOOLEAN)"
-    )
-    con.execute(
-        "INSERT INTO multi_source_sector_flow VALUES "
-        "('2026-07-14','801001','2026-07-14 10:00:00',FALSE),"
-        "('2026-07-14','801002','2026-07-14 10:00:00',FALSE)"
-    )
+    from test_readiness import _qualified_stock, _qualified_sector
+    _qualified_stock(con, "2026-07-14", ("000001", "000002"))
+    _qualified_sector(con, "2026-07-14")
     con.close()
 
     result = assess_capital_flow_health(
@@ -183,6 +165,8 @@ def test_capital_flow_health_accepts_fresh_migrated_flow_rows(tmp_path, monkeypa
     assert result["stock_flow"]["ready"] is True
     assert result["sector_flow"]["ready"] is True
     assert result["ready"] is True
+    assert result['stock_flow']['qualification']['passed']
+    assert result['sector_flow']['qualification']['passed']
 
     from scripts import check_capital_flow_health as entry
     import sys
@@ -247,3 +231,70 @@ def test_damaged_independent_pass_cannot_survive_evidence_read_error(tmp_path, m
     result = assess_capital_flow_health(db_path,'2026-07-09',1,1)
     assert result['reconciliation']['independent_status'] == 'unverified_or_changed_amount_evidence'
     assert result['reconciliation']['independent_reconciliation_ready'] is False
+
+
+def test_health_and_cli_share_partial_unit_and_taxonomy_gate(tmp_path, monkeypatch):
+    from test_readiness import _qualified_stock, _qualified_sector
+    from scripts import check_capital_flow_health as entry
+    import sys
+    db = tmp_path/'shared-gate.duckdb'
+    with duckdb.connect(str(db)) as con:
+        _qualified_stock(con, '2026-09-29')
+        _qualified_sector(con, '2026-09-29')
+        con.execute("UPDATE intraday_stock_flow_batch SET status='partial'")
+    result = assess_capital_flow_health(db, '2026-09-29', now=datetime(2026,9,29,10,1))
+    assert not result['source_ready'] and not result['data_certified_ready']
+    assert not result['stock_flow']['qualification']['passed']
+    monkeypatch.setattr(entry, 'assess_capital_flow_health', lambda *a,**k:result)
+    monkeypatch.setattr(sys, 'argv', ['check','--date','2026-09-29','--stage','intraday','--out',str(tmp_path/'health.md')])
+    assert entry.main() == 2
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE intraday_stock_flow_batch SET status='success'")
+        con.execute("UPDATE multi_source_stock_flow SET amount_unit='unknown'")
+        con.execute("UPDATE intraday_sector_flow_taxonomy SET expected_rows=0 WHERE taxonomy='ths_concept'")
+    result = assess_capital_flow_health(db, '2026-09-29', now=datetime(2026,9,29,10,1))
+    assert not result['stock_flow']['ready'] and not result['sector_flow']['ready']
+    assert not result['source_ready'] and not result['flow_certified_ready']
+
+
+def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path, monkeypatch):
+    import json
+    import trade_system.flow_contract as contract
+    from test_readiness import _qualified_stock, _qualified_sector
+    from scripts.reconcile_independent_stock_flow import reconcile
+    day = '2026-09-29'
+    db = tmp_path/'dynamic-reference.duckdb'
+    with duckdb.connect(str(db)) as con:
+        _qualified_stock(con, day, ('000001','000002'))
+        _qualified_sector(con, day)
+        con.execute("ALTER TABLE multi_source_stock_flow ADD COLUMN is_stale BOOLEAN DEFAULT false")
+        con.execute("ALTER TABLE multi_source_stock_flow ADD COLUMN raw_json VARCHAR DEFAULT '{}'")
+        con.execute("ALTER TABLE multi_source_stock_flow ADD COLUMN collected_at TIMESTAMP")
+        con.execute("UPDATE multi_source_stock_flow SET fetched_at='2026-09-29 17:00:00'")
+        con.execute("INSERT INTO multi_source_stock_flow SELECT source_date,stock_code,main_net,fetched_at,"
+                    "'ifind_fixture',amount_unit,'hithink_fixture','licensed_l2_fixture','reviewed_main_fixture',"
+                    "'reviewed_adapter_fixture',false,raw_json,collected_at FROM multi_source_stock_flow")
+        con.execute("UPDATE multi_source_sector_flow SET fetched_at='2026-09-29 17:00:00'")
+        raw = json.loads(con.execute("SELECT raw_json FROM multi_source_sector_flow WHERE sector_type='ths_concept_derived'").fetchone()[0])
+        raw['raw'].update(input_received_min=day+' 17:00:00',input_received_max=day+' 17:00:00')
+        con.execute("UPDATE multi_source_sector_flow SET raw_json=? WHERE sector_type='ths_concept_derived'", [json.dumps(raw)])
+        con.execute("CREATE TABLE intraday_stock_flow_reconciliation(trade_date DATE,status VARCHAR,reference_rows INTEGER,value_status VARCHAR)")
+        con.execute("INSERT INTO intraday_stock_flow_reconciliation VALUES (?,'pass',2,'pass')", [day])
+    axes = {k:'explicit_fixture_same_definition' for k in contract.FLOW_DEFINITION_AXES}
+    signatures = tuple(sorted([('eastmoney','moneyflow_dc','provider_main_orders_net',contract.FLOW_MAPPING_VERSION),
+                              ('hithink_fixture','licensed_l2_fixture','reviewed_main_fixture','reviewed_adapter_fixture')]))
+    proof = dict(canonical_definition='fixture_only',valid_from=day,valid_through=day,
+                 source_specification_sha256=['a'*64,'b'*64],specifications=[axes,axes],
+                 amount_precision=dict(primary_quantum_yuan=1,reference_quantum_yuan=1))
+    monkeypatch.setitem(contract.VERIFIED_FLOW_COMPARISONS, signatures, proof)
+    assert reconcile(db,day,reference_provider='ifind_fixture')['status'] == 'pass'
+    result = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)
+    assert result['reconciliation']['independent_reference_provider'] == 'ifind_fixture'
+    assert result['reconciliation']['independent_source_present']
+    assert result['reconciliation']['independent_reconciliation_ready']
+    assert result['flow_certified_ready']
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE multi_source_stock_flow SET main_net=main_net+1000 WHERE provider='ifind_fixture'")
+    changed = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)
+    assert not changed['flow_certified_ready']
+    assert changed['reconciliation']['independent_status'] == 'unverified_or_changed_amount_evidence'

@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 import sys
 
 import duckdb
@@ -83,7 +84,7 @@ def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_characte
         returncode=0
         def communicate(self, timeout=None):
             calls.append(timeout)
-            if timeout is not None:
+            if len(calls) == 1:
                 raise subprocess.TimeoutExpired('fixture',timeout)
             return b'committed',b''
         def kill(self):
@@ -91,7 +92,7 @@ def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_characte
     monkeypatch.setattr(runner.subprocess,'Popen',lambda *a,**k:SlowWriter())
     drained=[]
     result=runner._run_writer(['fixture'],cwd='.',env={},timeout=.01,on_drain=drained.append)
-    assert calls==[.01,None] and drained==[123] and result.returncode==-1
+    assert calls==[.01,5] and drained==[123] and result.returncode==-1
     assert result.stdout==b'committed'
     env = _utf8_subprocess_env()
     assert env["PYTHONUTF8"] == "1"
@@ -102,6 +103,57 @@ def test_subprocess_text_protocol_is_utf8_and_never_injects_replacement_characte
     assert broken is True
     assert "�" not in text
     assert "stdout_encoding_error" in text
+
+
+def test_stuck_writer_exposes_maintenance_before_safe_exit_and_keeps_guard(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from scripts import run_integrated_daily as runner
+    from trade_system import pipeline_runtime
+    from trade_system.pipeline_runtime import PipelineLock, PipelineAlreadyRunning, RunManifest
+
+    monkeypatch.setattr(pipeline_runtime, 'runtime_fingerprint', lambda: {'scope': 'fixture'})
+    manifest = RunManifest(tmp_path/'reports', 'drain', '2026-10-01', 'close')
+    db = tmp_path/'sample.duckdb'
+    count = 0
+    seen = []
+    times = iter([0, 0, 10, 35, 40])
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: next(times, 40))
+
+    class UninterruptibleWriter:
+        pid = 321
+        returncode = 0
+        def communicate(self, timeout):
+            nonlocal count
+            count += 1
+            # No poll, timeout, metadata mutation or callback may release the
+            # owner's guard before this simulated transaction finally exits.
+            with pytest.raises(PipelineAlreadyRunning):
+                with PipelineLock(db, 'must-not-start'):
+                    pass
+            if count <= 3:
+                raise subprocess.TimeoutExpired('fixture', timeout)
+            return b'committed', b''
+        def kill(self):
+            raise AssertionError('no termination is authorized')
+    monkeypatch.setattr(runner.subprocess, 'Popen', lambda *a, **k: UninterruptibleWriter())
+    progress = runner._writer_progress(manifest, 'fixture', ['fixture'])
+    def capture(state):
+        progress(state)
+        saved = json.loads(manifest.path.read_text())
+        seen.append(saved['status'])
+        assert not saved.get('completed_at')
+        assert saved['writer_state']['guard_retained']
+        assert not saved['writer_state']['new_work_permitted']
+    with PipelineLock(db, 'owner'):
+        result = runner._run_writer(['fixture'], cwd='.', env={}, timeout=.01,
+            on_progress=capture, drain_grace_seconds=30, poll_seconds=.01)
+        assert result.returncode == -1 and result.maintenance_seen
+        assert manifest.data['maintenance_blocked_seen']
+        assert seen == ['draining', 'draining', 'maintenance_blocked']
+    assert Path(str(db)+'.pipeline.lock.guard').exists()
+    with PipelineLock(db, 'after-safe-exit'):
+        pass
 
 
 def test_close_recovery_as_of_is_applied_to_all_freshness_gates():

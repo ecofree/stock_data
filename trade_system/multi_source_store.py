@@ -339,6 +339,7 @@ class MultiSourceStore:
             replace_on=['source_date', 'stock_code', 'provider'])
 
     def _store_sector_flow(self, data, provider, trade_date, stale, received_at=None):
+        from trade_system.time_utils import as_local_naive
         rows = data if isinstance(data, list) else []
         count = 0
         d_default = _date(trade_date) or date.today().isoformat()
@@ -356,6 +357,15 @@ class MultiSourceStore:
                 continue
             d = _date(row.get("date") or row.get("trade_date")) or d_default
             code = str(row.get("sector_code"))
+            input_clock = as_local_naive(row.get('input_received_at') or row.get('fetched_at') or received_at)
+            # meta.received_at may be the oldest derived input, not the time
+            # this batch is published. Each row retains its own input clock.
+            if input_clock is None or input_clock > datetime.now():
+                raise ValueError('sector input receipt time missing or later than publication')
+            newer = self.con.execute("SELECT fetched_at FROM multi_source_sector_flow "
+                "WHERE source_date=? AND sector_code=? AND provider=?", [d, code, provider]).fetchone()
+            if newer and newer[0] is not None and newer[0] > input_clock:
+                raise ValueError('older sector-flow receipt cannot overwrite newer canonical rows')
             conflicting = self.con.execute(
                 "SELECT 1 FROM multi_source_sector_flow WHERE source_date=? AND sector_code=? AND provider=? "
                 "AND sector_type IS NOT NULL AND sector_type<>'unknown' AND sector_type<>? LIMIT 1",
@@ -370,7 +380,7 @@ class MultiSourceStore:
                       canonical['large_net'], canonical['mid_net'], canonical['small_net'],
                       _number(row.get("change_pct")), _number(row.get("main_ratio")), canonical['sector_type'],
                       'yuan', stale, _json(dict(row, canonical_contract=canonical)),
-                      received_at or row.get("fetched_at")]
+                      input_clock]
             names = ",".join(columns)
             self.con.execute(
                 f"MERGE INTO multi_source_sector_flow AS target USING (VALUES ({','.join('?' for _ in columns)})) "

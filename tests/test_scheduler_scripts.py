@@ -278,3 +278,32 @@ def test_collectors_bind_db_and_fail_missing_contract_before_side_effects(tmp_pa
     assert result.returncode != 0 and 'Explicit collector contract' in result.stderr
     assert 'ParameterNameConflictsWithAlias' not in result.stderr
     assert not (tmp_path/'must-not-exist.duckdb').exists()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows close entry startup evidence')
+def test_close_entry_records_startup_failure_before_any_database_or_guard_access(tmp_path):
+    scripts=tmp_path/'scripts';scripts.mkdir()
+    (scripts/'run_stock_data_daily.ps1').write_text(_read('run_stock_data_daily.ps1'))
+    (scripts/'native_process.ps1').write_text(_read('native_process.ps1'))
+    (scripts/'run_integrated_daily.py').write_text('# not executed')
+    reports=tmp_path/'reports';db=tmp_path/'missing.duckdb'
+    result=_ps(scripts/'run_stock_data_daily.ps1','-Db',db,'-Python',sys.executable,
+               '-CollectorContract','fixture','-CollectorContractSha256','a'*64,'-ReportsDirectory',reports)
+    assert result.returncode!=0
+    logs=list((reports/'scheduled-logs').glob('scheduled_close_*.log'))
+    assert len(logs)==1
+    saved=logs[0].read_text(encoding='utf-8-sig')
+    assert 'DAILY_RUN_START' in saved and 'DAILY_RUN_FAILED' in saved and 'not found' in saved
+    assert not db.exists() and not Path(str(db)+'.pipeline.lock.guard').exists()
+
+
+def test_close_entry_uses_shared_owner_and_only_qualified_backup_retention():
+    # Function behavior and injected copy/compress/qualification failures are
+    # exercised in test_pipeline_runtime; this checks the live wrapper wiring.
+    close=_read('run_stock_data_daily.ps1')
+    assert 'prepare_daily_backup' in close and 'finalize_daily_backup' in close
+    assert 'retain_qualified_backups' in close
+    assert 'Test-Path -LiteralPath "$DbPath.pipeline.lock"' not in close
+    assert 'Remove-Item' not in close and 'Stop-Process' not in close
+    assert close.index('$result=Invoke-StockDataProcess') < close.index('finalize_daily_backup')
+    assert 'start_latest_at' in close and 'deadline_at' in close

@@ -70,22 +70,78 @@ def _safe_stream_write(stream, value: str) -> None:
 
 
 
-def _run_writer(command, *, cwd, env, timeout, on_drain=None):
+def _report_writer_state(message):
+    try:
+        _safe_stream_write(sys.stderr, message)
+    except (Exception, KeyboardInterrupt):
+        # An unavailable evidence/output device cannot authorize orphaning the
+        # still-live child by unwinding its owning guard.
+        pass
+
+
+def _run_writer(command, *, cwd, env, timeout, on_drain=None, on_progress=None,
+                drain_grace_seconds=30, poll_seconds=5):
     """Never terminate a database writer on timeout; retain the parent guard."""
     child = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     expired = False
+    maintenance_seen = False
+    drain_started = None
     try:
         out, err = child.communicate(timeout=max(0.01, timeout))
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, KeyboardInterrupt) as interruption:
         expired = True
+        maintenance_seen = isinstance(interruption, KeyboardInterrupt)
+        drain_started = time.monotonic()
         if on_drain:
-            on_drain(child.pid)
-        # Transport children inherit a deadline and stop new requests. If a
-        # writer cannot drain, its pid/state stays visible and the guard held.
-        out, err = child.communicate()
+            try:
+                on_drain(child.pid)
+            except (Exception, KeyboardInterrupt):
+                maintenance_seen = True
+        # Keep waiting safely, but never silently: each bounded wait exposes
+        # progress and the maintenance boundary. There is no safe hard-exit
+        # promise for a filesystem/transaction call that cannot be interrupted.
+        while True:
+            elapsed = time.monotonic() - drain_started
+            maintenance_seen |= elapsed >= drain_grace_seconds
+            state = {'pid': child.pid, 'status': 'maintenance_blocked' if maintenance_seen else 'draining',
+                'drain_elapsed_seconds': round(elapsed, 3), 'guard_retained': True,
+                'new_work_permitted': False, 'manual_maintenance_required': maintenance_seen,
+                'observed_at': datetime.now().isoformat(), 'exit_not_guaranteed': True}
+            if on_progress:
+                try:
+                    on_progress(state)
+                except (Exception, KeyboardInterrupt) as exc:
+                    # A failed evidence disk must not unwind the owning guard
+                    # while the child still writes. Keep a stderr fallback.
+                    _report_writer_state(f'WRITER_STATE_EVIDENCE_FAILED pid={child.pid} error={type(exc).__name__}\n')
+            if maintenance_seen:
+                _report_writer_state(f'WRITER_MAINTENANCE_BLOCKED pid={child.pid} elapsed={elapsed:.1f}s guard_retained=true\n')
+            try:
+                out, err = child.communicate(timeout=max(.01, poll_seconds))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except KeyboardInterrupt:
+                # Interrupting this parent is not permission to orphan a writer.
+                maintenance_seen = True
+                continue
     if expired:
         err += b'\nCollector deadline exceeded; writer drained without termination.\n'
-    return subprocess.CompletedProcess(command, -1 if expired else child.returncode, out, err)
+    result = subprocess.CompletedProcess(command, -1 if expired else child.returncode, out, err)
+    result.maintenance_seen = maintenance_seen
+    result.drain_elapsed_seconds = 0 if drain_started is None else round(time.monotonic()-drain_started, 3)
+    return result
+
+
+def _writer_progress(manifest, name, command, log_path=None):
+    def persist(state):
+        manifest.data['status'] = state['status']
+        manifest.data['writer_state'] = dict(state, step=name)
+        if state['manual_maintenance_required']:
+            manifest.data['maintenance_blocked_seen'] = True
+        manifest.upsert_step(name, state['status'], command,
+            log_path=str(log_path) if log_path else None, **{k:v for k,v in state.items() if k != 'status'})
+    return persist
 
 
 def main() -> int:
@@ -220,7 +276,10 @@ def main() -> int:
     manifest.data['deadline_epoch'] = phase_deadline
     manifest.write()
     try:
-        with PipelineLock(args.db, run_id):
+        with PipelineLock(args.db, run_id) as owner:
+            if owner.recovered_owner:
+                manifest.data['lock_recovery'] = owner.recovered_owner
+                manifest.write()
             session = trading_session_status(args.db, args.trade_date)
             if selected_phase != "history" and not args.skip_collect and session.state == "unverified":
                 # The parent already holds the single-writer guard. Fetch only
@@ -243,7 +302,8 @@ def main() -> int:
                 return 2
             initialization = _run_writer([python, "-X", "utf8", "-c", bootstrap, str(args.db)],
                 cwd=backend, timeout=min(args.step_timeout, phase_deadline-time.time()), env=_utf8_subprocess_env(),
-                on_drain=lambda pid: manifest.upsert_step('schema', 'draining', [], pid=pid))
+                on_drain=lambda pid: manifest.upsert_step('schema', 'draining', [], pid=pid),
+                on_progress=_writer_progress(manifest, 'schema', []))
             if initialization.returncode:
                 raise ValueError("collector schema initialization failed: "+initialization.stderr.decode("utf-8", "backslashreplace")[-500:])
             failed, warnings, pending = [], [], []
@@ -251,9 +311,9 @@ def main() -> int:
             required = {'prepare_stock_reference': True} if args.prepare_reference else {task.name: task.required for task in phase_tasks(selected_phase)}
             for name, command, _ in plan:
                 from trade_system.collection_profiles import task_due
-                if time.time() >= phase_deadline:
+                if time.time() >= phase_deadline or manifest.data.get('maintenance_blocked_seen'):
                     manifest.add_step(name, 'deadline_exhausted', command, required=required[name],
-                                      reason='phase deadline reached; no child started')
+                                      reason='maintenance drain observed; no further child started' if manifest.data.get('maintenance_blocked_seen') else 'phase deadline reached; no child started')
                     (failed if required[name] else warnings).append(name)
                     continue
                 if args.prepare_reference:
@@ -274,6 +334,7 @@ def main() -> int:
                 started = datetime.now()
                 log = artifact_dir / (name+".log")
                 manifest.upsert_step(name, "running", command, started_at=started.isoformat(), log_path=str(log))
+                process = None
                 try:
                     import hashlib
                     demand={'product_id':name,'semantic_version':'phase-product-v1',
@@ -290,7 +351,8 @@ def main() -> int:
                     process = _run_writer(command, cwd=backend, env=env,
                         timeout=step_deadline-time.time(),
                         on_drain=lambda pid: manifest.upsert_step(name, 'draining', command,
-                            pid=pid, reason='deadline exceeded; waiting for safe writer exit', log_path=str(log)))
+                            pid=pid, reason='deadline exceeded; waiting for safe writer exit', log_path=str(log)),
+                        on_progress=_writer_progress(manifest, name, command, log))
                     out, bad_out = _decode_process_bytes(process.stdout, "stdout")
                     err, bad_err = _decode_process_bytes(process.stderr, "stderr")
                     code = process.returncode or (-2 if bad_out or bad_err else 0)
@@ -310,6 +372,11 @@ def main() -> int:
                                      request_context=context,
                                      operation_counts=counts, request_metrics=request_metrics([log]),
                                      duration_seconds=round((datetime.now()-started).total_seconds(), 3))
+                if getattr(process, 'maintenance_seen', False):
+                    manifest.data['writer_state'] = dict(manifest.data.get('writer_state', {}),
+                        status='drained_after_maintenance', child_exited=True, guard_retained=True,
+                        new_work_permitted=False, drain_elapsed_seconds=process.drain_elapsed_seconds)
+                    manifest.write()
                 if code:
                     (pending if disclosure_pending and required[name] else failed if required[name] else warnings).append(name)
                 # Independent data sources still run after one provider fails.

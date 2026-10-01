@@ -106,7 +106,7 @@ def test_independent_amount_gate_rejects_unit_scale_and_shrunk_denominator(tmp_p
     from trade_system.schema import init_schema
     import trade_system.flow_contract as contract
     from scripts import reconcile_independent_stock_flow as entry
-    import scripts.collect_intraday_stock_flow_market as market
+    import trade_system.readiness as readiness
     db = tmp_path/'amount.duckdb'
     with duckdb.connect(str(db)) as con:
         init_schema(con)
@@ -116,7 +116,11 @@ def test_independent_amount_gate_rejects_unit_scale_and_shrunk_denominator(tmp_p
                     source_api,flow_definition,amount_unit,field_mapping_version,main_net,is_stale,fetched_at)
                     VALUES ('2026-07-09',?,?,?,?, 'fixture_definition','yuan','v3',?,false,'2026-07-09 17:00:00')''',
                     [code,provider,origin,api,amount])
-    monkeypatch.setattr(market,'_a_share_universe_by_exchange',lambda *args:{'000001':'SZ','600000':'SH'})
+    def scope(codes):
+        return dict(passed=True,codes=codes,codes_sha256=hashlib.sha256(json.dumps(sorted(codes)).encode()).hexdigest())
+    import hashlib
+    import json
+    monkeypatch.setattr(readiness,'qualified_stock_flow_scope',lambda *args,**kwargs:scope({'000001':'SZ','600000':'SH'}))
     semantics = {k:'fixture_identical' for k in contract.FLOW_DEFINITION_AXES}
     key = tuple(sorted([('eastmoney','moneyflow_dc','fixture_definition','v3'),('tushare','moneyflow','fixture_definition','v3')]))
     proof = dict(canonical_definition='fixture',source_specification_sha256=['a'*64,'b'*64],
@@ -131,7 +135,7 @@ def test_independent_amount_gate_rejects_unit_scale_and_shrunk_denominator(tmp_p
     assert result['status'] == 'warning' and result['amount_match_pct'] == 0
     with duckdb.connect(str(db)) as con:
         con.execute("UPDATE multi_source_stock_flow SET main_net=main_net/10000 WHERE provider='primary'")
-    monkeypatch.setattr(market,'_a_share_universe_by_exchange',lambda *args:{'000001':'SZ','600000':'SH','600001':'SH'})
+    monkeypatch.setattr(readiness,'qualified_stock_flow_scope',lambda *args,**kwargs:scope({'000001':'SZ','600000':'SH','600001':'SH'}))
     result = entry.reconcile(db,'2026-07-09',primary_provider='primary',reference_provider='reference')
     assert result['status'] == 'warning' and result['expected_rows'] == 3
     assert result['overlap_reference_pct'] < 67

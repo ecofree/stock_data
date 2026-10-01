@@ -11,6 +11,7 @@ from trade_system.data_store import connect_duckdb
 from trade_system.gate_contract import build_operator_state
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
+from trade_system.readiness import capital_flow_coverage, qualified_stock_flow_scope
 
 
 STOCK_FLOW_RELATIONS = (
@@ -182,7 +183,7 @@ def assess_capital_flow_health(
     expected_stock_codes: int = 0,
     expected_sector_codes: int = 0,
     collected_after: str | datetime | None = None,
-    min_coverage_pct: float = 80.0,
+    min_coverage_pct: float = 99.5,
     max_age_seconds: int | None = None,
     now: datetime | None = None,
     session_close: bool = False,
@@ -206,39 +207,22 @@ def assess_capital_flow_health(
     primary_stock_provider = None
     primary_stock_codes = None
     try:
-        # Full-market collectors persist their expected universe in a durable
-        # checkpoint.  Use it automatically when the CLI caller does not
-        # provide a count; otherwise a partial snapshot can look ready merely
-        # because it contains some rows.
-        if not expected_stock_codes and table_exists(con, "intraday_stock_flow_batch"):
-            batch_columns = set(table_columns(con, "intraday_stock_flow_batch"))
-            provider_expr = "provider" if "provider" in batch_columns else "NULL"
-            batch_row = con.execute(
-                f"SELECT coalesce(expected_rows,0), {provider_expr} "
-                "FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                [trade_date],
-            ).fetchone()
-            expected_stock_codes = int(batch_row[0] or 0) if batch_row else 0
-            primary_stock_provider = str(batch_row[1] or "") if batch_row else None
-        elif table_exists(con, "intraday_stock_flow_batch"):
-            batch_columns = set(table_columns(con, "intraday_stock_flow_batch"))
-            if "provider" in batch_columns:
-                batch_row = con.execute(
-                    "SELECT provider FROM intraday_stock_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                    [trade_date],
-                ).fetchone()
-                primary_stock_provider = str(batch_row[0] or "") if batch_row else None
+        stock_qualification = capital_flow_coverage(con, trade_date, "stock", require_actual=True,
+            max_age_seconds=effective_max_age_seconds, now=now, collected_after=collected_after)
+        sector_qualification = capital_flow_coverage(con, trade_date, "sector", require_actual=True,
+            max_age_seconds=effective_max_age_seconds, now=now, collected_after=collected_after)
+        # The shared gate preserves unknown/ambiguous metadata; do not pick
+        # an arbitrary duplicate batch or cast its NaN denominator to int.
+        if not expected_stock_codes:
+            expected_stock_codes = stock_qualification.get("expected_rows") or 0
+        primary_stock_provider = stock_qualification.get("provider")
         if primary_stock_provider and table_exists(con, "multi_source_stock_flow"):
             primary_health = _relation_health(con, 'multi_source_stock_flow', trade_date,
                 'stock_code', collected_after=collected_after,
                 max_age_seconds=effective_max_age_seconds, now=now, provider=primary_stock_provider)
             primary_stock_codes = primary_health['recent_codes']
-        if not expected_sector_codes and table_exists(con, "intraday_sector_flow_batch"):
-            batch_row = con.execute(
-                "SELECT coalesce(expected_rows,0) FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
-                [trade_date],
-            ).fetchone()
-            expected_sector_codes = int(batch_row[0] or 0) if batch_row else 0
+        if not expected_sector_codes:
+            expected_sector_codes = sector_qualification.get("expected_rows") or 0
         stock_relations = [
             _relation_health(
                 con, relation, trade_date, "stock_code", collected_after,
@@ -258,7 +242,6 @@ def assess_capital_flow_health(
 
     gated = collected_after is not None or effective_max_age_seconds is not None
     code_field = "recent_codes" if gated else "codes"
-    row_field = "recent_rows" if gated else "rows"
     # Coverage is measured against the batch's own provider/universe.  Taking
     # the union across TuShare and Eastmoney produced impossible ratios such
     # as 5,547 / 5,539 and hid the 17 unavailable primary rows.
@@ -271,46 +254,20 @@ def assess_capital_flow_health(
     stock_coverage = (
         stock_codes * 100.0 / expected_stock_codes if expected_stock_codes else None
     )
-    stock_ready = expected_stock_codes > 0 and stock_codes > 0 and (
-        stock_coverage is not None and stock_coverage >= min_coverage_pct
-    ) and any(item[row_field] > 0 for item in stock_relations
-              if item["relation"] == "multi_source_stock_flow")
+    stock_ready = bool(stock_qualification["passed"] and expected_stock_codes == stock_qualification["expected_rows"]
+                       and stock_qualification.get("actual", {}).get("coverage_pct", 0) >= max(99.5, min_coverage_pct))
     # Sector capital is the core directional flow; intraday sector volume alone is not equivalent.
     sector_candidates = [
         item for item in sector_relations
         if item["relation"] in {"multi_source_sector_flow", "sector_capital"}
     ]
-    sector_flow = max(sector_candidates, key=lambda item: item[code_field], default={"rows": 0, "codes": 0, "recent_rows": 0, "recent_codes": 0})
     sector_codes = max((item[code_field] for item in sector_candidates), default=0)
     sector_coverage = (
         sector_codes * 100.0 / expected_sector_codes if expected_sector_codes else None
     )
-    sector_ready = expected_sector_codes > 0 and sector_flow[row_field] > 0 and (
-        sector_coverage is not None and sector_coverage >= min_coverage_pct
-    )
-    # A full-sector checkpoint is authoritative when present.  Do not let a
-    # smaller bounded/legacy relation make a partial batch look ready.
-    try:
-        con = connect_duckdb(str(db_path), read_only=True)
-        sector_batch = con.execute(
-            "SELECT status,coverage_pct FROM intraday_sector_flow_batch WHERE trade_date=CAST(? AS DATE)",
-            [trade_date],
-        ).fetchone() if table_exists(con, "intraday_sector_flow_batch") else None
-        con.close()
-    except Exception:
-        sector_batch = None
-    # A matching count does not repair a partial membership/page batch.
-    # The producer already has a distinct success_with_optional_gap status.
-    if sector_batch:
-        batch_status = str(sector_batch[0] or "").lower()
-        batch_coverage = float(sector_batch[1] or 0)
-        batch_usable = batch_status in {
-            "success",
-            "success_with_unavailable",
-            "success_with_optional_gap",
-        }
-        if not batch_usable or batch_coverage < min_coverage_pct:
-            sector_ready = False
+    sector_ready = bool(sector_qualification["passed"] and expected_sector_codes == sector_qualification["expected_rows"]
+                        and all(fact.get("coverage_pct", 0) >= max(99.5, min_coverage_pct)
+                                for fact in sector_qualification.get("actual", {}).get("taxonomies", {}).values()))
     # A4: surface stale THS concept membership.  The concept taxonomy can be
     # coverage-complete yet built on an out-of-date membership snapshot; that must
     # be visible to the gate/report even though directional industry flow is fine.
@@ -330,16 +287,11 @@ def assess_capital_flow_health(
             if stale_row and str(stale_row[0] or "").lower() in {"stale_members", "partial_members"}:
                 sector_taxonomy_stale = True
                 sector_taxonomy_note = str(stale_row[1] or "ths concept membership is stale or partial")
-        if table_exists(con, "v_default_concept_stock_history"):
-            canonical_row = con.execute(
-                "SELECT max(CAST(trade_date AS DATE)) "
-                "FROM v_default_concept_stock_history WHERE trade_date<=CAST(? AS DATE)",
-                [trade_date],
-            ).fetchone()
-            canonical_membership_snapshot = (
-                str(canonical_row[0]) if canonical_row and canonical_row[0] else None
-            )
+        from trade_system.ths_quality import canonical_ths_snapshot
+        snapshot = canonical_ths_snapshot(con, trade_date)
+        canonical_membership_snapshot = snapshot['snapshot_date'] if snapshot else None
         if table_exists(con, "multi_source_sector_flow"):
+            sector_columns = set(table_columns(con, "multi_source_sector_flow"))
             derived_membership_snapshots = [
                 str(row[0])
                 for row in con.execute(
@@ -356,7 +308,7 @@ def assess_capital_flow_health(
                     [trade_date],
                 ).fetchall()
                 if row[0]
-            ]
+            ] if {'provider','raw_json','is_stale'} <= sector_columns else []
         if derived_membership_snapshots:
             membership_batch_consistent = (
                 canonical_membership_snapshot is not None
@@ -383,6 +335,8 @@ def assess_capital_flow_health(
     recon_sign_disagreement_pct = None
     recon_mean_abs_main_net_diff = None
     independent_source_present = False
+    independent_reference_provider = None
+    independent_reference_qualification = {}
     independent_status = "not_run"
     independent_overlap_pct = None
     independent_correlation = None
@@ -413,19 +367,14 @@ def assess_capital_flow_health(
                     recon_sign_disagreement_pct = float(recon_row[3]) if recon_row[3] is not None else None
                 if len(recon_row) > 4:
                     recon_mean_abs_main_net_diff = float(recon_row[4]) if recon_row[4] is not None else None
-        if table_exists(con, "multi_source_stock_flow"):
-            independent_source_present = bool(con.execute(
-                "SELECT count(*) FROM multi_source_stock_flow "
-                "WHERE source_date=CAST(? AS DATE) AND provider='tushare'",
-                [trade_date],
-            ).fetchone()[0])
         if table_exists(con, "intraday_stock_flow_independent_reconciliation"):
-            independent_row = con.execute(
+            independent_rows = con.execute(
                 "SELECT status, overlap_reference_pct, correlation_main_net, sign_agreement_pct, primary_provider, reference_provider "
                 "FROM intraday_stock_flow_independent_reconciliation "
                 "WHERE trade_date=CAST(? AS DATE)",
                 [trade_date],
-            ).fetchone()
+            ).fetchall()
+            independent_row = independent_rows[0] if len(independent_rows) == 1 else None
             if independent_row:
                 # Stay blocked even if reading or validating the evidence raises.
                 stored_status = str(independent_row[0] or "not_run")
@@ -435,12 +384,18 @@ def assess_capital_flow_health(
                 independent_sign_agreement_pct = float(independent_row[3]) if independent_row[3] is not None else None
                 from trade_system.flow_contract import independent_comparison_contract
                 comparison_contract = independent_comparison_contract(con, trade_date, independent_row[4], independent_row[5])
+                independent_reference_provider = independent_row[5]
+                # A qualified new reference is consumed by its saved product,
+                # never by a hardcoded vendor label or merely any dated row.
+                from trade_system.readiness import _actual_flow_coverage
+                independent_reference_qualification = _actual_flow_coverage(con, trade_date, "stock",
+                    {"provider": independent_reference_provider, "expected_rows": expected_stock_codes},
+                    now=now, collected_after=close_boundary)
+                independent_source_present = bool(independent_reference_qualification["passed"])
                 # Old correlation-only passes, and changed source rows, cannot
                 # certify the new amount/scope rule through a stored green flag.
                 import json
-                import hashlib
                 from scripts.reconcile_independent_stock_flow import RULE_VERSION
-                from scripts.collect_intraday_stock_flow_market import _a_share_universe_by_exchange
                 from trade_system.flow_contract import stock_flow_evidence_fingerprint
                 columns = {r[1] for r in con.execute("PRAGMA table_info('intraday_stock_flow_independent_reconciliation')").fetchall()}
                 qualified = False
@@ -448,12 +403,22 @@ def assess_capital_flow_health(
                     encoded, version = con.execute('SELECT evidence_json,rule_version FROM '
                         'intraday_stock_flow_independent_reconciliation WHERE trade_date=?', [trade_date]).fetchone()
                     evidence = json.loads(encoded or '{}')
+                    scope = qualified_stock_flow_scope(con, trade_date, now=now)
+                    from trade_system.readiness import _finite_number
+                    precision = comparison_contract.get('definition_evidence', {}).get('amount_precision', {})
+                    quantums = [precision.get(k) for k in ('primary_quantum_yuan','reference_quantum_yuan')]
+                    precision_valid = all(_finite_number(v) and v > 0 for v in quantums)
+                    tolerance = sum(quantums)/2 if precision_valid else None
                     qualified = (version == RULE_VERSION and evidence.get('status') == 'pass'
                         and evidence.get('rule_version') == RULE_VERSION
                         and evidence.get('expected_rows',0) == expected_stock_codes
-                        and evidence.get('expected_codes_sha256') == hashlib.sha256(json.dumps(
-                            sorted(_a_share_universe_by_exchange(con,trade_date))).encode()).hexdigest()
+                        and scope['passed'] and evidence.get('expected_codes_sha256') == scope.get('codes_sha256')
                         and evidence.get('amount_match_pct',0) >= 99.5
+                        and evidence.get('overlap_reference_pct',0) >= 99.5
+                        and not evidence.get('unexpected_codes')
+                        and precision_valid and evidence.get('absolute_tolerance_yuan') == tolerance
+                        and evidence.get('comparison_contract', {}).get('definition_evidence') == comparison_contract.get('definition_evidence')
+                        and independent_row[4] == primary_stock_provider
                         and all(evidence.get('source_fingerprints',{}).get(p) ==
                             stock_flow_evidence_fingerprint(con,trade_date,p) for p in independent_row[4:6]))
                 if qualified and stored_status.lower() == 'pass':
@@ -463,8 +428,7 @@ def assess_capital_flow_health(
         pass
     # A primary/reference comparison from the same Eastmoney family is useful
     # for transport consistency, but it is not independent accuracy evidence.
-    # Keep that result visible and fail the independent gate until TuShare (or
-    # another genuinely independent provider) has rows for this date.
+    # Keep it visible; only the saved, reviewed reference product can qualify.
     same_vendor_reconciliation_ready = (
         recon_status.lower() == "pass"
         and recon_value_status.lower() == "pass"
@@ -482,7 +446,7 @@ def assess_capital_flow_health(
     # label used by collectors.
     pipeline_ready = source_ready
     artifact_current = True
-    flow_certified_ready = independent_reconciliation_ready and not sector_taxonomy_stale
+    flow_certified_ready = source_ready and independent_reconciliation_ready and not sector_taxonomy_stale
     operator_state = build_operator_state(
         source_ready=source_ready,
         pipeline_ready=pipeline_ready,
@@ -509,7 +473,7 @@ def assess_capital_flow_health(
         "collection_started_at": collected_after.isoformat(timespec="seconds")
         if collected_after is not None
         else None,
-        "min_coverage_pct": float(min_coverage_pct),
+        "min_coverage_pct": float(max(99.5, min_coverage_pct)),
         "max_age_seconds": int(max_age_seconds) if max_age_seconds is not None else None,
         "effective_max_age_seconds": (
             int(effective_max_age_seconds) if effective_max_age_seconds is not None else None
@@ -523,6 +487,7 @@ def assess_capital_flow_health(
             "coverage_pct": round(stock_coverage, 2) if stock_coverage is not None else None,
             "coverage_provider": primary_stock_provider,
             "relations": stock_relations,
+            "qualification": stock_qualification,
         },
         "sector_flow": {
             "ready": sector_ready,
@@ -530,6 +495,7 @@ def assess_capital_flow_health(
             "expected_codes": int(expected_sector_codes or 0),
             "coverage_pct": round(sector_coverage, 2) if sector_coverage is not None else None,
             "relations": sector_relations,
+            "qualification": sector_qualification,
             "taxonomy_stale": sector_taxonomy_stale,
             "taxonomy_stale_note": sector_taxonomy_note,
             "canonical_membership_snapshot": canonical_membership_snapshot,
@@ -543,6 +509,8 @@ def assess_capital_flow_health(
             "overlap_sign_disagreement_pct": recon_sign_disagreement_pct,
             "mean_abs_main_net_diff": recon_mean_abs_main_net_diff,
             "independent_source_present": independent_source_present,
+            "independent_reference_provider": independent_reference_provider,
+            "independent_reference_qualification": independent_reference_qualification,
             "same_vendor_reconciliation_ready": same_vendor_reconciliation_ready,
             "independent_reconciliation_ready": independent_reconciliation_ready,
             "independent_status": independent_status,
@@ -585,7 +553,7 @@ def render_capital_flow_health_markdown(result: dict) -> str:
             "",
             "## Coverage",
             "",
-            f"- Minimum required: `{result['min_coverage_pct']}%` when an expected universe is supplied",
+            f"- Minimum required: `{result['min_coverage_pct']}%` with dated scope and canonical product evidence",
             f"- Stock codes: `{result['stock_flow']['observed_codes']}` / "
             f"`{result['stock_flow']['expected_codes'] or 'not supplied'}` "
             f"(provider `{result['stock_flow'].get('coverage_provider') or 'best available'}`)",
@@ -594,6 +562,10 @@ def render_capital_flow_health_markdown(result: dict) -> str:
             "",
         ]
     )
+    for name in ('stock_flow', 'sector_flow'):
+        qualification = result[name].get('qualification', {})
+        lines.append(f"- {name} shared qualification: `{str(qualification.get('passed', False)).lower()}`; "
+                     f"reason `{qualification.get('reason') or 'qualified'}`")
     if result["sector_flow"].get("taxonomy_stale"):
         lines.append(
             f"- WARNING: THS concept membership stale -- "
@@ -636,7 +608,7 @@ def render_capital_flow_health_markdown(result: dict) -> str:
         )
     if not recon.get("independent_source_present"):
         lines.append(
-            "- WARNING: independent provider (TuShare moneyflow) has no rows for this "
-            "date; flow accuracy relies on a single (Eastmoney) source."
+            "- WARNING: the saved reference product has no qualified same-date/full-scope rows; "
+            "an alternative vendor label or relay does not certify independence."
         )
     return "\n".join(lines)

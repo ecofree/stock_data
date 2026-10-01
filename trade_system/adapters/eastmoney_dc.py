@@ -15,7 +15,7 @@ import urllib.parse as _up
 import urllib.error as _ue  # noqa: F401
 
 from trade_system.logging_setup import get_logger
-from trade_system.http_transport import read_verified_once, request_deadline
+from trade_system.http_transport import read_verified_once, request_deadline, WireRequestBudgetExceeded
 
 try:
     from trade_system.config import SETTINGS as _PROJECT_SETTINGS
@@ -86,6 +86,10 @@ def _em_get_clist_json(params=None, timeout=15):
             guard.record_success(endpoint)
             payload["_clist_source"] = source
             return payload
+        except WireRequestBudgetExceeded:
+            # A caller's exhausted allowance is not a provider outage and must
+            # not trigger another route or poison its cooldown state.
+            raise
         except Exception as exc:
             guard.record_failure(exc, endpoint=endpoint)
             errors.append(f"{source}: {exc}")

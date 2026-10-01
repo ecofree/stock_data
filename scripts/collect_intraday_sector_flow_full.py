@@ -66,6 +66,21 @@ def _valid_rows(data, trade_date: str) -> list[dict]:
 
 
 def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds,
+                          expected_codes=None, catalogue_version=None, budget_seconds=180,
+                          max_wire_requests=40):
+    from trade_system.http_transport import wire_request_budget, measure_requests
+    with wire_request_budget(max_wire_requests) as budget, measure_requests() as receipts:
+        rows, pagination = _collect_sector_pages_bounded(store, trade_date, page_size,
+            max_pages, pause_seconds, expected_codes, catalogue_version, budget_seconds)
+    pagination.update(wire_requests=budget['attempts'], max_wire_requests=max_wire_requests,
+        requests=budget['attempts'], max_requests=max_wire_requests,
+        request_count_definition='shared_transport_attempts_including_failed_sends',
+        request_measurement_scope='this_page_capture_shared_transport_only',
+        request_receipts=receipts)
+    return rows, pagination
+
+
+def _collect_sector_pages_bounded(store, trade_date, page_size, max_pages, pause_seconds,
                           expected_codes=None, catalogue_version=None, budget_seconds=180):
     """Stage a bounded batch; never infer membership from matching row counts."""
     expected = set(expected_codes or [])
@@ -79,6 +94,7 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
     staged, totals, errors, cursors = {}, set(), [], []
     invalid, duplicates, requests, primary_pages, reverse_pages = 0, 0, 0, 0, 0
     transport_size = 0
+    terminal = False
     for direction, attempts in [('0', 3), ('1', 2)]:
         total = max(totals, default=0)
         if direction == '1' and (not total or not staged or len(staged) >= total):
@@ -99,6 +115,10 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
                     break
                 except Exception as exc:
                     errors.append(str(exc)[:300])
+                    from trade_system.http_transport import WireRequestBudgetExceeded, diagnostic_state
+                    if isinstance(exc, WireRequestBudgetExceeded) or (diagnostic_state.get() or {}).get('stopped'):
+                        terminal = True
+                        break
                     if attempt + 1 < attempts:
                         delay = max(min(5.0, 1.5*(attempt+1)), float(getattr(exc, 'retry_after_seconds', 0)))
                         if time.monotonic() + delay >= deadline:
@@ -114,9 +134,13 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
                 store.store('sector_flow_page', None, {'cursor':cursor,'error':errors[-1]},
                     {'source':'eastmoney_sector_full','status':'failed'}, trade_date=trade_date)
                 break
+            # Arrival belongs to this page, before later pages/publication.
+            # Native raw rows remain intact in the observation receipt.
+            page_received = datetime.now()
             if not isinstance(meta, dict): meta = {}
             store.store('sector_flow_page', None, {'cursor':cursor,'rows':raw,'meta':meta},
-                {'source':'eastmoney_sector_full','status':'observed'}, trade_date=trade_date)
+                {'source':'eastmoney_sector_full','status':'observed',
+                 'received_at':page_received.timestamp()}, trade_date=trade_date)
             raw_total = _number(meta.get('total'))
             if raw_total is not None and 0 < raw_total <= 10000 and raw_total.is_integer():
                 totals.add(int(raw_total))
@@ -138,12 +162,14 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
                     continue
                 code = str(row['sector_code'])
                 duplicates += int(code in staged)
-                staged.setdefault(code, row)
+                staged.setdefault(code, dict(row, input_received_at=page_received.isoformat()))
             total = max(totals, default=0)
             if total and len(staged) >= total: break
             if total and page >= math.ceil(total / transport_size): break
             if not total and (len(raw) < page_size or page > 1): break
             if pause_seconds > 0: time.sleep(float(pause_seconds))
+        if terminal:
+            break
     codes = set(staged)
     total = max(totals, default=0)
     missing = sorted(expected - codes) if expected_codes is not None else []
@@ -161,7 +187,7 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
         status = 'complete'
     membership = {'taxonomy':'em_industry','version':catalogue_version,'codes':sorted(expected)}
     return list(staged.values()), {
-        'status':status,'promoted':False,'requests':requests,'max_requests':max_pages*5,
+        'status':status,'promoted':False,'logical_calls':requests,'max_logical_calls':max_pages*5,
         'primary_pages':primary_pages,'reconciliation_pages':reverse_pages,
         'expected_pages':math.ceil(total/transport_size) if total and transport_size else 0,
         'expected_total':len(expected) if expected_codes is not None else total,
@@ -171,6 +197,8 @@ def _collect_sector_pages(store, trade_date, page_size, max_pages, pause_seconds
         'catalogue_sha256':hashlib.sha256(json.dumps(membership,sort_keys=True).encode()).hexdigest() if expected_codes is not None else None,
         'resume_cursor':None if status=='complete' else (cursors[-1] if cursors else None),
         'cursor_scope':'diagnostic_restart_whole_capture_no_cross_snapshot_page_stitching',
+        'input_received_min':min((r['input_received_at'] for r in staged.values()), default=None),
+        'input_received_max':max((r['input_received_at'] for r in staged.values()), default=None),
     }
 
 
@@ -217,7 +245,8 @@ def _retained_relay_industry(con, trade_date, expected_codes, catalogue_version,
         return dict(status='complete', promoted=True, accepted_retained=True,
             provider='tushare_sector_full', origin_provider='eastmoney', source_api='moneyflow_ind_dc',
             expected_total=len(seen), observed_codes=len(seen), expected_pages=0,
-            primary_pages=0, reconciliation_pages=0, requests=0, errors=[],
+            primary_pages=0, reconciliation_pages=0, requests=0, wire_requests=0,
+            logical_calls=0, errors=[],
             missing_codes=[], unexpected_codes=[], catalogue_version=catalogue_version,
             catalogue_sha256=hashlib.sha256(json.dumps(membership,sort_keys=True).encode()).hexdigest(),
             input_received_min=min(clocks), input_received_max=max(clocks), rows_written=0)
@@ -235,6 +264,8 @@ def _replace_sector_snapshot(store, trade_date, rows, pagination):
     con.execute('BEGIN TRANSACTION')
     try:
         qualified = [dict(row, catalogue_version=pagination['catalogue_version']) for row in rows]
+        if any(not row.get('input_received_at') for row in qualified):
+            raise ValueError('qualified page input receipt time missing before publication')
         result = store.store('sector_flow', None, qualified,
             {'source':'eastmoney_sector_full','status':'live'}, trade_date=trade_date, commit=False)
         if result['rows_written'] != pagination['expected_total']:
@@ -249,6 +280,7 @@ def _replace_sector_snapshot(store, trade_date, rows, pagination):
         con.rollback()
         raise
     pagination['promoted'] = True
+    pagination['published_at'] = datetime.now().isoformat()
     emit_product_counts('multi_source_sector_flow.eastmoney', rows_parsed=len(rows),
                         rows_written=result['rows_written'])
     return True
@@ -424,12 +456,15 @@ def collect_full_sector_flow(
     pause_seconds: float = 0.35,
     expected_codes: list[str] | None = None,
     catalogue_version: str | None = None,
+    max_wire_requests: int = 40,
 ) -> dict:
     run_id = f"em_sector_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     page_size = max(50, min(int(page_size), 5000))
     max_pages = int(max_pages)
     if not 1 <= max_pages <= 32:
         raise ValueError('sector capture requires one to 32 pages per sweep')
+    if type(max_wire_requests) is not int or not 1 <= max_wire_requests <= 1000:
+        raise ValueError('wire request budget must be one to 1000 attempts')
     # Refresh only the taxonomies produced by this collector.  Same-day
     # TuShare DC industry rows are an independent normalized source and must
     # survive an Eastmoney refresh.
@@ -532,7 +567,7 @@ def collect_full_sector_flow(
             if pagination is None:
                 staged_rows, pagination = _collect_sector_pages(
                     store, trade_date, page_size, max_pages, pause_seconds,
-                    expected_codes, catalogue_version)
+                    expected_codes, catalogue_version, max_wire_requests=max_wire_requests)
             em_total = pagination['expected_total']
             expected_taxonomies['em_industry'] = em_total
             expected_pages = pagination['expected_pages']
@@ -740,6 +775,7 @@ def main() -> int:
     parser.add_argument("--page-size", type=int, default=500)
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--pause-seconds", type=float, default=0.35)
+    parser.add_argument("--max-wire-requests", type=int, default=40)
     parser.add_argument('--catalogue', type=Path, help='Frozen JSON: trade_date, taxonomy=em_industry, version, codes; absent means observations only')
     parser.add_argument("--out", default="reports/intraday_sector_flow_latest.md")
     parser.add_argument(
@@ -760,6 +796,7 @@ def main() -> int:
         else collect_full_sector_flow(
             args.db, args.date, page_size=args.page_size,
             max_pages=args.max_pages, pause_seconds=args.pause_seconds,
+            max_wire_requests=args.max_wire_requests,
             expected_codes=catalogue.get('codes'), catalogue_version=catalogue.get('version'),
         )
     )
