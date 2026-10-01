@@ -68,7 +68,8 @@ _VALUATION_NATIVE_FIELDS = {
     'balancesheet': {'equity': 'total_hldr_eqy_exc_min_int', 'other_equity': 'oth_eqt_tools'},
 }
 _FINANCIAL_LABELS = {
-    'equity': ('归属于母公司所有者权益合计', '归属于母公司股东权益合计', 'parent equity'),
+    'equity': ('归属于母公司所有者权益合计', '归属于母公司股东权益合计',
+        '归属于母公司所有者权益（或股东权益）合计', 'parent equity'),
     'other_equity': ('其他权益工具', 'other equity'),
     'parent_profit': ('归属于母公司所有者的净利润', '归属于母公司股东的净利润', 'parent profit'),
     'ordinary_profit': ('归属于公司普通股股东的净利润', '归属于母公司普通股股东的净利润',
@@ -169,6 +170,219 @@ def _document_pages_locked(raw, digest, field, document_format):
     return '\n'.join(_VALUATION_PAGE_CACHE[digest, p] for p in range(span[0], span[1]+1))
 
 
+def _pdf_financial_column_amount(raw, digest, field):
+    """Locate a sparse financial cell from original PDF glyph coordinates.
+
+    Declared blank cells and flattened text cannot establish the column. This
+    narrowly supports right-aligned amounts beside physically verified dated
+    headers; ambiguous geometry remains unqualified.
+    """
+    from pypdf import PdfReader, filters
+    from pypdf._font import Font
+    from pypdf._text_extraction import mult
+    location = field['location']
+    proof = location.get('pdf_column_layout', {})
+    span = field.get('page_range', [field.get('page'), field.get('page')])
+    header_page, row_page = proof.get('header_page'), proof.get('row_page')
+    if (proof.get('schema') != 'physical_financial_columns_v1' or proof.get('alignment') != 'right'
+            or any(isinstance(p,bool) or not isinstance(p,int) or not span[0] <= p <= span[1]
+                   for p in (header_page,row_page)) or row_page < header_page
+            or (field.get('value_physical_page') is not None and field['value_physical_page'] != row_page)):
+        raise ValueError('explicit bounded PDF financial column geometry required')
+    with _VALUATION_PDF_LOCK:
+        limit = filters.ZLIB_MAX_OUTPUT_LENGTH
+        filters.ZLIB_MAX_OUTPUT_LENGTH = min(limit or _PDF_MAX_PAGE_BYTES, _PDF_MAX_PAGE_BYTES)
+        try:
+            reader = PdfReader(io.BytesIO(raw),strict=True)
+            if reader.is_encrypted or len(reader.pages)>800 or span[1]>len(reader.pages):
+                raise ValueError('valuation PDF page scope unavailable')
+            page_rows = {}
+            for number in {header_page,row_page}:
+                page = reader.pages[number-1]
+                content = page.get_contents()
+                if content is not None and len(content.get_data())>_PDF_MAX_PAGE_BYTES:
+                    raise ValueError('valuation page content exceeds limit')
+                segments, fonts, unsupported_operators = [], {}, []
+                font_resources=page.get('/Resources',{}).get('/Font',{})
+                text_state={'font':None,'size':None,'positioned':False}
+                graphics_stack=[]
+                def original_run(operands,cm,tm):
+                    if (not text_state['positioned'] or len(operands)!=1
+                            or text_state['font'] is None or text_state['size'] is None):
+                        raise ValueError('original financial text run position unavailable')
+                    font=text_state['font']
+                    operand=operands[0]
+                    if isinstance(operand,bytes):
+                        if isinstance(font.encoding,str):
+                            glyphs=operand.decode(font.encoding,errors='strict')
+                        else:
+                            glyphs=''.join(font.encoding[code] for code in operand)
+                    elif isinstance(operand,str):
+                        glyphs=operand
+                    else:
+                        raise ValueError('original financial glyph encoding unavailable')
+                    matrix=mult(tm,cm)
+                    if (len(segments)>=100000 or not font.interpretable
+                            or not all(math.isfinite(float(n)) for n in matrix)
+                            or matrix[0]<=0 or abs(matrix[1])>1e-6 or abs(matrix[2])>1e-6):
+                        raise ValueError('financial glyph rotation or geometry ambiguous')
+                    x,positions=float(matrix[4]),[]
+                    for glyph in glyphs:
+                        char=font.character_map.get(glyph,glyph)
+                        if not isinstance(char,str) or len(char)!=1 or char in '\r\n':
+                            raise ValueError('explicit original financial glyph mapping required')
+                        # Advance all original glyphs, including literal leading
+                        # and trailing spaces. Extractor-generated spaces are not
+                        # PDF operands and cannot shift a cell into another column.
+                        width=font.character_widths.get(glyph,font.character_widths['default'])
+                        end=x+float(width)*float(text_state['size'])*float(matrix[0])/1000
+                        if not math.isfinite(end) or end<x:
+                            raise ValueError('invalid financial glyph width')
+                        if not char.isspace():
+                            positions.append((_compact_text(char),x,end))
+                        x=end
+                    if positions:
+                        segments.append((float(matrix[5]),float(matrix[4]),positions))
+                    # Consecutive text-show operators without a new original
+                    # text position need cursor advancement, which is unsupported.
+                    text_state['positioned']=False
+                def operand_before(operator, operands, cm, tm):
+                    # The width model below supports only default spacing.
+                    # Check nested Forms too; pypdf may catch visitor exceptions
+                    # there, so reject after extraction rather than in a visitor.
+                    values = None
+                    defaults = None
+                    if operator in {b'Tc',b'Tw',b'Tz',b'Ts'}:
+                        values,defaults=operands,[100 if operator==b'Tz' else 0]
+                    elif operator==b'Tr':
+                        if (len(operands)!=1 or float(operands[0]) not in {0,1,2}):
+                            unsupported_operators.append(operator)
+                    elif operator in {b'"',b"'",b'Do'}:
+                        # Composite text-show and Form-resource inheritance are
+                        # deliberately unsupported by this bounded glyph reader.
+                        unsupported_operators.append(operator)
+                    elif operator==b'TJ':
+                        if len(operands)!=1 or not isinstance(operands[0],list):
+                            unsupported_operators.append(operator)
+                            return
+                        values=[value for value in operands[0] if not isinstance(value,(str,bytes))]
+                        defaults=[0]*len(values)
+                    if values is not None:
+                        try:
+                            valid=(len(values)==len(defaults) and all(math.isfinite(float(value))
+                                   and float(value)==default for value,default in zip(values,defaults)))
+                        except (TypeError,ValueError,OverflowError):
+                            valid=False
+                        if not valid:
+                            unsupported_operators.append(operator)
+                    try:
+                        if operator==b'q':
+                            graphics_stack.append((text_state['font'],text_state['size']))
+                        elif operator==b'Q':
+                            text_state['font'],text_state['size']=graphics_stack.pop()
+                        elif operator==b'Tf':
+                            if len(operands)!=2 or operands[0] not in font_resources:
+                                raise ValueError('original financial font resource unavailable')
+                            key=operands[0]
+                            if key not in fonts:
+                                fonts[key]=Font.from_font_resource(font_resources[key])
+                            size=float(operands[1])
+                            if not math.isfinite(size) or size<=0:
+                                raise ValueError('invalid original financial font size')
+                            text_state.update(font=fonts[key],size=size)
+                        elif operator==b'gs':
+                            state=page.get('/Resources',{}).get('/ExtGState',{}).get(operands[0],{})
+                            if '/Font' in state:
+                                raise ValueError('graphics-state financial font unsupported')
+                        elif operator in {b'BT',b'Tm',b'Td',b'TD',b'T*'}:
+                            text_state['positioned']=True
+                        elif operator==b'ET':
+                            text_state['positioned']=False
+                        elif operator==b'Tj':
+                            original_run(operands,cm,tm)
+                        elif operator==b'TJ' and not unsupported_operators:
+                            # Only zero adjustments are supported. Joining the
+                            # original strings preserves their actual glyph spaces.
+                            parts=[value for value in operands[0] if isinstance(value,(str,bytes))]
+                            if parts and all(isinstance(part,type(parts[0])) for part in parts):
+                                original_run([parts[0][:0].join(parts)],cm,tm)
+                            elif parts:
+                                raise ValueError('mixed original financial glyph encoding unsupported')
+                    except (KeyError,IndexError,TypeError,ValueError,OverflowError,UnicodeError):
+                        unsupported_operators.append(operator)
+                extracted=page.extract_text(visitor_operand_before=operand_before)
+                if unsupported_operators:
+                    raise ValueError('financial glyph text spacing or adjustment unsupported')
+                if len(extracted)>_PDF_MAX_PAGE_TEXT:
+                    raise ValueError('valuation page text exceeds limit')
+                rows=[]
+                for y,x,positions in sorted(segments,key=lambda item:(-item[0],item[1])):
+                    row=next((r for r in rows if abs(r[0]-y)<=1),None)
+                    if row is None:
+                        row=[y,[]]
+                        rows.append(row)
+                    row[1].append((x,positions))
+                page_rows[number]=[(y,[p for _,parts in sorted(pieces) for p in parts]) for y,pieces in rows]
+        finally:
+            filters.ZLIB_MAX_OUTPUT_LENGTH=limit
+    headers=[r for r in page_rows[header_page]
+             if ''.join(c for c,_,_ in r[1])==_compact_text(location['header_excerpt'])]
+    rows=[r for r in page_rows[row_page]
+          if ''.join(c for c,_,_ in r[1])==_compact_text(location['row_excerpt'])]
+    header_text=_document_pages(raw,digest,{'page':header_page},'pdf')
+    if (len(headers)!=1 or len(rows)!=1
+            or any(_compact_text(location[k]) not in _compact_text(header_text)
+                   for k in ('basis_label','unit_header'))
+            or (header_page==row_page and rows[0][0]>=headers[0][0])):
+        raise ValueError('financial physical header and row identity ambiguous')
+    chars=headers[0][1]
+    text=''.join(c for c,_,_ in chars)
+    edges=[]
+    for column in location['column_headers']:
+        token=_compact_text(column)
+        start=text.find(token)
+        if start<0 or text.count(token)!=1:
+            raise ValueError('financial physical date header ambiguous')
+        edges.append(chars[start+len(token)-1][2])
+    gaps=[b-a for a,b in zip(edges,edges[1:])]
+    if not gaps or min(gaps)<=0:
+        raise ValueError('financial physical column order ambiguous')
+    # Map each amount using its actual rendered right edge. A wide tolerance
+    # cannot turn a prior-period zero into a current-period zero.
+    row_chars=[]
+    for char,x,end in rows[0][1]:
+        if row_chars and x-row_chars[-1][2]>2.5:
+            row_chars.append((' ',row_chars[-1][2],x))
+        row_chars.append((char,x,end))
+    text=''.join(c for c,_,_ in row_chars)
+    label_pattern=r'\s*'.join(re.escape(ch) for ch in _compact_text(location['label']))
+    label_match=re.search(label_pattern,text)
+    if label_match is None:
+        raise ValueError('financial physical label unavailable')
+    start=label_match.end()
+    note=location.get('note_column')
+    if note is not None:
+        note_pattern=r'^\s*'+r'\s*'.join(re.escape(ch) for ch in _compact_text(note['cell_excerpt']))+r'(?=\s|$)'
+        note_match=re.match(note_pattern,text[start:])
+        if note_match is None:
+            raise ValueError('financial physical note cell unavailable')
+        start+=note_match.end()
+    amounts={}
+    for match in re.finditer(r'\(?-?\d[\d,]*(?:\.\d+)?\)?',text[start:]):
+        end_index=start+match.end()-1
+        edge=row_chars[end_index][2]
+        index=min(range(len(edges)),key=lambda n:abs(edges[n]-edge))
+        if abs(edges[index]-edge)>min(gaps)/4 or index in amounts:
+            raise ValueError('financial physical amount column ambiguous')
+        values=_page_amounts(match.group())
+        if len(values)!=1:
+            raise ValueError('financial physical amount invalid')
+        amounts[index]=values[0]
+    if location['column_index'] not in amounts:
+        raise ValueError('selected financial physical column is blank')
+    return amounts[location['column_index']]
+
+
 def _validate_page_value(raw, digest, field, document_format, *, subtraction=False):
     text = _document_pages(raw, digest, field, document_format)
     if not str(field.get('excerpt', '')).strip():
@@ -195,7 +409,27 @@ def _validate_page_value(raw, digest, field, document_format, *, subtraction=Fal
         for anchor in ('basis_label', 'unit_header', 'period_header'):
             if not str(location.get(anchor, '')).strip() or _compact_text(location[anchor]) not in compact:
                 raise ValueError('financial basis, unit or period anchor absent from cited pages')
-        row_text = row_text.split(label, 1)[1] if label in row_text else row_text
+        # Match the actual label across PDF line breaks; never substitute a
+        # canonical label or interpret a note number as a financial column.
+        label_pattern = r'\s*'.join(re.escape(ch) for ch in label if not ch.isspace())
+        label_match = re.search(label_pattern, row_text)
+        if label_match is None:
+            raise ValueError('actual financial row label binding missing')
+        row_text = row_text[label_match.end():]
+        note = location.get('note_column')
+        if note is not None:
+            if not isinstance(note, dict):
+                raise ValueError('explicit financial note column binding required')
+            note_header, cell = str(note.get('header', '')).strip(), str(note.get('cell_excerpt', '')).strip()
+            note_position = _compact_text(header_row).find(_compact_text(note_header))
+            if (note_header != '附注' or not cell or not re.search(r'\d', cell)
+                    or not 0 <= note_position < positions[0]):
+                raise ValueError('financial note header or exact cell binding mismatch')
+            note_pattern = r'^\s*' + r'\s*'.join(re.escape(ch) for ch in cell if not ch.isspace()) + r'(?=\s|$)'
+            note_match = re.match(note_pattern, row_text)
+            if note_match is None:
+                raise ValueError('financial note cell absent after actual row label')
+            row_text = row_text[note_match.end():]
     value = field.get('value')
     if value is None:
         # An empty cell remains unknown. Separate absence reviews own any zero.
@@ -206,7 +440,12 @@ def _validate_page_value(raw, digest, field, document_format, *, subtraction=Fal
             raise InvalidOperation
         amounts = _page_amounts(row_text)
         if location is not None:
-            amounts = [amounts[location['column_index']]]
+            if len(amounts) != len(headers):
+                if document_format != 'pdf' or not location.get('pdf_column_layout'):
+                    raise ValueError('financial numeric columns incomplete or ambiguous')
+                amounts = [_pdf_financial_column_amount(raw,digest,field)]
+            else:
+                amounts = [amounts[location['column_index']]]
     except (InvalidOperation, ValueError, TypeError, IndexError) as exc:
         raise ValueError('valuation extraction amount invalid') from exc
     if not any(abs(amount-wanted) < Decimal('0.000001') or
@@ -505,12 +744,8 @@ def derive_valuation(ts_code, trade_date, inputs, *, observed_at):
     return result
 
 
-def _validate_valuation_document(payload):
-    """Hash-bound official file plus explicit extraction/review provenance.
-
-    This checks integrity and scope, not automatic proof of financial facts.
-    The named reviewer remains responsible for reading the cited pages.
-    """
+def _read_valuation_document_original(payload):
+    """Recheck immutable original bytes, independently of an extraction."""
     from urllib.parse import urlparse
     document = payload['document']
     url = urlparse(document['url'])
@@ -528,6 +763,16 @@ def _validate_valuation_document(payload):
         raise ValueError('official valuation document changed')
     if document.get('format') == 'pdf' and not raw.startswith(b'%PDF-'):
         raise ValueError('official valuation PDF format mismatch')
+    if not payload.get('ts_code') or not payload.get('as_of'):
+        raise ValueError('official document dated identity required')
+    return raw, catalogue, official_catalogue
+
+
+def _validate_valuation_document(payload):
+    """Check official original and every declared extraction, not review truth."""
+    from urllib.parse import urlparse
+    raw, catalogue, official_catalogue = _read_valuation_document_original(payload)
+    document = payload['document']
     for field in payload.get('fields', {}).values():
         _validate_page_value(raw, document['sha256'], field, document.get('format'))
     # A component arithmetic reconciliation also needs the actual cited values;
@@ -535,8 +780,6 @@ def _validate_valuation_document(payload):
     for field in payload.get('other_equity_absence_review', {}).get('equity_components', []):
         _validate_page_value(raw, document['sha256'], field, document.get('format'),
                              subtraction=field.get('name') == 'treasury_stock')
-    if not payload.get('ts_code') or not payload.get('as_of'):
-        raise ValueError('official document dated identity required')
     related = payload.get('related_original_document_receipts', [])
     if not isinstance(related, list) or (payload.get('coverage') ==
             'all_price_and_share_affecting_actions' and not related):
@@ -602,6 +845,136 @@ def _validate_valuation_document(payload):
         if len(identities) != total or len(set(identities)) != total:
             raise ValueError('disclosure catalogue incomplete or duplicate pages')
     return payload
+
+
+def _verified_financial_extraction_replacements(proofs, documents, code, day):
+    """Accept a reviewed same-PDF extraction correction, never an issuer revision.
+
+    Both wrappers must already be hash-bound observations in this review. The
+    superseded wrapper still supplies its original identity and arrival clock;
+    only its erroneous numeric extraction is replaced by a strictly checked one.
+    """
+    if not isinstance(proofs, list):
+        raise ValueError('financial extraction replacements must be an explicit list')
+    replacements = {}
+    financial = set(_FINANCIAL_LABELS)
+    for proof in proofs:
+        if not isinstance(proof, dict) or proof.get('schema') != 'same_document_extraction_replacement_v1':
+            raise ValueError('explicit same-document extraction replacement schema required')
+        old_hash, new_hash = proof.get('superseded_receipt_sha256'), proof.get('replacement_receipt_sha256')
+        if (any(not isinstance(h, str) or not re.fullmatch('[0-9a-f]{64}', h) for h in (old_hash,new_hash))
+                or old_hash == new_hash or old_hash in replacements
+                or old_hash not in documents or new_hash not in documents or not str(proof.get('reason','')).strip()):
+            raise ValueError('financial extraction replacement hash bindings missing or ambiguous')
+        old, new = documents[old_hash][0], documents[new_hash][0]
+        for source in (old,new):
+            _read_valuation_document_original(source)
+            statement, fields = source.get('statement', {}), source.get('fields', {})
+            if (source.get('schema') != 'official_valuation_document_v1' or source.get('kind') is not None
+                    or source.get('ts_code') != code or proof.get('ts_code') != code
+                    or source['document'].get('format') != 'pdf'
+                    or source['document'].get('sha256') != proof.get('document_sha256')
+                    or statement.get('basis') != 'consolidated' or proof.get('basis') != 'consolidated'
+                    or _iso(statement.get('period','')) != _iso(proof.get('period',''))
+                    or _iso(statement.get('announcement_date','')) != _iso(proof.get('announcement_date',''))
+                    or not fields or set(fields) - financial
+                    or not _iso(statement.get('period','')) <= _iso(statement.get('announcement_date','')) <= day):
+                raise ValueError('financial extraction replacement original identity or statement mismatch')
+        if (old['statement'].get('period_start') != new['statement'].get('period_start')
+                or not set(old['fields']).issubset(new['fields'])):
+            raise ValueError('replacement cannot omit a superseded financial field or period')
+        _validate_valuation_document(new)
+        for name in new['fields']:
+            _official_field_binding(new, name, {'unit':'yuan'})
+        replacements[old_hash] = new_hash
+    if set(replacements).intersection(replacements.values()):
+        raise ValueError('financial extraction replacement chains or cycles forbidden')
+    return replacements
+
+
+def _verified_native_balance_date_conflicts(proofs, documents, code, day):
+    """Bind a relay-only announcement-date conflict to an actual official report.
+
+    This does not change the raw rows or their clocks and is never an income
+    revision exemption. Complete retained rows, not selected equal amounts,
+    must agree except for their explicit announcement/update metadata.
+    """
+    from urllib.parse import urlparse
+    from zoneinfo import ZoneInfo
+    if not isinstance(proofs,list):
+        raise ValueError('native balance date conflicts must be an explicit list')
+    reconciled={}
+    for proof in proofs:
+        if (not isinstance(proof,dict) or proof.get('schema')!='native_balance_disclosure_date_conflict_v1'
+                or proof.get('ts_code')!=code or not str(proof.get('reason','')).strip()):
+            raise ValueError('explicit reviewed native balance date conflict required')
+        hashes=[proof.get(k) for k in ('native_receipt_sha256','official_statement_receipt_sha256',
+                                     'official_catalogue_receipt_sha256')]
+        if any(not isinstance(h,str) or not re.fullmatch('[0-9a-f]{64}',h) or h not in documents for h in hashes):
+            raise ValueError('native disclosure date conflict receipt bindings missing')
+        native,statement,catalogue=[documents[h][0] for h in hashes]
+        rows=native.get('rows',[])
+        indices=[proof.get(k) for k in ('earlier_row_index','later_row_index')]
+        if (native.get('api')!='balancesheet' or native.get('error_type') or indices[0]==indices[1]
+                or any(isinstance(i,bool) or not isinstance(i,int) or not 0<=i<len(rows) for i in indices)):
+            raise ValueError('native disclosure date conflict exact original rows required')
+        earlier,later=[rows[i] for i in indices]
+        official_day=_iso(proof.get('official_announcement_date',''))
+        period=_iso(proof.get('period',''))
+        earlier_day,later_day=[_iso(r.get('f_ann_date') or r.get('ann_date','')) for r in (earlier,later)]
+        metadata={'ann_date','f_ann_date','update_flag'}
+        required={'ts_code','end_date','report_type','total_hldr_eqy_exc_min_int','oth_eqt_tools',*metadata}
+        if (set(earlier)!=set(later) or not required<=set(earlier)
+                or any(earlier[k]!=later[k] for k in set(earlier)-metadata)
+                or any(r.get('ts_code')!=code or _iso(r.get('end_date',''))!=period
+                       or str(r.get('report_type')) not in {'1','4'}
+                       or _iso(r.get('ann_date',''))!=_iso(r.get('f_ann_date','')) for r in (earlier,later))
+                or not period<=earlier_day==official_day<later_day<=day):
+            raise ValueError('native disclosure conflict differs in financial or statement fields')
+        _validate_valuation_document(statement)
+        _validate_valuation_document(catalogue)
+        identity=statement.get('statement',{})
+        if (statement.get('schema')!='official_valuation_document_v1' or statement.get('ts_code')!=code
+                or statement.get('document',{}).get('format')!='pdf' or identity.get('basis')!='consolidated'
+                or _iso(identity.get('period',''))!=period
+                or _iso(identity.get('announcement_date',''))!=official_day
+                or catalogue.get('kind')!='disclosure_inventory' or catalogue.get('ts_code')!=code
+                or catalogue.get('catalogue_complete') is not True or catalogue.get('as_of')!=day
+                or catalogue.get('window_from','9999-12-31')>period
+                or catalogue.get('window_through','')!=day):
+            raise ValueError('official statement and complete disclosure conflict scope required')
+        for name,native_name in (('equity','total_hldr_eqy_exc_min_int'),('other_equity','oth_eqt_tools')):
+            native_value=earlier.get(native_name)
+            if name=='other_equity' and native_value is None:
+                continue  # A raw null supplies no numeric fact or absence zero.
+            actual=_official_field_binding(statement,name,{'unit':'yuan'}).get('value')
+            if (isinstance(native_value,bool) or isinstance(actual,bool) or _num(native_value) is None
+                    or _num(actual) is None or abs(Decimal(str(native_value))-Decimal(str(actual)))>Decimal('0.01')):
+                raise ValueError('native disclosure date conflict amount differs from official statement')
+        manifest=json.loads(Path(catalogue['document']['path']).read_text(encoding='utf-8'))
+        matched=[]
+        official_path=urlparse(statement['document']['url']).path.lstrip('/')
+        for page in manifest['source_pages']:
+            for announcement in json.loads(Path(page['path']).read_text(encoding='utf-8')).get('announcements') or []:
+                stamp=announcement.get('announcementTime')
+                if isinstance(stamp,(int,float)) and not isinstance(stamp,bool) and math.isfinite(stamp):
+                    announced=datetime.fromtimestamp(stamp/1000,timezone.utc).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+                else:
+                    announced=_iso(announcement.get('announcement_date') or stamp or '')
+                title=str(announcement.get('announcementTitle',''))
+                url_path=urlparse(str(announcement.get('adjunctUrl',''))).path.lstrip('/')
+                if announced==official_day and url_path==official_path and '报告' in title and '摘要' not in title:
+                    matched.append(announcement['announcementId'])
+                # Conservative: any correction in the disputed interval, or
+                # another report for the selected financial year, still blocks.
+                correction=any(token in title for token in ('更正','修订','差错','重述','补充'))
+                report=str(date.fromisoformat(period).year) in title and '报告' in title
+                if official_day<announced<=later_day and (correction or report):
+                    raise ValueError('official catalogue contains possible disputed-date revision')
+        if len(matched)!=1 or (hashes[0],indices[1]) in reconciled:
+            raise ValueError('official native-date report identity absent or ambiguous')
+        reconciled[hashes[0],indices[1]]=official_day
+    return reconciled
 
 
 class TushareHistoryCollector:
@@ -778,7 +1151,8 @@ class TushareHistoryCollector:
                 'completion': self.valuation_completion_report(trade_date, results),
                 'certifies_daily_basic': False}
 
-    def _retained_financial_sources(self, code, day, observed_at, kind):
+    def _retained_financial_sources(self, code, day, observed_at, kind, *, extraction_replacements=None,
+                                    native_date_conflicts=None):
         """Only already-arrived, applicable consolidated facts may revoke a review."""
         from zoneinfo import ZoneInfo
         cutoff = datetime.fromisoformat(observed_at)
@@ -795,14 +1169,17 @@ class TushareHistoryCollector:
                 continue
             payload = json.loads(raw)
             if data_type == native:
-                for row in payload.get('rows', []):
+                for row_index,row in enumerate(payload.get('rows', [])):
                     if row.get('ts_code') != code or str(row.get('report_type')) not in {'1', '4'}:
                         continue  # A parent-company or unknown-basis row is not a consolidated revision.
                     announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
                     period = _iso(row['end_date'])
+                    native_announcement=announcement
+                    if kind=='balance':
+                        announcement=(native_date_conflicts or {}).get((digest,row_index),announcement)
                     if period <= announcement <= day:
                         yield dict(digest=digest, period=period, announcement=announcement,
-                                   document_sha=None, arrival=str(arrival))
+                                   native_announcement=native_announcement,document_sha=None, arrival=str(arrival))
             elif (payload.get('schema') == 'official_valuation_document_v1'
                     and payload.get('ts_code') == code and fields.intersection(payload.get('fields', {}))):
                 statement = payload.get('statement', {})
@@ -811,16 +1188,21 @@ class TushareHistoryCollector:
                 announcement = _iso(statement['announcement_date'])
                 period = _iso(statement['period'])
                 if period <= announcement <= day:
-                    _validate_valuation_document(payload)
+                    if digest in (extraction_replacements or {}):
+                        _read_valuation_document_original(payload)
+                    else:
+                        _validate_valuation_document(payload)
                     yield dict(digest=digest, period=period, announcement=announcement,
                                document_sha=payload['document']['sha256'], arrival=str(arrival))
 
-    def _assert_revision_inventory(self, code, day, observed_at, kind, inventory, documents, oldest, selected=()):
+    def _assert_revision_inventory(self, code, day, observed_at, kind, inventory, documents, oldest, selected=(),
+                                   *, extraction_replacements=None, native_date_conflicts=None):
         receipts = inventory.get('statement_receipts', [])
         # Re-extraction of one immutable PDF is not another issuer revision.
         original_files = {documents[h][0].get('document', {}).get('sha256')
             for h in receipts if h in documents}
-        sources = list(self._retained_financial_sources(code, day, observed_at, kind))
+        sources = list(self._retained_financial_sources(code, day, observed_at, kind,
+                      extraction_replacements=extraction_replacements,native_date_conflicts=native_date_conflicts))
         for source in sources:
             if source['period'] >= oldest and source['digest'] not in receipts:
                 if source['document_sha'] and source['document_sha'] in original_files:
@@ -900,22 +1282,43 @@ class TushareHistoryCollector:
         code = review['ts_code']
         if code != stock_code_to_ts_code(code):
             raise ValueError('canonical valuation identity required')
-        documents = {}
+        documents,receipt_types = {},{}
         for digest in review['source_receipts']:
             records = self.store.conn.execute(
-                'SELECT payload_json,observed_at FROM multi_source_observation WHERE payload_hash=?',
+                'SELECT payload_json,observed_at,data_type FROM multi_source_observation WHERE payload_hash=?',
                 [digest]).fetchall()
-            valid = [(raw, arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival)
-                     for raw, arrival in records if hashlib.sha256(raw.encode()).hexdigest() == digest]
-            valid = [(raw, arrival) for raw, arrival in valid if arrival <= reviewed]
+            valid = [(raw, arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival,kind)
+                     for raw, arrival,kind in records if hashlib.sha256(raw.encode()).hexdigest() == digest]
+            valid = [(raw, arrival,kind) for raw, arrival,kind in valid if arrival <= reviewed]
             if not valid:
                 raise ValueError('review source receipt absent, changed or received after review')
-            raw, arrival = min(valid, key=lambda item: item[1])
+            raw, arrival,_ = min(valid, key=lambda item: item[1])
             payload = json.loads(raw)
-            if payload.get('schema') == 'official_valuation_document_v1':
-                _validate_valuation_document(payload)
             documents[digest] = (payload, arrival.isoformat())
+            receipt_types[digest]={kind for _,_,kind in valid}
+        replacements = _verified_financial_extraction_replacements(
+            review.get('financial_extraction_replacements', []), documents, code, day)
+        for digest, (payload, _) in documents.items():
+            if payload.get('schema') == 'official_valuation_document_v1':
+                if digest in replacements:
+                    _read_valuation_document_original(payload)
+                else:
+                    _validate_valuation_document(payload)
+        date_proofs=review.get('native_disclosure_date_conflicts',[])
+        if not isinstance(date_proofs,list) or any('tushare_balancesheet' not in
+                receipt_types.get(proof.get('native_receipt_sha256'),set())
+                for proof in date_proofs if isinstance(proof,dict)):
+            raise ValueError('retained native balancesheet observation required for date conflict')
+        date_conflicts=_verified_native_balance_date_conflicts(date_proofs,documents,code,day)
         inventory = review['financial_inventory']
+        used_receipts = set(inventory.get('statement_receipts', []))
+        used_receipts.update(item.get('receipt_sha256') for item in review.get('inputs', {}).values())
+        for proof in review.get('earnings_reviews', {}).values():
+            used_receipts.update(proof.get('revision_inventory', {}).get('statement_receipts', []))
+            for period in proof.get('periods', []):
+                used_receipts.update(item.get('receipt_sha256') for item in period.get('inputs', {}).values())
+        if used_receipts.intersection(replacements):
+            raise ValueError('superseded extraction cannot supply a reviewed financial input')
         scopes = {'all_published_consolidated_revisions'}
         if review['schema'] == 'reviewed_valuation_inputs_v2':
             scopes.add('latest_applicable_consolidated_statement_and_corrections')
@@ -1029,7 +1432,8 @@ class TushareHistoryCollector:
         oldest = (_iso(inventory['selected_period']) if inventory.get('selected_period')
                   else min(identity[1] for identity in statement_identities.values()))
         self._assert_revision_inventory(code, day, observed_at, 'balance', inventory, documents, oldest,
-                                        selected=[identity[1:] for identity in statement_identities.values()])
+                                        selected=[identity[1:] for identity in statement_identities.values()],
+                                        extraction_replacements=replacements,native_date_conflicts=date_conflicts)
         # A same-day zero-volume vendor quote is not proof of a same-day
         # traded close. Calling it official_close cannot bypass the suspension
         # reference/corporate-action policy. Native same-day market values
@@ -1067,7 +1471,7 @@ class TushareHistoryCollector:
                 raise ValueError('suspension conflicts with retained trading')
         result = derive_valuation(code, day, inputs, observed_at=observed_at)
         earnings = self._reviewed_earnings(review.get('earnings_reviews', {}), documents, code, day,
-                                          observed_at=observed_at)
+                                          observed_at=observed_at, extraction_replacements=replacements)
         earnings_result = derive_earnings_valuation(result['values'].get('total_mv'), earnings,
                                                   ts_code=code, trade_date=day)
         result['values'].update(earnings_result['values'])
@@ -1086,6 +1490,8 @@ class TushareHistoryCollector:
         result['as_known_at'] = observed_at
         result['historical_recalculation'] = cutoff.astimezone(zone).date().isoformat() > day
         result['financial_inventory'] = inventory
+        result['financial_extraction_replacements'] = review.get('financial_extraction_replacements', [])
+        result['native_disclosure_date_conflicts'] = date_proofs
         result['source_receipts'] = sorted(documents)
         # Revision and action evidence is also an input. Its actual arrival
         # participates even when it does not supply a numeric field.
@@ -1097,7 +1503,7 @@ class TushareHistoryCollector:
         result['qualification'] = 'reviewed_derived_valuation' if result['valuation_eligible'] else 'incomplete'
         return result
 
-    def _reviewed_earnings(self, proofs, documents, code, day, *, observed_at=None):
+    def _reviewed_earnings(self, proofs, documents, code, day, *, observed_at=None, extraction_replacements=None):
         """Bind profit, allocation and every period's corrections independently.
 
         Missing PE evidence does not discard qualified PB. Malformed evidence is
@@ -1192,7 +1598,8 @@ class TushareHistoryCollector:
                                         period_end=component['period_end'], announcement_date=identity[2],
                                         statement_receipts=hashes))
                 self._assert_revision_inventory(code, day, known_at, 'income', inventory, documents, oldest,
-                    selected=[(p['period_end'], p['announcement_date']) for p in periods])
+                    selected=[(p['period_end'], p['announcement_date']) for p in periods],
+                    extraction_replacements=extraction_replacements)
                 latest = self._latest_income_period(catalogues, day, mode)
                 selected = periods[0]['period_end'] if mode == 'static' else proof.get('selected_period')
                 if selected != latest:

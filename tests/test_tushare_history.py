@@ -269,6 +269,374 @@ def test_financial_row_columns_parentheses_and_source_units_are_bound(tmp_path):
         _validate_valuation_document(wrong)
 
 
+def test_exact_financial_notes_crossline_label_and_blank_current_column(tmp_path):
+    import hashlib
+    from copy import deepcopy
+    from trade_system.tushare_history import _validate_valuation_document, _official_field_binding
+    path = tmp_path/'financial-notes.html'
+    header = '项目 附注 2026 年 6 月 30 日 2025 年 12 月 31 日'
+    label = '归属于母公司所有者权益（或股东权益）合计'
+    actual = '归属于母公司所有者权益\n（或股东权益）合计 2,345,500,394.20 2,727,774,137.43'
+    notes = ['七、54','注释 53','八-七、53']
+    text = '合并资产负债表 单位：元\n'+header+'\n'+actual+'\n'
+    text += '\n'.join('其他权益工具 '+note+' 3,810,000,000.00 3,810,000,000.00' for note in notes)
+    text += '\nother equity blank-current 0\n'
+    path.write_text(text,encoding='utf-8')
+    location = dict(label=label,row_excerpt=actual,header_excerpt=header,
+        column_headers=['2026 年 6 月 30 日','2025 年 12 月 31 日'],column_index=0,
+        column_header='2026 年 6 月 30 日',basis='consolidated',basis_label='合并资产负债表',
+        unit_header='单位：元',period_end='2026-06-30',period_header='2026 年 6 月 30 日')
+    source = dict(ts_code='600683.SH',as_of='2026-09-29',extraction_review={'unit':'yuan'},
+        statement=dict(basis='consolidated',period='20260630'),
+        document=dict(url='https://static.cninfo.com.cn/notes.html',path=str(path),format='html',
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
+        fields={'equity':dict(value=2345500394.20,page=1,excerpt=actual,location=location)})
+    _validate_valuation_document(source)
+    _official_field_binding(source,'equity',{'unit':'yuan'})
+    for note in notes:
+        other = deepcopy(location)
+        other.update(label='其他权益工具',row_excerpt='其他权益工具 '+note+' 3,810,000,000.00 3,810,000,000.00',
+                     note_column={'header':'附注','cell_excerpt':note})
+        noted = deepcopy(source)
+        noted['fields']={'other_equity':dict(value=3810000000,page=1,excerpt=other['row_excerpt'],location=other)}
+        _validate_valuation_document(noted)
+        _official_field_binding(noted,'other_equity',{'unit':'yuan'})
+        missing = deepcopy(noted)
+        missing['fields']['other_equity']['location'].pop('note_column')
+        with pytest.raises(ValueError,match='amount invalid'):
+            _validate_valuation_document(missing)
+        for change in ({'cell_excerpt':note[:-1]}, {'header':'项目'}):
+            wrong = deepcopy(noted)
+            wrong['fields']['other_equity']['location']['note_column'].update(change)
+            with pytest.raises(ValueError,match='note'):
+                _validate_valuation_document(wrong)
+    blank = deepcopy(source)
+    blank['fields']={'other_equity':dict(value=0,page=1,excerpt='actual blank current / prior zero',
+        location=dict(location,label='other equity',row_excerpt='other equity blank-current 0'))}
+    with pytest.raises(ValueError,match='amount invalid'):
+        _validate_valuation_document(blank)
+    blank['fields']['other_equity']['value']=None
+    _validate_valuation_document(blank)  # None remains unknown; separate absence evidence is needed.
+
+
+def test_same_pdf_extraction_replacement_is_hash_bound_and_preserves_revision_gate(tmp_path):
+    import hashlib
+    from copy import deepcopy
+    from datetime import datetime
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    from trade_system.tushare_history import (
+        _json, _validate_valuation_document, _verified_native_balance_date_conflicts,
+    )
+    code, day = '000701.SZ','2026-09-29'
+    path = tmp_path/'original.PDF'
+    writer = PdfWriter()
+    for lines in (['consolidated balance sheet yuan 2026-06-30 2025-12-31',
+                   'parent equity 1000000 900000','other equity 0 0'], ['wrong page 0']):
+        page = writer.add_blank_page(width=600,height=800)
+        font = DictionaryObject({NameObject('/Type'):NameObject('/Font'),
+            NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'):
+            DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
+        stream = DecodedStreamObject()
+        stream.set_data(('BT /F1 12 Tf 15 TL 10 700 Td '+
+            ' T* '.join('('+line+') Tj' for line in lines)+' ET').encode())
+        page[NameObject('/Contents')] = writer._add_object(stream)
+    writer.write(path)
+    def location(label, row):
+        return dict(label=label,row_excerpt=row,column_headers=['2026-06-30','2025-12-31'],
+            column_index=0,column_header='2026-06-30',header_excerpt='2026-06-30 2025-12-31',
+            basis='consolidated',basis_label='consolidated balance sheet',unit_header='yuan',
+            period_end='2026-06-30',period_header='2026-06-30')
+    source = dict(schema='official_valuation_document_v1',ts_code=code,as_of=day,
+        received_at='2026-10-01T08:00:00+08:00',extraction_review={'unit':'yuan'},
+        document=dict(path=str(path),url='https://static.cninfo.com.cn/original.PDF',format='pdf',
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
+        statement=dict(period='20260630',announcement_date='20260820',basis='consolidated'),
+        fields={'equity':dict(value=1000000,page=1,excerpt='actual equity',
+                location=location('parent equity','parent equity 1000000 900000')),
+            'other_equity':dict(value=0,page=1,excerpt='actual instrument amount',
+                location=location('other equity','other equity 0 0'))})
+    _validate_valuation_document(source)
+    with TushareHistoryCollector(tmp_path/'replace.duckdb',client=ScopedFixture()) as c:
+        def retain(payload, arrival='2026-10-01T08:00:00+08:00', kind='valuation_source_document'):
+            encoded = _json(payload)
+            digest = hashlib.sha256(encoded.encode()).hexdigest()
+            stamp = datetime.fromisoformat(arrival).replace(tzinfo=None)
+            c.store.conn.execute('INSERT INTO multi_source_observation '
+                '(data_type,provider,payload_json,payload_hash,observed_at) VALUES (?,\'custom\',?,?,?)',
+                [kind,encoded,digest,stamp])
+            return digest
+        old_page = deepcopy(source)
+        old_page['fields']['equity']['page']=2
+        old_zero = deepcopy(source)
+        old_zero['received_at']='2026-10-01T08:10:00+08:00'
+        old_zero['fields']['equity']['value']=0
+        old_hashes = [retain(old_page),retain(old_zero,old_zero['received_at'])]
+        new_hash = retain(source)
+        market = retain({'api':'daily_basic','rows':[dict(ts_code=code,trade_date='20260929',
+            total_mv=200,circ_mv=100)]},'2026-10-01T08:20:00+08:00',kind='test_source')
+        review = dict(schema='reviewed_valuation_inputs_v1',ts_code=code,trade_date=day,
+            reviewed_by='synthetic extraction reviewer',reviewed_at='2026-10-01T08:30:00+08:00',
+            source_receipts=old_hashes+[new_hash,market],financial_inventory=dict(as_of=day,
+                scope='all_published_consolidated_revisions',document_receipts=[new_hash],
+                statement_receipts=[new_hash],selected_statement_receipt=new_hash,selection_reason='synthetic inventory'),
+            financial_extraction_replacements=[dict(schema='same_document_extraction_replacement_v1',
+                superseded_receipt_sha256=h,replacement_receipt_sha256=new_hash,
+                document_sha256=source['document']['sha256'],ts_code=code,period='20260630',basis='consolidated',
+                announcement_date='20260820',reason='wrong physical page or incorrect zero extraction') for h in old_hashes],
+            inputs={})
+        for field,value,semantic,unit in [('equity',1000000,'parent_equity','yuan'),
+                ('other_equity',0,'other_equity_tools','yuan'),('total_mv',200,'total_market_value','10000_yuan'),
+                ('circ_mv',100,'circulating_market_value','10000_yuan')]:
+            review['inputs'][field] = dict(ts_code=code,value=value,semantic=semantic,unit=unit,
+                source_date='2026-08-20' if field in {'equity','other_equity'} else day,valid_through=day,
+                available_at='2026-09-29T15:00:00+08:00',receipt_sha256=new_hash if unit=='yuan' else market,
+                value_path=['rows',0,field])
+        at='2026-10-01T09:00:00+08:00'
+        result=c._valuation_review(review,day,at)
+        assert result['valuation_eligible'] and result['values']['pb']==2
+        assert result['input_received_at_min']==source['received_at']
+        assert result['input_received_at_max']=='2026-10-01T08:20:00+08:00'
+        assert result['financial_extraction_replacements']==review['financial_extraction_replacements']
+        for change,message in [('no_proof','row'),('missing_old','hash bindings'),
+                               ('wrong_pdf','identity'),('wrong_issuer','identity'),
+                               ('wrong_period','identity'),('wrong_announcement','identity'),
+                               ('old_input','superseded')]:
+            invalid=deepcopy(review)
+            if change=='no_proof':
+                invalid.pop('financial_extraction_replacements')
+            elif change=='missing_old':
+                invalid['source_receipts'].remove(old_hashes[0])
+            elif change=='old_input':
+                invalid['inputs']['equity']['receipt_sha256']=old_hashes[0]
+            else:
+                key={'wrong_pdf':'document_sha256','wrong_issuer':'ts_code','wrong_period':'period',
+                     'wrong_announcement':'announcement_date'}[change]
+                invalid['financial_extraction_replacements'][0][key]={
+                    'wrong_pdf':'0'*64,'wrong_issuer':'000001.SZ','wrong_period':'20260331',
+                    'wrong_announcement':'20260821'}[change]
+            with pytest.raises(ValueError,match=message):
+                c._valuation_review(invalid,day,at)
+        bad_new=deepcopy(source)
+        bad_new['fields']['equity']['value']=0
+        bad_hash=retain(bad_new)
+        invalid=deepcopy(review)
+        invalid['source_receipts'].append(bad_hash)
+        for proof in invalid['financial_extraction_replacements']:
+            proof['replacement_receipt_sha256']=bad_hash
+        with pytest.raises(ValueError,match='absent from cited'):
+            c._valuation_review(invalid,day,at)
+        c.store.conn.execute('DELETE FROM multi_source_observation WHERE payload_hash=?',[bad_hash])
+        # The original old observation hash and immutable PDF are rechecked.
+        for digest in old_hashes+[new_hash]:
+            encoded=c.store.conn.execute('SELECT payload_json FROM multi_source_observation WHERE payload_hash=?',[digest]).fetchone()[0]
+            c.store.conn.execute('UPDATE multi_source_observation SET payload_json=\'{}\' WHERE payload_hash=?',[digest])
+            with pytest.raises(ValueError,match='absent, changed'):
+                c._valuation_review(review,day,at)
+            c.store.conn.execute('UPDATE multi_source_observation SET payload_json=? WHERE payload_hash=?',[encoded,digest])
+        original=path.read_bytes()
+        path.write_bytes(original+b'\nchanged')
+        with pytest.raises(ValueError,match='document changed'):
+            c._valuation_review(review,day,at)
+        path.write_bytes(original)
+        native_rows=[dict(ts_code=code,end_date='20260630',ann_date='20260820',f_ann_date='20260820',
+            report_type='1',update_flag='1',total_hldr_eqy_exc_min_int=1000000,oth_eqt_tools=0)]
+        native_rows.append(dict(native_rows[0],ann_date='20260821',f_ann_date='20260821',update_flag='0'))
+        native=retain({'api':'balancesheet','rows':native_rows},'2026-10-01T08:23:00+08:00',kind='tushare_balancesheet')
+        page_path=tmp_path/'date-catalogue-page.json'
+        page_body=dict(totalAnnouncement=1,hasMore=False,announcements=[dict(secCode='000701',orgId='fixture-org',
+            announcementId='fixture-report',announcementTitle='2026年半年度报告',
+            announcement_date='2026-08-20',adjunctUrl='original.PDF')])
+        page_path.write_text(_json(page_body),encoding='utf-8')
+        manifest_path=tmp_path/'date-catalogue.json'
+        manifest=dict(schema='official_disclosure_page_set_v1',ts_code=code,source_pages=[dict(
+            path=str(page_path),sha256=hashlib.sha256(page_path.read_bytes()).hexdigest(),http_status=200,
+            params=dict(stock='000701,fixture-org',tabName='fulltext',pageNum='1',seDate='2026-06-30~'+day))])
+        manifest_path.write_text(_json(manifest),encoding='utf-8')
+        catalogue=dict(schema='official_valuation_document_v1',ts_code=code,as_of=day,
+            received_at='2026-10-01T08:22:00+08:00',kind='disclosure_inventory',window_from='2026-06-30',
+            window_through=day,catalogue_complete=True,document=dict(format='json',path=str(manifest_path),
+            url='https://www.cninfo.com.cn/new/hisAnnouncement/query',sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest()))
+        catalogue_hash=retain(catalogue,catalogue['received_at'])
+        dated=deepcopy(review)
+        dated['source_receipts'] += [native,catalogue_hash]
+        dated['financial_inventory']['statement_receipts'].append(native)
+        dated['financial_inventory']['document_receipts']=[catalogue_hash]
+        with pytest.raises(ValueError,match='superseded'):
+            c._valuation_review(dated,day,at)
+        proof=dict(schema='native_balance_disclosure_date_conflict_v1',ts_code=code,period='20260630',
+            official_announcement_date='2026-08-20',native_receipt_sha256=native,earlier_row_index=0,later_row_index=1,
+            official_statement_receipt_sha256=new_hash,official_catalogue_receipt_sha256=catalogue_hash,
+            reason='synthetic complete official catalogue and equal full raw rows except date/update metadata')
+        dated['native_disclosure_date_conflicts']=[proof]
+        qualified=c._valuation_review(dated,day,at)
+        assert qualified['valuation_eligible'] and qualified['values']['pb']==2
+        assert qualified['input_received_at_max']=='2026-10-01T08:23:00+08:00'
+        assert c.store.conn.execute('SELECT payload_json FROM multi_source_observation WHERE payload_hash=?',
+            [native]).fetchone()[0]==_json({'api':'balancesheet','rows':native_rows})
+        # The date proof itself must bind every nonnull raw financial field,
+        # including one not selected as an input by the valuation bundle.
+        date_documents={native:({'api':'balancesheet','rows':native_rows},'2026-10-01T08:23:00+08:00'),
+                        new_hash:(source,source['received_at']),
+                        catalogue_hash:(catalogue,catalogue['received_at'])}
+        assert _verified_native_balance_date_conflicts([proof],date_documents,code,day)
+        for change,message in [('prior_column','period column'),('wrong_unit','unit mismatch')]:
+            wrong_statement=deepcopy(source)
+            other=wrong_statement['fields']['other_equity']
+            if change=='prior_column':
+                other['location'].update(column_index=1,column_header='2025-12-31')
+            else:
+                other['unit']='10000_yuan'
+            # Both zero columns and the raw numeric equality remain valid;
+            # only strict current-period/unit binding can reject this proof.
+            _validate_valuation_document(wrong_statement)
+            wrong_hash=hashlib.sha256(_json(wrong_statement).encode()).hexdigest()
+            wrong_proof=dict(proof,official_statement_receipt_sha256=wrong_hash)
+            wrong_documents=dict(date_documents,**{wrong_hash:(wrong_statement,source['received_at'])})
+            with pytest.raises(ValueError,match=message):
+                _verified_native_balance_date_conflicts([wrong_proof],wrong_documents,code,day)
+        for change,message in [('different_field','financial or statement'),('same_wrong_amount','amount differs'),
+                               ('wrong_native_kind','balancesheet observation'),('wrong_date','financial or statement')]:
+            rows=deepcopy(native_rows)
+            kind='tushare_balancesheet'
+            if change=='different_field':
+                rows[1]['oth_eqt_tools']=1
+            elif change=='same_wrong_amount':
+                for row in rows:
+                    row['total_hldr_eqy_exc_min_int']=2000000
+            elif change=='wrong_native_kind':
+                kind='test_source'
+                rows[0]['update_flag']='0'
+            else:
+                rows[1].update(ann_date='20260820',f_ann_date='20260820')
+            wrong_native=retain({'api':'balancesheet','rows':rows},'2026-10-01T08:24:00+08:00',kind=kind)
+            invalid=deepcopy(dated)
+            invalid['source_receipts'].append(wrong_native)
+            invalid['native_disclosure_date_conflicts'][0]['native_receipt_sha256']=wrong_native
+            with pytest.raises(ValueError,match=message):
+                c._valuation_review(invalid,day,at)
+            c.store.conn.execute('DELETE FROM multi_source_observation WHERE payload_hash=?',[wrong_native])
+        # A real announcement in the disputed date interval prevents exemption.
+        page_body['announcements'].append(dict(page_body['announcements'][0],announcementId='correction',
+            announcementTitle='2026年半年度报告更正',announcement_date='2026-08-21',adjunctUrl='correction.PDF'))
+        page_body['totalAnnouncement']=2
+        page_path.write_text(_json(page_body),encoding='utf-8')
+        manifest['source_pages'][0]['sha256']=hashlib.sha256(page_path.read_bytes()).hexdigest()
+        manifest_path.write_text(_json(manifest),encoding='utf-8')
+        changed_catalogue=deepcopy(catalogue)
+        changed_catalogue['document']['sha256']=hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        changed_hash=retain(changed_catalogue,changed_catalogue['received_at'])
+        invalid=deepcopy(dated)
+        invalid['source_receipts'].remove(catalogue_hash)
+        invalid['source_receipts'].append(changed_hash)
+        invalid['native_disclosure_date_conflicts'][0]['official_catalogue_receipt_sha256']=changed_hash
+        with pytest.raises(ValueError,match='possible disputed-date revision'):
+            c._valuation_review(invalid,day,at)
+        c.store.conn.execute('DELETE FROM multi_source_observation WHERE payload_hash=?',[native])
+        # A different original issued later remains a real revision blocker.
+        correction_path=tmp_path/'correction.PDF'
+        correction_path.write_bytes(original+b'\nissuer correction')
+        correction=deepcopy(source)
+        correction['document'].update(path=str(correction_path),
+            sha256=hashlib.sha256(correction_path.read_bytes()).hexdigest())
+        correction['statement']['announcement_date']='20260821'
+        retain(correction,'2026-10-01T08:40:00+08:00')
+        with pytest.raises(ValueError,match='omits retained'):
+            c._valuation_review(review,day,at)
+        assert not c.client.calls
+
+
+def test_sparse_pdf_column_requires_actual_geometry_and_never_shifts_prior_zero(tmp_path):
+    import hashlib
+    import io
+    from copy import deepcopy
+    from pypdf import PdfWriter
+    from pypdf._font import Font
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    from trade_system.tushare_history import _validate_page_value
+    writer=PdfWriter()
+    page=writer.add_blank_page(width=600,height=800)
+    font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),
+                          NameObject('/BaseFont'):NameObject('/Helvetica')})
+    page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):
+        DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
+    metrics=Font.from_core_font_name('/Helvetica')
+    def width(text):
+        return metrics.get_text_width(text)*12/1000
+    right_edges=[300+width('2026-06-30'),420+width('2025-12-31')]
+    chunks=[('consolidated balance sheet yuan',40,760),('item',40,720),('note',220,720),
+            ('2026-06-30',300,720),('2025-12-31',420,720),('treasury stock',40,680),
+            ('33,100,433.76',right_edges[0]-width('33,100,433.76'),680),('other equity',40,650),
+            ('0',right_edges[1]-width('0'),650)]
+    stream=DecodedStreamObject()
+    stream.set_data(' '.join(f'BT /F1 12 Tf {x} {y} Td ({text}) Tj ET' for text,x,y in chunks).encode())
+    page[NameObject('/Contents')]=writer._add_object(stream)
+    path=tmp_path/'physical-columns.PDF'
+    writer.write(path)
+    raw=path.read_bytes()
+    digest=hashlib.sha256(raw).hexdigest()
+    location=dict(label='treasury stock',row_excerpt='treasury stock 33,100,433.76',
+        header_excerpt='item note 2026-06-30 2025-12-31',column_headers=['2026-06-30','2025-12-31'],
+        column_index=0,column_header='2026-06-30',basis_label='consolidated balance sheet',
+        unit_header='yuan',period_header='2026-06-30',pdf_column_layout=dict(
+            schema='physical_financial_columns_v1',header_page=1,row_page=1,alignment='right'))
+    field=dict(value=-33100433.76,page=1,excerpt=location['row_excerpt'],location=location)
+    _validate_page_value(raw,digest,field,'pdf',subtraction=True)
+    no_geometry=deepcopy(field)
+    no_geometry['location'].pop('pdf_column_layout')
+    with pytest.raises(ValueError,match='amount invalid'):
+        _validate_page_value(raw,digest,no_geometry,'pdf',subtraction=True)
+    blank=deepcopy(field)
+    blank.update(value=0,excerpt='current blank with prior zero')
+    blank['location'].update(label='other equity',row_excerpt='other equity 0')
+    with pytest.raises(ValueError,match='amount invalid'):
+        _validate_page_value(raw,digest,blank,'pdf')
+    blank['location'].update(column_index=1,column_header='2025-12-31')
+    _validate_page_value(raw,digest,blank,'pdf')  # Actual comparison zero is in column one only.
+    baseline=' '.join(f'BT /F1 12 Tf {x} {y} Td ({text}) Tj ET' for text,x,y in chunks[:-1])
+    def original_pdf(show):
+        stream.set_data((baseline+' '+show).encode())
+        output=io.BytesIO()
+        writer.write(output)
+        content=output.getvalue()
+        return content,hashlib.sha256(content).hexdigest()
+    blank['location'].update(column_index=0,column_header='2026-06-30')
+    current_x=right_edges[0]-width('0')
+    # These real PDF instructions put the glyph's rendered right edge in the
+    # comparison column. Ignoring their state used to fabricate current zero.
+    instructions=[
+        (f'BT /F1 12 Tf {current_x} 650 Td [-10000 (0)] TJ ET','0'),
+        (f'BT /F1 12 Tf 40 Tc {right_edges[0]-width("0.00")} 650 Td (0.00) Tj ET','0.00'),
+        (f'BT /F1 12 Tf {120-width(" ")} Tw {current_x} 650 Td ( 0) Tj ET','0'),
+        (f'BT /F1 12 Tf {(120+width("0"))/width("0")*100} Tz {current_x} 650 Td (0) Tj ET','0'),
+        (f'BT /F1 12 Tf 20 Ts {current_x} 650 Td (0) Tj ET','0'),
+        (f'BT /F1 12 Tf 3 Tr {current_x} 650 Td (0) Tj ET','0'),
+        (f'BT /F1 12 Tf {current_x} 650 Td 120 0 ( 0) " ET','0'),
+    ]
+    for instruction,amount in instructions:
+        content,fingerprint=original_pdf(instruction)
+        rejected=deepcopy(blank)
+        rejected['location']['row_excerpt']='other equity '+amount
+        with pytest.raises(ValueError,match='amount invalid') as failure:
+            _validate_page_value(content,fingerprint,rejected,'pdf')
+        assert 'unsupported' in str(failure.value.__cause__)
+    # Only actual original spaces advance glyph coordinates. pypdf may add
+    # synthetic spaces to visitor text even when the original run has none.
+    content,fingerprint=original_pdf(f'BT /F1 12 Tf {current_x} 650 Td ({" "*36}0) Tj ET')
+    with pytest.raises(ValueError,match='amount invalid'):
+        _validate_page_value(content,fingerprint,blank,'pdf')
+    prior=deepcopy(blank)
+    prior['location'].update(column_index=1,column_header='2025-12-31')
+    _validate_page_value(content,fingerprint,prior,'pdf')
+    content,fingerprint=original_pdf(f'BT /F1 12 Tf {current_x} 650 Td (0{" "*36}) Tj ET')
+    _validate_page_value(content,fingerprint,blank,'pdf')
+    # Supported explicit defaults and zero TJ adjustment preserve the current
+    # physical column, including visible fill-and-stroke text (Tr2).
+    content,fingerprint=original_pdf(f'BT /F1 12 Tf 0 Tc 0 Tw 100 Tz 0 Ts 2 Tr {current_x} 650 Td [0 (0)] TJ ET')
+    _validate_page_value(content,fingerprint,blank,'pdf')
+
+
 def test_direct_income_intake_latest_catalogue_and_known_at_corrections(tmp_path):
     import hashlib
     from copy import deepcopy

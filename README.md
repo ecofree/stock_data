@@ -5,8 +5,8 @@ A 股人工研究与复盘助手。项目分为日常数据、独立研究和显
 ## 当前状态
 
 当前状态见 [状态入口](docs/v2/STATUS.json)。用户已要求全量暂停：所有七项计划任务停用，
-跟进自动化保持 PAUSED。已安装版本仍为 0.3.37；当前统一整改候选为 0.3.43，
-位于 `D:\accio\stock_data-final-remediation`，尚未部署。代码、合格输入、交接、完整日、
+跟进自动化保持 PAUSED。已安装版本仍为 0.3.37；当前输入验收整改候选为 0.3.44，
+位于 `D:\accio\stock_data-input-acceptance`，尚未部署，原 0.3.43 封存不变。代码、合格输入、交接、完整日、
 连续五日及真实账户分别验收；隔离修复不计生产通过日。
 
 唯一清理关闭账是 [handover completion](D:/accio/stock_data-retirement/reports/handover-20260917/completion.json) 的
