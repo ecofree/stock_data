@@ -312,3 +312,149 @@ def test_candidate_cli_never_opens_database_and_refuses_output_escape_or_overwri
     with pytest.raises(SystemExit):
         entry.main()
     assert not (tmp_path / 'escape.json').exists()
+
+
+def _sina_fixture(tmp_path, monkeypatch):
+    """Synthetic document/response bytes; CI never fetches official sources."""
+    import hashlib
+    import json
+    import trade_system.flow_contract as contract
+    documents, paths, specifications = {}, {}, {}
+    for name, (url, _) in contract.SINA_PRODUCT_DOCUMENTS.items():
+        documents[name] = ('synthetic source: ' + name).encode()
+        paths[name] = tmp_path / (name + '.source')
+        paths[name].write_bytes(documents[name])
+        specifications[name] = (url, hashlib.sha256(documents[name]).hexdigest())
+    monkeypatch.setattr(contract, 'SINA_PRODUCT_DOCUMENTS', specifications)
+    row = dict(opendate='2026-09-29', trade='11.35', changeratio='0.1', turnover='0.2',
+               ratioamount='0.3', netamount='36992108.7300', r0_net='68661768.3700',
+               r1_net='-26419159.1700', r2_net='-4436695.7500', r3_net='-813804.7200',
+               r0='400000000.0100', r1='200000000.0000', r2='100000000.0000', r3='80000000.0000')
+    kwargs = dict(trade_date='2026-09-29', securities=['000001.SZ'],
+                  received_at='2026-09-30T09:45:00.748385+00:00',
+                  request_url=contract.SINA_FLOW_URL + '?page=1&num=3&sort=opendate&asc=0&daima=sz000001',
+                  source_documents=documents)
+    return row, json.dumps([row]).encode(), kwargs, paths
+
+
+def test_sina_pc_net_units_and_main_keep_precision_without_canonical_promotion(tmp_path, monkeypatch):
+    import hashlib
+    from trade_system.flow_contract import parse_sina_flow_response, VERIFIED_FLOW_COMPARISONS
+    _, raw, kwargs, _ = _sina_fixture(tmp_path, monkeypatch)
+    result = parse_sina_flow_response(raw, **kwargs)
+    row = result['rows'][0]
+    assert row['candidate_main_net_yuan'] == '68661768.3700'  # PC r0, not r0+r1 or display rounding.
+    assert row['net_amounts_yuan']['netamount'] == '36992108.7300'  # No second 10000 multiplier.
+    assert result['bucket_labels']['r2_net'] == 'small' and result['bucket_labels']['r3_net'] == 'retail'
+    assert result['documented_net_field_unit'] == 'yuan' and row['gross_amount_unit'] == 'unknown'
+    assert row['gross_raw']['r0'] == '400000000.0100'
+    assert result['response_sha256'] == hashlib.sha256(raw).hexdigest()
+    assert result['request_sha256'] == hashlib.sha256(kwargs['request_url'].encode()).hexdigest()
+    assert row['received_at'] == kwargs['received_at'] and row['source_date'] == kwargs['trade_date']
+    assert row['identity_binding'] == 'original_request_only' and not row['response_security_identity_verified']
+    assert result['net_arithmetic_qualified'] and result['arithmetic_qualified']
+    assert result['canonical_writes'] == result['production_writes'] == result['new_market_requests'] == 0
+    assert not result['independent_comparison_eligible'] and not result['full_sh_sz_bj_scope_verified']
+    assert not result['six_axis_definition_verified'] and not VERIFIED_FLOW_COMPARISONS
+
+
+def test_sina_rejects_source_hash_response_identity_query_and_date_fallback(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from trade_system.flow_contract import parse_sina_flow_response
+    item, raw, kwargs, _ = _sina_fixture(tmp_path, monkeypatch)
+    for name in ('page', 'fields', 'method'):
+        documents = dict(kwargs['source_documents'])
+        documents[name] += b' '
+        with pytest.raises(ValueError, match='source document SHA256'):
+            parse_sina_flow_response(raw, **dict(kwargs, source_documents=documents))
+    for replacement in ('daima=sh600000', 'page=2', 'num=4', 'sort=r0_net', 'asc=1'):
+        key = replacement.split('=')[0]
+        original = next(p for p in kwargs['request_url'].split('?')[1].split('&') if p.startswith(key + '='))
+        with pytest.raises(ValueError, match='scope/query'):
+            parse_sina_flow_response(raw, **dict(kwargs, request_url=kwargs['request_url'].replace(original, replacement)))
+    for url in (kwargs['request_url'] + '&num=3', kwargs['request_url'] + '&token=secret',
+                kwargs['request_url'] + '#fragment', kwargs['request_url'].replace('https:', 'http:')):
+        with pytest.raises(ValueError):
+            parse_sina_flow_response(raw, **dict(kwargs, request_url=url))
+    with pytest.raises(ValueError, match='BJ protocol unverified'):
+        parse_sina_flow_response(raw, **dict(kwargs, securities=['920128.BJ']))
+    with pytest.raises(ValueError, match='target date missing'):
+        parse_sina_flow_response(json.dumps([dict(item, opendate='2026-09-28')]).encode(), **kwargs)
+    for payload in ([item, item], [dict(item, opendate='2026-10-01')], [dict(item, ts_code='600000.SH')]):
+        with pytest.raises(ValueError):
+            parse_sina_flow_response(json.dumps(payload).encode(), **kwargs)
+    with pytest.raises(ValueError, match='timezone'):
+        parse_sina_flow_response(raw, **dict(kwargs, received_at='2026-09-30T17:45:00'))
+
+
+def test_sina_null_mismatch_numeric_json_and_precision_fail_closed(tmp_path, monkeypatch):
+    import json
+    import pytest
+    from trade_system.flow_contract import parse_sina_flow_response
+    item, raw, kwargs, _ = _sina_fixture(tmp_path, monkeypatch)
+    result = parse_sina_flow_response(json.dumps([dict(item, r0_net=None)]).encode(), **kwargs)
+    assert result['rows'][0]['candidate_main_net_yuan'] is None and not result['net_arithmetic_qualified']
+    assert 'missing_value:r0_net' in result['rows'][0]['quality_issues']
+    result = parse_sina_flow_response(json.dumps([dict(item, netamount='0')]).encode(), **kwargs)
+    assert 'net_bucket_sum_differs' in result['rows'][0]['quality_issues']
+    assert not result['arithmetic_qualified'] and not result['independent_comparison_eligible']
+    result = parse_sina_flow_response(json.dumps([dict(item, r0=None)]).encode(), **kwargs)
+    assert result['rows'][0]['gross_raw']['r0'] is None and result['net_arithmetic_qualified']
+    for invalid in ('NaN', 'Infinity', '1e1000', '1e-1000', True, {}, ' ', 'bad'):
+        with pytest.raises(ValueError):
+            parse_sina_flow_response(json.dumps([dict(item, r0_net=invalid)]).encode(), **kwargs)
+    for payload in (raw.replace(b'"r0_net":', b'"netamount":', 1),
+                    raw.replace(b'"36992108.7300"', b'NaN', 1), b'[]', b'{}'):
+        with pytest.raises(ValueError):
+            parse_sina_flow_response(payload, **kwargs)
+    # Decimal JSON numbers must not pass through binary floating-point rounding.
+    numeric = raw.replace(b'"68661768.3700"', b'68661768.3700')
+    assert parse_sina_flow_response(numeric, **kwargs)['rows'][0]['candidate_main_net_yuan'] == '68661768.3700'
+
+
+def test_sina_file_audit_and_cli_require_hashes_and_never_open_db_or_network(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import sys
+    import pytest
+    import trade_system.http_transport as transport
+    from scripts import audit_stock_flow_contract as entry
+    _, raw, kwargs, paths = _sina_fixture(tmp_path, monkeypatch)
+    receipt = tmp_path / 'retained.response'
+    receipt.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(entry, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(entry.duckdb, 'connect', lambda *a, **k: pytest.fail('Sina candidate opened DB'))
+    monkeypatch.setattr(transport, 'read_verified_once', lambda *a, **k: pytest.fail('Sina audit sent a request'))
+    target = tmp_path / 'reports' / 'sina.json'
+    args = ['audit', '--candidate-receipt', str(receipt), '--candidate-provider', 'sina',
+            '--response-sha256', digest, '--date', kwargs['trade_date'], '--codes', '000001.SZ',
+            '--received-at', kwargs['received_at'], '--request-url', kwargs['request_url'],
+            '--db', 'production-must-not-open.duckdb']
+    for name, path in paths.items():
+        args += ['--sina-' + name + '-source', str(path)]
+    monkeypatch.setattr(sys, 'argv', args + ['--out', str(target)])
+    assert entry.main() == 0
+    result = json.loads(target.read_text(encoding='utf-8'))
+    assert result['rows'][0]['candidate_main_net_yuan'] == '68661768.3700'
+    original = target.read_bytes()
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert target.read_bytes() == original
+    monkeypatch.setattr(sys, 'argv', args + ['--out', str(tmp_path / 'escape.json')])
+    with pytest.raises(SystemExit):
+        entry.main()
+    assert not (tmp_path / 'escape.json').exists()
+    receipt.write_bytes(raw + b' ')
+    with pytest.raises(ValueError, match='response SHA256 differs'):
+        entry.audit_candidate_file(receipt, digest, kwargs['trade_date'], ['000001.SZ'],
+                                   kwargs['received_at'], provider='sina',
+                                   request_url=kwargs['request_url'], source_document_paths=paths)
+    with pytest.raises(ValueError, match='source document paths'):
+        entry.audit_candidate_file(receipt, hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                                   kwargs['trade_date'], ['000001.SZ'], kwargs['received_at'],
+                                   provider='sina', request_url=kwargs['request_url'], source_document_paths={})
+    monkeypatch.setattr(sys, 'argv', ['audit', '--candidate-provider', 'sina'])
+    with pytest.raises(SystemExit):
+        entry.main()

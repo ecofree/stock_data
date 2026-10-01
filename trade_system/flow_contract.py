@@ -198,6 +198,168 @@ def normalize_stock_flow_row(row: dict[str, Any], provider: str) -> dict[str, An
 # Values must include dated validity and hashes of both original specifications.
 VERIFIED_FLOW_COMPARISONS = {}
 
+# This evidence binds the current PC display product, not the undisclosed
+# producer or a same-definition reconciliation with another vendor.
+SINA_FLOW_URL = ('https://vip.stock.finance.sina.com.cn/quotes_service/api/'
+                 'json_v2.php/MoneyFlow.ssl_qsfx_lscjfb')
+SINA_PRODUCT_DOCUMENTS = {
+    'page': ('https://vip.stock.finance.sina.com.cn/moneyflow/',
+             '046d9d4f456f33e3a6755a10c254310de1766a9a6ab41bee2c93516db2e60bcd'),
+    'fields': ('https://n.sinaimg.cn/finance/cnstock/pc/zjlx.z.js?ver=1.1',
+               '2f992f42ff7b8835d29c8684f02ae1fc3be2874a56e69480e3614f20a87b40a5'),
+    'method': ('https://finance.sina.com.cn/temp/guest4377.shtml',
+               '35a75b1a25bc8c124708f349eda12e6a3daa884aca88a630aa7ab96ecdde8717'),
+}
+SINA_NET_BUCKET_LABELS = {'r0_net': 'super_large', 'r1_net': 'large',
+                          'r2_net': 'small', 'r3_net': 'retail'}
+SINA_NET_FIELDS = ('netamount', *SINA_NET_BUCKET_LABELS)
+SINA_GROSS_FIELDS = ('r0', 'r1', 'r2', 'r3')
+
+
+def parse_sina_flow_response(raw, trade_date, securities, *, received_at, request_url, source_documents):
+    """Offline PC-product facts. No eval, requests, canonical mapping or DB writes.
+
+    The body omits security identity; retain the original request binding and
+    explicitly mark that limitation. Only the five displayed net fields have
+    a documented yuan unit. Gross fields never borrow that unit.
+    """
+    import re
+    from datetime import datetime
+    from decimal import Decimal, InvalidOperation, localcontext
+    from urllib.parse import parse_qsl, urlsplit
+    from zoneinfo import ZoneInfo
+
+    if not isinstance(trade_date, str) or not isinstance(received_at, str):
+        raise ValueError('explicit ISO trade date and original arrival required')
+    day = date.fromisoformat(trade_date)
+    if day.isoformat() != trade_date:
+        raise ValueError('explicit ISO trade date required')
+    if (not isinstance(securities, (list, tuple)) or len(securities) != 1
+            or not isinstance(securities[0], str)
+            or not re.fullmatch(r'\d{6}\.(SH|SZ)', securities[0])):
+        raise ValueError('one explicit SH/SZ security required; BJ protocol unverified')
+    arrival = datetime.fromisoformat(received_at)
+    if arrival.utcoffset() is None:
+        raise ValueError('original arrival must include timezone')
+    arrival_day = arrival.astimezone(ZoneInfo('Asia/Shanghai')).date()
+    if day > arrival_day:
+        raise ValueError('requested trade date is later than original arrival')
+    if not isinstance(request_url, str) or len(request_url) > 2048 or not request_url.isascii() or any(
+            c.isspace() for c in request_url):
+        raise ValueError('original bounded Sina request URL required')
+    url = urlsplit(request_url)
+    if request_url.split('?', 1)[0] != SINA_FLOW_URL or url.fragment:
+        raise ValueError('Sina request endpoint differs from reviewed product')
+    pairs = parse_qsl(url.query, keep_blank_values=True, strict_parsing=True)
+    query = dict(pairs)
+    code = securities[0]
+    if (len(pairs) != 5 or len(query) != 5
+            or set(query) != {'page', 'num', 'sort', 'asc', 'daima'}
+            or query['page'] != '1' or query['num'] not in {'1', '2', '3'}
+            or query['sort'] != 'opendate' or query['asc'] != '0'
+            or query['daima'] != code[-2:].lower() + code[:6]):
+        raise ValueError('Sina original request scope/query differs')
+    if not isinstance(source_documents, dict) or set(source_documents) != set(SINA_PRODUCT_DOCUMENTS):
+        raise ValueError('all three original Sina source documents required')
+    proof = {}
+    for name, (source_url, digest) in SINA_PRODUCT_DOCUMENTS.items():
+        content = source_documents[name]
+        if (not isinstance(content, bytes) or not 0 < len(content) <= 1_000_000
+                or hashlib.sha256(content).hexdigest() != digest):
+            raise ValueError('Sina source document SHA256 differs: ' + name)
+        proof[name] = dict(url=source_url, sha256=digest)
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= 8_000_000:
+        raise ValueError('bounded original response bytes required')
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate response object field')
+            result[key] = value
+        return result
+
+    def invalid_constant(_):
+        raise ValueError('nonfinite JSON constant')
+
+    body = json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object,
+                      parse_float=Decimal, parse_int=Decimal, parse_constant=invalid_constant)
+    if not isinstance(body, list) or not 1 <= len(body) <= int(query['num']):
+        raise ValueError('invalid or empty bounded Sina response')
+    scalar_fields = ('trade', 'changeratio', 'turnover', 'ratioamount')
+    fields = (*SINA_NET_FIELDS, *SINA_GROSS_FIELDS, *scalar_fields)
+
+    def amount(value):
+        if value is None:
+            return None
+        if (isinstance(value, bool) or not isinstance(value, (str, Decimal))
+                or len(str(value)) > 96 or str(value) != str(value).strip()):
+            raise ValueError('invalid Sina numeric field')
+        try:
+            result = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError('invalid Sina numeric field') from exc
+        # Bounded precision also makes the net-sum check exact, without float
+        # rounding or the official two-decimal display rounding.
+        if (not result.is_finite() or len(result.as_tuple().digits) > 48
+                or abs(result.adjusted()) > 30 or result.as_tuple().exponent < -30):
+            raise ValueError('nonfinite or unbounded Sina numeric field')
+        return result
+
+    rows, seen, previous_day = [], set(), None
+    for item in body:
+        if not isinstance(item, dict) or set(item) != {'opendate', *fields}:
+            raise ValueError('Sina response field contract differs')
+        source_date = item['opendate']
+        if not isinstance(source_date, str):
+            raise ValueError('explicit Sina source date required')
+        source_day = date.fromisoformat(source_date)
+        if (source_day.isoformat() != source_date or source_date in seen
+                or source_day > arrival_day or (previous_day is not None and source_day >= previous_day)):
+            raise ValueError('duplicate, unordered or inapplicable Sina source date')
+        seen.add(source_date)
+        previous_day = source_day
+        values = {f: amount(item[f]) for f in fields}
+        issues = ['missing_value:' + f for f, value in values.items() if value is None]
+        net_complete = all(values[f] is not None for f in SINA_NET_FIELDS)
+        net_matches = False
+        if net_complete:
+            with localcontext() as context:
+                context.prec = 100
+                net_matches = sum(values[f] for f in SINA_NET_BUCKET_LABELS) == values['netamount']
+            if not net_matches:
+                issues.append('net_bucket_sum_differs')
+        if any(values[f] is not None and values[f] < 0 for f in SINA_GROSS_FIELDS):
+            issues.append('negative_gross')
+        display = lambda value: str(value) if value is not None else None
+        rows.append(dict(security_code=code, source_date=source_date, received_at=received_at,
+                         selected_target_date=source_date == trade_date,
+                         identity_binding='original_request_only', response_security_identity_verified=False,
+                         net_amounts_yuan={f: display(values[f]) for f in SINA_NET_FIELDS},
+                         candidate_main_net_yuan=display(values['r0_net']),
+                         gross_raw={f: display(values[f]) for f in SINA_GROSS_FIELDS},
+                         gross_amount_unit='unknown',
+                         other_numeric_fields={f: display(values[f]) for f in scalar_fields},
+                         net_arithmetic_qualified=net_complete and net_matches,
+                         arithmetic_qualified=not issues, quality_issues=issues))
+    if trade_date not in seen:
+        raise ValueError('explicit target date missing; no date fallback')
+    return dict(provider='sina_pc_candidate', origin_provider='unknown',
+                source_api='MoneyFlow.ssl_qsfx_lscjfb',
+                flow_definition='sina_pc_reported_r0_net', official_pc_main_field='r0_net',
+                request_url=request_url, request_sha256=hashlib.sha256(request_url.encode()).hexdigest(),
+                response_sha256=hashlib.sha256(raw).hexdigest(), received_at=received_at,
+                source_documents=proof, documented_net_field_unit='yuan',
+                bucket_labels=dict(SINA_NET_BUCKET_LABELS), gross_field_units='unknown',
+                expected_trade_date=trade_date, returned_rows=len(rows), rows=rows,
+                target_date_present=True, response_security_identity_verified=False,
+                arithmetic_qualified=all(r['arithmetic_qualified'] for r in rows),
+                net_arithmetic_qualified=all(r['net_arithmetic_qualified'] for r in rows),
+                six_axis_definition_verified=False, full_sh_sz_bj_scope_verified=False,
+                independent_comparison_eligible=False,
+                missing_evidence=['original_producer', *FLOW_DEFINITION_AXES, 'full_bj_scope'],
+                authenticated_requests=0, new_market_requests=0, canonical_writes=0, production_writes=0)
+
 # Acquisition vendor and original producer are distinct. This public SDK
 # describes a transport/field contract, not an independent definition mapping.
 GANGTISE_SOURCE_COMMIT = 'f244b4741df82077b5afb7d4714289555b401db9'
