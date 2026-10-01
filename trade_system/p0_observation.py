@@ -25,8 +25,8 @@ TUSHARE_CLOSE_DATASETS = (
     "moneyflow",
     "industry_flow",
 )
-GOOD_STOCK_BATCH = {"success", "success_with_unavailable", "partial"}
-GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap", "partial"}
+GOOD_STOCK_BATCH = {"success", "success_with_unavailable"}
+GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap"}
 
 
 def phase_evidence_errors(manifest, trade_date):
@@ -407,6 +407,25 @@ def _batch_status(
     }
 
 
+def _sector_status(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
+    """A known successful industry product cannot certify an unknown THS scope."""
+    from trade_system.readiness import required_sector_taxonomy_coverage
+    batch = _batch_status(con, 'intraday_sector_flow_batch', trade_date, GOOD_SECTOR_BATCH)
+    required = required_sector_taxonomy_coverage(con, trade_date)
+    aggregate_passed = batch['passed']
+    return {
+        **batch,
+        'passed': bool(aggregate_passed and required['passed']),
+        'taxonomies': required['taxonomies'],
+        'required_taxonomies': ['em_industry', 'ths_concept'],
+        'taxonomy_evidence_passed': required['passed'],
+        'reason': (required['reason'] if not required['passed']
+                   else None if aggregate_passed else 'aggregate_batch_not_qualified'),
+        'coverage_scope': 'independent_required_taxonomies_not_aggregate_minimum',
+        'row_count_scope': 'sum_product_rows_not_unique_industries',
+    }
+
+
 def _tushare_status(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
     if not table_exists(con, "history_fetch_checkpoint"):
         return {"passed": False, "datasets": {}, "missing": list(TUSHARE_CLOSE_DATASETS)}
@@ -559,9 +578,7 @@ def audit_five_day_observation(
             stock = _batch_status(
                 con, "intraday_stock_flow_batch", trade_date, GOOD_STOCK_BATCH
             )
-            sector = _batch_status(
-                con, "intraday_sector_flow_batch", trade_date, GOOD_SECTOR_BATCH
-            )
+            sector = _sector_status(con, trade_date)
             tushare = _tushare_status(con, trade_date)
             ths = _ths_status(con, trade_date, minimum_ths_concepts)
             checks = {

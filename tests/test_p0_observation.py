@@ -66,6 +66,11 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
         "coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)"
     )
     con.execute(
+        "CREATE TABLE intraday_sector_flow_taxonomy("
+        "trade_date DATE,taxonomy VARCHAR,expected_rows INTEGER,fetched_rows INTEGER,"
+        "coverage_pct DOUBLE,status VARCHAR)"
+    )
+    con.execute(
         "INSERT INTO intraday_stock_flow_batch VALUES "
         "('2026-07-23',5200,5200,100,'success','2026-07-23 15:01:00'),"
         "('2026-07-24',5200,5200,100,'success','2026-07-24 15:01:00')"
@@ -74,6 +79,13 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
         "INSERT INTO intraday_sector_flow_batch VALUES "
         "('2026-07-23',870,870,100,'success_with_optional_gap','2026-07-23 15:02:00'),"
         "('2026-07-24',870,870,100,'success_with_optional_gap','2026-07-24 15:02:00')"
+    )
+    con.execute(
+        "INSERT INTO intraday_sector_flow_taxonomy VALUES "
+        "('2026-07-23','em_industry',496,496,100,'success'),"
+        "('2026-07-23','ths_concept',374,374,100,'success'),"
+        "('2026-07-24','em_industry',496,496,100,'success'),"
+        "('2026-07-24','ths_concept',374,374,100,'success')"
     )
     con.execute(
         "CREATE TABLE history_fetch_checkpoint("
@@ -380,3 +392,59 @@ def test_window_attempts_sort_by_actual_timezone_and_unverified_time_stays_red(t
     recovery['started_at'] = None
     path.write_text(json.dumps(recovery))
     assert 'unassigned_phase_time_unverified' in _phase_check(tmp_path)['evidence_errors']
+
+
+def test_meaningful_unknown_required_taxonomy_cannot_be_hidden_by_green_aggregate(tmp_path):
+    from trade_system.p0_observation import _sector_status
+    con = duckdb.connect(str(tmp_path / 'unknown-taxonomy.duckdb'))
+    try:
+        con.execute('CREATE TABLE intraday_sector_flow_batch(trade_date DATE,expected_rows INTEGER,'
+                    'fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)')
+        con.execute("INSERT INTO intraday_sector_flow_batch VALUES "
+                    "('2026-09-29',496,496,100,'partial','2026-09-29 15:00:00')")
+        missing = _sector_status(con, '2026-09-29')
+        assert not missing['passed']
+        assert missing['reason'] == 'required_taxonomy_evidence_missing'
+        con.execute('CREATE TABLE intraday_sector_flow_taxonomy(trade_date DATE,taxonomy VARCHAR,'
+                    'expected_rows INTEGER,fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR)')
+        con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES "
+                    "('2026-09-29','em_industry',496,496,100,'success'),"
+                    "('2026-09-29','ths_concept',0,0,100,'missing')")
+        unknown = _sector_status(con, '2026-09-29')
+        assert not unknown['passed'] and unknown['coverage_pct'] == 100
+        assert unknown['taxonomies']['em_industry']['passed'] is True
+        ths = unknown['taxonomies']['ths_concept']
+        assert ths['passed'] is False and ths['denominator_known'] is False
+        assert ths['expected_rows'] is None and ths['coverage_pct'] is None
+        # Old/misleading batch statuses must not manufacture the missing scope.
+        con.execute("UPDATE intraday_sector_flow_batch SET status='success_with_optional_gap'")
+        assert not _sector_status(con, '2026-09-29')['passed']
+        con.execute("UPDATE intraday_sector_flow_taxonomy SET expected_rows=390,fetched_rows=390,"
+                    "coverage_pct=100,status='success' WHERE taxonomy='ths_concept'")
+        assert _sector_status(con, '2026-09-29')['passed']
+        con.execute("UPDATE intraday_sector_flow_batch SET status='partial'")
+        assert not _sector_status(con, '2026-09-29')['passed']
+        con.execute("UPDATE intraday_sector_flow_batch SET status='success'")
+        con.execute("DELETE FROM intraday_sector_flow_taxonomy WHERE taxonomy='ths_concept'")
+        assert not _sector_status(con, '2026-09-29')['passed']
+    finally:
+        con.close()
+
+
+def test_partial_stock_batch_keeps_available_facts_but_cannot_qualify_a_complete_day(tmp_path):
+    from trade_system.p0_observation import _batch_status, GOOD_STOCK_BATCH
+    con = duckdb.connect(str(tmp_path / 'partial-stock.duckdb'))
+    try:
+        con.execute('CREATE TABLE intraday_stock_flow_batch(trade_date DATE,expected_rows INTEGER,'
+                    'fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR,updated_at TIMESTAMP)')
+        con.execute("INSERT INTO intraday_stock_flow_batch VALUES "
+                    "('2026-09-29',5200,5174,99.5,'partial','2026-09-29 15:00:00')")
+        partial = _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)
+        assert not partial['passed'] and partial['fetched'] == 5174 and partial['coverage_pct'] == 99.5
+        con.execute('UPDATE intraday_stock_flow_batch SET fetched_rows=5200,coverage_pct=100')
+        assert not _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
+        for qualified_status in ('success', 'success_with_unavailable'):
+            con.execute('UPDATE intraday_stock_flow_batch SET status=?', [qualified_status])
+            assert _batch_status(con, 'intraday_stock_flow_batch', '2026-09-29', GOOD_STOCK_BATCH)['passed']
+    finally:
+        con.close()

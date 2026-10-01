@@ -27,6 +27,33 @@ def _normalize_trade_date(value: str) -> str:
     return str(value)[:10]
 
 
+def required_sector_taxonomy_coverage(con, trade_date):
+    """Shared required-product gate; aggregate rows cannot prove a denominator."""
+    required=('em_industry','ths_concept')
+    if not table_exists(con,'intraday_sector_flow_taxonomy'):
+        return {'passed':False,'taxonomies':{},'reason':'required_taxonomy_evidence_missing'}
+    try:
+        rows=con.execute('SELECT taxonomy,expected_rows,fetched_rows,coverage_pct,status '
+            'FROM intraday_sector_flow_taxonomy WHERE trade_date=CAST(? AS DATE)',[trade_date]).fetchall()
+    except duckdb.Error:
+        return {'passed':False,'taxonomies':{},'reason':'required_taxonomy_evidence_invalid'}
+    facts={}
+    for name,expected,observed,coverage,status in rows:
+        if name not in required:
+            continue
+        if name in facts:
+            return {'passed':False,'taxonomies':facts,'reason':'duplicate_taxonomy_evidence'}
+        known=isinstance(expected,(int,float)) and expected>0
+        passed=bool(known and status=='success' and coverage is not None and coverage>=99.5
+                    and observed is not None and observed*100/expected>=99.5)
+        facts[name]={'expected_rows':expected if known else None,'fetched_rows':observed,
+            'coverage_pct':coverage if known else None,'denominator_known':known,
+            'status':status,'passed':passed}
+    passed=all(name in facts and facts[name]['passed'] for name in required)
+    return {'passed':passed,'taxonomies':facts,
+            'reason':None if passed else 'required_taxonomy_missing_unknown_or_partial'}
+
+
 @dataclass(frozen=True)
 class ReadinessGroup:
     name: str
@@ -314,21 +341,16 @@ def relation_freshness(
             ).fetchone()
         except Exception:
             sector_batch = None
-        # The sector collector can be marked ``partial`` when an optional
-        # taxonomy (for example TuShare DC) is unavailable even though the
-        # required Eastmoney industry and THS concept universes are complete.
-        # Coverage is the stronger gate for trading readiness; a 99.5%+
-        # same-date snapshot is usable and remains visibly labelled partial.
+        taxonomy_coverage=required_sector_taxonomy_coverage(con,trade_date)
         sector_complete = bool(
             sector_batch
             and int(sector_batch[0] or 0) > 0
             and float(sector_batch[2] or 0) >= 99.5
             and sector_batch[3] in {
                 "success",
-                "partial",
-                "success_with_unavailable",
                 "success_with_optional_gap",
             }
+            and taxonomy_coverage['passed']
         )
         if sector_batch and not sector_complete:
             status = "partial"
@@ -517,18 +539,12 @@ def assess_trade_date_readiness(
                 ).fetchone()
                 batch_status = str(batch[0] or "") if batch else ""
                 batch_coverage = float(batch[1] or 0) if batch else 0.0
-                # Live sessions often land 99.0–99.5% with a few suspended names
-                # and status ``partial``.  That is still usable for analytics and
-                # candidate evidence; only fail clearly incomplete runs.
+                # Retain usable facts from partial batches for display, but do
+                # not promote their coverage percentage into stage readiness.
                 batch_complete = (
                     batch_status == "success"
                     or (
-                        batch_status
-                        in {
-                            "success_with_unavailable",
-                            "partial",
-                            "success_with_optional_gap",
-                        }
+                        batch_status == "success_with_unavailable"
                         and batch_coverage >= 99.5
                     )
                 )
@@ -556,10 +572,9 @@ def assess_trade_date_readiness(
                     and float(sector_batch[1] or 0) >= 99.5
                     and sector_batch[0] in {
                         "success",
-                        "partial",
-                        "success_with_unavailable",
                         "success_with_optional_gap",
                     }
+                    and required_sector_taxonomy_coverage(con,trade_date)['passed']
                 )
                 if sector_batch and not sector_complete:
                     group_results[-1]["ready"] = False

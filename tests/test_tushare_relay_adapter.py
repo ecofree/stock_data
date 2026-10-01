@@ -199,6 +199,12 @@ def test_missing_and_nonfinite_raw_values_remain_null(tmp_path):
     with duckdb.connect(str(db_path), read_only=True) as con:
         assert con.execute("SELECT open, volume, turnover FROM tushare_index_daily").fetchone() == (None, None, None)
         assert con.execute("SELECT close, turnover FROM v_index_state").fetchone() == (3010, None)
+        import json
+        raw = json.loads(con.execute("SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='tushare_index_daily'").fetchone()[0])
+        assert raw['rows'][0]['vol'] == 'nan'
+        assert con.execute("SELECT count(*) FROM multi_source_observation "
+            "WHERE data_type='market_row_quarantine'").fetchone()[0] == 0
 
 
 def test_data_catalog_lists_tushare_relay_basic_data_source():

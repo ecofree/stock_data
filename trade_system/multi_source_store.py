@@ -442,7 +442,7 @@ class MultiSourceStore:
                 raise ValueError(f"sector_capital namespace/measure collision; snapshot preserved: {collisions}")
             sector_order = provider_rank_sql("sector_flow", "provider")
             rows = self.con.execute(
-                f"SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net FROM ("
+                f"SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net,fetched_at FROM ("
                 "SELECT source_date,sector_code,main_net,super_net,large_net,mid_net,small_net,provider,fetched_at,"
                 f"row_number() OVER (PARTITION BY source_date,sector_code ORDER BY {sector_order} ASC, fetched_at DESC) AS _rn "
                 "FROM multi_source_sector_flow WHERE is_stale=FALSE"
@@ -458,7 +458,7 @@ class MultiSourceStore:
                 self.con.execute("DELETE FROM sector_capital WHERE date=CAST(? AS DATE)", [selected_date])
             for row in rows:
                 self.con.execute(
-                    "INSERT INTO sector_capital(date,sector_code,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow) VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO sector_capital(date,sector_code,main_net_inflow,super_net_inflow,big_net_inflow,mid_net_inflow,small_net_inflow,fetched_at) VALUES (?,?,?,?,?,?,?,?)",
                     list(row),
                 )
             self.con.commit()

@@ -132,6 +132,9 @@ def test_sector_writer_and_read_only_kline_projection(tmp_path):
         assert store.con.execute("SELECT fetched_at FROM multi_source_sector_flow").fetchone()[0].timestamp() == 1000000000.0
         store.store("kline", "000001", [{"date": "2026-07-10", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100, "amount": 1000}], {"source": "sina", "status": "live"})
         assert store.sync_sector_capital("2026-07-10") == 1
+        assert store.con.execute('SELECT fetched_at FROM sector_capital').fetchone()[0].timestamp() == 1000000000.0
+        assert store.sync_sector_capital("2026-07-10") == 1
+        assert store.con.execute('SELECT fetched_at FROM sector_capital').fetchone()[0].timestamp() == 1000000000.0
         from trade_system.normalize import _create_kline_daily
         _create_kline_daily(store.con)
         assert store.con.execute("SELECT close FROM v_kline_daily").fetchone()[0] == 10.5

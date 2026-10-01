@@ -4,6 +4,20 @@ from datetime import datetime
 from trade_system.readiness import assess_trade_date_readiness, relation_freshness
 
 
+def test_unknown_required_sector_denominator_never_borrows_other_product_coverage():
+    from trade_system.readiness import required_sector_taxonomy_coverage
+    con=duckdb.connect(':memory:')
+    assert not required_sector_taxonomy_coverage(con,'2026-09-29')['passed']
+    con.execute('CREATE TABLE intraday_sector_flow_taxonomy(trade_date DATE,taxonomy VARCHAR,expected_rows INTEGER,fetched_rows INTEGER,coverage_pct DOUBLE,status VARCHAR)')
+    con.execute("INSERT INTO intraday_sector_flow_taxonomy VALUES ('2026-09-29','em_industry',496,496,100,'success'),('2026-09-29','ths_concept',0,0,0,'missing')")
+    result=required_sector_taxonomy_coverage(con,'2026-09-29')
+    assert result['taxonomies']['em_industry']['passed']
+    assert not result['passed'] and result['taxonomies']['ths_concept']['coverage_pct'] is None
+    con.execute("UPDATE intraday_sector_flow_taxonomy SET expected_rows=390,fetched_rows=390,coverage_pct=100,status='success' WHERE taxonomy='ths_concept'")
+    assert required_sector_taxonomy_coverage(con,'2026-09-29')['passed']
+    con.close()
+
+
 def test_historical_as_of_rejects_rows_written_after_the_audit_time(tmp_path):
     db_path = tmp_path / "future-row.duckdb"
     con = duckdb.connect(str(db_path))
@@ -158,6 +172,18 @@ def test_partial_market_batch_cannot_be_replaced_by_bounded_flow(tmp_path):
 
     assert result["ready"] is False
     assert result["missing_groups"] == ["stock_capital_flow"]
+
+    for coverage in (99.5, 100.0):
+        con = duckdb.connect(str(db_path))
+        con.execute(
+            "UPDATE intraday_stock_flow_batch SET fetched_rows=5000, coverage_pct=?",
+            [coverage],
+        )
+        con.close()
+        result = assess_trade_date_readiness(db_path, "2026-07-09", "intraday")
+        stock_group = next(item for item in result["groups"] if item["group"] == "stock_capital_flow")
+        assert stock_group["ready"] is False
+        assert stock_group["status"] == "partial"
 
 
 def test_auction_accepts_calendar_proven_previous_session_market_context(tmp_path):

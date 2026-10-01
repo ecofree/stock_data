@@ -1932,6 +1932,19 @@ class TushareHistoryCollector:
         allowed = self._expected_stock_codes(trade_date) if self._is_production_source() and dataset != 'index_daily' else set()
         valid, rejected = [], []
         fields = MARKET_FIELDS[dataset].split(',')[2:]
+        required_numeric = {'adj_factor'} if dataset == 'adj_factor' else {'close'} if dataset in {'daily', 'index_daily'} else set()
+
+        def optional_unknown(field, value):
+            # Provider NaN denotes an unavailable optional value, not a bad
+            # identity or an absent price. market_batch keeps it NULL while
+            # the unmodified acquisition receipt preserves the original.
+            if field in required_numeric or isinstance(value, bool):
+                return False
+            try:
+                return math.isnan(float(value))
+            except (TypeError, ValueError, OverflowError):
+                return False
+
         for row in rows:
             reason = None
             try:
@@ -1946,7 +1959,8 @@ class TushareHistoryCollector:
                     reason = 'duplicate_identity'
                 elif any(row.get(field) not in (None, '', '-') and
                          (isinstance(row.get(field), bool) or _num(row.get(field)) is None
-                          or not math.isfinite(_num(row.get(field)))) for field in fields):
+                          or not math.isfinite(_num(row.get(field))))
+                         and not optional_unknown(field, row.get(field)) for field in fields):
                     reason = 'invalid_nonfinite_numeric_field'
                 elif dataset == 'daily_basic':
                     if not any(_num(row.get(field)) is not None and math.isfinite(_num(row.get(field)))

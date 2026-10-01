@@ -95,6 +95,44 @@ def test_later_page_failure_retains_prior_valid_rows_without_certification(tmp_p
         assert c.store.conn.execute("SELECT count(*) FROM close_snapshot_certification WHERE status='certified'").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize('dataset,field,value', [
+    ('index_daily','close','nan'), ('index_daily','close',float('nan')),
+    ('index_daily','vol','inf'), ('index_daily','vol',True),
+    ('index_daily','vol','not_a_number'), ('adj_factor','adj_factor','nan'),
+])
+def test_invalid_market_numbers_still_quarantined(tmp_path, dataset, field, value):
+    class Invalid:
+        def query_rows(self, api, params=None, fields=''):
+            return [dict(ts_code=params['ts_code'], trade_date='20260701',
+                         close=10, adj_factor=1, **{field:value})] if field not in {'close','adj_factor'} else [
+                dict(ts_code=params['ts_code'],trade_date='20260701',**{field:value})]
+    code = '000001.SH' if dataset == 'index_daily' else '000001.SZ'
+    with TushareHistoryCollector(tmp_path/'invalid-number.duckdb',client=Invalid()) as c:
+        with pytest.raises(XiaodefaError,match='source rows quarantined'):
+            c._collect_market(dataset,'20260701',codes=[code])
+        assert c.store.conn.execute('SELECT count(*) FROM tushare_'+dataset).fetchone()[0] == 0
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation "
+            "WHERE data_type='market_row_quarantine'").fetchone()[0] == 1
+
+
+def test_unknown_valuation_core_fields_preserve_valid_facts_without_qualification(tmp_path):
+    import json
+    class MissingPB:
+        def query_rows(self, api, params=None, fields=''):
+            return [dict(ts_code=params['ts_code'],trade_date='20260701',
+                         pb='nan',pe=12,total_mv=100,circ_mv=50)]
+    with TushareHistoryCollector(tmp_path/'unknown-pb.duckdb',client=MissingPB()) as c:
+        with pytest.raises(XiaodefaError,match='coverage incomplete'):
+            c._collect_market('daily_basic','20260701',codes=['000001.SZ'])
+        assert c.store.conn.execute('SELECT pb,pe,total_mv,circ_mv FROM tushare_daily_basic').fetchone() == (None,12,100,50)
+        assert c._covered_codes('daily_basic','20260701') == set()
+        assert c.store.conn.execute('SELECT status FROM close_snapshot_certification').fetchone()[0] == 'error'
+        raw = json.loads(c.store.conn.execute("SELECT payload_json FROM multi_source_observation "
+            "WHERE data_type='tushare_daily_basic'").fetchone()[0])
+        assert raw['rows'][0]['pb'] == 'nan'
+        assert c._product_counts['daily_basic']['rows_written'] == 1
+
+
 def test_pdf_extraction_uses_exact_physical_page_and_bounded_range(tmp_path):
     import hashlib
     from copy import deepcopy
