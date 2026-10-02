@@ -99,8 +99,10 @@ def handler(root, output, port, *, shutdown=None):
                 _,files=read_current(output/'publication')
                 # Read the sealed published projection and the small journal only.
                 # GET never loads a model, fetches data or changes the publication.
-                html=(render(product.journal_projection(output,json.loads(files['desk.json'])),include_account=True)
-                      if 'desk.json' in files else files['index.html'].decode('utf-8'))
+                if 'desk.json' not in files:
+                    return self.reply(410,'旧版 HTML 仅保留为历史资料，不能作为当前工作台；请发布合格的基础市场事实。原文件未修改。')
+                data=product._retire_active_forecasts(json.loads(files['desk.json']))
+                html=render(product.journal_projection(output,data),include_account=True)
                 html=server_page(html,token,state['message'],state['running'])
                 self.reply(200,html,'text/html; charset=utf-8')
             except Exception:

@@ -1,4 +1,5 @@
 import http.client
+import json
 from http.server import ThreadingHTTPServer
 import threading
 import re
@@ -175,6 +176,36 @@ def test_cli_retired_commands_do_not_create_output(tmp_path,monkeypatch,command)
                                   '--config',str(tmp_path/'absent.json')])
     with pytest.raises(ValueError,match='RESEARCH_RETIRED'):product.main()
     assert not output.exists()
+
+
+@pytest.mark.parametrize('legacy_html_only',[False,True])
+def test_http_current_view_cannot_reactivate_retained_forecast_or_legacy_html(tmp_path,legacy_html_only):
+    from tests.test_model_independent_workspace import _retained_forecast_publication
+    from trade_system.v2.publisher import publish
+    if legacy_html_only:
+        publish(tmp_path/'publication','legacy-html',{'index.html':b'<html>legacy forecast</html>'},generation=1)
+    else:
+        original=_retained_forecast_publication(tmp_path)
+    before={str(p.relative_to(tmp_path)):p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    service=ThreadingHTTPServer(('127.0.0.1',0),server.handler(tmp_path,tmp_path,0))
+    port=service.server_port;service.RequestHandlerClass=server.handler(tmp_path,tmp_path,port)
+    thread=threading.Thread(target=service.serve_forever,daemon=True);thread.start()
+    try:
+        conn=http.client.HTTPConnection('127.0.0.1',port,timeout=15);conn.request('GET','/')
+        response=conn.getresponse();html=response.read().decode();status=response.status;conn.close()
+        if legacy_html_only:
+            assert status==410 and '历史资料' in html and '原文件未修改' in html
+        else:
+            assert status==200
+            data=json.loads(html.split('<script type="application/json" id="data">')[1].split('</script>')[0])
+            assert data['prediction'] is None and data['model']=={} and data['candidate_model'] is None
+            assert data['research_retirement']['status']=='retired'
+            assert data['market']['stocks']['000001']['change_pct']==1
+            assert data['retained_prediction_evidence']==original['prediction']
+            assert product.saved_projection(tmp_path)['prediction']==original['prediction']
+            assert 'action="/update"' not in html
+        assert {str(p.relative_to(tmp_path)):p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
+    finally:service.shutdown();service.server_close();thread.join()
 
 
 def test_prediction_and_contributions_use_frozen_feature_order(tmp_path):
