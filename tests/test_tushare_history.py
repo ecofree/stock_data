@@ -58,6 +58,11 @@ def test_per_security_valuation_capability_does_not_exclude_quote_or_flow(tmp_pa
         assert not b['financial_reference']['supplies_numeric_qualification']
         assert not conflict['fields']['pb']['numeric_qualified_for_session']
         assert conflict['fields']['pb']['value'] is None  # No raw/committed conflict can become green.
+        worklist = c.prepare_valuation_reviews('20260701', codes, observed_at='2026-07-01T17:00:00+08:00')
+        assert worklist['rows']['000001.SZ']['qualified_core']
+        assert worklist['rows']['000001.SZ']['required_review'] == []
+        assert not worklist['rows']['000003.SZ']['qualified_core']  # Source/fact conflict stays pending.
+        assert worklist['unattended_all_market_valuation_promise'] == 'retired'
         assert not outside['qualified_core_for_session'] and outside['included_in_expected_universe'] is False
         assert c._expected_stock_codes('20260701','daily_basic') == set(codes)
         assert not c._is_complete_stock_table('tushare_daily_basic','date','20260701')
@@ -1567,7 +1572,7 @@ def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_p
         assert len(c.client.calls) == before
 
 
-def test_official_absence_review_requires_dated_inventory_and_revalidates_file(tmp_path):
+def test_official_absence_review_requires_dated_inventory_and_revalidates_file(tmp_path, monkeypatch):
     import hashlib
     import json
     from copy import deepcopy
@@ -1655,6 +1660,43 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         assert capabilities['qualified_core_for_session'] and capabilities['fields']['pb']['value'] < 0
         assert not capabilities['value_screen_eligible_for_session']
         assert capabilities['fields']['pe']['value'] is None and capabilities['fields']['pe_ttm']['value'] is None
+        # Exercise the ordinary-task local intake path with the same strict
+        # original PDF/catalogue bindings, not a mocked qualification result.
+        from datetime import datetime, timezone
+        from trade_system import tushare_history
+        class SessionClock(datetime):
+            @classmethod
+            def now(cls,tz=None):
+                value = datetime(2026,7,1,9,tzinfo=timezone.utc)
+                return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+        market_raw = c.store.conn.execute('SELECT payload_json FROM multi_source_observation WHERE payload_hash=?',[market]).fetchone()[0]
+        received_market = dict(data_type='tushare_daily_basic',provider='xiaodefa',
+            payload_json=market_raw,payload_hash=market,observed_at='2026-07-01T16:00:00+08:00')
+        daily_bundle = tmp_path/'daily-reviewed-bundle.json'
+        daily_bundle.write_text(_json(dict(reviews=[review],reviewed_source_documents=[source,catalogue],
+            retained_source_receipts=[received_market])),encoding='utf-8')
+        daily_manifest = tmp_path/'daily-manifest.json'
+        daily_manifest.write_text(_json(dict(schema='valuation_daily_intake_v1',trade_date=day,
+            reviewed_by='synthetic-fixture-reviewer',reviewed_at='2026-07-01T16:30:00+08:00',
+            bundles=[dict(path=daily_bundle.name,sha256=hashlib.sha256(daily_bundle.read_bytes()).hexdigest())])),encoding='utf-8')
+        with monkeypatch.context() as patch:
+            patch.setattr(tushare_history,'datetime',SessionClock)
+            with TushareHistoryCollector(tmp_path/'daily-loop.duckdb',local_only=True) as daily:
+                daily.store.conn.execute('INSERT INTO tushare_stock_basic(ts_code) VALUES (?)',[code])
+                daily.store.conn.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb) VALUES (?,'2026-07-01',NULL)",[code])
+                patch.setattr(daily,'_reference_version',lambda *_: dict(membership_date=day))
+                accepted = daily.receive_valuation_session(day,manifest_path=daily_manifest,
+                    manifest_sha256=hashlib.sha256(daily_manifest.read_bytes()).hexdigest())
+                assert accepted['workflow_completed'] and accepted['valuation_complete']
+                assert accepted['status'] == 'qualified_for_session' and not accepted['pending_codes']
+                assert accepted['worklist']['rows'][code]['qualification_fields']['pb']['value'] < 0
+                assert accepted['market_requests'] == accepted['business_rows_written'] == 0
+                assert daily.store.conn.execute('SELECT pb FROM tushare_daily_basic').fetchone() == (None,)
+                assert daily.client is None
+                again = daily.receive_valuation_session(day,manifest_path=daily_manifest,
+                    manifest_sha256=hashlib.sha256(daily_manifest.read_bytes()).hexdigest())
+                assert again['valuation_complete']
+                assert daily.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_review'").fetchone()[0] == 1
         # A bare qualified assertion cannot make equity into annual earnings.
         forged = deepcopy(review)
         forged['earnings_reviews'] = {'static': dict(qualified=True,
@@ -1809,6 +1851,143 @@ def test_valuation_cli_is_scoped_and_holds_pipeline_lock(tmp_path, monkeypatch):
     assert cli.main() == 2
     assert json.loads((tmp_path/'diagnostic.json').read_text())['market_requests'] == 0
     assert len(calls) == 1
+    class Session:
+        def __init__(self, db, **kwargs):
+            assert kwargs == {'local_only': True}
+            assert (tmp_path/'cli.duckdb.pipeline.lock').exists()
+        def __enter__(self):
+            return self
+        def __exit__(self,*args):
+            pass
+        def receive_valuation_session(self,day,codes,**kwargs):
+            assert day == '20260701' and codes == ['000001.SZ']
+            calls.append(kwargs)
+            return dict(workflow_completed=True,valuation_complete=False,status='pending_review',market_requests=0)
+    monkeypatch.setattr(cli,'TushareHistoryCollector',Session)
+    session_args = [('--valuation-session' if value=='--valuation-diagnostic' else value) for value in args]
+    monkeypatch.setattr(sys,'argv',session_args+['--valuation-workspace',str(tmp_path/'workspace')])
+    assert cli.main() == 0  # A pending capability is separate from successfully producing the daily worklist.
+    assert len(calls) == 2 and calls[-1] == dict(manifest_path=None,manifest_sha256=None,deadline_epoch=None)
+    assert not json.loads((tmp_path/'diagnostic.json').read_text())['valuation_complete']
+    intake = tmp_path/'workspace'/'valuation-intake'/'20260701'
+    intake.mkdir(parents=True)
+    (intake/'manifest.json').write_text('{}',encoding='utf-8')
+    assert cli.main() == 2
+    assert len(calls) == 2  # Missing approved hash fails before opening a database writer.
+    assert not (tmp_path/'cli.duckdb.pipeline.lock').exists()
+
+
+def test_daily_local_valuation_intake_requires_current_hash_scope_and_preserves_original_arrival(tmp_path, monkeypatch):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    from trade_system.tushare_history import _json
+    from trade_system import tushare_history
+    class NoClient:
+        def __init__(self, **kwargs):
+            raise AssertionError('local evidence intake cannot initialize a provider client')
+    monkeypatch.setattr(tushare_history,'XiaodefaClient',NoClient)
+    now = datetime.now(timezone.utc)
+    from zoneinfo import ZoneInfo
+    day = now.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    previous = (now.astimezone(ZoneInfo('Asia/Shanghai')).date()-timedelta(days=1)).isoformat()
+    code = '000001.SZ'
+    db = tmp_path/'daily-intake.duckdb'
+    with TushareHistoryCollector(db,local_only=True) as c:
+        c.store.conn.execute('INSERT INTO tushare_stock_basic(ts_code) VALUES (?)',[code])
+        monkeypatch.setattr(c,'_reference_version',lambda *_: dict(membership_date=day))
+        c.store.conn.execute('INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv) VALUES (?,?,NULL,100,50)',[code,day])
+        missing = c.receive_valuation_session(day)
+        assert missing['workflow_completed'] and not missing['valuation_complete']
+        assert missing['pending_codes'] == [code] and missing['status'] == 'pending_review'
+        assert missing['worklist']['rows'][code]['required_review']
+        assert missing['market_requests'] == missing['business_rows_written'] == 0
+        from trade_system.pipeline_runtime import PipelineLock
+        from scripts.backfill_2026_tushare import run_local_valuation_session
+        owned_db = tmp_path/'parent-owned.duckdb'
+        with TushareHistoryCollector(owned_db,local_only=True) as setup:
+            setup.store.conn.execute('INSERT INTO tushare_stock_basic(ts_code) VALUES (?)',[code])
+        with PipelineLock(owned_db,'synthetic-parent-owner') as owner:
+            report_path = tmp_path/'owned-session.json'
+            parent_result = run_local_valuation_session(owned_db,day,report=report_path,owner=owner)
+            assert parent_result['workflow_completed'] and not parent_result['valuation_complete']
+            assert owner.path.exists() and owner._guard.fd is not None
+            expired = run_local_valuation_session(owned_db,day,report=report_path,owner=owner,deadline_epoch=1)
+            assert not expired['workflow_completed'] and not expired['valuation_complete']
+            assert expired['status'] == 'deferred'
+            assert 'deadline exhausted' in expired['intake_errors'][0]['reason']
+            # A bounded caller can expire during the worklist, not only before
+            # the first package. The actual held guard remains until return.
+            from trade_system.tushare_store import RetainedValuationReader
+            original_check = RetainedValuationReader._check_valuation_deadline
+            checks = []
+            def expire_in_worklist(self):
+                original_check(self)
+                checks.append(True)
+                if len(checks) >= 4:
+                    raise TimeoutError('synthetic deadline exhausted in local worklist')
+            with monkeypatch.context() as patch:
+                patch.setattr(RetainedValuationReader,'_check_valuation_deadline',expire_in_worklist)
+                deferred = run_local_valuation_session(owned_db,day,report=report_path,owner=owner)
+                assert deferred['status'] == 'deferred' and not deferred['workflow_completed']
+                assert not deferred['valuation_complete'] and deferred['market_requests'] == 0
+                assert len(checks) == 4 and owner.path.exists() and owner._guard.fd is not None
+        with pytest.raises(ValueError,match='caller-owned database guard'):
+            run_local_valuation_session(owned_db,day,report=report_path,owner=owner)
+        assert not owner.path.exists() and owner.path.with_suffix(owner.path.suffix+'.guard').exists()
+        before_sessions = c.store.conn.execute("SELECT count(*) FROM multi_source_observation "
+            "WHERE data_type='valuation_daily_session'").fetchone()[0]
+        checks.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(RetainedValuationReader,'_check_valuation_deadline',expire_in_worklist)
+            with pytest.raises(TimeoutError,match='local worklist'):
+                c.receive_valuation_session(day)
+        assert c._valuation_deadline_epoch is None and len(checks) == 4
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation "
+            "WHERE data_type='valuation_daily_session'").fetchone()[0] == before_sessions
+        with pytest.raises(XiaodefaError,match='offline collector cannot acquire'):
+            c._read_rows('daily',{},'')
+        with pytest.raises(ValueError,match='actual current session'):
+            c.receive_valuation_session(previous)
+        bundle = tmp_path/'bundle.json'
+        manifest = tmp_path/'manifest.json'
+        review = dict(ts_code=code,trade_date=previous)
+        raw = _json(dict(reviews=[review]))
+        bundle.write_text(raw,encoding='utf-8')
+        header = dict(schema='valuation_daily_intake_v1',trade_date=day,
+            reviewed_by='synthetic-fixture-reviewer',reviewed_at=now.isoformat(),
+            bundles=[dict(path='bundle.json',sha256=hashlib.sha256(raw.encode()).hexdigest())])
+        def write_manifest():
+            manifest.write_text(_json(header),encoding='utf-8')
+            return hashlib.sha256(manifest.read_bytes()).hexdigest()
+        sha = write_manifest()
+        with pytest.raises(ValueError,match='manifest hash mismatch'):
+            c.receive_valuation_session(day,manifest_path=manifest,manifest_sha256='0'*64)
+        with pytest.raises(ValueError,match='bundle session/security mismatch'):
+            c.receive_valuation_session(day,manifest_path=manifest,manifest_sha256=sha)
+        # Exact original bytes may be received across isolation; they never
+        # overwrite a raw NULL or become a qualification merely through intake.
+        payload = _json(dict(api='daily_basic',params=dict(trade_date=day.replace('-','')),
+            rows=[dict(ts_code=code,trade_date=day.replace('-',''),pb=None,total_mv=100,circ_mv=50)]))
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        arrival = now-timedelta(minutes=30)
+        retained = dict(data_type='tushare_daily_basic',provider='xiaodefa',payload_json=payload,
+            payload_hash=digest,observed_at=arrival.isoformat(),asset_code=code)
+        review.update(trade_date=day,source_receipts=[digest])
+        c._import_review_source_receipts([retained],[review],now.isoformat())
+        stored = c.store.conn.execute('SELECT payload_json,observed_at FROM multi_source_observation '
+            'WHERE payload_hash=?',[digest]).fetchone()
+        assert stored[0] == payload and stored[1] == arrival.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
+        assert c.store.conn.execute('SELECT pb FROM tushare_daily_basic').fetchone() == (None,)
+        assert c.qualified_valuation_reviews(day) == {}
+        changed = dict(retained,payload_json='{}')
+        with pytest.raises(ValueError,match='hash or review binding'):
+            c._import_review_source_receipts([changed],[review],now.isoformat())
+        bundle.write_text(_json(dict(reviews=[review],retained_source_receipts=[retained])),encoding='utf-8')
+        header['bundles'][0]['sha256']=hashlib.sha256(bundle.read_bytes()).hexdigest()
+        failed = c.receive_valuation_session(day,manifest_path=manifest,manifest_sha256=write_manifest())
+        assert not failed['workflow_completed'] and not failed['valuation_complete']
+        assert failed['intake_errors'] and failed['pending_codes'] == [code]
+        assert c.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_review'").fetchone()[0] == 0
 
 
 def test_dated_identity_allows_flow_publication_but_not_definition_shortcut(tmp_path, monkeypatch):

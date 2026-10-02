@@ -435,11 +435,13 @@ def assess_capital_flow_health(
         and recon_reference_rows > 0
     )
     independent_reconciliation_ready = (
-        same_vendor_reconciliation_ready
-        and independent_source_present
+        independent_source_present
         and independent_status.lower() == "pass"
         and comparison_contract['eligible']
     )
+    # Same-origin relay consistency and sector coverage are separate uses;
+    # neither grants nor revokes a qualified independent stock comparison.
+    stock_independent_certified_ready = stock_ready and independent_reconciliation_ready
     source_ready = stock_ready and sector_ready
     # Coverage is a source/pipeline property.  Independent reconciliation is a
     # certification property and must not be hidden behind the same ``ready``
@@ -480,6 +482,7 @@ def assess_capital_flow_health(
         **operator_state,
         "operator_state": dict(operator_state),
         "operational_capabilities": operational_capabilities,
+        "stock_independent_certified_ready": stock_independent_certified_ready,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "trade_date": trade_date,
         "collection_started_at": collected_after.isoformat(timespec="seconds")
@@ -524,6 +527,7 @@ def assess_capital_flow_health(
             "independent_reference_provider": independent_reference_provider,
             "independent_reference_qualification": independent_reference_qualification,
             "same_vendor_reconciliation_ready": same_vendor_reconciliation_ready,
+            "stock_independent_certified_ready": stock_independent_certified_ready,
             "independent_reconciliation_ready": independent_reconciliation_ready,
             "independent_status": independent_status,
             "comparison_contract": comparison_contract,

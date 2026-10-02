@@ -12,6 +12,7 @@ import io
 import json
 import math
 import re
+import time
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1106,6 +1107,12 @@ class RetainedValuationReader:
     def _valuation_scope_error(message):
         return ValueError(message)
 
+    def _check_valuation_deadline(self):
+        """Finish the current bounded read, then stop starting further work."""
+        deadline = getattr(self, '_valuation_deadline_epoch', None)
+        if deadline is not None and (not math.isfinite(deadline) or time.time() >= deadline):
+            raise TimeoutError('daily local intake phase deadline exhausted; no further local input work started')
+
     def _retained_financial_sources(self, code, day, observed_at, kind, *, extraction_replacements=None,
                                     native_date_conflicts=None):
         """Only already-arrived, applicable consolidated facts may revoke a review."""
@@ -1120,11 +1127,13 @@ class RetainedValuationReader:
             'FROM multi_source_observation WHERE data_type IN (?,\'valuation_source_document\') '
             'AND observed_at<=?', [native, cutoff.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)]).fetchall()
         for data_type, raw, digest, arrival in rows:
+            self._check_valuation_deadline()
             if hashlib.sha256(raw.encode()).hexdigest() != digest:
                 continue
             payload = json.loads(raw)
             if data_type == native:
                 for row_index,row in enumerate(payload.get('rows', [])):
+                    self._check_valuation_deadline()
                     if row.get('ts_code') != code or str(row.get('report_type')) not in {'1', '4'}:
                         continue  # A parent-company or unknown-basis row is not a consolidated revision.
                     announcement = _iso(row.get('f_ann_date') or row.get('ann_date', ''))
@@ -1227,6 +1236,7 @@ class RetainedValuationReader:
         or unbound numeric input is accepted.
         """
         from zoneinfo import ZoneInfo
+        self._check_valuation_deadline()
         zone = ZoneInfo('Asia/Shanghai')
         day = _iso(trade_date)
         cutoff = datetime.fromisoformat(observed_at)
@@ -1242,6 +1252,7 @@ class RetainedValuationReader:
             raise ValueError('canonical valuation identity required')
         documents,receipt_types = {},{}
         for digest in review['source_receipts']:
+            self._check_valuation_deadline()
             records = self._valuation_con.execute(
                 'SELECT payload_json,observed_at,data_type FROM multi_source_observation WHERE payload_hash=?',
                 [digest]).fetchall()
@@ -1257,6 +1268,7 @@ class RetainedValuationReader:
         replacements = _verified_financial_extraction_replacements(
             review.get('financial_extraction_replacements', []), documents, code, day)
         for digest, (payload, _) in documents.items():
+            self._check_valuation_deadline()
             if payload.get('schema') == 'official_valuation_document_v1':
                 if digest in replacements:
                     _read_valuation_document_original(payload)
@@ -1300,6 +1312,7 @@ class RetainedValuationReader:
         inputs = json.loads(_json(review['inputs']))
         statement_identities = {}
         for field, item in inputs.items():
+            self._check_valuation_deadline()
             digest = item['receipt_sha256']
             if digest not in documents:
                 raise ValueError('unbound valuation input')
@@ -1471,6 +1484,7 @@ class RetainedValuationReader:
         """
         results = {}
         for mode in ('static', 'ttm'):
+            self._check_valuation_deadline()
             proof = proofs.get(mode, {})
             out = dict(proof, qualified=False, ts_code=code, trade_date=day)
             try:
@@ -1488,6 +1502,7 @@ class RetainedValuationReader:
                 receipts = inventory['statement_receipts']
                 catalogues = [documents[h][0] for h in inventory['document_receipts']]
                 for digest in inventory['document_receipts']:
+                    self._check_valuation_deadline()
                     arrival = datetime.fromisoformat(documents[digest][1])
                     if arrival.tzinfo is None or arrival > cutoff:
                         raise ValueError('income catalogue received after observation')
@@ -1501,6 +1516,7 @@ class RetainedValuationReader:
                     raise ValueError('complete dated income correction catalogue missing')
                 periods = []
                 for component in components:
+                    self._check_valuation_deadline()
                     values = {}
                     identity = None
                     hashes = []
@@ -1515,6 +1531,7 @@ class RetainedValuationReader:
                         ['parent_profit', 'other_equity_profit_distribution'] if subtraction else
                         ['parent_profit'] if 'parent_profit' in supplied else [])
                     for field in fields:
+                        self._check_valuation_deadline()
                         item = component['inputs'][field]
                         digest = item['receipt_sha256']
                         source, arrival = documents[digest]
@@ -1565,6 +1582,8 @@ class RetainedValuationReader:
                     raise ValueError('selected earnings period is not latest applicable disclosed period')
                 out.update(qualified=True, periods=periods, latest_applicable_period=latest,
                            as_known_at=known_at)
+            except TimeoutError:
+                raise
             except (KeyError, ValueError, TypeError, IndexError, OSError, OverflowError) as exc:
                 out['qualification_error'] = str(exc)
             results[mode] = out
@@ -1573,6 +1592,7 @@ class RetainedValuationReader:
 
     def qualified_valuation_reviews(self, trade_date, *, observed_at=None):
         """Revalidate underlying receipts on every read; never trust cached green."""
+        self._check_valuation_deadline()
         now = observed_at or datetime.now(timezone.utc).isoformat()
         results, seen = {}, set()
         self._valuation_review_failures = {}
@@ -1581,6 +1601,7 @@ class RetainedValuationReader:
             "AND json_extract_string(payload_json,'$.review.trade_date')=? ORDER BY observed_at DESC,rowid DESC",
             [_iso(trade_date)]).fetchall()
         for raw, digest in records:
+            self._check_valuation_deadline()
             code = None
             try:
                 payload = json.loads(raw)
@@ -1596,6 +1617,8 @@ class RetainedValuationReader:
                     results[code] = dict(result, review_sha256=digest)
                 else:
                     self._valuation_review_failures[code] = 'reviewed core inputs remain unqualified'
+            except TimeoutError:
+                raise
             except (KeyError, TypeError, ValueError, IndexError, AttributeError, ImportError, OSError) as exc:
                 if code:
                     self._valuation_review_failures[code] = str(exc)
@@ -1611,6 +1634,7 @@ class RetainedValuationReader:
         Every unresolved security remains in the report, including null-PB rows.
         """
         from zoneinfo import ZoneInfo
+        self._check_valuation_deadline()
         zone = ZoneInfo('Asia/Shanghai')
         at = datetime.fromisoformat(observed_at) if observed_at else datetime.now(timezone.utc)
         if at.tzinfo is None:
@@ -1627,6 +1651,7 @@ class RetainedValuationReader:
             "AND json_extract_string(payload_json,'$.params.trade_date')=? "
             "ORDER BY observed_at DESC,payload_hash", [*types, provider, _ymd(trade_date)]).fetchall()
         for typ, raw, digest, arrival in receipts:
+            self._check_valuation_deadline()
             received = arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival
             if hashlib.sha256(raw.encode()).hexdigest() != digest or received > at:
                 rejected.append({'receipt_sha256': digest, 'reason': 'hash_or_arrival_invalid'})
@@ -1638,6 +1663,7 @@ class RetainedValuationReader:
             rows = payload.get('rows', [])
             identities = [r.get('ts_code') for r in rows if isinstance(r, dict)]
             for row in rows:
+                self._check_valuation_deadline()
                 code = row.get('ts_code')
                 if code not in wanted or api in retained[code]:
                     continue
@@ -1653,6 +1679,7 @@ class RetainedValuationReader:
                 "SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
                 "WHERE data_type='tushare_balancesheet' AND provider=? ORDER BY observed_at DESC",
                 [provider]).fetchall():
+            self._check_valuation_deadline()
             received = arrival.replace(tzinfo=zone) if arrival.tzinfo is None else arrival
             if hashlib.sha256(raw.encode()).hexdigest() != digest or received > at:
                 continue
@@ -1660,6 +1687,7 @@ class RetainedValuationReader:
             if payload.get('api') != 'balancesheet' or payload.get('error_type'):
                 continue
             for row in payload.get('rows', []):
+                self._check_valuation_deadline()
                 code = row.get('ts_code')
                 if code not in wanted or str(row.get('report_type')) != '1':
                     continue
@@ -1679,6 +1707,7 @@ class RetainedValuationReader:
         output = {}
         reviewed_values = self.qualified_valuation_reviews(day, observed_at=at.isoformat())
         for code, sources in retained.items():
+            self._check_valuation_deadline()
             inputs = {}
             for field, native, semantic, unit in (
                     ('price', 'close', 'official_close', 'yuan'),
@@ -1789,6 +1818,7 @@ class RetainedValuationReader:
                     'SELECT ts_code,pb,total_mv,circ_mv,pe,fetched_at FROM tushare_daily_basic '
                     'WHERE date=? AND ts_code IN (' + ','.join('?' for _ in wanted) + ')',
                     [day, *wanted]).fetchall():
+                    self._check_valuation_deadline()
                     if row[0] in committed:
                         committed[row[0]] = None
                     else:
@@ -1800,6 +1830,7 @@ class RetainedValuationReader:
             "AND observed_at<=?", [at.astimezone(zone).replace(tzinfo=None)]).fetchall()}
         rows, qualified_reviews = {}, {}
         for code, item in report['rows'].items():
+            self._check_valuation_deadline()
             scope_ok = expected is not None and code in expected
             reviewed = (bool(item.get('valuation_eligible')) and scope_ok
                         and item.get('review_sha256') in review_receipts)
@@ -1886,7 +1917,9 @@ class RetainedValuationReader:
             'observed_at': at.isoformat(), 'historical_as_of': historical, 'rows': rows,
             'reviewed_valuation': qualified_reviews,
             'scope': 'valuation_only', 'market_requests': 0, 'business_rows_written': 0,
-            'certifies_daily_basic': False, 'changes_expected_universe': False}
+            'certifies_daily_basic': False, 'changes_expected_universe': False,
+            'unattended_all_market_valuation_promise': 'retired',
+            'daily_review_requirement': 'same_session_inputs_named_review_exact_sha_receipt_intake'}
 
 
     def _expected_stock_codes(self, trade_date, dataset=None):

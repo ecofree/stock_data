@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 
 import numpy as np
 import pandas as pd
@@ -50,14 +51,47 @@ def test_forecast_timing_uses_final_freeze_not_capture_start(entry,frozen,expect
     assert product.forecast_timing(entry,frozen)['forecast_status']==expected
 
 
-def test_failed_publication_restores_pointer(tmp_path,monkeypatch):
-    old={'path':'last_success'};write_json(tmp_path/'prediction-current.json',old)
-    def fail(_):raise ValueError('simulated rendering failure')
+@pytest.mark.parametrize('name',['prediction-current.json','research-current.json','research-candidate.json'])
+def test_retired_publication_keeps_pointer_without_renderer_or_lock(tmp_path,monkeypatch,name):
+    old={'path':'last_success'};write_json(tmp_path/name,old)
+    before=(tmp_path/name).read_bytes()
+    def fail(_):raise AssertionError('retired publication must not render')
     monkeypatch.setattr(product,'_publish_desk',fail)
-    with pytest.raises(ValueError,match='simulated'):product.publish_state(tmp_path,'prediction-current.json',{'path':'new'})
-    assert read_json(tmp_path/'prediction-current.json')[0]==old
-    with pytest.raises(ValueError):product.publish_state(tmp_path,'research-current.json',{'build':'new'})
-    assert not (tmp_path/'research-current.json').exists()
+    with pytest.raises(ValueError,match='RESEARCH_RETIRED'):product.publish_state(tmp_path,name,{'path':'new'})
+    assert (tmp_path/name).read_bytes()==before
+    assert read_json(tmp_path/name)[0]==old
+    assert not (tmp_path/'publication.guard').exists()
+
+
+@pytest.mark.parametrize('damage',['configuration','model','preprocessing','identity'])
+def test_retained_historical_build_still_rejects_artifact_tampering(tmp_path,monkeypatch,damage):
+    from trade_system.v2 import rolling_research
+    run=tmp_path/'builds'/'retained';run.mkdir(parents=True)
+    write_json(run/'configuration.json',{'universe':['000001']})
+    (run/'model.txt').write_text('retained synthetic model',encoding='utf-8')
+    write_json(run/'preprocessing.json',{'used_features':ds.BASE})
+    (run/'dataset').mkdir()
+    write_json(run/'dataset/features.metadata.json',{'source_sha256':'old-historical-source'})
+    model={'model_path':str(run/'model.txt'),'model_sha256':file_hash(run/'model.txt'),
+        'preprocessing_path':str(run/'preprocessing.json'),
+        'preprocessing_sha256':file_hash(run/'preprocessing.json')}
+    model['model_id']=identity(model);write_json(run/'frozen-model.json',model)
+    pointer={'build':str(run),'configuration_sha256':file_hash(run/'configuration.json'),
+        'model_manifest_sha256':file_hash(run/'frozen-model.json')}
+    write_json(tmp_path/'research-current.json',pointer)
+    monkeypatch.setattr(rolling_research,'read_result',lambda _:{'retained':True})
+    assert product.read_build(tmp_path,historical=True)[1]==model
+    with pytest.raises(ValueError,match='feature formulas changed'):product.read_build(tmp_path)
+    if damage=='identity':
+        model['model_id']='invalid-identity'
+        (run/'frozen-model.json').write_text(json.dumps(model),encoding='utf-8')
+        pointer['model_manifest_sha256']=file_hash(run/'frozen-model.json')
+        (tmp_path/'research-current.json').write_text(json.dumps(pointer),encoding='utf-8')
+    else:
+        name={'configuration':'configuration.json','model':'model.txt','preprocessing':'preprocessing.json'}[damage]
+        (run/name).write_text('changed retained artifact',encoding='utf-8')
+    with pytest.raises(ValueError,match='frozen .*changed'):
+        product.read_build(tmp_path,historical=True)
 
 
 def test_weekend_forecast_is_valid_before_exact_next_entry():

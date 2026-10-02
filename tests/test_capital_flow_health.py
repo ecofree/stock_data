@@ -315,6 +315,17 @@ def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path,
     assert result['reconciliation']['independent_source_present']
     assert result['reconciliation']['independent_reconciliation_ready']
     assert result['flow_certified_ready']
+    assert result['stock_independent_certified_ready']
+    with duckdb.connect(str(db)) as con:
+        con.execute('DROP TABLE intraday_stock_flow_reconciliation')
+    without_relay = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)
+    assert not without_relay['reconciliation']['same_vendor_reconciliation_ready']
+    assert without_relay['stock_independent_certified_ready'] and without_relay['flow_certified_ready']
+    with duckdb.connect(str(db)) as con:
+        con.execute('DELETE FROM multi_source_sector_flow')
+    without_sector = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)
+    assert without_sector['stock_independent_certified_ready']
+    assert not without_sector['sector_flow']['ready'] and not without_sector['flow_certified_ready']
     with duckdb.connect(str(db)) as con:
         con.execute("UPDATE multi_source_stock_flow SET main_net=main_net+1000 WHERE provider='ifind_fixture'")
     changed = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)

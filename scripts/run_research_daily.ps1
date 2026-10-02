@@ -7,6 +7,7 @@ param([Parameter(Mandatory=$true)][string]$Python,
       [string]$ReleaseDirectory='',
       [string]$ReleaseManifestSha256='')
 $ErrorActionPreference='Stop'
+if ($RefreshResearch) { throw 'Retired active model refresh: historical models are read-only; no provider request or publication performed' }
 $projectPath=Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectPath
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw 'Verified research Python is required' }
@@ -15,7 +16,6 @@ $Workspace=(Resolve-Path -LiteralPath $Workspace -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath (Join-Path $Workspace 'workspace-config.json') -PathType Leaf)) {
     throw 'Configure the read-only market database before scheduling research updates'
 }
-if ($RefreshResearch -and -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) { throw 'Explicit provider environment file is required for separate research refresh' }
 if ([bool]$ReleaseDirectory -ne [bool]$ReleaseManifestSha256) { throw 'Release directory and approved manifest hash must be supplied together' }
 if ($ReleaseDirectory) {
     if ($ReleaseManifestSha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid approved release hash' }
@@ -31,7 +31,6 @@ if ($ReleaseDirectory) {
     $launcher=Join-Path $ReleaseDirectory 'run_research.py'
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Verified release launcher required' }
 }
-if ($RefreshResearch) { $env:KPL_ENV_FILE=$EnvironmentFile }
 $env:PYTHONUTF8='1'
 . (Join-Path $PSScriptRoot 'native_process.ps1')
 $runLogDirectory=Join-Path $Workspace 'scheduled-logs'
@@ -58,11 +57,6 @@ if ($marketReceipt.status -eq 'market_closed') {
 if ($marketReceipt.status -ne 'market_published' -or $marketReceipt.date -ne $ExpectedTradeDate -or
     -not $marketReceipt.snapshot_id -or $marketReceipt.provider_requests -ne 0 -or $marketReceipt.fits -ne 0) {
     throw 'Local market receipt is not current and verified; no research refresh'
-}
-if ($RefreshResearch) {
-    $research=Invoke-StockDataProcess -Executable $Python -Arguments ($prefix+@('update','--output',$Workspace)) -WorkingDirectory $projectPath
-    ($research.Stdout+$research.Stderr) | Tee-Object -FilePath $runLog -Append
-    if ($research.ExitCode -ne 0) { throw "Research refresh failed ($($research.ExitCode)); market publication remains available. Log: $runLog" }
 }
 Write-Output "DAILY_WORKSPACE_COMPLETE expected_date=$ExpectedTradeDate; no trading, account import or task registration."
 exit 0

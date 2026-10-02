@@ -42,8 +42,7 @@ def handler(root, output, port, *, shutdown=None):
                 result=product.observe(output,capture_quotes=mode=='capture_quotes')
                 state['message']=f"报价核对完成：{result['qualified']} / {result['securities']} 只通过当前时点校验；本次请求 {result['provider_requests']} 次，失败 {result['capture_failures']} 次，未训练。缺失不使用昨日价格回填。"
             else:
-                result=product.update(root,output)
-                state['message']=f"更新完成：{result['date']}，{result['predictions']}个非空研究预测。"
+                raise ValueError('RESEARCH_RETIRED: active prediction refresh is unavailable')
         except Exception as exc:
             state['message']='本次更新失败，保留上一成功版本：'+type(exc).__name__+' / '+str(exc)[:200]
         finally:
@@ -119,6 +118,8 @@ def handler(root, output, port, *, shutdown=None):
                 fields=parse_qs(self.rfile.read(size).decode('utf-8'),strict_parsing=True,keep_blank_values=True,max_num_fields=14)
                 if any(len(v)!=1 for v in fields.values()) or fields.get('csrf')!=[token]: return self.reply(403,'Token refused')
                 values={k:v[0] for k,v in fields.items() if k!='csrf'}
+                if self.path=='/update':
+                    return self.reply(410,'预测更新与自动晋级已退役；历史记录只读，基础市场发布和报价观察继续独立使用。')
                 if self.path=='/shutdown':
                     if shutdown is None or state['running']:return self.reply(409,'Update running or managed shutdown unavailable')
                     self.reply(200,'Local workspace is stopping; data and tasks are unchanged')

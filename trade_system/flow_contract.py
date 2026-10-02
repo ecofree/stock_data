@@ -468,60 +468,28 @@ def parse_sina_flow_response(raw, trade_date, securities, *, received_at, reques
                                   *('cross_source_alignment:' + axis for axis in FLOW_DEFINITION_AXES)],
                 authenticated_requests=0, new_market_requests=0, canonical_writes=0, production_writes=0)
 
-# Acquisition vendor and original producer are distinct. This public SDK
-# describes a transport/field contract, not an independent definition mapping.
+# Historical Gangtise receipts remain readable offline. The inaccessible
+# acquisition/onboarding route is retired; no URL or credential consumer exists.
 GANGTISE_SOURCE_COMMIT = 'f244b4741df82077b5afb7d4714289555b401db9'
-GANGTISE_FLOW_URL = 'https://openapi.gangtise.com/application/open-quote/fund-flow/daily'
 GANGTISE_FLOW_FIELDS = tuple(
     f'{bucket}{suffix}' for bucket in ('small', 'medium', 'large', 'xlarge', 'total', 'main')
     for suffix in ('Inflow', 'Outflow', 'NetInflow'))
 
 
-def candidate_flow_request(trade_date, securities):
-    """One explicit historical session; no lookup, pagination or date fallback."""
-    import re
-    day = date.fromisoformat(trade_date)
-    if day.isoformat() != trade_date:
-        raise ValueError('explicit ISO trade date required')
-    if not isinstance(securities, (list, tuple)) or not 1 <= len(securities) <= 10000:
-        raise ValueError('explicit bounded securities required')
-    if (any(not isinstance(c, str) or not re.fullmatch(r'\d{6}\.(SH|SZ|BJ)', c) for c in securities)
-            or len(set(securities)) != len(securities)):
-        raise ValueError('unique exchange-qualified securities required')
-    return dict(securityList=list(securities), startDate=trade_date, endDate=trade_date,
-                limit=len(securities), fieldList=list(GANGTISE_FLOW_FIELDS))
-
-
-def candidate_flow_capabilities(settings=None):
-    """Local configuration presence only; never authenticate or claim entitlement."""
-    import os
-    import importlib.util
-    from trade_system.config import SETTINGS
-    values = SETTINGS if settings is None else settings
-
-    def present(key):
-        value = values.get(key) or (os.environ.get(key) if settings is None else '')
-        return bool(isinstance(value, str) and value.strip())
-
-    return {
-        'hithink_ai_client_key_present': present('HITHINK_FINANCE_API_KEY'),
-        'ifind_access_token_present': present('IFIND_ACCESS_TOKEN'),
-        'ifind_refresh_token_present': present('IFIND_REFRESH_TOKEN'),
-        'ifind_sdk_present': importlib.util.find_spec('iFinDPy') is not None,
-        'gangtise_authorization_present': present('GANGTISE_AUTHORIZATION'),
-        'gangtise_ak_sk_present': present('GTS_ACCESS_KEY') and present('GTS_SECRET_KEY'),
-        'entitlement_verified': False,
-        'hithink_ai_key_authorizes_ifind': False,
-        'independent_definition_verified': False,
-    }
-
-
 def parse_candidate_flow_response(raw, trade_date, securities, *, received_at):
-    """Audit original bytes without qualifying a provider or writing canonical facts."""
+    """Read archived Gangtise bytes only; no acquisition or provider qualification."""
     from datetime import datetime
+    import re
     from decimal import Decimal, InvalidOperation
     import math
-    request = candidate_flow_request(trade_date, securities)
+    if date.fromisoformat(trade_date).isoformat() != trade_date:
+        raise ValueError('explicit ISO trade date required')
+    if (not isinstance(securities, (list, tuple)) or not 1 <= len(securities) <= 10000
+            or any(not isinstance(c, str) or not re.fullmatch(r'\d{6}\.(SH|SZ|BJ)', c) for c in securities)
+            or len(set(securities)) != len(securities)):
+        raise ValueError('unique bounded exchange-qualified securities required')
+    request = dict(securityList=list(securities), startDate=trade_date, endDate=trade_date,
+                   limit=len(securities), fieldList=list(GANGTISE_FLOW_FIELDS))
     arrival = datetime.fromisoformat(received_at)
     if arrival.utcoffset() is None:
         raise ValueError('original arrival must include timezone')
@@ -598,7 +566,7 @@ def parse_candidate_flow_response(raw, trade_date, securities, *, received_at):
                              str(numbers['mainNetInflow']) if numbers['mainNetInflow'] is not None else None),
                          arithmetic_qualified=not issues, quality_issues=issues))
     missing = sorted(expected - seen)
-    return dict(provider='gangtise_candidate', origin_provider='unknown',
+    return dict(provider='gangtise_archive', acquisition_status='retired', origin_provider='unknown',
                 source_api='fund-flow/daily', source_commit=GANGTISE_SOURCE_COMMIT,
                 request=request, request_sha256=hashlib.sha256(json.dumps(
                     request, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
@@ -610,63 +578,6 @@ def parse_candidate_flow_response(raw, trade_date, securities, *, received_at):
                 missing_evidence=['original_producer', *FLOW_DEFINITION_AXES],
                 production_writes=0, canonical_writes=0)
 
-
-def request_candidate_flow(trade_date, securities, *, authorization, entitlement_sha256):
-    """Explicit diagnostic consumer; caller supplies a separately approved budget.
-
-    No credential login/refresh, retries, name lookup, fallback or production write.
-    Receipt hashes bind the exact request and bytes; they do not certify entitlement.
-    """
-    import re
-    from datetime import datetime, timezone
-    from urllib.request import Request
-    from trade_system.http_transport import diagnostic_state, read_verified_once, request_budget, stop_diagnostic
-    if diagnostic_state.get() is None:
-        raise RuntimeError('explicit newly authorized diagnostic context required')
-    if (not isinstance(entitlement_sha256, str)
-            or not re.fullmatch('[0-9a-f]{64}', entitlement_sha256)):
-        raise ValueError('reviewed entitlement document hash required')
-    if not isinstance(authorization, str) or not authorization.strip() or any(
-            c in authorization for c in '\r\n'):
-        raise ValueError('local authorization required')
-    payload = candidate_flow_request(trade_date, securities)
-    wire = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
-    token = authorization.strip()
-    if not token.lower().startswith('bearer '):
-        token = 'Bearer ' + token
-    state = diagnostic_state.get()
-    if state['stopped']:
-        raise RuntimeError('diagnostic stopped: ' + state['stopped'])
-    # Reuse complete valid bytes in this bounded diagnosis without refreshing
-    # their arrival time or duplicating a successful request. Tokens stay local.
-    from copy import deepcopy
-    cache_key = (hashlib.sha256(wire).hexdigest(), hashlib.sha256(token.encode()).hexdigest(),
-                 entitlement_sha256)
-    cache = state.setdefault('candidate_flow_cache', {})
-    if cache_key in cache:
-        raw, result = cache[cache_key]
-        return raw, dict(deepcopy(result), reused=True)
-    request = Request(GANGTISE_FLOW_URL, data=wire, method='POST',
-                      headers={'Authorization': token, 'Content-Type': 'application/json'})
-    with request_budget(20):
-        raw = read_verified_once(request, timeout=20, max_bytes=8_000_000)
-    arrival = datetime.now(timezone.utc).isoformat()
-    # Rejected business responses stop the shared diagnosis even with HTTP 200.
-    try:
-        result = parse_candidate_flow_response(raw, trade_date, securities, received_at=arrival)
-    except (ValueError, UnicodeError):
-        stop_diagnostic('business_rejected')
-        # Return original bytes for isolated preservation even when rejected.
-        # Provider messages are not echoed into diagnostics or terminal output.
-        return raw, dict(status='response_rejected', request=payload,
-                         response_sha256=hashlib.sha256(raw).hexdigest(), received_at=arrival,
-                         independent_comparison_eligible=False, production_writes=0,
-                         entitlement_document_sha256=entitlement_sha256)
-    result['entitlement_document_sha256'] = entitlement_sha256
-    result['reused'] = False
-    if result['returned_scope_complete'] and result['arithmetic_qualified']:
-        cache[cache_key] = (raw, deepcopy(result))
-    return raw, result
 
 # Product-specific, reviewed specifications only. Auction calibration does
 # not authorize this money-flow product. Until a specification is accepted,

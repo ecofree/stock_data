@@ -8,6 +8,7 @@ param(
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
+    [string]$ValuationWorkspace='',
     [string]$EnvironmentFile='',
     [ValidateSet('', 'StockData-ResearchDaily')][string]$PublicationTask=''
 )
@@ -49,6 +50,7 @@ $args = @(
     "--phase", $Phase, "--run-id", $runId,
     "--collection-profile", "priority"
 )
+if ($ValuationWorkspace) { $args += @("--valuation-workspace", $ValuationWorkspace) }
 if ($TradeDate) { $args += @("--trade-date", $TradeDate) }
 if ($PrepareReference) { $args += "--prepare-reference" }
 
@@ -71,7 +73,7 @@ if ($PublicationTask -and $code -in @(0,2)) {
         $receipt.collector_contract_sha256 -ne $CollectorContractSha256) { throw 'Collection receipt binding mismatch; no publication requested' }
     $normalized=@($receipt.steps | Where-Object { $_.name -eq 'build_normalized_views' -and $_.status -eq 'completed' -and $_.return_code -eq 0 })
     $ready=$receipt.publication_readiness
-    if ($receipt.status -in @('completed','completed_with_warnings','completed_with_degradation') -and $normalized.Count -eq 1 -and
+    if ($receipt.status -in @('completed','completed_with_warnings','completed_with_certification_gaps','completed_with_degradation') -and $normalized.Count -eq 1 -and
         $ready.passed -eq $true -and $ready.trade_date -eq $TradeDate) {
         $task=Get-ScheduledTask -TaskName $PublicationTask -TaskPath '\' -ErrorAction Stop
         if ($task.State -eq 'Running') { throw 'Publication task already running; request not queued. Retry publication after completion.' }

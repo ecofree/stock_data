@@ -172,12 +172,12 @@ def test_missing_price_date_and_duplicate_identity_refused(con):
     with pytest.raises(ValueError,match='duplicate'):project(con)
 
 
-def test_market_failure_prevents_half_publication(tmp_path,monkeypatch):
+def test_market_argument_cannot_restore_retired_prediction_publication(tmp_path,monkeypatch):
     write_json(tmp_path/'prediction-current.json',{'old':'pointer'})
     old=(tmp_path/'prediction-current.json').read_bytes()
-    def fail(*args,**kwargs):raise ValueError('synthetic render failed')
+    def fail(*args,**kwargs):raise AssertionError('retired renderer must not execute')
     monkeypatch.setattr(product,'_publish_desk',fail)
-    with pytest.raises(ValueError,match='render failed'):
+    with pytest.raises(ValueError,match='RESEARCH_RETIRED'):
         product.publish_state(tmp_path,'prediction-current.json',{'new':'pointer'},market={'trade_date':'2026-09-11'})
     assert (tmp_path/'prediction-current.json').read_bytes()==old
 

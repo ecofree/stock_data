@@ -61,61 +61,30 @@ def test_market_capability_rejects_only_unqualified_price_inputs(damage):
 def test_missing_price_model_never_borrows_stage_readiness():
     from trade_system.readiness import price_research_capability
     result = price_research_capability(None, "2026-09-29", now=datetime(2026, 9, 29, 17))
-    assert not result["ready"] and result["blockers"] == ["frozen_price_workspace_missing"]
+    assert not result["ready"] and result["blockers"] == ["active_price_research_retired"]
+    assert result["status"] == "retired" and not result["automatic_promotion"]
 
 
-def test_frozen_price_research_uses_actual_features_window_and_original_clocks(tmp_path, monkeypatch):
-    """Synthetic boundary fixture; existing build/campaign tests cover their seals."""
-    import pandas as pd
+def test_qualified_looking_frozen_pointer_cannot_restore_retired_price_capability(tmp_path, monkeypatch):
     from trade_system.readiness import price_research_capability
-    from trade_system.v2 import research_product as product, research_campaign as campaign, research_dataset as dataset
-    from trade_system.v2.domain import file_hash
+    from trade_system.v2 import research_product as product, research_campaign as campaign
     from trade_system.v2.gap_evidence import write_json
-    days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2026-08-31", periods=22)]
-    day = days[-1]
-    rows = [dict(instrument="000001", datetime=d, open=10+i/10, high=12+i/10,
-                 low=9+i/10, close=11+i/10, volume=100+i, turnover=1000+i,
-                 net_mf_amount=None, receipt_files=dict(native="raw.json", daily="raw.json", adj_factor="raw.json"))
-            for i, d in enumerate(days)]
-    actual_frame = pd.DataFrame(rows)
-    actual_frame["net_mf_amount"] = pd.to_numeric(actual_frame["net_mf_amount"], errors="coerce")
-    actual = dataset.features(actual_frame, days).iloc[-1]
-    write_json(tmp_path / "preprocessing.json", {"used_features": dataset.BASE})
-    write_json(tmp_path / "configuration.json", {"universe": ["000001"]})
-    write_json(tmp_path / "raw.json", {"received_at": day + "T16:10:00+08:00"})
-    model = dict(model_id="frozen-fixture", preprocessing_path=str(tmp_path / "preprocessing.json"),
-                 frozen_at=days[0] + "T16:00:00+08:00", train_end=days[0], inference_policy="price_21_sessions_v2")
-    prediction = dict(model_id=model["model_id"], date=day, execution_ready=False,
-        scope="actually_received_current_research_predictions_not_trading_signals", captured_at=day + "T17:00:00+08:00",
-        feature_source_sha256=file_hash(dataset.__file__), receipt_folder=str(tmp_path),
-        receipt_manifest_id="actual-fixture-manifest", prediction_id="frozen-prediction",
-        rows=[dict(instrument="000001", prediction=0.5, features={c:float(actual[c]) for c in dataset.BASE})])
-    reg = dict(origin="native_and_relay", config={"codes": ["000001.SZ"]})
-    observed = dict(calendar={"SSE": days, "SZSE": days.copy()}, rows=rows,
-                    receipt_manifest_id=prediction["receipt_manifest_id"])
-    monkeypatch.setattr(product, "read_build", lambda _: (tmp_path, model, {}))
-    monkeypatch.setattr(product, "read_prediction", lambda _: prediction)
-    monkeypatch.setattr(campaign, "cached_replay", lambda _: (reg, {"raw.json":file_hash(tmp_path / "raw.json")}, {0:days}, []))
-    monkeypatch.setattr(campaign, "derive", lambda *a, **kw: observed)
-    result = price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))
-    assert result["ready"] and result["eligible_codes"] == ["000001"]
-    assert result["minimum_input_sessions"] == 21 and not result["execution_ready"]
-    (tmp_path / "preprocessing.json").write_text(json.dumps({"used_features": dataset.BASE + dataset.MONEY}), encoding="utf-8")
-    assert not price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))["ready"]
-    (tmp_path / "preprocessing.json").write_text(json.dumps({"used_features": dataset.BASE}), encoding="utf-8")
-    rows[-10]["close"] = None
-    assert not price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))["ready"]
-    rows[-10]["close"] = 11+12/10
-    (tmp_path / "raw.json").write_text(json.dumps({"received_at": day + "T19:00:00+08:00"}), encoding="utf-8")
-    assert not price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))["ready"]
-    (tmp_path / "raw.json").write_text(json.dumps({"received_at": day + "T16:10:00+08:00"}), encoding="utf-8")
-    write_json(tmp_path / "receipt-00.json", {"received_at": day + "T19:00:00+08:00"})
-    reg["requests"] = [{"kind": "native_calendar"}]
-    monkeypatch.setattr(campaign, "cached_replay", lambda _: (reg,
-        {name:file_hash(tmp_path / name) for name in ("raw.json", "receipt-00.json")}, {0:days}, []))
-    late_calendar = price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))
-    assert not late_calendar["ready"]
-    assert late_calendar["blockers"] == ["research_calendar_or_identity_arrived_after_as_of"]
+    write_json(tmp_path / "research-current.json", {"build": "retained-frozen-model"})
+    write_json(tmp_path / "prediction-current.json", {"path": "retained-prediction"})
+    before = {p.name:p.read_bytes() for p in tmp_path.iterdir()}
+    def forbidden(*args, **kwargs):
+        raise AssertionError("retired capability cannot load, infer or recapture")
+    monkeypatch.setattr(product, "read_build", forbidden)
+    monkeypatch.setattr(product, "read_prediction", forbidden)
+    monkeypatch.setattr(product, "predict", forbidden)
+    monkeypatch.setattr(campaign, "cached_replay", forbidden)
+    for day in ("2026-09-29", "2026-10-02"):
+        result = price_research_capability(tmp_path, day, now=datetime.fromisoformat(day + "T18:00:00"))
+        assert not result["ready"] and result["status"] == "retired"
+        assert result["eligible_codes"] == [] and result["model_id"] is None
+        assert result["blockers"] == ["active_price_research_retired"]
+        assert not result["automatic_promotion"] and not result["execution_ready"]
+    assert {p.name:p.read_bytes() for p in tmp_path.iterdir()} == before
 
 
 def _batch_evidence(con, kind, day, expected=1, observed=1, coverage=100, status="success"):

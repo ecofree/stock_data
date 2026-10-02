@@ -1,8 +1,6 @@
 """Local research delivery: existing dataset, QLib runner, observations and journal."""
 import argparse
-from datetime import timedelta
 from pathlib import Path
-from collections import Counter
 import uuid
 
 from .domain import canonical, file_hash, identity, now_utc
@@ -16,78 +14,8 @@ def write_pointer(root, name, value):
 
 
 def build(config_path, root, output):
-    import pandas as pd
-    from . import research_dataset as dataset, rolling_research as research
-    output=Path(output).resolve(); output.mkdir(parents=True,exist_ok=True)
-    config=read_json(config_path)[0]
-    run=output/'builds'/uuid.uuid4().hex; run.mkdir(parents=True)
-    write_json(run/'configuration.json',config)
-    recent = set(config['sources']) == {'receipts'}
-    previous = read_build(output)[1] if recent else None
-    if recent:
-        write_json(run/'previous-build-pointer.json',read_json(output/'research-current.json')[0])
-    if recent:
-        from . import research_recent
-        write_json(run/'capacity-preflight.json',research_recent.capacity_preflight(config,root))
-        meta=research_recent.build_dataset(config,root,run/'dataset')
-    else:
-        meta=dataset.build(config,root,run/'dataset')
-    plan=dataset.experiment_plan(config,meta,'delivery-'+run.name[:12])
-    research.register_experiment(run,run/'dataset/features.parquet',dict(plan,experiment_id='experiment'))
-    result=research.run_experiment(run/'experiment')
-    research.read_result(run/'experiment')
-    from . import research_baselines
-    rules=research_baselines.build(run,result)
-    last=run/'experiment/run'/f"fold-{len(result['folds'])-1:02d}"/'price_baseline'
-    model={'model_path':str(last/'model.txt'),'model_sha256':file_hash(last/'model.txt'),
-        'preprocessing_path':str(last/'preprocessing.json'),'preprocessing_sha256':file_hash(last/'preprocessing.json'),
-        'selection':'predeclared_last_fold_price_baseline_not_best_test_variant',
-        'inference_policy':'price_21_sessions_v2',
-        'train_end':result['folds'][-1]['partition']['train_end'],
-        'validation_end':result['folds'][-1]['partition']['valid_end'],
-        'frozen_at':now_utc().isoformat(),'execution_ready':False}
-    if recent:
-        research_recent.compare_previous(run,previous,config,result,plan)
-        last,boundaries=research_recent.refit(run,config,result,plan)
-        model.update(model_path=str(last/'model.txt'),model_sha256=file_hash(last/'model.txt'),
-            preprocessing_path=str(last/'preprocessing.json'),preprocessing_sha256=file_hash(last/'preprocessing.json'),
-            selection='predeclared_recent_price_refit_not_test_winner',
-            train_end=boundaries['train_end'],validation_end=boundaries['validation_end'],
-            refit_boundaries=boundaries,final_refit_scored=False,previous_model_id=previous['model_id'],
-            frozen_at=now_utc().isoformat())
-        frame,days,_=research_recent.load_receipts(config,root)
-        current=predict(frame,days,model)
-        if not current.prediction.notna().any():
-            raise ValueError('recent model has no nonempty latest prediction; retain previous build')
-        write_json(run/'inference-check.json',{'date':days[-1],
-            'nonempty':int(current.prediction.notna().sum()),'execution_ready':False})
-        previous_prediction=read_prediction(output)
-        daily=read_json(run/'experiment/run/daily_metrics.json')[0]['price_baseline']
-        readiness=research_recent.publication_readiness(daily,plan['top_k'],
-            int(current.prediction.notna().sum()),previous_prediction['predictions'] if previous_prediction else 0)
-        write_json(run/'publication-readiness.json',readiness)
-    model['model_id']=identity(model)
-    write_json(run/'frozen-model.json',model)
-    if recent:
-        write_json(run/'candidate-predictions.json',{'date':days[-1],'model_id':model['model_id'],
-            'frozen_at':now_utc().isoformat(),'scope':'recent_model_candidate_not_active_prediction_archive',
-            'rows':[{'instrument':r['instrument'],'prediction':float(r['prediction']) if pd.notna(r['prediction']) else None}
-                for r in current.to_dict('records')], 'execution_ready':False})
-    pointer={'build':str(run),'dataset_id':meta['dataset_id'],'model_id':model['model_id'],
-        'model_manifest_sha256':file_hash(run/'frozen-model.json'),
-        'configuration_sha256':file_hash(run/'configuration.json')}
-    pointer['rule_baselines_sha256']=file_hash(run/'rule-baselines.json')
-    pointer['rule_baselines_id']=rules['baseline_id']
-    if recent:
-        pointer['previous_comparison_sha256']=file_hash(run/'previous-model-comparison.json')
-        pointer['readiness_sha256']=file_hash(run/'publication-readiness.json')
-        publish_state(output,'research-candidate.json',pointer)
-    if not recent or readiness['can_replace_current_model']:
-        publish_state(output,'research-current.json',pointer)
-    return {'status':'recent_candidate_not_promoted' if recent and not readiness['can_replace_current_model'] else 'historical_experiment_completed','build':str(run),'rows':result['sampled_rows'],
-        'folds':len(result['folds']),'fits':len(result['folds'])*len(plan['variants'])+int(recent),
-        'execution_ready':False,'next':'update current observations and freeze research predictions'}
-
+    """Retired active trainer; standalone historical experiment readers remain."""
+    raise ValueError('RESEARCH_RETIRED: active model training, prediction refresh and automatic promotion are retired; retained historical evidence is read-only')
 
 def read_build(output, *, pointer_name='research-current.json', historical=False):
     from . import research_dataset as dataset, rolling_research as research
@@ -174,12 +102,8 @@ def forecast_timing(entry,captured_at):
 
 
 def update(root, output, *, receipts=None, client=None, replay_build=False, force_refresh=False):
-    """All callers share one update owner, including CLI and HTTP."""
-    from trade_system.file_lock import FileLock
-    output=Path(output); output.mkdir(parents=True,exist_ok=True)
-    with FileLock(output/'update.guard'):
-        return _update(root,output,receipts=receipts,client=client,replay_build=replay_build,force_refresh=force_refresh)
-
+    """Refuse all former CLI/HTTP refresh paths before locks, requests or writes."""
+    raise ValueError('RESEARCH_RETIRED: active model training, prediction refresh and automatic promotion are retired; retained historical evidence is read-only')
 
 def configured_market(output, prediction):
     path=Path(output)/'workspace-config.json'
@@ -206,115 +130,8 @@ def calendar_covers_clock(reg, parsed, today):
 
 
 def _update(root, output, *, receipts=None, client=None, replay_build=False, force_refresh=False):
-    import pandas as pd
-    from . import research_dataset as dataset
-    from . import research_campaign as campaign
-    run,model,_=read_build(output); config=read_json(run/'configuration.json')[0]
-    if replay_build:
-        from . import research_recent
-        if receipts or client or set(config['sources'])!={'receipts'}:
-            raise ValueError('build replay requires its own frozen receipt source')
-        research_recent.load_receipts(config,root)
-        receipts=Path(root)/config['sources']['receipts']['path']
-    moment=now_utc(); today=moment.astimezone(campaign.CST).date()
-    capture={'codes':[c+('.SH' if c.startswith('6') else '.SZ') for c in config['universe']],
-        'start':(today-timedelta(days=89)).isoformat(),'end':today.isoformat(),
-        'window_days':90,'max_requests':300,'selection_scope':'same_registered_research_universe_not_limit_pool_or_full_market'}
-    base=None;replay_cache={}
-    prior=read_prediction(output)
-    if not receipts and prior and prior.get('receipt_folder'):
-        previous=Path(prior['receipt_folder'])
-        old,members,parsed_prior,_=campaign.cached_replay(previous,replay_cache)
-        saved=old.get('config') or {}
-        previous_calendar=parsed_prior.get(0,[])
-        same_model=prior.get('model_id')==model['model_id']
-        if (not force_refresh and same_model and saved.get('codes')==capture['codes']
-            and saved.get('selection_scope')==capture['selection_scope']
-            and old['origin']=='native_and_relay' and previous_calendar and calendar_covers_clock(old,parsed_prior,today.isoformat())
-            and latest_closed_session(previous_calendar,moment)==prior['date']):
-            campaign.derive(previous,replayed=replay_cache[str(previous.resolve())],replay_cache=replay_cache)
-            market=configured_market(output,prior)
-            if market is not None:publish_desk(output,market=market)
-            return {'status':'sealed_session_reused','date':prior['date'],'predictions':prior['predictions'],
-                    'prediction_id':prior['prediction_id'],'provider_requests':0,'fits':0,'execution_ready':False}
-        elapsed=(today-pd.Timestamp(saved.get('end',today)).date()).days
-        if (saved.get('codes')==capture['codes'] and saved.get('selection_scope')==capture['selection_scope']
-            and 0<=elapsed<=7 and old.get('incremental_depth',0)<6):
-            base=previous
-            capture['start']=max(saved['start'],(pd.Timestamp(saved['end']).date()-timedelta(days=4)).isoformat())
-    folder=Path(output)/'observations'/uuid.uuid4().hex; folder.mkdir(parents=True)
-    write_json(folder/'request-plan.json',capture)
-    source=Path(receipts) if receipts else folder/'receipts'
-    if not receipts: campaign.capture(source,client=client,config=capture,base=base,replay_cache=replay_cache)
-    # Replay the raw capture; it is not enough that files happen to exist.
-    replayed=campaign.cached_replay(source,replay_cache)
-    reg,_,parsed,_=replayed
-    if receipts:
-        saved=reg.get('config') or {}
-        if (saved.get('codes')!=capture['codes'] or (not replay_build and saved.get('selection_scope')!=capture['selection_scope'])
-            or saved.get('end','')>today.isoformat()):raise ValueError('replay requires frozen universe and nonfuture receipt range')
-    elif reg.get('config')!=capture: raise ValueError('current update requires exact current range and frozen universe')
-    observed=campaign.derive(source,replayed=replayed,replay_cache=replay_cache)
-    calendar=observed['calendar']['SSE']
-    if calendar!=observed['calendar']['SZSE'] or not calendar:
-        raise ValueError('current exchange session not available; retain previous publication')
-    native_calendar=parsed.get(0,[])
-    market_calendar=native_calendar or calendar
-    if receipts and not replay_build and (not native_calendar or max(native_calendar)<today.isoformat()):
-        raise ValueError('replay cannot certify latest market session')
-    session=latest_closed_session(market_calendar,moment)
-    if session not in calendar:raise ValueError('latest closed session absent from receipts; retain previous date')
-    calendar=[d for d in calendar if d<=session]
-    frame=pd.DataFrame([r for r in observed['rows'] if r['datetime']<=session]); current=predict(frame,calendar,model)
-    future=[d for d in market_calendar if d>session]
-    entry=future[0]+'T09:30:00+08:00' if future else None
-    rows=[]
-    for r in current.to_dict('records'):
-        score=float(r['prediction']) if pd.notna(r['prediction']) else None
-        code=r['instrument']; original=next(x for x in observed['rows'] if x['instrument']==code and x['datetime']==calendar[-1])
-        rows.append({'instrument':code,'date':calendar[-1],'prediction':score,
-            'name':observed['identity_snapshots'].get(code+('.SH' if code.startswith('6') else '.SZ'),{}).get('name',''),
-            'baseline_momentum_20d':float(r['ret_20d']) if pd.notna(r['ret_20d']) else None,
-            'close_adjusted':float(r['close']) if pd.notna(r['close']) else None,
-            'features':{k:float(r[k]) if pd.notna(r[k]) else None for k in dataset.BASE+dataset.MONEY},
-            'contributions':r['contributions'],
-            'eligibility':{k:bool(r[k]) for k in ('price_eligible','money_eligible','alpha158_window_eligible')},
-            'status':'research_prediction' if score is not None else 'insufficient_current_features',
-            'risks':['historical_availability_selected_training_universe','unvalidated_model_not_execution',
-                'price_target_not_portfolio_return','model_age_and_market_regime_shift'],
-            'source_gaps':original['gaps'],'receipt_files':original['receipt_files']})
-        history=[item for item in observed['rows'] if item['instrument']==code and item['datetime']<=session]
-        rows[-1]['window_gap_counts']=dict(Counter(gap for item in history for gap in item['gaps']))
-        rows[-1]['active_window_gap_counts']=dict(Counter(gap for item in history[-21:] for gap in item['gaps']))
-    rows.sort(key=lambda x:(x['prediction'] is None,-(x['prediction'] or 0),x['instrument']))
-    result={'date':calendar[-1],'captured_at':now_utc().isoformat(),'model_id':model['model_id'],
-        'model_frozen_at':model['frozen_at'],'model_train_end':model['train_end'],
-        'scope':'actually_received_current_research_predictions_not_trading_signals',
-        'receipt_manifest_id':observed['receipt_manifest_id'],'receipt_folder':str(source.resolve()),
-        'rows':rows,'predictions':sum(r['prediction'] is not None for r in rows),'execution_ready':False,
-        'feature_source_sha256':file_hash(dataset.__file__)}
-    result.update(scheduled_entry_at=entry,scheduled_exit_date=future[1] if len(future)>1 else None,
-        **forecast_timing(entry,result['captured_at']),
-        received_date=today.isoformat(),receipt_replay=bool(receipts),
-        verified_calendar_scope='native_exchange_calendar_with_dual_relay_history',
-        data_received_at=max(read_json(path)[0]['received_at'] for path in source.glob('receipt-*.json')),
-        baseline_rule='descending 20-session adjusted return; ties by code; no training')
-    if replay_build:
-        result.update(scope='frozen_recent_receipt_replay_not_latest_session_certified',
-            latest_session_certified=False)
-    from .research_followup import collect
-    result['reviews']=collect(output,frame,calendar,result['captured_at'])
-    result['prediction_id']=identity(result)
-    write_json(folder/'predictions.json',result)
-    if not result['predictions']: raise ValueError('no nonempty current prediction; previous publication retained')
-    market=configured_market(output,result)
-    state={'path':str(folder/'predictions.json'),'sha256':file_hash(folder/'predictions.json')}
-    if market is None:publish_state(output,'prediction-current.json',state)
-    else:publish_state(output,'prediction-current.json',state,market=market)
-    return {'date':result['date'],'predictions':result['predictions'],'cohort':len(rows),'prediction_id':result['prediction_id'],
-            'update_mode':'receipt_replay' if receipts else 'incremental_revision' if base else 'bounded_bootstrap_checkpoint',
-            'provider_requests':0 if receipts else len(campaign.plan(capture)),'execution_ready':False}
-
+    """Private spelling cannot restore the retired active update owner."""
+    raise ValueError('RESEARCH_RETIRED: active model training, prediction refresh and automatic promotion are retired; retained historical evidence is read-only')
 
 def read_prediction(output):
     pointer=Path(output)/'prediction-current.json'
@@ -336,6 +153,8 @@ def publish_state(output,name,value,*,market=None):
     """Keep the previous state pointer if building/publishing its page fails."""
     from trade_system.file_lock import FileLock
     if name not in ('research-current.json','research-candidate.json','prediction-current.json','price-study-current.json'):raise ValueError('known state pointer required')
+    if name in ('research-current.json', 'research-candidate.json', 'prediction-current.json'):
+        raise ValueError('RESEARCH_RETIRED: active model training, prediction refresh and automatic promotion are retired; retained historical evidence is read-only')
     path=Path(output)/name
     with FileLock(Path(output)/'publication.guard'):
         previous=read_json(path)[0] if path.exists() else None
@@ -347,11 +166,27 @@ def publish_state(output,name,value,*,market=None):
             raise
 
 
+def _retire_active_forecasts(data):
+    """Retain evidence without exposing it as current forecasts or promotion."""
+    if data.get('prediction') is not None:
+        data['retained_prediction_evidence'] = data['prediction']
+    if data.get('model'):
+        data['retained_model_evidence'] = data['model']
+    data.update(prediction=None, model={}, candidate_model=None, candidate_readiness=None,
+                prediction_matches_market=None, execution_ready=False,
+                research_retirement={'status':'retired', 'active_predictions':False,
+                                     'automatic_promotion':False,
+                                     'retained_history':'read_only_original_artifacts'})
+    data.pop('report_id', None)
+    data['report_id'] = identity(data)
+    return data
+
+
 def _publish_desk(output,*,market=None):
     from .daily_workspace import projection, period_history
     from .research_product_view import render
     if market is not None:market=period_history(output,market)
-    data=projection(output,market=market,research_loader=_research_projection)
+    data=_retire_active_forecasts(projection(output,market=market,research_loader=_research_projection))
     publication=Path(output)/'publication'
     generation=read_current(publication)[0]['generation']+1 if (publication/'current.json').exists() else 1
     return publish(publication,uuid.uuid4().hex,{'index.html':render(data).encode('utf-8'),'desk.json':canonical(data).encode()},generation=generation)
@@ -471,7 +306,7 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
         if capture_quotes and quote_receipts:raise ValueError('capture and replay are mutually exclusive')
         config=read_json(output/'workspace-config.json')[0]
         if config.get('read_only') is not True:raise ValueError('explicit read-only market source required')
-        data=saved_projection(output)
+        data=_retire_active_forecasts(saved_projection(output))
         codes={r['instrument'] for r in (data.get('prediction') or {}).get('rows',[])}
         from .journal_index import effective
         attention={n['instrument'] for n in effective(output,'note')}
@@ -610,6 +445,15 @@ def observe(output,*,capture_quotes=False,quote_receipts=None):
                 'fits':0,'execution_ready':False}
 
 
+def _checked_market_review(path):
+    market=read_json(path)[0]
+    if market.get('snapshot_id')!=identity({k:v for k,v in market.items() if k!='snapshot_id'}):
+        raise ValueError('market snapshot identity changed')
+    if market.get('scope')!='read_only_market_review_not_execution' or market.get('execution_ready') is not False:
+        raise ValueError('non-executable market snapshot required')
+    return market
+
+
 def saved_projection(output,*,market_review=None):
     """Read a sealed projection without network/model execution."""
     import json
@@ -619,11 +463,7 @@ def saved_projection(output,*,market_review=None):
         raise ValueError('published projection identity changed')
     data=journal_projection(output,data)
     if market_review:
-        market=read_json(market_review)[0]
-        if market.get('snapshot_id')!=identity({k:v for k,v in market.items() if k!='snapshot_id'}):
-            raise ValueError('market snapshot identity changed')
-        if market.get('scope')!='read_only_market_review_not_execution' or market.get('execution_ready') is not False:
-            raise ValueError('non-executable market snapshot required')
+        market=_checked_market_review(market_review)
         if not data.get('prediction') or market['trade_date']!=data['prediction']['date']:
             raise ValueError('market and prediction dates differ; do not silently combine')
         data['market']=market
@@ -637,7 +477,10 @@ def present(output,*,market_review=None):
     from .research_product_view import render
     output=Path(output)
     with FileLock(output/'publication.guard'):
-        data=saved_projection(output,market_review=market_review)
+        data=_retire_active_forecasts(saved_projection(output))
+        if market_review:
+            data['market']=_checked_market_review(market_review)
+            data=journal_projection(output,data)
         publication=output/'publication'
         generation=read_current(publication)[0]['generation']+1
         return publish(publication,uuid.uuid4().hex,
@@ -758,9 +601,7 @@ def main():
         from .research_recent import capacity_preflight
         result=capacity_preflight(read_json(root/a.config)[0],root)
     elif a.command=='price-study':
-        if not a.donor: p.error('--donor is required for the frozen supplemental price study')
-        from .price_study import run
-        result=run(root,output,root/a.donor)
+        raise ValueError('RESEARCH_RETIRED: active model training, prediction refresh and automatic promotion are retired; retained historical evidence is read-only')
     elif a.command=='build': result=build(root/a.config,root,output)
     elif a.command=='update': result=update(root,output,receipts=a.receipts,replay_build=a.replay_build,force_refresh=a.force_refresh)
     elif a.command=='stop':
@@ -770,17 +611,9 @@ def main():
         from .research_product_server import serve
         return serve(root,output,a.port,open_browser=a.open_browser)
     else:
-        _,model,result=read_build(output);prediction=read_prediction(output)
-        result={'model_id':model['model_id'],'folds':len(result['folds']),'prediction_date':prediction['date'] if prediction else None,
-            'predictions':prediction['predictions'] if prediction else 0,'execution_ready':False}
-        result['active_train_end']=model['train_end']
-        if (output/'research-candidate.json').exists():
-            candidate_run,candidate,_=read_build(output,pointer_name='research-candidate.json',historical=True)
-            result['candidate_train_end']=candidate['train_end']
-            result['candidate_readiness']=read_json(candidate_run/'publication-readiness.json')[0]
-            from . import research_recent
-            meta=dataset_metadata(candidate_run)
-            result['candidate_formulas_current']=meta.get('recent_source_sha256')==file_hash(research_recent.__file__)
+        result={'status':'retired', 'active_predictions':False, 'automatic_promotion':False,
+                'retained_history':'read_only_original_artifacts', 'provider_requests':0,
+                'fits':0, 'execution_ready':False}
     print(canonical(result))
 
 

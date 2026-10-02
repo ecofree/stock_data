@@ -74,7 +74,7 @@ class TushareHistoryCollector(RetainedValuationReader):
 
     @property
     def _valuation_provider(self):
-        return 'xiaodefa' if self.offline else self._provider_name(self.client)
+        return 'xiaodefa' if self.offline or self.local_only else self._provider_name(self.client)
 
     @staticmethod
     def _valuation_scope_error(message):
@@ -83,12 +83,16 @@ class TushareHistoryCollector(RetainedValuationReader):
     def __init__(self, db_path: str | Path, *, client: XiaodefaClient | None = None,
                  request_timeout: int = 20, retries: int = 3,
                  batch_limit: int = 5000, moneyflow_page_size: int = 1000,
-                 budget_seconds: float = 300.0, offline: bool = False, connection=None):
+                 budget_seconds: float = 300.0, offline: bool = False, connection=None,
+                 local_only: bool = False):
         # Validate the only approved client before opening a business database.
-        self.client = client if client is not None else (None if offline else XiaodefaClient(
+        if local_only and (offline or client is not None):
+            raise ValueError('local intake requires a writable collector without a network client')
+        self.client = client if client is not None else (None if offline or local_only else XiaodefaClient(
             timeout=request_timeout, max_retries=retries))
         self.db_path = str(db_path)
         self.offline = offline
+        self.local_only = local_only
         self.store = DuckDBStore(self.db_path, read_only=offline, connection=connection)
         try:
             if offline:
@@ -261,7 +265,13 @@ class TushareHistoryCollector(RetainedValuationReader):
     def import_valuation_reviews(self, path, expected_sha256, trade_date):
         """Explicit, hash-pinned local intake; no network or provider-row update."""
         from zoneinfo import ZoneInfo
-        raw = Path(path).read_bytes()
+        self._check_valuation_deadline()
+        if self.offline:
+            raise ValueError('read-only collector cannot import reviewed evidence')
+        source = Path(path)
+        if source.stat().st_size > 8_000_000:
+            raise ValueError('valuation evidence bundle exceeds local intake size bound')
+        raw = source.read_bytes()
         if hashlib.sha256(raw).hexdigest() != expected_sha256:
             raise ValueError('valuation evidence file hash mismatch')
         bundle = json.loads(raw)
@@ -270,7 +280,9 @@ class TushareHistoryCollector(RetainedValuationReader):
             raise ValueError('empty or duplicate valuation review scope')
         now = datetime.now(timezone.utc).isoformat()
         with self._transaction(True):
+            self._import_review_source_receipts(bundle.get('retained_source_receipts', []), reviews, now)
             for document in bundle.get('reviewed_source_documents', []):
+                self._check_valuation_deadline()
                 _validate_valuation_document(document)
                 received = datetime.fromisoformat(document['received_at'])
                 if received.tzinfo is None or received > datetime.fromisoformat(now):
@@ -286,17 +298,184 @@ class TushareHistoryCollector(RetainedValuationReader):
             if not all(r['valuation_eligible'] for r in results):
                 raise ValueError('valuation review inputs incomplete')
             for review in reviews:
+                self._check_valuation_deadline()
                 payload = _json(dict(review=review, import_bundle_sha256=expected_sha256))
                 digest = hashlib.sha256(payload.encode()).hexdigest()
                 if not self.store.conn.execute(
                         "SELECT 1 FROM multi_source_observation WHERE data_type='valuation_review' AND payload_hash=?",
                         [digest]).fetchone():
                     self.store.conn.execute(
-                        'INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash) '
-                        "VALUES ('valuation_review','stock',?,'reviewed_evidence','reviewed',?,?)",
-                        [review['ts_code'], payload, digest])
+                        'INSERT INTO multi_source_observation(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) '
+                        "VALUES ('valuation_review','stock',?,'reviewed_evidence','reviewed',?,?,?)",
+                        [review['ts_code'], payload, digest,
+                         datetime.fromisoformat(now).astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)])
         return {'trade_date': _iso(trade_date), 'rows': results, 'market_requests': 0,
                 'raw_daily_basic_overwritten': False, 'bundle_sha256': expected_sha256}
+
+    def _import_review_source_receipts(self, receipts, reviews, observed_at):
+        """Receive exact original bytes for an explicitly reviewed local bundle.
+
+        These records are inputs, not provider fact-table writes. The named
+        review is still revalidated after intake; importing a receipt cannot
+        certify its numerical fields or refresh its original arrival clock.
+        """
+        from zoneinfo import ZoneInfo
+        if not isinstance(receipts, list) or len(receipts) > 512:
+            raise ValueError('retained valuation receipt scope exceeds local intake bound')
+        wanted = {digest for review in reviews for digest in review['source_receipts']}
+        allowed = {'daily', 'daily_basic', 'stk_premarket', 'bak_basic', 'balancesheet', 'suspend_d'}
+        seen = set()
+        cutoff = datetime.fromisoformat(observed_at)
+        for receipt in receipts:
+            self._check_valuation_deadline()
+            raw, digest = receipt['payload_json'], receipt['payload_hash']
+            if (not isinstance(raw, str) or digest not in wanted or digest in seen
+                    or hashlib.sha256(raw.encode()).hexdigest() != digest):
+                raise ValueError('retained valuation receipt hash or review binding mismatch')
+            seen.add(digest)
+            payload = json.loads(raw)
+            typ, provider = receipt['data_type'], receipt['provider']
+            api = payload.get('api')
+            snapshot = typ == 'tushare_suspend_d_snapshot'
+            if (provider != 'xiaodefa' or payload.get('error_type')
+                    or not isinstance(payload.get('rows'), list)
+                    or not ((api in allowed and typ == 'tushare_'+api and not snapshot)
+                            or (snapshot and receipt.get('status') == 'qualified'
+                                and payload.get('params', {}).get('trade_date')))):
+                raise ValueError('retained valuation receipt product/provider/status mismatch')
+            arrival = datetime.fromisoformat(receipt['observed_at'])
+            if arrival.tzinfo is None or arrival > cutoff:
+                raise ValueError('retained valuation receipt arrival timezone/future mismatch')
+            if self.store.conn.execute(
+                    'SELECT 1 FROM multi_source_observation WHERE payload_hash=?', [digest]).fetchone():
+                continue
+            self.store.conn.execute('INSERT INTO multi_source_observation '
+                '(data_type,asset_type,asset_code,provider,status,payload_json,payload_hash,observed_at) '
+                "VALUES (?,'receipt',?,?,?,?,?,?)", [typ,receipt.get('asset_code'),provider,
+                'qualified' if snapshot else 'received_unverified',raw,digest,
+                arrival.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)])
+
+    def receive_valuation_session(self, trade_date, codes=None, *, manifest_path=None,
+                                  manifest_sha256=None, observed_at=None, deadline_epoch=None):
+        """Bind the caller's phase deadline to every local evidence/read loop."""
+        previous_deadline = getattr(self, '_valuation_deadline_epoch', None)
+        self._valuation_deadline_epoch = deadline_epoch
+        try:
+            return self._receive_valuation_session(trade_date, codes,
+                manifest_path=manifest_path, manifest_sha256=manifest_sha256,
+                observed_at=observed_at, deadline_epoch=deadline_epoch)
+        finally:
+            self._valuation_deadline_epoch = previous_deadline
+
+    def _receive_valuation_session(self, trade_date, codes=None, *, manifest_path=None,
+                                  manifest_sha256=None, observed_at=None, deadline_epoch=None):
+        """Daily local intake and full pending worklist, with no acquisition.
+
+        A machine can receive a human-reviewed exact-SHA package; it cannot
+        manufacture today's prices, statements, corrections or named review.
+        Missing packages are an explicit pending capability, not a failed basic
+        collection or an all-market valuation-complete promise.
+        """
+        from zoneinfo import ZoneInfo
+        def within_deadline():
+            self._check_valuation_deadline()
+        within_deadline()
+        if self.offline or not self.local_only:
+            raise ValueError('daily valuation session requires local-only writable intake')
+        now = observed_at or datetime.now(timezone.utc).isoformat()
+        at = datetime.fromisoformat(now)
+        if at.tzinfo is None or _iso(trade_date) != at.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat():
+            raise ValueError('daily valuation intake requires the actual current session')
+        day = _iso(trade_date)
+        expected = self._expected_stock_codes(day, 'daily_basic')
+        wanted = sorted(expected if codes is None else set(codes))
+        if len(wanted) > 12_000 or any(code != stock_code_to_ts_code(code) for code in wanted):
+            raise ValueError('canonical bounded valuation scope required')
+        if set(wanted) - expected:
+            raise ValueError('valuation intake cannot expand the dated expected universe')
+        reference = self._reference_version(day) or {}
+        # Same-day scope is not inferred from an old or unqualified stock table.
+        dated_scope = bool(reference and reference.get('membership_date') == day)
+        imports, errors = [], []
+        if bool(manifest_path) != bool(manifest_sha256):
+            raise ValueError('valuation intake manifest requires its exact reviewed SHA256')
+        if manifest_path:
+            source = Path(manifest_path)
+            if source.stat().st_size > 100_000:
+                raise ValueError('valuation daily intake manifest exceeds size bound')
+            raw = source.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+                raise ValueError('valuation daily intake manifest hash mismatch')
+            manifest = json.loads(raw)
+            if (manifest.get('schema') != 'valuation_daily_intake_v1' or manifest.get('trade_date') != day
+                    or not str(manifest.get('reviewed_by', '')).strip()):
+                raise ValueError('valuation daily intake manifest schema/session/reviewer mismatch')
+            reviewed = datetime.fromisoformat(manifest['reviewed_at'])
+            if reviewed.tzinfo is None or reviewed > at or reviewed.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() != day:
+                raise ValueError('valuation daily intake manifest requires a same-session dated review')
+            entries = manifest.get('bundles')
+            if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
+                raise ValueError('valuation daily intake requires one to sixteen reviewed bundles')
+            if not dated_scope:
+                raise ValueError('valuation daily intake requires qualified same-session identity scope')
+            total_bytes, seen = 0, set()
+            for entry in entries:
+                within_deadline()
+                digest = entry['sha256']
+                bundle_path = Path(entry['path'])
+                if not bundle_path.is_absolute():
+                    bundle_path = source.parent/bundle_path
+                if not re.fullmatch(r'[a-f0-9]{64}', digest or '') or digest in seen:
+                    raise ValueError('valuation daily intake bundle SHA scope invalid or duplicate')
+                seen.add(digest)
+                bundle_bytes = bundle_path.stat().st_size
+                total_bytes += bundle_bytes
+                if bundle_bytes > 8_000_000 or total_bytes > 32_000_000:
+                    raise ValueError('valuation daily intake total size exceeds bound')
+                raw_bundle = bundle_path.read_bytes()
+                if len(raw_bundle) > 8_000_000 or hashlib.sha256(raw_bundle).hexdigest() != digest:
+                    raise ValueError('valuation daily intake bundle hash or size mismatch')
+                bundle = json.loads(raw_bundle)
+                reviews = bundle.get('reviews', [])
+                if (not reviews or len(reviews) > 12_000
+                        or any(review.get('trade_date') != day or review.get('ts_code') not in wanted
+                               for review in reviews)):
+                    raise ValueError('valuation daily intake bundle session/security mismatch')
+            # All files and session scopes are checked before the first write.
+            # Each reviewed bundle is atomic; a bad independent review leaves
+            # its securities pending without erasing earlier valid reviews.
+            for entry in entries:
+                within_deadline()
+                path = Path(entry['path'])
+                if not path.is_absolute():
+                    path = source.parent/path
+                try:
+                    result = self.import_valuation_reviews(path, entry['sha256'], day)
+                    imports.append({'bundle_sha256': entry['sha256'], 'reviewed_codes': [r['ts_code'] for r in result['rows']]})
+                except TimeoutError:
+                    raise
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    errors.append({'bundle_sha256': entry['sha256'], 'reason': str(exc)})
+        now = observed_at or datetime.now(timezone.utc).isoformat()
+        worklist = self.prepare_valuation_reviews(day, wanted, observed_at=now)
+        pending = [code for code, row in worklist['rows'].items() if not row['qualified_core']]
+        result = {'schema': 'valuation_daily_session_v1', 'trade_date': day, 'observed_at': now,
+            'status': 'intake_errors' if errors else 'pending_review' if pending or not dated_scope else 'qualified_for_session',
+            'identity_scope_status': 'qualified_same_session' if dated_scope else 'unverified',
+            'imports': imports, 'intake_errors': errors, 'manifest_sha256': manifest_sha256,
+            'worklist': worklist, 'pending_codes': pending,
+            'valuation_complete': bool(wanted) and not pending and dated_scope and not errors,
+            'workflow_completed': not errors, 'market_requests': 0, 'business_rows_written': 0,
+            'raw_daily_basic_overwritten': False,
+            'qualification_scope': 'valuation_only_not_market_day_or_account_acceptance',
+            'automatic_financial_acquisition': 'retired', 'unattended_all_market_valuation_promise': 'retired'}
+        encoded = _json(result)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        self.store.conn.execute('INSERT INTO multi_source_observation '
+            '(data_type,asset_type,provider,status,payload_json,payload_hash) '
+            "VALUES ('valuation_daily_session','diagnostic','reviewed_evidence',?,?,?)",
+            [result['status'], encoded, digest])
+        return result
 
 
     def prepare_valuation_reviews(self, trade_date, codes, *, observed_at=None):
@@ -309,14 +488,17 @@ class TushareHistoryCollector(RetainedValuationReader):
         """
         day = _iso(trade_date)
         now = observed_at or datetime.now(timezone.utc).isoformat()
+        self._check_valuation_deadline()
         wanted = sorted(set(codes))
         completion = self.valuation_completion_report(day, wanted, observed_at=now)
         qualified = self.qualified_valuation_reviews(day, observed_at=now)
+        capabilities = self.valuation_capability_report(day, wanted, observed_at=now)
         templates, seen, invalid = {}, set(), {}
         for raw, digest in self.store.conn.execute(
                 "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='valuation_review' "
                 "AND json_extract_string(payload_json,'$.review.trade_date')<=? ORDER BY observed_at DESC,rowid DESC",
                 [day]).fetchall():
+            self._check_valuation_deadline()
             code = None
             try:
                 payload = json.loads(raw)
@@ -336,17 +518,22 @@ class TushareHistoryCollector(RetainedValuationReader):
                     'previous_financial_inventory': review['financial_inventory'],
                     'input_received_at_min': previous['input_received_at_min'],
                     'input_received_at_max': previous['input_received_at_max']}
+            except TimeoutError:
+                raise
             except (KeyError, ValueError, TypeError, IndexError, AttributeError, OSError) as exc:
                 if code in wanted:
                     invalid[code] = str(exc)
         rows = {}
         for code in wanted:
+            self._check_valuation_deadline()
             current = completion['rows'][code]
-            rows[code] = {'status': 'same_session_qualified' if code in qualified else 'awaiting_inputs_and_review',
+            qualified_core = capabilities['rows'][code]['qualified_core_for_session']
+            rows[code] = {'status': 'same_session_qualified' if qualified_core else 'awaiting_inputs_and_review',
                 'core_missing_inputs': current.get('missing_inputs', {}),
-                'qualified_core': code in qualified, 'reusable_financial_evidence': templates.get(code),
+                'qualified_core': qualified_core, 'qualification_fields': capabilities['rows'][code]['fields'],
+                'reusable_financial_evidence': templates.get(code),
                 'invalid_prior_evidence': invalid.get(code),
-                'required_review': [] if code in qualified else [
+                'required_review': [] if qualified_core else [
                     'same_session_price_or_native_market_value_and_dated_shares',
                     'financial_correction_inventory_through_target_session',
                     'dated_suspension_and_full_action_window_if_reference_price',
@@ -361,6 +548,7 @@ class TushareHistoryCollector(RetainedValuationReader):
             'rows': rows, 'market_requests': 0, 'business_rows_written': 0,
             'permits_requests': False, 'certifies_daily_basic': False,
             'qualification_scope': 'core_pb_and_market_value_pe_independent',
+            'unattended_all_market_valuation_promise': 'retired',
             'review_boundary': 'reuse_original_finance_then_review_new_session_never_relabel_old_bundle'}
 
 

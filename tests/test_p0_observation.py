@@ -26,7 +26,8 @@ def _contract(reports):
     return path
 
 
-def _manifest(reports: Path, trade_date: str, phase: str, status: str = "completed"):
+def _manifest(reports: Path, trade_date: str, phase: str, status: str = "completed", *, certifier=None,
+              operational_assessor=None):
     _contract(reports)
     windows = (observation_windows(POLICY, trade_date, phase) if phase != 'supplemental'
                else [{'start_at': trade_date + 'T17:30:00+08:00'}])
@@ -36,12 +37,24 @@ def _manifest(reports: Path, trade_date: str, phase: str, status: str = "complet
         run_dir.mkdir(parents=True, exist_ok=True)
         started = datetime.fromisoformat(window['start_at'])
         ended = started + timedelta(seconds={'auction': 45, 'intraday': 180}.get(phase, 1800))
+        operational = {}
+        if operational_assessor:
+            from trade_system.p0_observation import _evidence_digest
+            assessed = operational_assessor(None, trade_date, phase, (started + (ended - started) / 2).isoformat())
+            assessed['collector_contract_sha256'] = CONTRACT_SHA
+            assessed['evidence_identity_sha256'] = _evidence_digest(assessed)
+            operational = {'operational_assessment': assessed,
+                           'operational_completion': {'completed': True, 'failures': [], 'pending': []}}
         (run_dir / 'run.json').write_text(json.dumps({
             'run_id': run_id, 'trade_date': trade_date, 'phase': phase, 'status': status,
             'started_at': started.isoformat(), 'completed_at': ended.isoformat(),
             'steps': [{'name': 'fixture_required_step', 'required': True, 'status': 'completed'}],
             'scope': 'transitional_market_collection_only',
             'collector_contract_sha256': CONTRACT_SHA,
+            **operational,
+            **({'strict_financial_certification': certifier(None, trade_date, CONTRACT_SHA,
+                (started + (ended - started) / 2).isoformat(), run_started_at=started.isoformat())}
+               if certifier is not None and phase in ('close', 'supplemental') else {}),
         }), encoding='utf-8')
 
 
@@ -174,7 +187,45 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
         collector_contract_sha256=CONTRACT_SHA, collector_contract_path=_contract(reports)
     )
 
+    # The old metadata-only fixture previously passed without independent
+    # financial evidence. A complete schedule/page cannot fill this gap.
+    assert result["ready_for_p1"] is False
+    assert not result['daily'][-1]['checks']['strict_financial_certification']
+    assert not result['operational_completeness']['complete']
+    from trade_system import p0_observation
+    def certifier(db_path, day, sha, observed, *, run_started_at=None):
+        return {'schema': 'strict_financial_certification_v1', 'trade_date': day,
+                'collector_contract_sha256': sha, 'evaluated_at': observed, 'passed': True,
+                'run_started_at': run_started_at,
+                'blockers': [], 'source_fingerprints': {'fixture_primary': 'a' * 64,
+                                                       'fixture_reference': 'b' * 64}}
+    monkeypatch.setattr(p0_observation, 'build_financial_certification', certifier)
+    from trade_system import collection_profiles
+    def operational_assessor(db_path, day, phase, observed):
+        return {'schema': 'supported_operation_assessment_v1', 'trade_date': day,
+                'phase': phase, 'evaluated_at': observed, 'ready': True,
+                'scope': 'isolated_test_verified_core_input_facts'}
+    monkeypatch.setattr(collection_profiles, 'operational_readiness', operational_assessor)
+    # This test isolates scheduling/publication from the separately exercised
+    # actual source and definition validator below.
+    for trade_date in ("2026-07-23", "2026-07-24"):
+        for phase in ('auction', 'intraday', 'close'):
+            _manifest(reports, trade_date, phase, certifier=certifier, operational_assessor=operational_assessor)
+    result = audit_five_day_observation(db, reports, '2026-07-24', required_days=2,
+        workspace=workspace, collector_contract_sha256=CONTRACT_SHA,
+        collector_contract_path=_contract(reports))
     assert result["ready_for_p1"] is True
+    assert result['operational_completeness']['complete'] is True
+    close_file = reports / 'runs/2026-07-24-close/run.json'
+    original_close = close_file.read_bytes()
+    original_payload = json.loads(original_close)
+    original_payload.pop('strict_financial_certification')
+    close_file.write_text(json.dumps(original_payload))
+    operation_only = audit_five_day_observation(db, reports, '2026-07-24', required_days=2,
+        workspace=workspace, collector_contract_sha256=CONTRACT_SHA, collector_contract_path=_contract(reports))
+    assert operation_only['operational_completeness']['complete'] is True
+    assert operation_only['consecutive_passes'] == 0 and not operation_only['ready_for_p1']
+    close_file.write_bytes(original_close)
     assert result["consecutive_passes"] == 2
     assert result['daily'][-1]['phases']['auction']['required_window_count'] == 5
     assert result['daily'][-1]['phases']['intraday']['required_window_count'] == 49
@@ -220,7 +271,7 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
                                            workspace=workspace,collector_contract_sha256=CONTRACT_SHA,
                                            collector_contract_path=_contract(reports))
     assert premature['daily'][-1]['publication']['error'] == 'publication_precedes_close_completion'
-    _manifest(reports,'2026-07-24','close')
+    _manifest(reports,'2026-07-24','close', certifier=certifier)
 
     page = workspace/'publication/runs/2026-07-24/index.html'
     original = page.read_bytes()
@@ -233,12 +284,14 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
 
     # Recovery is a new linked receipt, not a rewrite of a failed close or
     # permission to recover missed auction/intraday stages after the fact.
-    _manifest(reports,'2026-07-24','close','completed_with_degradation')
+    _manifest(reports,'2026-07-24','close','completed_with_degradation', certifier=certifier)
     close_bytes=close_path.read_bytes();close=json.loads(close_bytes)
-    _manifest(reports,'2026-07-24','supplemental','completed_with_warnings')
+    _manifest(reports,'2026-07-24','supplemental','completed_with_warnings', certifier=certifier)
     recovery_path=reports/'runs/2026-07-24-supplemental/run.json'
     recovery=json.loads(recovery_path.read_text())
     recovery.update(started_at='2026-07-24T18:10:00',completed_at='2026-07-24T18:20:00',
+        strict_financial_certification=certifier(None, '2026-07-24', CONTRACT_SHA, '2026-07-24T18:15:00',
+            run_started_at='2026-07-24T18:10:00'),
         recovery_of={'phase':'close','run_id':close['run_id'],'completed_at':close['completed_at'],
                      'manifest_sha256':hashlib.sha256(close_bytes).hexdigest(),
                      'scope':'same_day_close_recovery_not_auction_or_intraday_replay'})
@@ -526,3 +579,82 @@ def test_p0_sector_taxonomies_need_coherent_separate_denominators(expected, fetc
         assert not _sector_status(con, '2026-09-29')['passed']
     finally:
         con.close()
+
+
+@pytest.mark.parametrize('defect', [None, 'missing', 'collector', 'clock', 'raw_receipt', 'same_origin', 'definition', 'older_reconciliation', 'future'])
+def test_p0_financial_certificate_binds_original_time_contract_and_actual_evidence(tmp_path, monkeypatch, defect):
+    from trade_system import p0_observation as p0
+    from trade_system import capital_flow_health
+    from trade_system import readiness
+    db = tmp_path / 'funds.duckdb'
+    comparison = {'eligible': True, 'reason': 'fixture_reviewed_mapping',
+                  'definition_evidence': {'primary_spec_sha256': 'c' * 64, 'reference_spec_sha256': 'd' * 64}}
+    source = {'primary_provider': 'first', 'reference_provider': 'second', 'status': 'pass',
+              'source_fingerprints': {'first': 'a' * 64, 'second': 'b' * 64}}
+    with duckdb.connect(str(db)) as con:
+        con.execute('CREATE TABLE intraday_stock_flow_independent_reconciliation('
+            'trade_date DATE,evidence_json VARCHAR,rule_version VARCHAR,updated_at TIMESTAMP)')
+        con.execute("INSERT INTO intraday_stock_flow_independent_reconciliation VALUES "
+            "('2026-09-29',?,'fixture-rule','2026-09-29 17:30:01')", [json.dumps(source)])
+    def health(*args, **kwargs):
+        return {'data_certified_ready': True, 'stock_independent_certified_ready': comparison['eligible'],
+                'flow_certified_ready': comparison['eligible'],
+                'reconciliation': {'comparison_contract': comparison, 'independent_reconciliation_ready': comparison['eligible']}}
+    monkeypatch.setattr(capital_flow_health, 'assess_capital_flow_health', health)
+    monkeypatch.setattr(readiness, 'assess_trade_date_readiness', lambda *a, **k:
+        {'data_certified_ready': True, 'missing_groups': []})
+    saved = p0.build_financial_certification(db, '2026-09-29', CONTRACT_SHA, '2026-09-29T17:45:00+08:00',
+        run_started_at='2026-09-29T17:30:00+08:00')
+    assert saved['passed'] is True
+    receipt = {'run_id': 'close', 'trade_date': '2026-09-29', 'phase': 'close',
+               'collector_contract_sha256': CONTRACT_SHA, 'started_at': '2026-09-29T17:30:00+08:00',
+               'completed_at': '2026-09-29T18:00:00+08:00', 'strict_financial_certification': saved}
+    if defect == 'missing':
+        receipt.pop('strict_financial_certification')
+    elif defect == 'collector':
+        saved['collector_contract_sha256'] = 'f' * 64
+    elif defect == 'clock':
+        saved['evaluated_at'] = '2026-09-29T20:00:00+08:00'
+    elif defect == 'raw_receipt':
+        source['source_fingerprints']['first'] = 'e' * 64
+        with duckdb.connect(str(db)) as con:
+            con.execute('UPDATE intraday_stock_flow_independent_reconciliation SET evidence_json=?', [json.dumps(source)])
+    elif defect == 'same_origin':
+        comparison.update(eligible=False, reason='same_original_source')
+    elif defect == 'definition':
+        comparison['definition_evidence']['primary_spec_sha256'] = 'e' * 64
+    elif defect == 'older_reconciliation':
+        with duckdb.connect(str(db)) as con:
+            con.execute("UPDATE intraday_stock_flow_independent_reconciliation SET updated_at='2026-09-29 17:00:00'")
+    elif defect == 'future':
+        fake_now = datetime.fromisoformat('2026-09-29T17:40:00+08:00')
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fake_now
+        monkeypatch.setattr(p0, 'datetime', Clock)
+    result = p0._financial_certification_status(db, [receipt], '2026-09-29', CONTRACT_SHA, {'run_id': 'close'})
+    assert result['passed'] is (defect is None)
+    if defect:
+        assert result['blockers']
+
+
+def test_operational_revalidation_ignores_strict_progress_but_rejects_changed_factual_inputs(monkeypatch):
+    from trade_system import p0_observation as p0, collection_profiles
+    assessment = {'schema': 'supported_operation_assessment_v1', 'trade_date': '2026-09-29',
+        'phase': 'close', 'evaluated_at': '2026-09-29T17:45:00+08:00', 'ready': True,
+        'required_capabilities': ['market_view', 'flow_observation'],
+        'capabilities': {'market_view': {'ready': True, 'source_sha256': 'a' * 64},
+                         'flow_observation': {'ready': True}},
+        'strict_data_certified_ready': False, 'strict_missing_groups': ['kline']}
+    saved = dict(assessment, collector_contract_sha256=CONTRACT_SHA)
+    saved['evidence_identity_sha256'] = p0.operational_evidence_identity(saved)
+    manifest = {'phase': 'close', 'started_at': '2026-09-29T17:30:00+08:00',
+        'completed_at': '2026-09-29T18:00:00+08:00', 'operational_assessment': saved,
+        'operational_completion': {'completed': True, 'failures': [], 'pending': []}}
+    monkeypatch.setattr(collection_profiles, 'operational_readiness', lambda *a, **k: dict(assessment))
+    assessment.update(strict_data_certified_ready=True, strict_missing_groups=[])
+    assert p0._operational_receipt_errors(manifest, '2026-09-29', CONTRACT_SHA, 'unused') == []
+    assessment['capabilities'] = {'market_view': {'ready': True, 'source_sha256': 'b' * 64},
+                                  'flow_observation': {'ready': True}}
+    assert p0._operational_receipt_errors(manifest, '2026-09-29', CONTRACT_SHA, 'unused')

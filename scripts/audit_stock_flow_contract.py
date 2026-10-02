@@ -18,7 +18,7 @@ from trade_system.config import DB_PATH
 
 
 def audit_candidate_file(path, expected_sha256, trade_date, securities, received_at, *,
-                         provider='gangtise', request_url=None, source_document_paths=None):
+                         provider=None, request_url=None, source_document_paths=None):
     """Exact-byte offline receipt audit. It does not insert canonical facts."""
     import re
     from trade_system.flow_contract import parse_candidate_flow_response, parse_sina_flow_response
@@ -38,7 +38,7 @@ def audit_candidate_file(path, expected_sha256, trade_date, securities, received
                 documents[name] = source.read(1_000_001)
         return parse_sina_flow_response(raw, trade_date, securities, received_at=received_at,
                                         request_url=request_url, source_documents=documents)
-    if provider != 'gangtise' or request_url is not None or source_document_paths is not None:
+    if provider != 'gangtise-archive' or request_url is not None or source_document_paths is not None:
         raise ValueError('unknown candidate provider or incompatible source options')
     return parse_candidate_flow_response(raw, trade_date, securities, received_at=received_at)
 
@@ -75,13 +75,12 @@ def main() -> int:
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--out", default="reports/stock_flow_contract_audit_latest.md")
     parser.add_argument("--date", default="")
-    parser.add_argument('--candidate-plan', action='store_true', help='Build an offline Gangtise request plan; no requests.')
     parser.add_argument('--candidate-receipt', help='Audit original candidate JSON bytes offline; no database access.')
     parser.add_argument('--candidate-selection', help='Screen saved product evidence offline; no requests or database access.')
     parser.add_argument('--selection-sha256', help='Exact saved product observation SHA256.')
     parser.add_argument('--primary-origin', help='Explicit original compute source of the primary product.')
     parser.add_argument('--required-scope-sha256', help='Exact dated full required security scope fingerprint.')
-    parser.add_argument('--candidate-provider', choices=('gangtise', 'sina'), default='gangtise')
+    parser.add_argument('--candidate-provider', choices=('sina', 'gangtise-archive'), help='Explicit offline receipt format; archived Gangtise has no live route.')
     parser.add_argument('--request-url', help='Original Sina request URL, including its exact bounded query.')
     parser.add_argument('--sina-page-source', help='Saved official PC page bytes.')
     parser.add_argument('--sina-fields-source', help='Saved official PC field/formatter source bytes.')
@@ -95,37 +94,27 @@ def main() -> int:
     has_sina_options = args.request_url is not None or any(v is not None for v in sina_paths.values())
     if any(v is not None for v in (args.selection_sha256, args.primary_origin, args.required_scope_sha256)) and not args.candidate_selection:
         parser.error('product selection options require --candidate-selection')
-    if (args.candidate_provider == 'sina' or has_sina_options) and not args.candidate_receipt:
-        parser.error('Sina supports explicit offline --candidate-receipt only')
+    if (args.candidate_provider is not None or has_sina_options) and not args.candidate_receipt:
+        parser.error('provider options require explicit offline --candidate-receipt')
     if has_sina_options and args.candidate_provider != 'sina':
         parser.error('Sina source options require --candidate-provider sina')
-    if args.candidate_plan or args.candidate_receipt or args.candidate_selection:
-        if sum(bool(v) for v in (args.candidate_plan, args.candidate_receipt, args.candidate_selection)) != 1 or not args.date:
+    if args.candidate_receipt or args.candidate_selection:
+        if sum(bool(v) for v in (args.candidate_receipt, args.candidate_selection)) != 1 or not args.date:
             parser.error('select one candidate mode with explicit --date')
         if not args.candidate_selection and not args.codes:
-            parser.error('candidate plan or receipt requires explicit --codes')
-        from trade_system.flow_contract import candidate_flow_capabilities, candidate_flow_request, GANGTISE_FLOW_URL
+            parser.error('candidate receipt requires explicit --codes')
         try:
             if args.candidate_selection:
                 result = audit_product_selection_file(args.candidate_selection, args.selection_sha256,
                     args.date, args.primary_origin, args.required_scope_sha256)
             elif args.candidate_receipt:
-                if not args.received_at:
-                    raise ValueError('original --received-at required')
+                if not args.received_at or not args.candidate_provider:
+                    raise ValueError('original --received-at and explicit --candidate-provider required')
                 result = audit_candidate_file(args.candidate_receipt, args.response_sha256,
                                               args.date, args.codes, args.received_at,
                                               provider=args.candidate_provider,
                                               request_url=args.request_url,
                                               source_document_paths=(sina_paths if args.candidate_provider == 'sina' else None))
-            else:
-                result = dict(status='awaiting_entitlement_and_new_request_approval',
-                              endpoint=GANGTISE_FLOW_URL,
-                              request=candidate_flow_request(args.date, args.codes),
-                              local_capabilities=candidate_flow_capabilities(),
-                              max_requests_per_endpoint=2, max_requests_total=6,
-                              timeout_seconds=20, automatic_retries=0, date_fallback=False,
-                              authenticated_requests=0, production_writes=0,
-                              independent_comparison_eligible=False)
             # Candidate evidence stays inside the unsealed checkout, independent
             # of --db or any live/runtime paths. Existing artifacts cannot be replaced.
             report = Path(args.out).resolve()

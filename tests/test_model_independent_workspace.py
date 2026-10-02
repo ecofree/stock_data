@@ -67,8 +67,81 @@ def test_changed_snapshot_and_model_failure_do_not_erase_judgement(tmp_path):
     _,files=read_current(tmp_path/'publication')
     data=json.loads(files['desk.json'])
     assert data['research_status']=='unavailable' and data['notes'][0]['note_id']==first
+    assert data['prediction'] is None and data['model']=={}
+    assert data['research_retirement']['status']=='retired'
+    assert data['market']['stocks']['000001']['change_pct']==1
     with pytest.raises(ValueError,match='market evidence changed'):
         product.save_note(tmp_path,dict(command(),request_id='4'*32,evidence_id='0'*64))
+
+
+def _retained_forecast_publication(output):
+    """Original historical projection remains readable with its original identity."""
+    from trade_system.v2.daily_workspace import empty_projection
+    from trade_system.v2.publisher import publish
+    from trade_system.v2.domain import canonical
+    from trade_system.v2.research_product_view import render
+    data=empty_projection()
+    data.update(market=market(),prediction={'prediction_id':'retained-fixture',
+        'date':'2020-01-01','predictions':1,'rows':[{'instrument':'600000'}]},
+        model={'model_id':'retained-model'})
+    data['report_id']=identity(data)
+    publish(output/'publication','retained-original',{'desk.json':canonical(data).encode(),
+        'index.html':render(data).encode()},generation=1)
+    return data
+
+
+def test_base_publication_retires_legacy_forecast_without_changing_original_pointer(tmp_path,monkeypatch):
+    write_json(tmp_path/'research-current.json',{'retained':'fixture'})
+    pointer=(tmp_path/'research-current.json').read_bytes()
+    monkeypatch.setattr(product,'_research_projection',lambda _:dict(
+        prediction={'date':'2026-09-11','predictions':1,'rows':[{'instrument':'600000'}]},
+        model={'model_id':'retained-model'},candidate_model={'model_id':'candidate'},
+        candidate_readiness={'ready':True}))
+    product.publish_desk(tmp_path,market=market())
+    _,files=read_current(tmp_path/'publication');data=json.loads(files['desk.json'])
+    assert data['market']['stocks']['000001']['change_pct']==1
+    assert data['prediction'] is None and data['model']=={} and data['candidate_model'] is None
+    assert data['candidate_readiness'] is None and not data['research_retirement']['automatic_promotion']
+    assert data['retained_prediction_evidence']['rows'][0]['instrument']=='600000'
+    assert (tmp_path/'research-current.json').read_bytes()==pointer
+    html=files['index.html'].decode()
+    assert 'action="/update"' not in html and 'value="qlib"' not in html
+
+
+def test_observe_preserves_human_scope_without_using_retired_forecasts(tmp_path,monkeypatch):
+    from trade_system.v2 import observation_workspace
+    original=_retained_forecast_publication(tmp_path)
+    write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic-unused','read_only':True})
+    selected=[]
+    def load(database,codes,as_of):
+        selected.append(set(codes));return []
+    monkeypatch.setattr(observation_workspace,'load_rows',load)
+    assert product.saved_projection(tmp_path)['prediction']==original['prediction']
+    note=product.save_note(tmp_path,command())
+    result=product.observe(tmp_path)
+    assert selected==[{'000001'}] and result['provider_requests']==0 and result['fits']==0
+    _,files=read_current(tmp_path/'observation-publication')
+    live=json.loads(files['observation.json'])['live_scope']
+    assert [row['instrument'] for row in live]==['000001']
+    assert 'human_attention' in live[0]['roles'] and 'research_forecast' not in live[0]['roles']
+    assert journal.read_note(tmp_path,note)['evidence_id']==market()['snapshot_id']
+
+
+def test_present_current_market_is_independent_of_old_forecast_but_keeps_snapshot_guard(tmp_path):
+    original=_retained_forecast_publication(tmp_path)
+    path=tmp_path/'market.json';write_json(path,market())
+    with pytest.raises(ValueError,match='dates differ'):
+        product.saved_projection(tmp_path,market_review=path)
+    product.present(tmp_path,market_review=path)
+    _,files=read_current(tmp_path/'publication');data=json.loads(files['desk.json'])
+    assert data['prediction'] is None and data['market']['trade_date']=='2026-09-11'
+    assert data['retained_prediction_evidence']==original['prediction']
+    before=(tmp_path/'publication/current.json').read_bytes()
+    broken=market();broken['stocks']['000001']['change_pct']=2
+    path.write_text(json.dumps(broken),encoding='utf-8')
+    with pytest.raises(ValueError,match='snapshot identity changed'):
+        product.present(tmp_path,market_review=path)
+    assert (tmp_path/'publication/current.json').read_bytes()==before
 
 
 def test_unavailable_valuation_and_flow_confirmation_preserve_market_and_notes(tmp_path):

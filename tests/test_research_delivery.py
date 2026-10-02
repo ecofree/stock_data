@@ -138,6 +138,8 @@ def test_http_refuses_foreign_host_origin_csrf_and_paths(tmp_path,monkeypatch):
     monkeypatch.setattr(server,'read_current',lambda _:({}, {'index.html':b'<input name="csrf" value="__CSRF__">'}))
     monkeypatch.setattr(product,'read_prediction',lambda _:prediction())
     monkeypatch.setattr(product,'publish_desk',lambda _:None)
+    def retired_forbidden(*args,**kwargs):raise AssertionError('HTTP must not invoke retired update')
+    monkeypatch.setattr(product,'update',retired_forbidden)
     service=ThreadingHTTPServer(('127.0.0.1',0),server.handler(tmp_path,tmp_path,0))
     port=service.server_port;service.RequestHandlerClass=server.handler(tmp_path,tmp_path,port)
     thread=threading.Thread(target=service.serve_forever,daemon=True);thread.start()
@@ -157,11 +159,22 @@ def test_http_refuses_foreign_host_origin_csrf_and_paths(tmp_path,monkeypatch):
         conn=http.client.HTTPConnection('127.0.0.1',port,timeout=3);conn.request('GET','/')
         response=conn.getresponse();html=response.read().decode();conn.close()
         token=re.search(r'value="([^"]+)"',html).group(1)
+        assert request('/update','POST',headers,urlencode({'csrf':token}))==410
+        assert not (tmp_path/'update.guard').exists()
         form={'csrf':token,'request_id':'1'*32,'prediction_id':prediction()['prediction_id'],'instrument':'000001','intent':'observe',
             'operator':'SYNTHETIC TEST ONLY','hypothesis':'test','invalidation':'test'}
         assert request('/note','POST',headers,urlencode(form))==303
         assert len(list((tmp_path/'notes').glob('*.json')))==1
     finally:service.shutdown();service.server_close();thread.join()
+
+
+@pytest.mark.parametrize('command',['build','update','price-study'])
+def test_cli_retired_commands_do_not_create_output(tmp_path,monkeypatch,command):
+    output=tmp_path/'not-created'
+    monkeypatch.setattr('sys.argv',['run_research.py',command,'--output',str(output),
+                                  '--config',str(tmp_path/'absent.json')])
+    with pytest.raises(ValueError,match='RESEARCH_RETIRED'):product.main()
+    assert not output.exists()
 
 
 def test_prediction_and_contributions_use_frozen_feature_order(tmp_path):

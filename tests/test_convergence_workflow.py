@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from trade_system.file_lock import FileLock, FileLockBusy
 from trade_system.v2 import research_campaign as campaign, research_product as product
 from trade_system.v2 import research_followup as followup
 from trade_system.v2.domain import identity
@@ -29,14 +28,17 @@ def capture_config(start,end):
             'window_days':90,'max_requests':300,'selection_scope':'synthetic_bounded_test'}
 
 
-def test_cli_and_http_share_update_owner_before_any_work(tmp_path,monkeypatch):
-    calls=[]
-    monkeypatch.setattr(product,'_update',lambda *a,**k:calls.append(1))
-    with FileLock(tmp_path/'update.guard'):
-        with pytest.raises(FileLockBusy):product.update(tmp_path,tmp_path)
-    assert calls==[]
-    product.update(tmp_path,tmp_path)
-    assert calls==[1] and (tmp_path/'update.guard').exists()
+def test_retired_build_update_and_private_update_refuse_before_any_work(tmp_path,monkeypatch):
+    def forbidden(*args,**kwargs):raise AssertionError('retired path must not read, fetch, fit or publish')
+    monkeypatch.setattr(product,'read_build',forbidden)
+    monkeypatch.setattr(product,'publish_state',forbidden)
+    monkeypatch.setattr(campaign,'capture',forbidden)
+    output=tmp_path/'never-created'
+    for call in (lambda:product.build(tmp_path/'missing.json',tmp_path,output),
+                 lambda:product.update(tmp_path,output),
+                 lambda:product._update(tmp_path,output)):
+        with pytest.raises(ValueError,match='RESEARCH_RETIRED'):call()
+    assert not output.exists()
 
 
 def test_saved_judgement_survives_renderer_failure_without_running_renderer(tmp_path,monkeypatch):
@@ -123,34 +125,15 @@ def test_release_runtime_has_no_tools_dependency():
     assert not any(p.startswith('tools/') for p in files)
 
 
-@pytest.mark.parametrize('calendar_end,force,expected_reuse',[
-    ('2026-09-12',False,True),('2026-09-11',False,False),('2026-09-12',True,False)])
-def test_session_reuse_requires_calendar_coverage_and_respects_refresh(tmp_path,monkeypatch,calendar_end,force,expected_reuse):
-    from datetime import datetime, timezone
-    scope='same_registered_research_universe_not_limit_pool_or_full_market'
-    source=tmp_path/'receipts';calls=[]
-    monkeypatch.setattr(product,'read_build',lambda _: (tmp_path,{'model_id':'synthetic'},{}))
-    monkeypatch.setattr(product,'read_json',lambda _: ({'universe':['000001']},None))
-    monkeypatch.setattr(product,'now_utc',lambda:datetime(2026,9,12,4,tzinfo=timezone.utc))
-    monkeypatch.setattr(product,'read_prediction',lambda _:{'receipt_folder':str(source),'date':'2026-09-11',
-        'model_id':'synthetic','predictions':1,'prediction_id':'synthetic-not-real'})
-    saved={'codes':['000001.SZ'],'selection_scope':scope,'start':'2026-06-14','end':'2026-09-11'}
-    def replay(folder,cache):
-        result=({'config':saved,'origin':'native_and_relay'},[],{0:['2026-09-11',calendar_end]},None)
-        cache[str(folder.resolve())]=result
-        return result
-    monkeypatch.setattr(campaign,'cached_replay',replay)
-    monkeypatch.setattr(product,'latest_closed_session',lambda *args:'2026-09-11')
-    monkeypatch.setattr(campaign,'derive',lambda *args,**kwargs:calls.append('validate_lineage'))
-    def capture(*args,**kwargs):
-        calls.append('refresh_required')
-        raise RuntimeError('synthetic stop before network')
-    monkeypatch.setattr(campaign,'capture',capture)
-    if expected_reuse:
-        result=product.update(tmp_path,tmp_path,force_refresh=force)
-        assert result['provider_requests']==0 and result['fits']==0
-        assert calls==['validate_lineage']
-    else:
-        with pytest.raises(RuntimeError,match='before network'):
-            product.update(tmp_path,tmp_path,force_refresh=force)
-        assert calls==['refresh_required']
+@pytest.mark.parametrize('force,replay_build,receipts',[
+    (False,False,None),(True,False,None),(False,True,'saved-receipts'),
+    (True,True,'saved-receipts')])
+def test_legacy_refresh_and_replay_flags_cannot_restore_retired_update(tmp_path,monkeypatch,force,replay_build,receipts):
+    def forbidden(*args,**kwargs):raise AssertionError('no replay, fitting or capture after retirement')
+    monkeypatch.setattr(campaign,'cached_replay',forbidden)
+    monkeypatch.setattr(campaign,'capture',forbidden)
+    monkeypatch.setattr(product,'read_build',forbidden)
+    for entry in (product.update,product._update):
+        with pytest.raises(ValueError,match='RESEARCH_RETIRED'):
+            entry(tmp_path,tmp_path,force_refresh=force,replay_build=replay_build,receipts=receipts)
+    assert not (tmp_path/'update.guard').exists()

@@ -1,18 +1,18 @@
 {
   "schema": 2,
-  "as_of": "2026-10-02",
+  "as_of": "2026-10-03",
   "status": "full_pause_by_user",
-  "branch": "codex/capability-isolation-20261002",
-  "candidate_version": "0.3.45",
-  "candidate_workspace": "D:/accio/stock_data-capability-isolation",
+  "branch": "codex/root-cause-closure-20261002",
+  "candidate_version": "0.3.46",
+  "candidate_workspace": "D:/accio/stock_data-root-closure",
   "candidate_deployed": false,
-  "baseline": "7e1bd4d83c15877bc140c1bbd8df7b1e4e6204ed",
+  "baseline": "33d29d39470e45b5a7b781e30f734b6938ced6e3",
   "automation_status": "PAUSED",
   "execution_ready": false,
   "production_cutover": false,
   "ledger": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921",
-  "current_remediation": "capability_isolation_20261002",
-  "evidence": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921.capability_isolation_20261002",
+  "current_remediation": "root_cause_repair_20261002",
+  "evidence": "D:/accio/stock_data-retirement/reports/handover-20260917/completion.json#value_delivery_0_3_29.live_acceptance_20260921.root_cause_repair_20261002",
   "admission_policy": "user approved capability-scoped operation; each capability requires its own qualified inputs; concrete safe task handover pending separate confirmation",
   "installed_runtime": {
     "version": "0.3.37",
@@ -22,12 +22,18 @@
     "scope": "user disabled all seven tasks; latest ordinary read-only session sees four protected-task subset"
   },
   "acceptance": {
-    "engineering": "capability-isolation candidate; exact source checks, sealed runtime and task proposal evidence are recorded in the authoritative ledger; isolated checks are not production",
+    "engineering": "root-cause repair and retirement implemented; verification results tracked in original ledger, not deployed",
     "qualified_valuation_inputs": "64 retained 2026-09-29 PB/market-value reviews formally imported and revalidated in isolated database: all 53 PB gaps plus 11 of 12 suspended securities; 002731 issuer financial disclosure remains unavailable; PE/TTM unknown; historical recalculation is not production certification",
     "independent_funds": "strict definition/full scope unavailable; auxiliary evidence separate",
     "complete_production_day": "not_passed",
     "five_complete_sessions": "0/5; no historical backfill credit",
     "real_account": "not_exported; returns unknown"
   },
-  "historical_records": "Prior versions, reports and failed receipts retained. New source and isolated checks do not supersede production acceptance."
+  "historical_records": "Prior versions, reports and failed receipts retained. New source and isolated checks do not supersede production acceptance.",
+  "retired_capabilities": [
+    "gangtise_live_onboarding",
+    "active_model_predictions_and_promotion",
+    "unattended_complete_market_valuations",
+    "superseded_task_handover_recommendations"
+  ]
 }

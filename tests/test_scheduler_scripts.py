@@ -112,9 +112,10 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     for suffix in ('Auction','Intraday','DailyClose','SupplementalRetry'):
         if 'StockData-'+suffix in rows:
             assert f'-EnvironmentFile "{environment}"' in rows['StockData-'+suffix]['Arguments']
+            assert f'-ValuationWorkspace "{tmp_path / 'workspace'}"' in rows['StockData-'+suffix]['Arguments']
     if 'StockData-QLibResearch' in rows:
         assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
-        assert '-RefreshResearch' in rows['StockData-QLibResearch']['Arguments']
+        assert '-RefreshResearch' not in rows['StockData-QLibResearch']['Arguments']
         assert rows['StockData-QLibResearch']['Principal']['RunLevel']=='Limited'
     assert rows['StockData-MonthlyCompact']['Arguments']=='old'
     assert rows['StockData-MonthlyCompact']['Disposition']=='preserve_disabled'
@@ -243,8 +244,8 @@ function Start-ScheduledTask {Write-Output 'MOCK_REQUEST_ONLY'}
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows research adapter')
-@pytest.mark.parametrize('case', ['current','closed','wrong_date','failed','refresh_failed'])
-def test_research_schedule_uses_frozen_update_not_legacy_pipeline(tmp_path,case):
+@pytest.mark.parametrize('case', ['current','closed','wrong_date','failed','retired_refresh'])
+def test_research_schedule_publishes_market_and_rejects_retired_model_refresh(tmp_path,case):
     scripts=tmp_path/'scripts';scripts.mkdir()
     (scripts/'run_research_daily.ps1').write_text(_read('run_research_daily.ps1'))
     workspace=tmp_path/'workspace';workspace.mkdir();(workspace/'workspace-config.json').write_text('{}')
@@ -259,15 +260,20 @@ function Invoke-StockDataProcess {
  return [pscustomobject]@{ExitCode=$(if('__CASE__' -eq 'failed'){1}else{0});
  Stdout=(@{status=$status;date=$date;snapshot_id='fixture';provider_requests=0;fits=0}|ConvertTo-Json -Compress);Stderr=''}
  }
- if ($Arguments -contains 'update') {return [pscustomobject]@{ExitCode=$(if('__CASE__' -eq 'refresh_failed'){2}else{0});Stdout='FROZEN_UPDATE_MOCK';Stderr=''}}
+ if ($Arguments -contains 'update') {throw 'Retired update must never be invoked'}
  throw 'Unexpected command'
 }
 '''.replace('__CASE__',case)
     (scripts/'native_process.ps1').write_text(native)
-    result=_ps(scripts/'run_research_daily.ps1','-Python',sys.executable,'-Workspace',workspace,
-        '-EnvironmentFile',environment,'-RefreshResearch','-ExpectedTradeDate','2026-09-17')
+    arguments=['-Python',sys.executable,'-Workspace',workspace,
+        '-EnvironmentFile',environment,'-ExpectedTradeDate','2026-09-17']
+    if case=='retired_refresh':arguments+=['-RefreshResearch']
+    result=_ps(scripts/'run_research_daily.ps1',*arguments)
     assert (result.returncode==0)==(case in ('current','closed')),result.stderr
-    assert ('FROZEN_UPDATE_MOCK' in result.stdout)==(case in ('current','refresh_failed'))
+    assert 'FROZEN_UPDATE_MOCK' not in result.stdout
+    if case=='retired_refresh':
+        assert 'Retired active model refresh' in result.stderr
+        assert not (workspace/'scheduled-logs').exists()
     assert ('DAILY_WORKSPACE_COMPLETE' in result.stdout)==(case=='current')
 
 
@@ -293,16 +299,18 @@ def test_collector_provider_environment_path_reaches_child_without_copying_conte
     for name in ('run_phase_once.ps1','native_process.ps1'):
         (scripts/name).write_text(_read(name))
     child=scripts/'run_integrated_daily.py'
-    child.write_text("import os,sys\nprint('PROVIDER_ENV_PATH='+os.environ.get('KPL_ENV_FILE',''))\nsys.exit(3)\n")
+    child.write_text("import os,sys\nprint('PROVIDER_ENV_PATH='+os.environ.get('KPL_ENV_FILE',''))\nprint('VALUATION_WORKSPACE='+sys.argv[sys.argv.index('--valuation-workspace')+1])\nsys.exit(3)\n")
     inherited=tmp_path/'inherited.env';inherited.write_text('SYNTHETIC=not-a-credential')
     selected=tmp_path/'selected.env';selected.write_text('SYNTHETIC=not-a-credential')
     monkeypatch.setenv('KPL_ENV_FILE', str(inherited))
     args=['-Python',sys.executable,'-Db',tmp_path/'not-created.duckdb','-Phase','intraday',
-          '-CollectorContract','fixture','-CollectorContractSha256','a'*64,'-ReportsDirectory',tmp_path/'reports']
+          '-CollectorContract','fixture','-CollectorContractSha256','a'*64,'-ReportsDirectory',tmp_path/'reports',
+          '-ValuationWorkspace',tmp_path/'valuation-workspace']
     if explicit:args+=['-EnvironmentFile',selected]
     result=_ps(scripts/'run_phase_once.ps1',*args)
     assert result.returncode==3,result.stdout+result.stderr
     assert 'PROVIDER_ENV_PATH='+str(selected if explicit else inherited) in result.stdout
+    assert 'VALUATION_WORKSPACE='+str(tmp_path/'valuation-workspace') in result.stdout
     assert 'SYNTHETIC=' not in result.stdout+result.stderr
     assert not (tmp_path/'.env').exists() and not (tmp_path/'not-created.duckdb').exists()
 

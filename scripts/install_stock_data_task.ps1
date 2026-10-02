@@ -62,7 +62,7 @@ if ($identity.UserId -notmatch '^S-1-5-21-' -or $identity.LogonType -ne 'Passwor
     ($identity.RunLevel -and $identity.RunLevel -ne 'LeastPrivilege')) { throw 'Retained dedicated Limited/Password identity required, never SYSTEM' }
 }
 $repo=Split-Path -Parent $PSScriptRoot
-$common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'" -EnvironmentFile "'+$EnvironmentFile+'"'
+$common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'" -EnvironmentFile "'+$EnvironmentFile+'" -ValuationWorkspace "'+$Workspace+'"'
 $prefix='-NoProfile -NonInteractive -File "'
 $research=$prefix+(Join-Path $PSScriptRoot 'run_research_daily.ps1')+'" -Python "'+$ResearchPython+'" -Workspace "'+$Workspace+'" -ReleaseDirectory "'+$ResearchReleaseDirectory+'" -ReleaseManifestSha256 '+$ResearchReleaseManifestSha256
 $actions=@{
@@ -71,7 +71,7 @@ $actions=@{
     'StockData-DailyClose'=$prefix+(Join-Path $PSScriptRoot 'run_stock_data_daily.ps1')+'" -Phase close -CollectionProfile priority'+$common
     'StockData-SupplementalRetry'=$prefix+(Join-Path $PSScriptRoot 'run_phase_once.ps1')+'" -Phase supplemental -PublicationTask StockData-ResearchDaily'+$common
     'StockData-ResearchDaily'=$research
-    'StockData-QLibResearch'=$research+' -RefreshResearch -EnvironmentFile "'+$EnvironmentFile+'"'
+    'StockData-QLibResearch'=$research
 }
 $rows=@(foreach ($name in $baseline.Name) {
     $existing=@($baseline | Where-Object Name -eq $name)[0]
@@ -86,7 +86,7 @@ $rows=@(foreach ($name in $baseline.Name) {
         Schedule=$(if($name -eq 'StockData-ResearchDaily'){'proposed weekdays 19:30 plus on-demand request after supplemental; exact start date requires new approval'}else{'preserve existing triggers'});
         Principal=$(if($isResearch){[ordered]@{UserId=[string]$identity.UserId;LogonType='Password';RunLevel='Limited'}}else{[ordered]@{Mode='preserve_exact_xml';Definition=([xml]$xmlByName[$name]).Task.Principals.OuterXml}});
         IdentityRule=$(if($isResearch){'dedicated Limited/Password, never SYSTEM'}else{'preserve existing identity'});
-        Responsibility=$(if($preserve){'no compaction; retained disabled'}elseif($name -eq 'StockData-QLibResearch'){'current research product frozen-model update; no fit, promotion, legacy registry or page callback'}elseif($isResearch){'local market snapshot -> unified daily workspace; no provider requests or model fits'}else{'collection and diagnostics only; supplemental requests unified publication after releasing database lock'});
+        Responsibility=$(if($preserve){'no compaction; retained disabled'}elseif($name -eq 'StockData-QLibResearch'){'retired active prediction task; retain disabled, historical evidence only'}elseif($isResearch){'local market snapshot -> unified daily workspace; no provider requests or model fits'}else{'qualified market collection, local dated reviewed-valuation intake and diagnostics; no automatic financial requests; supplemental requests publication after lock release'});
         Rollback='restore exact BeforeXml and original enabled/disabled state under separately approved authenticated rollback; no database rollback or deletion of human notes'
     }
 })

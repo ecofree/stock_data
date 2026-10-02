@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import math
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,6 +145,31 @@ def _writer_progress(manifest, name, command, log_path=None):
     return persist
 
 
+def _certification_gap(name: str, code: int, out: str, err: str, trade_date: str,
+                       operational_assessment: dict | None = None) -> bool:
+    """Only a normal, explicit quality result may be separated from run failure.
+
+    Tracebacks, encoding errors, timeouts and core input failures retain their
+    nonzero operational result. A report-only flag must never manufacture a
+    passing financial certificate.
+    """
+    if err.strip():
+        return False
+    if name == 'reconcile_independent_stock_flow' and code == 1:
+        return any(re.fullmatch(r'date=' + re.escape(trade_date) +
+            r' status=(?:incomparable|unknown_scope|unverified_amount_precision|warning) '
+            r'primary=\d+ reference=\S+ overlap=\S+ corr=\S+ sign=\S+', line)
+            for line in out.splitlines())
+    if name == 'check_capital_flow_health' and code == 2:
+        return any(line.startswith('date=' + trade_date + ' ')
+            and 'data_certified_ready=true' in line.split()
+            and 'flow_certified_ready=false' in line.split() for line in out.splitlines())
+    if name == 'check_data_readiness' and code == 2 and (operational_assessment or {}).get('ready') is True:
+        return any(line.startswith('trade_date=' + trade_date + ' ')
+            and 'data_certified_ready=false' in line.split() for line in out.splitlines())
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Transitional market collection adapter; no legacy decisions or user-page publication.")
     parser.add_argument("--db", default="kpl_data.duckdb")
@@ -159,6 +185,7 @@ def main() -> int:
     parser.add_argument("--as-of", default="")
     parser.add_argument("--prepare-reference", action="store_true", help="Auction preflight only, before 09:15; never an auction pass")
     parser.add_argument("--reports-dir", default="reports")
+    parser.add_argument("--valuation-workspace", help="Explicit daily reviewed valuation inbox; no automatic remote acquisition")
     parser.add_argument("--migration-root", help="Verified disposable backup for offline/migration execution")
     parser.add_argument("--collector-contract", help="Explicit hash-bound transitional source/runtime/target manifest")
     parser.add_argument("--collector-contract-sha256")
@@ -231,7 +258,8 @@ def main() -> int:
     plan = command_plan(args.db, args.trade_date, include_collection=not args.skip_collect,
         signal_limit=args.signal_limit, reports_dir=str(artifact_dir), phase=selected_phase,
         as_of_time=args.as_of or None, collection_profile=args.collection_profile,
-        history_start=args.history_start, history_end=args.history_end, history_max_days=args.history_max_days)
+        history_start=args.history_start, history_end=args.history_end, history_max_days=args.history_max_days,
+        valuation_workspace=args.valuation_workspace)
     plan = [(name, [python, *command[1:]], optional) for name, command, optional in plan]
     if not args.skip_collect:
         validate_production_plan(selected_phase, [name for name, _, _ in plan])
@@ -306,7 +334,7 @@ def main() -> int:
                 on_progress=_writer_progress(manifest, 'schema', []))
             if initialization.returncode:
                 raise ValueError("collector schema initialization failed: "+initialization.stderr.decode("utf-8", "backslashreplace")[-500:])
-            failed, warnings, pending = [], [], []
+            failed, warnings, pending, certification_gaps = [], [], [], []
             from trade_system.collection_profiles import phase_tasks
             required = {'prepare_stock_reference': True} if args.prepare_reference else {task.name: task.required for task in phase_tasks(selected_phase)}
             for name, command, _ in plan:
@@ -348,11 +376,28 @@ def main() -> int:
                     step_deadline = min(phase_deadline, time.time()+args.step_timeout)
                     # Leave time for response validation and transaction commit.
                     env['STOCKDATA_REQUEST_DEADLINE_EPOCH'] = str(step_deadline-5)
-                    process = _run_writer(command, cwd=backend, env=env,
-                        timeout=step_deadline-time.time(),
-                        on_drain=lambda pid: manifest.upsert_step(name, 'draining', command,
-                            pid=pid, reason='deadline exceeded; waiting for safe writer exit', log_path=str(log)),
-                        on_progress=_writer_progress(manifest, name, command, log))
+                    if name == 'prepare_valuation_session':
+                        # The parent already owns the real permanent guard.
+                        # Pass that owner in-process; a child/assume-lock flag
+                        # would either deadlock or bypass verified ownership.
+                        from scripts.backfill_2026_tushare import run_local_valuation_session
+                        local = run_local_valuation_session(args.db, args.trade_date,
+                            report=command[command.index('--report') + 1], owner=owner,
+                            workspace=args.valuation_workspace, deadline_epoch=step_deadline)
+                        process = subprocess.CompletedProcess(command,
+                            0 if local['workflow_completed'] else 2,
+                            ('valuation_session workflow_completed=' + str(local['workflow_completed']).lower()
+                             + ' valuation_complete=' + str(local['valuation_complete']).lower() + '\n').encode(), b'')
+                        process.local_valuation_evidence = {k: local.get(k) for k in
+                            ('trade_date', 'status', 'workflow_completed', 'valuation_complete',
+                             'market_requests', 'raw_daily_basic_overwritten', 'intake_errors')}
+                        process.local_valuation_evidence['report_path'] = command[command.index('--report') + 1]
+                    else:
+                        process = _run_writer(command, cwd=backend, env=env,
+                            timeout=step_deadline-time.time(),
+                            on_drain=lambda pid: manifest.upsert_step(name, 'draining', command,
+                                pid=pid, reason='deadline exceeded; waiting for safe writer exit', log_path=str(log)),
+                            on_progress=_writer_progress(manifest, name, command, log))
                     out, bad_out = _decode_process_bytes(process.stdout, "stdout")
                     err, bad_err = _decode_process_bytes(process.stderr, "stderr")
                     code = process.returncode or (-2 if bad_out or bad_err else 0)
@@ -366,9 +411,22 @@ def main() -> int:
                 from trade_system.http_transport import request_metrics
                 counts = read_product_counts(out, context)
                 disclosure_pending = code == 4 and name in {'collect_xiaodefa', 'collect_xiaodefa_critical'}
-                status = "awaiting_publication" if disclosure_pending else "completed" if code == 0 else "degraded" if required[name] else "warning"
+                operation_assessment = None
+                if name == 'check_data_readiness' and code == 2 and not err.strip():
+                    from trade_system.collection_profiles import operational_readiness
+                    operation_assessment = operational_readiness(args.db, args.trade_date,
+                        selected_phase, datetime.now().isoformat())
+                certification_gap = _certification_gap(name, code, out, err, args.trade_date,
+                    operation_assessment)
+                status = ("certification_gap" if certification_gap else
+                          "awaiting_publication" if disclosure_pending else
+                          "completed" if code == 0 else "degraded" if required[name] else "warning")
                 manifest.upsert_step(name, status, command, return_code=code, log_path=str(log),
                                      required=required[name],
+                                     operational_failure=bool(code and not disclosure_pending and not certification_gap),
+                                     certification_gap=certification_gap,
+                                     operational_assessment=operation_assessment,
+                                     local_valuation_evidence=getattr(process, 'local_valuation_evidence', None),
                                      request_context=context,
                                      operation_counts=counts, request_metrics=request_metrics([log]),
                                      duration_seconds=round((datetime.now()-started).total_seconds(), 3))
@@ -378,12 +436,29 @@ def main() -> int:
                         new_work_permitted=False, drain_elapsed_seconds=process.drain_elapsed_seconds)
                     manifest.write()
                 if code:
-                    (pending if disclosure_pending and required[name] else failed if required[name] else warnings).append(name)
+                    (certification_gaps if certification_gap else
+                     pending if disclosure_pending and required[name] else
+                     failed if required[name] else warnings).append(name)
                 # Independent data sources still run after one provider fails.
                 # No failed run is reported as a successful publication.
             if selected_phase in ('close', 'supplemental'):
                 from trade_system.collection_profiles import publication_readiness
                 manifest.data['publication_readiness'] = publication_readiness(args.db, args.trade_date)
+                from trade_system.p0_observation import build_financial_certification
+                manifest.data['strict_financial_certification'] = build_financial_certification(
+                    args.db, args.trade_date, args.collector_contract_sha256, datetime.now().isoformat(),
+                    run_started_at=manifest.data['started_at'])
+                if manifest.data['strict_financial_certification']['passed'] is not True:
+                    certification_gaps.append('strict_financial_certification')
+            from trade_system.collection_profiles import operational_readiness
+            manifest.data['operational_assessment'] = operational_readiness(args.db, args.trade_date,
+                selected_phase, datetime.now().isoformat()) if not args.prepare_reference else {
+                    'ready': not failed, 'scope': 'pre_session_identity_preparation_not_market_operation'}
+            from trade_system.p0_observation import operational_evidence_identity
+            manifest.data['operational_assessment']['collector_contract_sha256'] = str(args.collector_contract_sha256 or '').lower()
+            manifest.data['operational_assessment']['evidence_identity_sha256'] = operational_evidence_identity(manifest.data['operational_assessment'])
+            if manifest.data['operational_assessment']['ready'] is not True:
+                failed.append('supported_operational_inputs')
             if selected_phase == 'supplemental' and not failed and not pending:
                 from trade_system.pipeline_runtime import latest_manifests
                 prior = latest_manifests(args.reports_dir).get((args.trade_date, 'close'))
@@ -395,7 +470,13 @@ def main() -> int:
                         'manifest_sha256': prior['_manifest_sha256'],
                         'scope': 'same_day_close_recovery_not_auction_or_intraday_replay'}
             manifest.data['pending'] = pending
-            manifest.finish("completed_with_degradation" if failed else "awaiting_publication" if pending else "completed_with_warnings" if warnings else "completed",
+            manifest.data['certification_gaps'] = certification_gaps
+            manifest.data['operational_completion'] = {'completed': not failed and not pending,
+                'failures': failed, 'pending': pending,
+                'scope': 'scheduled_collection_execution_not_financial_certification_or_publication'}
+            manifest.finish("completed_with_degradation" if failed else "awaiting_publication" if pending else
+                            "completed_with_certification_gaps" if certification_gaps else
+                            "completed_with_warnings" if warnings else "completed",
                             ",".join(failed) or None, warnings=warnings)
             print(f"COLLECTION_COMPLETE date={args.trade_date} failed={len(failed)} user_pages_published=false manifest={manifest.path}")
             return 2 if failed else 0

@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import duckdb
+import pytest
 
 from scripts.run_integrated_daily import command_plan
 from trade_system.collection_profiles import phase_tasks, resolve_phase, task_due
@@ -33,6 +34,21 @@ def test_phase_auto_resolves_market_windows():
     assert resolve_phase("auto", datetime(2026, 7, 15, 10, 0)) == "intraday"
     assert resolve_phase("auto", datetime(2026, 7, 15, 16, 0)) == "close"
     assert resolve_phase("auto", datetime(2026, 7, 15, 22, 0)) == "close"
+
+
+@pytest.mark.parametrize('price_ready,flow_ready', [(True, True), (False, True), (True, False)])
+def test_supported_close_operation_is_separate_from_full_valuation_certification(monkeypatch, price_ready, flow_ready):
+    from trade_system import readiness
+    from trade_system.collection_profiles import operational_readiness
+    monkeypatch.setattr(readiness, 'assess_trade_date_readiness', lambda *a, **k: {
+        'data_certified_ready': False, 'missing_groups': ['kline'],
+        'operational_capabilities': {'capabilities': {'market_view': {'ready': price_ready},
+            'flow_observation': {'ready': flow_ready}, 'price_research': {'ready': False},
+            'flow_confirmation': {'ready': False}}}})
+    result = operational_readiness('unused', '2026-09-29', 'close', '2026-09-29T17:30:00')
+    assert result['ready'] is (price_ready and flow_ready)
+    assert result['strict_data_certified_ready'] is False and result['strict_missing_groups'] == ['kline']
+    assert result['required_capabilities'] == ['market_view', 'flow_observation']
 
 
 def test_retired_full_phase_is_rejected():
@@ -153,9 +169,10 @@ def test_close_priority_plan_keeps_incremental_tushare_and_official_ths():
     names = [name for name, _, _ in steps]
     assert not {"collect_capital_flow_focus", "collect_multisource_capital_flow"} & set(names)
 
-    assert names[:9] == [
+    assert names[:10] == [
         "collect_market_context",
         "sync_tushare_close",
+        "prepare_valuation_session",
         "collect_ths_concepts_api",
         "collect_hithink_limit_pool_daily",
         "collect_realtime_limit_pool",
@@ -202,11 +219,18 @@ def test_close_tushare_checkpoint_requires_all_five_successful_datasets(tmp_path
     assert close_datasets('2026-07-15', '2026-07-15T17:30:00+08:00') == ('daily','daily_basic','adj_factor')
     assert len(close_datasets('2026-07-15', '2026-07-15T11:00:00+00:00')) == 5
     assert task_due(db, '2026-07-15', 'reconcile_independent_stock_flow', phase='close',
-                    now=datetime(2026,7,15,17,30))[1].startswith('publication pending:')
+                    now=datetime(2026,7,15,17,30)) == (True, 'declared local computation')
     early = dict((name, command) for name,command,_ in command_plan(str(db),'2026-07-15',
                  phase='close',include_collection=True,as_of_time='2026-07-15T17:30:00'))
     assert early['sync_tushare_close'][early['sync_tushare_close'].index('--datasets')+1] == 'daily,daily_basic,adj_factor'
-    assert early['check_capital_flow_health'][early['check_capital_flow_health'].index('--stage')+1] == 'intraday'
+    assert early['check_capital_flow_health'][early['check_capital_flow_health'].index('--stage')+1] == 'close'
+    assert early['prepare_valuation_session'].index('--valuation-session') > 0
+    for phase in ('close', 'supplemental'):
+        scoped = dict((name, command) for name, command, _ in command_plan(str(db), '2026-07-15',
+            phase=phase, include_collection=True, valuation_workspace=str(tmp_path / 'workspace')))
+        intake = scoped['prepare_valuation_session']
+        assert intake[intake.index('--valuation-workspace') + 1] == str(tmp_path / 'workspace')
+        assert list(scoped).index('sync_tushare_close') < list(scoped).index('prepare_valuation_session')
     from collectors import xiaodefa
     with duckdb.connect(str(db)) as con:
         con.execute("CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)")

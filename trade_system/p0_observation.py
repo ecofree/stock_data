@@ -29,7 +29,7 @@ GOOD_STOCK_BATCH = {"success", "success_with_unavailable"}
 GOOD_SECTOR_BATCH = {"success", "success_with_optional_gap"}
 
 
-def phase_evidence_errors(manifest, trade_date):
+def phase_evidence_errors(manifest, trade_date, *, operational: bool = False):
     """A green summary cannot override missed windows or failed required work."""
     from datetime import datetime, time
     from zoneinfo import ZoneInfo
@@ -59,7 +59,9 @@ def phase_evidence_errors(manifest, trade_date):
         if not isinstance(step,dict):
             errors.append('step_evidence_invalid')
             continue
-        if step.get('required',True) and step.get('status') not in {'completed','skipped'}:
+        quality_gap = (operational and step.get('status') == 'certification_gap'
+                       and step.get('certification_gap') is True and step.get('operational_failure') is False)
+        if step.get('required',True) and step.get('status') not in {'completed','skipped'} and not quality_gap:
             errors.append('required_step_not_complete:'+str(step.get('name')))
         if step.get('required',True) and step.get('status')=='skipped' and not step.get('reason'):
             errors.append('required_skip_without_evidence:'+str(step.get('name')))
@@ -72,9 +74,14 @@ def _local_stamp(value: Any) -> datetime:
             else stamp.astimezone(ZoneInfo('Asia/Shanghai')))
 
 
-def _receipt_errors(manifest: dict, trade_date: str, contract_sha256: str) -> list[str]:
-    errors = phase_evidence_errors(manifest, trade_date)
-    if manifest.get('status') not in {'completed', 'completed_with_warnings'}:
+def _receipt_errors(manifest: dict, trade_date: str, contract_sha256: str,
+                    *, operational: bool = False, db_path: str | Path | None = None) -> list[str]:
+    errors = phase_evidence_errors(manifest, trade_date, operational=operational)
+    good = {'completed', 'completed_with_warnings'}
+    if operational:
+        good.add('completed_with_certification_gaps')
+        errors.extend(_operational_receipt_errors(manifest, trade_date, contract_sha256, db_path))
+    if manifest.get('status') not in good:
         errors.append('phase_not_qualified')
     if manifest.get('scope') != 'transitional_market_collection_only':
         errors.append('phase_scope_unqualified')
@@ -112,7 +119,8 @@ def _publication_after(publication: dict, completed_at: Any, trade_date: str) ->
 
 def audit_phase_windows(manifests: list[dict], trade_date: str, phase: str,
                         collector_contract_sha256: str, policy: dict | None,
-                        publication: dict | None = None, *, contract_error: str | None = None) -> dict:
+                        publication: dict | None = None, *, contract_error: str | None = None,
+                        operational: bool = False, db_path: str | Path | None = None) -> dict:
     """Qualify all scheduled slots, retaining failures and bounded recoveries.
 
     A late start can recover only a timely attempt with the same collector hash
@@ -149,7 +157,8 @@ def audit_phase_windows(manifests: list[dict], trade_date: str, phase: str,
             if not start <= started < deadline:
                 continue
             assigned.add(index)
-            errors = _receipt_errors(manifest, trade_date, collector_contract_sha256)
+            errors = _receipt_errors(manifest, trade_date, collector_contract_sha256,
+                operational=operational, db_path=db_path)
             same_contract = str(manifest.get('collector_contract_sha256', '')).lower() == collector_contract_sha256.lower()
             scope_ok = manifest.get('scope') == 'transitional_market_collection_only'
             if started > start_latest and not timely_same_contract:
@@ -191,7 +200,8 @@ def audit_phase_windows(manifests: list[dict], trade_date: str, phase: str,
                         or bound.get('completed_at') != last_manifest.get('completed_at')
                         or bound.get('manifest_sha256') != last_manifest.get('_manifest_sha256')
                         or bound.get('scope') != 'same_day_close_recovery_not_auction_or_intraday_replay'
-                        or _receipt_errors(candidate, trade_date, collector_contract_sha256)):
+                        or _receipt_errors(candidate, trade_date, collector_contract_sha256,
+                            operational=operational, db_path=db_path)):
                     continue
                 try:
                     began = _local_stamp(candidate['started_at'])
@@ -443,6 +453,156 @@ def _tushare_status(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str
     return {"passed": not missing, "datasets": datasets, "missing": missing}
 
 
+def _evidence_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                     default=str).encode('utf-8')).hexdigest()
+
+
+def operational_evidence_identity(value: dict) -> str:
+    """Strict diagnostic progress cannot revoke unchanged factual-use evidence."""
+    return _evidence_digest({k: v for k, v in value.items() if k not in {
+        'strict_data_certified_ready', 'strict_missing_groups', 'evidence_identity_sha256'}})
+
+
+def _operational_receipt_errors(manifest: dict, trade_date: str, collector_sha: str,
+                                db_path: str | Path | None) -> list[str]:
+    """New operation evidence cannot borrow old green summaries or certification."""
+    saved = manifest.get('operational_assessment')
+    completed = manifest.get('operational_completion') or {}
+    if (not isinstance(saved, dict) or saved.get('ready') is not True
+            or completed.get('completed') is not True or completed.get('failures') or completed.get('pending')):
+        return ['supported_operational_assessment_missing_or_failed']
+    try:
+        observed = _local_stamp(saved['evaluated_at'])
+        start, end = (_local_stamp(manifest[k]) for k in ('started_at', 'completed_at'))
+        if (db_path is None or not start <= observed <= end or saved.get('trade_date') != trade_date
+                or saved.get('collector_contract_sha256') != collector_sha.lower()
+                or end > datetime.now(ZoneInfo('Asia/Shanghai'))):
+            return ['operational_day_clock_or_contract_unbound']
+        from trade_system.collection_profiles import operational_readiness
+        current = operational_readiness(db_path, trade_date, manifest['phase'], saved['evaluated_at'])
+        current['collector_contract_sha256'] = collector_sha.lower()
+        current['evidence_identity_sha256'] = operational_evidence_identity(current)
+        if (current['evidence_identity_sha256'] != saved.get('evidence_identity_sha256')
+                or operational_evidence_identity(saved) != saved.get('evidence_identity_sha256')
+                or current.get('ready') is not True):
+            return ['operational_actual_inputs_changed_or_unqualified']
+    except (KeyError, ValueError, TypeError) as exc:
+        return ['operational_receipt_invalid:' + str(exc)]
+    return []
+
+
+def build_financial_certification(db_path: str | Path, trade_date: str,
+                                  collector_contract_sha256: str | None,
+                                  evaluated_at: str, *, run_started_at: str | None = None) -> dict[str, Any]:
+    """Bind strict close qualification to actual stored inputs, never an exit code.
+
+    The clock is the original observation clock. Reading historical evidence
+    today must not refresh its age or replace the original producer/definition
+    contract. Missing evidence is a certification gap, not invented success.
+    """
+    result = {'schema': 'strict_financial_certification_v1', 'trade_date': trade_date,
+              'collector_contract_sha256': str(collector_contract_sha256 or '').lower(),
+              'evaluated_at': evaluated_at, 'passed': False, 'blockers': [],
+              'run_started_at': run_started_at,
+              'scope': 'strict_same_day_data_and_independent_flow_not_account_performance'}
+    try:
+        stamp = _local_stamp(evaluated_at)
+        began = _local_stamp(run_started_at)
+        sha = result['collector_contract_sha256']
+        if (stamp.date().isoformat() != trade_date or stamp.hour < 15
+                or began.date().isoformat() != trade_date or not began <= stamp
+                or stamp > datetime.now(ZoneInfo('Asia/Shanghai'))
+                or len(sha) != 64 or any(c not in '0123456789abcdef' for c in sha)):
+            raise ValueError('same_day_close_clock_and_collector_contract_required')
+        from trade_system.capital_flow_health import assess_capital_flow_health
+        health = assess_capital_flow_health(db_path, trade_date, now=stamp,
+            session_close=True, min_coverage_pct=99.5)
+        from trade_system.readiness import assess_trade_date_readiness
+        data = assess_trade_date_readiness(db_path, trade_date, 'close', now=stamp,
+            max_age_seconds=7200)
+        reconciliation = health.get('reconciliation') or {}
+        comparison = reconciliation.get('comparison_contract') or {}
+        with duckdb.connect(str(db_path), read_only=True) as con:
+            if not table_exists(con, 'intraday_stock_flow_independent_reconciliation'):
+                raise ValueError('independent_reconciliation_receipt_missing')
+            rows = con.execute('SELECT evidence_json,rule_version,updated_at FROM '
+                'intraday_stock_flow_independent_reconciliation WHERE trade_date=?',
+                [trade_date]).fetchall()
+        if len(rows) != 1 or not rows[0][0] or len(rows[0][0]) > 8_000_000:
+            raise ValueError('independent_reconciliation_receipt_unqualified')
+        raw_evidence, rule_version, updated_at = rows[0]
+        receipt = json.loads(raw_evidence)
+        receipt_stamp = _local_stamp(str(updated_at))
+        if (receipt_stamp.date().isoformat() != trade_date or receipt_stamp > stamp
+                or receipt_stamp.hour < 15 or receipt_stamp < began):
+            raise ValueError('independent_reconciliation_clock_unqualified')
+        fingerprints = receipt.get('source_fingerprints') or {}
+        providers = (receipt.get('primary_provider'), receipt.get('reference_provider'))
+        valid_fingerprints = (all(providers) and len(set(providers)) == 2 and
+            all(isinstance(fingerprints.get(p), str) and len(fingerprints[p]) == 64
+                and all(c in '0123456789abcdef' for c in fingerprints[p]) for p in providers))
+        result.update(data_certified_ready=data.get('data_certified_ready') is True,
+            strict_data_missing_groups=data.get('missing_groups') or [],
+            capital_data_certified_ready=health.get('data_certified_ready') is True,
+            stock_independent_certified_ready=health.get('stock_independent_certified_ready',
+                reconciliation.get('independent_reconciliation_ready')) is True,
+            flow_certified_ready=health.get('flow_certified_ready') is True,
+            independent_definition_eligible=comparison.get('eligible') is True,
+            reconciliation_rule_version=rule_version,
+            reconciliation_updated_at=str(updated_at),
+            reconciliation_sha256=_evidence_digest(receipt),
+            comparison_contract_sha256=_evidence_digest(comparison),
+            source_fingerprints=fingerprints)
+        for name in ('data_certified_ready', 'capital_data_certified_ready', 'stock_independent_certified_ready',
+                     'flow_certified_ready', 'independent_definition_eligible'):
+            if not result[name]:
+                result['blockers'].append(name + '_not_qualified')
+        if not valid_fingerprints:
+            result['blockers'].append('independent_source_fingerprints_unqualified')
+        result['passed'] = not result['blockers']
+    except (OSError, ValueError, TypeError, KeyError, duckdb.Error) as exc:
+        result['blockers'].append(str(exc))
+    result['evidence_identity_sha256'] = _evidence_digest(result)
+    return result
+
+
+def _financial_certification_status(db_path: str | Path, manifests: list[dict],
+                                     trade_date: str, collector_sha: str,
+                                     phase: dict) -> dict[str, Any]:
+    """A completed close cannot bypass the strict evidence check before 19:00."""
+    selected = [m for m in manifests if m.get('run_id') == phase.get('run_id')
+                and m.get('trade_date') == trade_date
+                and m.get('phase') in {'close', 'supplemental'}]
+    if len(selected) != 1:
+        return {'passed': False, 'blockers': ['strict_certification_run_unbound']}
+    manifest = selected[0]
+    saved = manifest.get('strict_financial_certification')
+    if not isinstance(saved, dict):
+        return {'passed': False, 'blockers': ['strict_certification_receipt_missing']}
+    errors = []
+    try:
+        observed = _local_stamp(saved['evaluated_at'])
+        began, completed = (_local_stamp(manifest[k]) for k in ('started_at', 'completed_at'))
+        if (not began <= observed <= completed or saved.get('trade_date') != trade_date
+                or _local_stamp(saved.get('run_started_at')) != began
+                or saved.get('collector_contract_sha256') != collector_sha.lower()
+                or manifest.get('collector_contract_sha256', '').lower() != collector_sha.lower()
+                or completed > datetime.now(ZoneInfo('Asia/Shanghai'))):
+            errors.append('strict_certification_day_clock_or_contract_mismatch')
+        refreshed = build_financial_certification(db_path, trade_date, collector_sha, saved['evaluated_at'],
+            run_started_at=manifest['started_at'])
+        if saved != refreshed:
+            errors.append('strict_certification_evidence_changed_or_unverified')
+        if refreshed.get('passed') is not True:
+            errors.extend(refreshed.get('blockers') or ['strict_certification_not_qualified'])
+    except (KeyError, ValueError, TypeError) as exc:
+        errors.append('strict_certification_receipt_invalid:' + str(exc))
+        refreshed = {}
+    return {'passed': not errors, 'run_id': manifest.get('run_id'),
+            'blockers': errors, 'original_receipt': saved, 'revalidated': refreshed}
+
+
 def _ths_status(
     con: duckdb.DuckDBPyConnection,
     trade_date: str,
@@ -556,6 +716,9 @@ def audit_five_day_observation(
             for phase in PHASES:
                 phases[phase] = audit_phase_windows(manifests, trade_date, phase,
                     collector_contract_sha256, policy, publication, contract_error=contract_error)
+            operational_phases = {phase: audit_phase_windows(manifests, trade_date, phase,
+                collector_contract_sha256, policy, publication, contract_error=contract_error,
+                operational=True, db_path=db_path) for phase in PHASES}
             if publication['passed']:
                 try:
                     completed = _local_stamp(phases['close']['completed_at'])
@@ -571,6 +734,8 @@ def audit_five_day_observation(
             sector = _sector_status(con, trade_date)
             tushare = _tushare_status(con, trade_date)
             ths = _ths_status(con, trade_date, minimum_ths_concepts)
+            financial = _financial_certification_status(db_path, manifests, trade_date,
+                collector_contract_sha256, phases['close'])
             checks = {
                 "calendar": bool(session["calendar_verified"]),
                 "auction_run": phases["auction"]["passed"],
@@ -579,6 +744,7 @@ def audit_five_day_observation(
                 "stock_flow": stock["passed"],
                 "sector_flow": sector["passed"],
                 "tushare_close": tushare["passed"],
+                "strict_financial_certification": financial['passed'],
                 "ths_weekly": ths["passed"],
                 "publication": publication['passed'],
                 "pre_session_observation": publication.get('observation',{}).get('passed',False),
@@ -592,8 +758,16 @@ def audit_five_day_observation(
                     "stock_flow": stock,
                     "sector_flow": sector,
                     "tushare": tushare,
+                    "strict_financial_certification": financial,
                     "ths": ths,
                     "publication": publication,
+                    "operational_completeness": {
+                        'passed': bool(session['calendar_verified'] and publication['passed']
+                            and publication.get('observation', {}).get('passed', False)
+                            and all(p['passed'] for p in operational_phases.values())),
+                        'phases': operational_phases,
+                        'scope': 'qualified_basic_collection_and_independent_publication_stability_not_strict_financial_certification',
+                        'grants_p1_or_independent_flow_confirmation': False},
                 }
             )
     finally:
@@ -603,11 +777,22 @@ def audit_five_day_observation(
         if not item["passed"]:
             break
         consecutive += 1
+    operational_consecutive = 0
+    for item in reversed(daily):
+        if item['operational_completeness']['passed'] is not True:
+            break
+        operational_consecutive += 1
     return {
         "as_of": as_of,
         "required_days": int(required_days),
         "observed_sessions": len(daily),
         "consecutive_passes": consecutive,
+        "operational_completeness": {
+            'consecutive_passes': operational_consecutive,
+            'required_days': int(required_days),
+            'complete': len(daily) >= int(required_days) and operational_consecutive >= int(required_days),
+            'scope': 'qualified_basic_collection_and_independent_publication_stability',
+            'grants_p1_or_strict_financial_certification': False},
         "ready_for_p1": len(daily) >= int(required_days)
         and consecutive >= int(required_days),
         "daily": daily,
@@ -615,7 +800,7 @@ def audit_five_day_observation(
         "collector_contract_path": str(Path(collector_contract_path).resolve()) if collector_contract_path else None,
         "observation_window_contract": policy,
         "observation_window_contract_error": contract_error,
-        "scope": "market_collection_and_publication_not_account_performance_or_trading_permission",
+        "scope": "strict_market_collection_financial_certification_and_publication_not_account_performance_or_trading_permission",
     }
 
 
@@ -626,10 +811,11 @@ def render_observation(result: dict[str, Any]) -> str:
         f"- As of: `{result['as_of']}`",
         f"- Required consecutive sessions: `{result['required_days']}`",
         f"- Consecutive strict passes: `{result['consecutive_passes']}`",
+        f"- Consecutive supported-operation passes: `{result['operational_completeness']['consecutive_passes']}` (does not grant P1 or strict financial certification)",
         f"- Ready to enter P1: `{str(result['ready_for_p1']).lower()}`",
         "",
-        "| trade date | calendar | auction | intraday | close | stock flow | sector flow | TuShare close | THS weekly | publication | pass |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| trade date | calendar | auction | intraday | close | stock flow | sector flow | TuShare close | strict financial certificate | THS weekly | publication | pass |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in result["daily"]:
         checks = item["checks"]
@@ -639,6 +825,7 @@ def render_observation(result: dict[str, Any]) -> str:
             f"{mark(checks['auction_run'])} | {mark(checks['intraday_run'])} | "
             f"{mark(checks['close_run'])} | {mark(checks['stock_flow'])} | "
             f"{mark(checks['sector_flow'])} | {mark(checks['tushare_close'])} | "
+            f"{mark(checks['strict_financial_certification'])} | "
             f"{mark(checks['ths_weekly'])} | {mark(checks['publication'])} | {mark(item['passed'])} |"
         )
     lines.extend(
@@ -647,6 +834,7 @@ def render_observation(result: dict[str, Any]) -> str:
             "Strict rule: every required observation window in the original accepted collector contract must qualify. "
             "Pre-session preparation, out-of-window successes and later green summaries cannot replace missing slots. "
             "A degraded phase, unverified trading calendar, missing report, "
+            "missing or changed same-day/collector-bound strict financial evidence, "
             "capital-flow coverage below 99.5%, incomplete TuShare close batch, or stale/incomplete "
             "THS snapshots without a source-recorded expected concept count reset the consecutive-pass count.",
             "",

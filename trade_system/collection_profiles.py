@@ -59,6 +59,7 @@ _TASKS = {
     'collect_l2_focus': ProfileTask('collect_l2_focus', 'KPL /l2/stock-intraday (candidates)', 300, 'bounded L2 price curves; phase mode never runs full L2', network=True),
     'collect_intraday_sector_flow_full': ProfileTask('collect_intraday_sector_flow_full', 'Eastmoney sector pages + TuShare/THS aggregate', 300, 'full-sector capital flow refreshed after L2', network=True),
     'sync_tushare_close': ProfileTask('sync_tushare_close', 'TuShare relay date batches', 3600, 'same-day daily/basic/adjustment/money-flow facts', network=True),
+    'prepare_valuation_session': ProfileTask('prepare_valuation_session', 'local hash-bound reviewed inputs', None, 'daily valuation intake and explicit unresolved input worklist; no acquisition', network=False),
     'collect_hithink_limit_pool_daily': ProfileTask('collect_hithink_limit_pool_daily', 'HiThink official limit-up pool', 3600, 'same-day close limit-up facts and reasons', network=True),
     'collect_kpl_stock_flow_focus': ProfileTask('collect_kpl_stock_flow_focus', 'KPL advanced/zjmm-min', 3600, 'bounded candidate supplement; full-market reconciliation remains mandatory', network=True, required=False),
     'collect_review_supplement': ProfileTask('collect_review_supplement', 'KPL bounded P1 review supplement', 86400, 'daily review enhancement; never a close gate', network=True, required=False),
@@ -106,6 +107,7 @@ def command_plan(
     history_end: str = "",
     history_max_days: int = 0,
     include_research: bool | None = None,
+    valuation_workspace: str | None = None,
 ) -> list[CommandStep]:
     py = sys.executable
     selected_date = trade_date or default_trade_date(db_path)
@@ -162,6 +164,10 @@ def command_plan(
                 ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 # Daily ingestion writes raw facts; normalization projects them without copies.
                 close_facts,
+                ("prepare_valuation_session", [py, "scripts/backfill_2026_tushare.py", "--db", db_path,
+                 "--start-date", selected_date.replace('-', ''), "--end-date", selected_date.replace('-', ''),
+                 "--valuation-session", "--report", report("valuation_session_latest.md"),
+                 *(["--valuation-workspace", valuation_workspace] if valuation_workspace else [])], False),
                 # The official same-day THS snapshot must exist before the
                 # stock-flow aggregate is grouped into concepts.  Running this
                 # after sector flow created same-date rows based on a prior
@@ -221,6 +227,7 @@ def command_plan(
                 # Reuse the close dependency order; retry only its essential
                 # producers and the existing late-disclosure entry.
                 retained = {'collect_market_context', 'sync_tushare_close', 'collect_ths_concepts_api',
+                            'prepare_valuation_session',
                             'collect_hithink_limit_pool_daily', 'collect_realtime_limit_pool',
                             'collect_intraday_stock_flow_market', 'collect_intraday_sector_flow_full',
                             'derive_market_context', 'collect_lhb_daily', 'collect_auction_market_daily',
@@ -265,8 +272,7 @@ def command_plan(
             ("audit_multisource_readiness", [py, "scripts/audit_multisource_readiness.py", "--db", db_path,
              "--as-of", selected_date, "--out", report("multisource_readiness_latest.md")], False),
             ("check_capital_flow_health", [py, "scripts/check_capital_flow_health.py", "--db", db_path,
-             "--stage", ("intraday" if selected_phase == "close" and
-                         "moneyflow" not in close_datasets(selected_date, as_of_time) else selected_phase),
+             "--stage", selected_phase,
              "--date", selected_date, "--max-age-seconds", str(age), "--min-coverage-pct", "99.5",
              "--out", report("capital_flow_freshness_latest.md"),
              *(["--as-of", as_of_time] if as_of_time else [])], False),
@@ -465,6 +471,46 @@ def publication_readiness(db_path: str | Path, trade_date: str) -> dict:
         return dict(result, reason='publication_inputs_unavailable', error_type=type(exc).__name__)
 
 
+def operational_readiness(db_path: str | Path, trade_date: str, phase: str,
+                          evaluated_at: str) -> dict:
+    """Assess supported factual uses without granting the old strict certificate.
+
+    Full data certification and unavailable valuation/independent confirmation
+    remain explicit gaps. Identity, dates, units and input clocks are still
+    validated by each existing factual capability reader.
+    """
+    from trade_system.readiness import assess_trade_date_readiness
+    selected = 'close' if phase == 'supplemental' else phase
+    result = {'schema': 'supported_operation_assessment_v1', 'trade_date': trade_date,
+              'phase': phase, 'evaluated_at': evaluated_at, 'ready': False,
+              'scope': 'qualified_factual_uses_not_full_market_financial_certification',
+              'required_capabilities': [], 'capabilities': {}, 'blockers': []}
+    if selected == 'history':
+        return dict(result, ready=True, scope='explicit_bounded_history_execution_only')
+    try:
+        stamp = as_local_naive(evaluated_at)
+        if stamp is None or stamp.date().isoformat() != trade_date or stamp > datetime.now():
+            raise ValueError('operational_session_clock_unqualified')
+        assessment = assess_trade_date_readiness(db_path, trade_date, selected, now=stamp,
+            max_age_seconds={'auction': 300, 'intraday': 600, 'close': 7200}[selected])
+        capabilities = (assessment.get('operational_capabilities') or {}).get('capabilities') or {}
+        required = (('market_view', 'flow_observation') if selected == 'close' else
+                    ('flow_observation',) if selected == 'intraday' else ())
+        result.update(required_capabilities=list(required),
+                      capabilities={k: capabilities.get(k, {'ready': False}) for k in required},
+                      strict_data_certified_ready=assessment.get('data_certified_ready') is True,
+                      strict_missing_groups=assessment.get('missing_groups') or [])
+        for name in required:
+            if result['capabilities'][name].get('ready') is not True:
+                result['blockers'].append(name + '_unqualified')
+        if selected == 'auction' and assessment.get('data_certified_ready') is not True:
+            result['blockers'].append('auction_core_inputs_unqualified')
+        result['ready'] = not result['blockers']
+    except (ValueError, TypeError, KeyError, duckdb.Error) as exc:
+        result['blockers'].append('operational_inputs_unverified:' + str(exc))
+    return result
+
+
 def task_due(db_path: str | Path, trade_date: str, task_name: str,
              *, phase: str | None = None, now: datetime | None = None, force: bool = False) -> tuple[bool, str]:
     """Return ``(due, reason)`` without making any network request.
@@ -476,9 +522,6 @@ def task_due(db_path: str | Path, trade_date: str, task_name: str,
     if task is None:
         raise ValueError(f"unregistered task in phase {phase}: {task_name}")
     current = now or datetime.now()
-    if (task_name == 'reconcile_independent_stock_flow'
-            and 'moneyflow' not in close_datasets(trade_date, current)):
-        return False, 'publication pending: independent moneyflow available after 19:00 Asia/Shanghai'
     if not task.network:
         return True, "declared local computation"
     if force:

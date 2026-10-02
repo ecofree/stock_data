@@ -17,6 +17,7 @@ param(
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
+    [string]$ValuationWorkspace='',
     [string]$EnvironmentFile=''
 )
 
@@ -79,7 +80,8 @@ try {
     if (-not $TradeDate) {$TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')}
     # Contract verification is read-only. Backup and collection use its same
     # original close deadline; preflight/copy may never renew the phase budget.
-    $preflight=Invoke-StockDataProcess -Executable $Python -Arguments @($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
+    $valuationArgs=if ($ValuationWorkspace) {@('--valuation-workspace',$ValuationWorkspace)} else {@()}
+    $preflight=Invoke-StockDataProcess -Executable $Python -Arguments (@($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') + $valuationArgs) -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
     if ($preflight.ExitCode -ne 0) {throw ('Collection contract rejected before backup: '+$preflight.Stderr)}
     $windowCode="import json,sys; from trade_system.pipeline_runtime import load_observation_contract,observation_windows; print(json.dumps(observation_windows(load_observation_contract(sys.argv[1],sys.argv[2]),sys.argv[3],'close')[0]))"
     $windowResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$windowCode,$CollectorContract,$CollectorContractSha256,$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 30 -ProgressPath $processState
@@ -111,6 +113,7 @@ try {
     $args = @($IntegratedRunner,"--db",$DbPath,"--reports-dir",$ReportDir,
         "--collector-contract",$CollectorContract,"--collector-contract-sha256",$CollectorContractSha256,
         "--collection-profile",$CollectionProfile,"--phase",$Phase,"--trade-date",$TradeDate)
+    $args += $valuationArgs
     if ($SkipCollection) {$args+='--skip-collect'}
     Push-Location $Root
     try {

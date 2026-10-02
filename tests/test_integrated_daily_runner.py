@@ -268,6 +268,8 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
         (False,'retry cooldown age=0s ttl=150s status=error') if cooldown and name=='collect_intraday_stock_flow_market'
         else (False,'publication pending: fixture') if case=='pending' and name=='reconcile_independent_stock_flow'
         else (True,'fixture_due'))
+    monkeypatch.setattr(collection_profiles, 'operational_readiness', lambda *a, **k:
+        {'ready': True, 'scope': 'isolated_test_qualified_factual_inputs'})
     for case,expected in [('optional',0),('core',2),('cooldown',2),('pending',0)]:
         fail_core=case=='core';cooldown=case=='cooldown'
         monkeypatch.setattr(sys,'argv',['run_integrated_daily.py','--migration-root',str(migration),
@@ -280,6 +282,80 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
         assert receipt['warnings']==['collect_market_context']
         if cooldown:
             assert next(x for x in receipt['steps'] if x['name']=='collect_intraday_stock_flow_market')['status']=='degraded'
+
+
+@pytest.mark.parametrize('name,code,out,err,expected', [
+    ('reconcile_independent_stock_flow', 1,
+     'date=2026-09-29 status=incomparable primary=5571 reference=unqualified:0 overlap=0.00% corr=None sign=None\nout=report.md\n', '', True),
+    ('reconcile_independent_stock_flow', 1, '', 'Traceback: bad database', False),
+    ('reconcile_independent_stock_flow', 1, 'date=2026-09-28 status=incomparable primary=5571 reference=unqualified:0 overlap=0.00% corr=None sign=None', '', False),
+    ('check_capital_flow_health', 2,
+     'date=2026-09-29 source_ready=true data_certified_ready=true flow_certified_ready=false analysis_ready=false stock_ready=true sector_ready=true out=report.md', '', True),
+    ('check_capital_flow_health', 2,
+     'date=2026-09-29 data_certified_ready=false flow_certified_ready=false', '', False),
+    ('check_capital_flow_health', -1, 'data_certified_ready=true flow_certified_ready=false', '', False),
+    ('check_data_readiness', 2, 'data_certified_ready=false', '', False),
+])
+def test_only_explicit_financial_quality_results_are_separate_from_operation_failure(name, code, out, err, expected):
+    from scripts.run_integrated_daily import _certification_gap
+    assert _certification_gap(name, code, out, err, '2026-09-29') is expected
+
+
+def test_runner_financial_gap_preserves_operational_completion_and_strict_failure(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from scripts import run_integrated_daily as runner
+    from trade_system import collection_profiles, pipeline_runtime
+    from trade_system.p0_observation import phase_evidence_errors
+    from tools.v2.backup_verify import backup_verify
+    day = date.today().isoformat()
+    source = tmp_path / 'source.duckdb'
+    with duckdb.connect(str(source)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
+        con.executemany('INSERT INTO tushare_trade_cal VALUES (?,?,true)', [(x, day) for x in ('SSE', 'SZSE')])
+    migration = tmp_path / 'migration'
+    verified = backup_verify(source, migration)
+    commands = []
+    def child(command, **kwargs):
+        commands.append(command)
+        if command[1] == 'scripts/reconcile_independent_stock_flow.py':
+            return SimpleNamespace(returncode=1, stdout=(f'date={day} status=incomparable primary=5571 '
+                'reference=unqualified:0 overlap=0.00% corr=None sign=None\n').encode(), stderr=b'')
+        if command[1] == 'scripts/check_capital_flow_health.py':
+            return SimpleNamespace(returncode=2, stdout=(f'date={day} source_ready=true '
+                'data_certified_ready=true flow_certified_ready=false\n').encode(), stderr=b'')
+        return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+    monkeypatch.setattr(runner, '_run_writer', child)
+    monkeypatch.setattr(pipeline_runtime, 'runtime_fingerprint', lambda: {'scope': 'test_fixture'})
+    monkeypatch.setattr(collection_profiles, 'task_due', lambda *a, **k: (True, 'fixture_due'))
+    monkeypatch.setattr(collection_profiles, 'operational_readiness', lambda *a, **k:
+        {'ready': True, 'scope': 'isolated_test_qualified_factual_inputs'})
+    monkeypatch.setattr(sys, 'argv', ['runner', '--migration-root', str(migration), '--db', str(verified['backup']),
+        '--reports-dir', str(migration / 'reports'), '--phase', 'close', '--run-id', 'financial-gap', '--trade-date', day])
+    assert main() == 0
+    receipt = json.loads((migration / 'reports/runs/financial-gap/run.json').read_text())
+    assert receipt['status'] == 'completed_with_certification_gaps'
+    assert receipt['operational_completion']['completed'] is True
+    assert receipt['strict_financial_certification']['passed'] is False
+    assert {'reconcile_independent_stock_flow', 'check_capital_flow_health', 'strict_financial_certification'} <= set(receipt['certification_gaps'])
+    assert 'required_step_not_complete:reconcile_independent_stock_flow' in phase_evidence_errors(receipt, day)
+    local = next(step for step in receipt['steps'] if step['name'] == 'prepare_valuation_session')
+    assert local['status'] == 'completed' and local['local_valuation_evidence']['market_requests'] == 0
+    assert local['local_valuation_evidence']['valuation_complete'] is False
+    assert Path(local['local_valuation_evidence']['report_path']).is_file()
+    assert not any('--valuation-session' in command for command in commands)
+    with duckdb.connect(str(verified['backup']), read_only=True) as con:
+        assert con.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_daily_session'").fetchone() == (1,)
+
+
+@pytest.mark.parametrize('operational_ready', [False, True])
+def test_data_gap_only_separates_when_actual_supported_inputs_qualify(operational_ready):
+    from scripts.run_integrated_daily import _certification_gap
+    normal = 'trade_date=2026-09-29 stage=close data_certified_ready=false missing=kline out=report.md'
+    assert _certification_gap('check_data_readiness', 2, normal, '', '2026-09-29',
+        {'ready': operational_ready}) is operational_ready
+    assert not _certification_gap('check_data_readiness', 2, normal, 'Traceback', '2026-09-29',
+        {'ready': operational_ready})
 
 
 def test_close_tushare_sync_uses_gapfill_lookback():
@@ -339,7 +415,7 @@ def test_supplemental_recovers_close_facts_under_shared_plan():
     from trade_system.source_authority import validate_production_plan
     steps=command_plan('sample.duckdb','2026-09-17',include_collection=True,phase='supplemental')
     names=[n for n,_,_ in steps]
-    assert names==['collect_market_context','sync_tushare_close','collect_ths_concepts_api',
+    assert names==['collect_market_context','sync_tushare_close','prepare_valuation_session','collect_ths_concepts_api',
                    'collect_hithink_limit_pool_daily','collect_realtime_limit_pool',
                    'collect_intraday_stock_flow_market','collect_intraday_sector_flow_full',
                    'derive_market_context','collect_lhb_daily','collect_auction_market_daily',
