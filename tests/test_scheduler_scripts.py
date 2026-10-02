@@ -112,7 +112,8 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     for suffix in ('Auction','Intraday','DailyClose','SupplementalRetry'):
         if 'StockData-'+suffix in rows:
             assert f'-EnvironmentFile "{environment}"' in rows['StockData-'+suffix]['Arguments']
-            assert f'-ValuationWorkspace "{tmp_path / 'workspace'}"' in rows['StockData-'+suffix]['Arguments']
+            workspace_argument = '-ValuationWorkspace "' + str(tmp_path / 'workspace') + '"'
+            assert workspace_argument in rows['StockData-'+suffix]['Arguments']
     if 'StockData-QLibResearch' in rows:
         assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
         assert '-RefreshResearch' not in rows['StockData-QLibResearch']['Arguments']
