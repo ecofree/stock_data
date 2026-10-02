@@ -71,9 +71,16 @@ def test_current_native_source_beats_new_fallback_and_conflicts_are_not_hidden()
 
 
 def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monkeypatch):
+    from copy import deepcopy
+    from trade_system.v2 import journal_index
     (tmp_path/'workspace-config.json').write_text(json.dumps({'read_only':True,'market_database':'synthetic'}))
-    desk={'prediction':{'rows':[{'instrument':'000001'}]},'notes':[]}
-    monkeypatch.setattr(product,'saved_projection',lambda out:desk)
+    desk={'prediction':{'rows':[{'instrument':'600888'}]},'notes':[]}
+    attention=['000001']
+    # Synthetic effective human attention is explicit observation authorization;
+    # a retained model forecast is not an additional capture subject.
+    monkeypatch.setattr(journal_index,'effective',lambda out,kind:
+        [{'instrument':code} for code in attention] if kind=='note' else [])
+    monkeypatch.setattr(product,'saved_projection',lambda out:deepcopy(desk))
     monkeypatch.setattr(watch,'load_rows',lambda *args:[])
     calls=[]
     original=capture.capture
@@ -87,6 +94,11 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     monkeypatch.setattr(capture,'replay',lambda folder:dict(original_replay(folder),origin='tencent_https'))
     first=product.observe(tmp_path,capture_quotes=True)
     assert first['provider_requests']==1 and len(calls)==1
+    _,files=product.read_current(tmp_path/'observation-publication')
+    scope=json.loads(files['observation.json'])['live_scope']
+    assert [r['instrument'] for r in scope]==['000001']
+    assert scope[0]['roles']==['human_attention']
+    assert desk['prediction']['rows']==[{'instrument':'600888'}]
     second=product.observe(tmp_path)
     third=product.observe(tmp_path,capture_quotes=True)
     assert second['provider_requests']==third['provider_requests']==0
@@ -105,7 +117,7 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     assert {r['instrument'] for r in value['rows']}=={'000001','000002'}
     assert 'no_verified_pre_session_scope_for_today' in value['warnings']
     desk['plans']={'account':{'status':'risk_unavailable'}}
-    desk['prediction']['rows']=[{'instrument':f'{i:06}'} for i in range(1,202)]
+    attention[:]=[f'{i:06}' for i in range(1,202)]
     product.observe(tmp_path)
     _,files=product.read_current(tmp_path/'observation-publication')
     value=json.loads(files['observation.json'])
@@ -117,7 +129,6 @@ def test_explicit_capture_then_readonly_and_repeated_capture_reuse(tmp_path,monk
     _,files=product.read_current(tmp_path/'observation-publication')
     rotated=json.loads(files['observation.json'])
     assert not deferred & {r['instrument'] for r in rotated['rows'] if r['state']=='capacity_blocked'}
-    from trade_system.v2 import journal_index
     monkeypatch.setattr(journal_index,'effective',lambda out,kind: [{'instrument':'600999'}] if kind=='note' else [])
     # A note omitted from the display projection is still a live attention subject.
     product.observe(tmp_path)
