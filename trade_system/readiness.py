@@ -20,7 +20,7 @@ import duckdb
 
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
-from trade_system.gate_contract import build_operator_state
+from trade_system.gate_contract import build_operator_state, build_operational_capabilities
 
 
 def _normalize_trade_date(value: str) -> str:
@@ -692,6 +692,231 @@ def _sector_semantic_gate(con: duckdb.DuckDBPyConnection, trade_date: str) -> di
     return {"ready": not issues, "invalid_rows": invalid_unit + absurd, "issues": issues}
 
 
+def market_view_capability(con, trade_date: str, *, now: datetime | None = None) -> dict:
+    """Qualify available price facts while retaining the entire dated denominator.
+
+    This is a factual view, not full-market certification or a trading signal.
+    Invalid/absent securities remain explicit gaps and never become zero rows.
+    """
+    day = _normalize_trade_date(trade_date)
+    clock = as_local_naive(now) or datetime.now()
+    result = {"ready": False, "scope": "qualified_factual_rows_not_full_market_certification",
+              "expected_rows": None, "qualified_rows": 0, "eligible_codes": [],
+              "ineligible_codes": [], "scope_sha256": None, "breadth": None,
+              "input_received_at_min": None, "input_received_at_max": None,
+              "full_market_certified": False, "blockers": []}
+    try:
+        if day > clock.date().isoformat():
+            return dict(result, blockers=["future_market_session"])
+        if not table_exists(con, "tushare_trade_cal"):
+            return dict(result, blockers=["exact_dual_exchange_calendar_missing"])
+        flags = con.execute("SELECT exchange,is_open FROM tushare_trade_cal WHERE cal_date=? "
+                            "AND exchange IN ('SSE','SZSE') ORDER BY exchange", [day]).fetchall()
+        if flags != [("SSE", True), ("SZSE", True)]:
+            return dict(result, blockers=["exact_dual_exchange_open_session_unqualified"])
+        scope = qualified_stock_flow_scope(con, day, now=clock)
+        if not scope["passed"]:
+            return dict(result, blockers=[scope["reason"]])
+        expected = set(scope["codes"])
+        result.update(expected_rows=len(expected), scope_sha256=scope["codes_sha256"],
+                      identity_reference_version=scope["version"])
+        if not table_exists(con, "v_kline_daily"):
+            return dict(result, ineligible_codes=[{"stock_code": code, "reason": "price_missing"}
+                        for code in sorted(expected)], blockers=["canonical_price_relation_missing"])
+        required = {"trade_date", "stock_code", "open", "high", "low", "close", "volume",
+                    "turnover", "change_pct", "provider", "adjustment", "volume_unit",
+                    "amount_unit", "fetched_at", "is_fallback"}
+        if not required <= set(table_columns(con, "v_kline_daily")):
+            return dict(result, blockers=["canonical_price_contract_missing"])
+        rows = con.execute("SELECT stock_code,open,high,low,close,volume,turnover,change_pct,"
+                           "provider,adjustment,volume_unit,amount_unit,fetched_at,is_fallback "
+                           "FROM v_kline_daily WHERE trade_date=? ORDER BY stock_code LIMIT 10001", [day]).fetchall()
+        if len(rows) > 10000:
+            return dict(result, blockers=["canonical_price_scope_budget_exceeded"])
+        by_code = {}
+        for row in rows:
+            by_code.setdefault(str(row[0]), []).append(row)
+        good = {}
+        invalid = []
+        for code in sorted(expected | set(by_code)):
+            values = by_code.get(code, [])
+            reason = None
+            if code not in expected:
+                reason = "outside_dated_stock_scope"
+            elif not values:
+                reason = "price_missing"
+            elif len(values) != 1:
+                reason = "duplicate_price_identity"
+            else:
+                _, opening, high, low, close, volume, turnover, pct, provider, adjustment, vol_unit, amount_unit, received, fallback = values[0]
+                numbers = (opening, high, low, close, volume, turnover, pct)
+                if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) for v in numbers):
+                    reason = "price_numeric_fields_missing_or_nonfinite"
+                elif min(opening, high, low, close) <= 0 or volume < 0 or turnover < 0 or not low <= min(opening, close) <= max(opening, close) <= high:
+                    reason = "price_arithmetic_invalid"
+                elif not provider or str(provider).lower() in {"unknown", "fallback", "existing_core"} or fallback is not False:
+                    reason = "price_source_unqualified"
+                elif adjustment != "none" or vol_unit != "shares" or amount_unit != "yuan":
+                    reason = "price_adjustment_or_units_unqualified"
+                else:
+                    received = as_local_naive(received)
+                    if received is None or received > clock or received.date().isoformat() < day:
+                        reason = "price_input_clock_unqualified"
+                    else:
+                        good[code] = {"change_pct": pct, "provider": provider,
+                                      "input_received_at": received.isoformat()}
+            if reason:
+                invalid.append({"stock_code": code, "reason": reason})
+        dates = [v["input_received_at"] for v in good.values()]
+        pct = [v["change_pct"] for v in good.values()]
+        return dict(result, ready=bool(good), eligible_codes=sorted(good), qualified_rows=len(good),
+                    ineligible_codes=invalid, qualified_facts=good,
+                    breadth={"rise": sum(v > 0 for v in pct), "fall": sum(v < 0 for v in pct),
+                             "flat": sum(v == 0 for v in pct), "samples": len(pct)} if good else None,
+                    breadth_scope="exact_qualified_price_subset_not_exchange_total",
+                    input_received_at_min=min(dates) if dates else None,
+                    input_received_at_max=max(dates) if dates else None,
+                    blockers=[] if good else ["no_qualified_current_price_facts"])
+    except (duckdb.Error, ValueError, TypeError, KeyError) as exc:
+        return dict(result, blockers=["market_view_evidence_invalid:" + type(exc).__name__])
+
+
+def price_research_capability(workspace: str | Path | None, trade_date: str, *, now: datetime | None = None) -> dict:
+    """Re-read a frozen price-only prediction and its actual input window.
+
+    No update, fit, inference, capture or publication is invoked. A missing
+    workspace/model/receipt remains unassessed rather than borrowing readiness.
+    """
+    result = {"ready": False, "scope": "frozen_price_research_not_signals_or_account_returns",
+              "model_id": None, "feature_columns": [], "eligible_codes": [], "ineligible_codes": [],
+              "blockers": ["frozen_price_workspace_missing"], "execution_ready": False}
+    if workspace is None:
+        return result
+    try:
+        import pandas as pd
+        import numpy as np
+        from zoneinfo import ZoneInfo
+        from trade_system.v2 import research_product as product, research_campaign as campaign, research_dataset as dataset
+        from trade_system.v2.gap_evidence import read_json
+        from trade_system.v2.domain import file_hash, utc
+        clock = as_local_naive(now) or datetime.now()
+        aware_clock = clock.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        day = _normalize_trade_date(trade_date)
+        run, model, _ = product.read_build(workspace)
+        prediction = product.read_prediction(workspace)
+        prep = read_json(model["preprocessing_path"])[0]
+        columns = prep["used_features"]
+        result.update(model_id=model["model_id"], feature_columns=columns)
+        # An actual frozen preprocessing manifest is the feature authority.
+        # Unknown and money-dependent columns cannot borrow a price capability.
+        if not isinstance(columns, list) or not columns or len(set(columns)) != len(columns) or not set(columns) <= set(dataset.BASE):
+            return dict(result, blockers=["frozen_model_features_not_proven_price_only"])
+        policy = model.get("inference_policy", "legacy_61_sessions")
+        if policy not in {"price_21_sessions_v2", "legacy_61_sessions"}:
+            return dict(result, blockers=["unknown_frozen_inference_policy"])
+        minimum = 21 if policy == "price_21_sessions_v2" else 61
+        result["minimum_input_sessions"] = minimum
+        if (not prediction or prediction.get("model_id") != model["model_id"]
+            or prediction.get("date") != day or prediction.get("execution_ready") is not False
+            or prediction.get("scope") != "actually_received_current_research_predictions_not_trading_signals"
+            or utc(model["frozen_at"]) > utc(prediction["captured_at"])
+            or utc(prediction["captured_at"]) > utc(aware_clock)
+            or str(model["train_end"]) >= day):
+            return dict(result, blockers=["current_frozen_prediction_binding_unqualified"])
+        if prediction.get("feature_source_sha256") != file_hash(dataset.__file__) and not dataset.inference_compatible({"source_sha256": prediction.get("feature_source_sha256")}):
+            return dict(result, blockers=["prediction_feature_formulas_changed"])
+        folder = Path(prediction["receipt_folder"])
+        replayed = campaign.cached_replay(folder)
+        reg, members, parsed, _ = replayed
+        config = read_json(run / "configuration.json")[0]
+        codes = config["universe"]
+        request_codes = [c + (".SH" if c.startswith("6") else ".SZ") for c in codes]
+        if reg.get("config", {}).get("codes") != request_codes or reg["origin"] != "native_and_relay":
+            return dict(result, blockers=["prediction_receipt_universe_unqualified"])
+        observed = campaign.derive(folder, replayed=replayed)
+        calendar = observed["calendar"]["SSE"]
+        if calendar != observed["calendar"]["SZSE"] or not calendar:
+            return dict(result, blockers=["research_exchange_calendar_unqualified"])
+        native_calendar = parsed.get(0, [])
+        if (not native_calendar or not product.calendar_covers_clock(reg, parsed, clock.date().isoformat())
+            or product.latest_closed_session(native_calendar, aware_clock) != day
+            or observed["receipt_manifest_id"] != prediction.get("receipt_manifest_id")):
+            return dict(result, blockers=["research_latest_session_or_receipt_binding_unqualified"])
+        common_clocks = []
+        for index, request in enumerate(reg.get("requests", [])):
+            if request.get("kind") not in {"native_calendar", "calendar", "identity_snapshot"}:
+                continue
+            filename = f"receipt-{index:02d}.json"
+            if filename not in members:
+                return dict(result, blockers=["research_calendar_or_identity_receipt_missing"])
+            received = utc(read_json(folder / filename)[0]["received_at"])
+            if received > utc(aware_clock) or received > utc(prediction["captured_at"]):
+                return dict(result, blockers=["research_calendar_or_identity_arrived_after_as_of"])
+            common_clocks.append(received.isoformat())
+        calendar = [d for d in calendar if d <= day]
+        if len(calendar) < minimum or calendar[-1] != day:
+            return dict(result, blockers=["research_price_window_insufficient"])
+        frame = pd.DataFrame([r for r in observed["rows"] if r["datetime"] <= day])
+        # All-null money inputs may have pandas object dtype. Preserve them
+        # as NaN for the shared formulas; they are not inputs to this model
+        # and must not turn a valid price-only window into a type error.
+        frame["net_mf_amount"] = pd.to_numeric(frame["net_mf_amount"], errors="coerce")
+        calculated = dataset.features(frame, calendar)
+        current = calculated[calculated.datetime == pd.Timestamp(day)]
+        saved = {r["instrument"]: r for r in prediction["rows"]}
+        if len(saved) != len(prediction["rows"]) or set(saved) != set(codes):
+            return dict(result, blockers=["prediction_security_scope_changed"])
+        eligible = []
+        rejected = []
+        clocks = list(common_clocks)
+        for row in current.to_dict("records"):
+            code = str(row["instrument"])
+            valid = bool(row["price_eligible" if minimum == 21 else "feature_eligible"])
+            valid = valid and np.isfinite([row[c] for c in columns]).all()
+            value = saved[code].get("prediction")
+            valid = valid and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            valid = valid and all(saved[code].get("features", {}).get(c) is not None and
+                math.isclose(float(saved[code]["features"][c]), float(row[c]), rel_tol=1e-10, abs_tol=1e-10) for c in columns)
+            window = [r for r in observed["rows"] if r["instrument"] == code and r["datetime"] in calendar[-minimum:]]
+            window_clocks = []
+            for original in window:
+                for name in ("native", "daily", "adj_factor"):
+                    receipt = original["receipt_files"].get(name)
+                    if not receipt:
+                        valid = False
+                        continue
+                    path = Path(receipt)
+                    raw = read_json(path if path.is_absolute() else folder / path)[0]
+                    received = utc(raw["received_at"])
+                    if received > utc(aware_clock) or received > utc(prediction["captured_at"]):
+                        valid = False
+                    window_clocks.append(received.isoformat())
+            if valid:
+                clocks.extend(window_clocks)
+            (eligible if valid else rejected).append(code)
+        return dict(result, ready=bool(eligible), eligible_codes=sorted(eligible), ineligible_codes=sorted(rejected),
+                    frozen_universe=codes, receipt_manifest_id=observed["receipt_manifest_id"],
+                    receipt_members_sha256=hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest(),
+                    prediction_id=prediction["prediction_id"],
+                    input_received_at_min=min(clocks) if clocks else None,
+                    input_received_at_max=max(clocks) if clocks else None,
+                    blockers=[] if eligible else ["no_qualified_frozen_price_window"])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, duckdb.Error) as exc:
+        return dict(result, blockers=["price_research_evidence_invalid:" + type(exc).__name__])
+
+
+def flow_observation_capability(con, trade_date: str, kind: str, *, now=None, max_age_seconds=None, collected_after=None) -> dict:
+    """Observe one qualified raw product; independence is assessed elsewhere."""
+    try:
+        qualification = capital_flow_coverage(con, trade_date, kind, require_actual=True,
+            now=now, max_age_seconds=max_age_seconds, collected_after=collected_after)
+        return {"ready": qualification["passed"] is True, "qualification": qualification,
+                "usage": "single_product_observation_not_independent_confirmation",
+                "blockers": [] if qualification["passed"] is True else [qualification.get("reason") or "flow_observation_unqualified"]}
+    except (duckdb.Error, ValueError, TypeError, KeyError) as exc:
+        return {"ready": False, "blockers": ["flow_observation_evidence_invalid:" + type(exc).__name__]}
+
+
 def assess_trade_date_readiness(
     db_path: str | Path | duckdb.DuckDBPyConnection,
     trade_date: str,
@@ -699,6 +924,7 @@ def assess_trade_date_readiness(
     required_groups: Iterable[str] | None = None,
     max_age_seconds: int | None = None,
     now: datetime | None = None,
+    research_workspace: str | Path | None = None,
 ) -> dict:
     trade_date = _normalize_trade_date(trade_date)
     # Freeze one local reference time for the whole assessment.  Besides
@@ -726,6 +952,18 @@ def assess_trade_date_readiness(
     owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
     con = duckdb.connect(str(db_path), read_only=True) if owns_connection else db_path
     try:
+        observation_age = freshness_max_age_seconds
+        close_boundary = datetime.fromisoformat(trade_date + "T15:00:00")
+        if stage in {"close", "postmarket"} and now >= close_boundary:
+            observation_age = int((now - close_boundary).total_seconds())
+        elif observation_age is None:
+            observation_age = 7200
+        market_capability = market_view_capability(con, trade_date, now=now)
+        price_capability = price_research_capability(research_workspace, trade_date, now=now)
+        stock_observation = flow_observation_capability(con, trade_date, "stock", now=now,
+            max_age_seconds=observation_age)
+        sector_observation = flow_observation_capability(con, trade_date, "sector", now=now,
+            max_age_seconds=observation_age)
         group_results = []
         for group_name in selected_groups:
             definition = GROUPS[group_name]
@@ -1053,6 +1291,11 @@ def assess_trade_date_readiness(
     effective_executable_candidates = (
         executable_candidates if operator_state["execution_ready"] else 0
     )
+    operational_capabilities = build_operational_capabilities(
+        trade_date=trade_date, as_of=now.isoformat(), market_view=market_capability,
+        price_research=price_capability, stock_observation=stock_observation,
+        sector_observation=sector_observation, flow_certified_ready=flow_certified_ready,
+    )
     return {
         **operator_state,
         "operator_state": dict(operator_state),
@@ -1072,6 +1315,7 @@ def assess_trade_date_readiness(
         "missing_groups": missing,
         "groups": group_results,
         "capital_flow_health": flow_health,
+        "operational_capabilities": operational_capabilities,
     }
 
 

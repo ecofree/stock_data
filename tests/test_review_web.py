@@ -65,6 +65,117 @@ def test_server_clock_is_explicit_shanghai_time():
     assert _fmt_clock(stamp * 1000) == '09:35'
 
 
+def test_valuation_gaps_without_review_remain_visible_and_historical(tmp_path):
+    import hashlib
+    from datetime import datetime, timezone
+    from trade_system.tushare_history import TushareHistoryCollector
+    from trade_system.review_queries import _data_source_review, _valuation_capability_review
+    from trade_system.review_web import _render_data_gates
+    class NoRequests:
+        def query_rows(self, *args, **kwargs):
+            raise AssertionError('page generation cannot acquire data')
+    db = tmp_path/'valuation-page.duckdb'
+    with TushareHistoryCollector(db,client=NoRequests()) as c:
+        con = c.store.conn
+        con.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000001.SZ'),('000002.SZ')")
+        con.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv,fetched_at) "
+                    "VALUES ('000001.SZ','2026-07-01',2,100,50,'2026-07-01 16:00:00')")
+        def retain(typ, payload, stamp='2026-07-01 16:00:00'):
+            raw = json.dumps(payload)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            con.execute("INSERT INTO multi_source_observation(data_type,provider,status,payload_json,payload_hash,observed_at) "
+                        "VALUES (?,'xiaodefa','qualified',?,?,?)", [typ,raw,digest,stamp])
+            return digest
+        retain('tushare_daily_basic',dict(api='daily_basic',params={'trade_date':'20260701'},
+            rows=[dict(ts_code='000001.SZ',trade_date='20260701',pb=2,total_mv=100,circ_mv=50)]))
+        ref = retain('tushare_balancesheet',dict(api='balancesheet',rows=[dict(ts_code='000002.SZ',report_type='1',
+            end_date='20251231',ann_date='20260430',total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=None)]))
+        retain('valuation_completion',dict(trade_date='2026-07-01',rows={'000001.SZ':{},'000002.SZ':{'values':{'pb':999}}}))
+        # A retained gap's cached claim cannot establish a reviewed fact.
+        retain('tushare_daily_basic_gaps_snapshot',dict(trade_date='2026-07-01',missing_codes=['000002.SZ'],
+            reviewed_valuation={'000002.SZ':{'values':{'pb':999}}}),stamp='2026-07-01 16:05:00')
+    with duckdb.connect(str(db),read_only=True) as con:
+        before = con.execute('SELECT count(*) FROM multi_source_observation').fetchone()[0]
+        clock = datetime(2026,7,2,1,0,tzinfo=timezone.utc)
+        gaps = _valuation_capability_review(con,'2026-07-01',now=clock)
+        assert gaps['reviewed_valuation'] == {}
+        capabilities = gaps['valuation_capabilities']
+        assert set(capabilities['rows']) == {'000001.SZ','000002.SZ'}
+        a,b = (capabilities['rows'][code] for code in ('000001.SZ','000002.SZ'))
+        assert a['qualified_core_for_session'] and not a['current_core_available']
+        assert not a['value_screen_eligible'] and capabilities['historical_as_of']
+        assert not b['qualified_core_for_session'] and b['fields']['pb']['value'] is None
+        assert b['included_in_expected_universe'] and b['financial_reference']['receipt_sha256'] == ref
+        assert b['financial_reference']['other_equity_tools_yuan'] is None
+        result = _data_source_review(con,'2026-07-01',now=clock)
+        assert result['daily_basic_gaps']['valuation_capabilities'] == capabilities
+        assert con.execute('SELECT count(*) FROM multi_source_observation').fetchone()[0] == before
+        earlier = _valuation_capability_review(con,'2026-07-01',now='2026-07-01T15:30:00+08:00')
+        assert earlier == {}  # No worklist or raw receipt existed at the requested clock.
+    b['reasons']['untrusted'] = ['<script>not executable</script>']
+    html = _render_data_gates({'data_sources':{'daily_basic_gaps':gaps}})
+    assert '逐证券估值能力' in html and '000002.SZ' in html and '在应采范围' in html
+    assert '历史数据，仅供该数据日回看' in html and '当前筛选不可用' in html
+    assert '行情、成交及主资金分别核验' in html and '不代表全市场基本面或 P0 验收通过' in html
+    assert '历史净资产参考，不供给当前 PB' in html and '2025-12-31' in html and '2026-04-30' in html
+    assert '2026-07-01T16:00:00+08:00' in html and ref in html and '其他权益工具（元）未知' in html
+    assert '<td>未知' in html and '999' not in html
+    assert '&lt;script&gt;not executable&lt;/script&gt;' in html and '<script>not executable' not in html
+    assert 'fetch(' not in html and '<iframe' not in html
+
+
+def test_missing_pdf_reader_blocks_only_valuation_qualification(tmp_path, monkeypatch):
+    import hashlib
+    import sys
+    from pypdf import PdfWriter
+    from trade_system.review_queries import _valuation_capability_review
+    from trade_system.tushare_store import RetainedValuationReader, _VALUATION_PAGE_CACHE
+    from trade_system.tushare_history import TushareHistoryCollector
+    class NoRequests:
+        def query_rows(self, *args, **kwargs):
+            raise AssertionError('missing parser cannot trigger acquisition')
+    document = tmp_path/'unreviewed-pages.pdf'
+    writer = PdfWriter()
+    writer.add_blank_page(width=100,height=100)
+    writer.write(document)
+    with TushareHistoryCollector(tmp_path/'no-parser.duckdb',client=NoRequests()) as collector:
+        con = collector.store.conn
+        con.execute("INSERT INTO tushare_stock_basic(ts_code) VALUES ('000001.SZ'),('000002.SZ')")
+        con.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv,fetched_at) "
+                    "VALUES ('000001.SZ','2026-07-01',2,100,50,'2026-07-01 16:00:00')")
+        def retain(typ, value):
+            raw = json.dumps(value)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            con.execute("INSERT INTO multi_source_observation(data_type,provider,payload_json,payload_hash,observed_at) "
+                        "VALUES (?,'xiaodefa',?,?,TIMESTAMP '2026-07-01 16:00:00')",[typ,raw,digest])
+            return digest
+        retain('tushare_daily_basic',dict(api='daily_basic',params={'trade_date':'20260701'},
+            rows=[dict(ts_code='000001.SZ',trade_date='20260701',pb=2,total_mv=100,circ_mv=50)]))
+        receipt = retain('valuation_source_document',dict(schema='official_valuation_document_v1',
+            ts_code='000002.SZ',as_of='2026-07-01',document=dict(path=str(document),format='pdf',
+                url='https://static.cninfo.com.cn/unreviewed.pdf',sha256=hashlib.sha256(document.read_bytes()).hexdigest()),
+            fields={'equity':dict(value=1,page=1,excerpt='unreviewed fixture, not financial evidence')}))
+        retain('valuation_review',{'review':dict(schema='reviewed_valuation_inputs_v2',ts_code='000002.SZ',
+            trade_date='2026-07-01',reviewed_at='2026-07-01T16:30:00+08:00',reviewed_by='fixture',
+            source_receipts=[receipt])})
+        retain('valuation_completion',dict(trade_date='2026-07-01',rows={'000001.SZ':{},'000002.SZ':{}}))
+        _VALUATION_PAGE_CACHE.clear()
+        monkeypatch.setitem(sys.modules,'pypdf',None)
+        result = _valuation_capability_review(con,'2026-07-01',now='2026-07-01T17:00:00+08:00')
+        rows = result['valuation_capabilities']['rows']
+        assert rows['000001.SZ']['current_core_available']
+        assert not rows['000002.SZ']['qualified_core_for_session']
+        assert rows['000002.SZ']['fields']['pb']['value'] is None
+        assert 'PDF extraction dependency unavailable' in rows['000002.SZ']['reasons']['review'][0]
+        assert result['valuation_capabilities']['status'] == 'partial'
+        assert not result['valuation_capabilities']['certifies_daily_basic']
+        only_gap = RetainedValuationReader(con).valuation_capability_report('20260701',['000002.SZ'],
+            observed_at='2026-07-01T17:00:00+08:00')
+        assert only_gap['status'] == 'unknown' and only_gap['rows']['000002.SZ']['fields']['pe']['value'] is None
+        assert RetainedValuationReader._valuation_review is TushareHistoryCollector._valuation_review
+        assert RetainedValuationReader.qualified_valuation_reviews is TushareHistoryCollector.qualified_valuation_reviews
+
+
 
 
 def test_blocked_page_labels_plans_as_research_drafts():

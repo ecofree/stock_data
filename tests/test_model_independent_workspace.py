@@ -71,6 +71,30 @@ def test_changed_snapshot_and_model_failure_do_not_erase_judgement(tmp_path):
         product.save_note(tmp_path,dict(command(),request_id='4'*32,evidence_id='0'*64))
 
 
+def test_unavailable_valuation_and_flow_confirmation_preserve_market_and_notes(tmp_path):
+    value=market();value.pop('snapshot_id')
+    value['operational_capabilities']={
+        'schema':'operational_capabilities_v1','trade_date':value['trade_date'],'as_of':value['as_of'],
+        'capabilities':{'market_view':{'ready':True,'qualified_rows':1,'expected_rows':2},
+            'price_research':{'ready':False},'flow_observation':{'ready':False},
+            'flow_confirmation':{'ready':False}},'execution_ready':False}
+    value['valuation_capabilities']={'rows':{'000001.SZ':{'current_core_available':False,
+        'reasons':{'pb':['no_qualified_same_session_pb']}}}}
+    value['snapshot_id']=identity(value)
+    product.publish_desk(tmp_path,market=value)
+    note_id=product.save_note(tmp_path,dict(command(),evidence_id=value['snapshot_id']))
+    product.publish_desk(tmp_path,market=value)
+    _,files=read_current(tmp_path/'publication')
+    data=json.loads(files['desk.json'])
+    assert data['market']['stocks']['000001']['change_pct']==1
+    assert data['market']['operational_capabilities']['capabilities']['flow_confirmation']['ready'] is False
+    assert data['market']['valuation_capabilities']['rows']['000001.SZ']['current_core_available'] is False
+    assert data['notes'][0]['note_id']==note_id and data['execution_ready'] is False
+    html=files['index.html'].decode() if isinstance(files['index.html'],bytes) else files['index.html']
+    assert 'capability-state' in html and '逐证券估值缺口与历史参考' in html
+    assert 'Object.entries(values)' in html and 'no_qualified_same_session_pb' in html
+
+
 def test_daily_import_and_render_without_any_research_packages():
     script='''
 import importlib.abc, sys

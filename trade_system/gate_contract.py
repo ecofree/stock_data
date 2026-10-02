@@ -13,6 +13,54 @@ from typing import Any
 
 
 OPERATOR_STATE_VERSION = "p0.operator_state.v1"
+OPERATIONAL_CAPABILITIES_VERSION = "operational_capabilities_v1"
+
+
+def build_operational_capabilities(
+    *, trade_date: str, as_of: str,
+    market_view: dict | None = None, price_research: dict | None = None,
+    stock_observation: dict | None = None, sector_observation: dict | None = None,
+    flow_certified_ready: bool = False,
+) -> dict[str, Any]:
+    """Describe separately assessed uses without granting legacy certification.
+
+    Callers supply domain facts obtained from the read-only input validators;
+    neither source readiness nor an absent assessment grants a capability.
+    This envelope never changes operator-state aliases or execution authority.
+    """
+    def fact(value: dict | None, reason: str) -> dict:
+        result = dict(value or {"blockers": [reason]})
+        result["ready"] = result.get("ready") is True
+        return result
+
+    market = fact(market_view, "market_view_not_assessed")
+    price = fact(price_research, "frozen_price_model_and_window_not_assessed")
+    stock = fact(stock_observation, "stock_observation_not_assessed")
+    sector = fact(sector_observation, "sector_observation_not_assessed")
+    observation_ready = stock["ready"] and sector["ready"]
+    return {
+        "schema": OPERATIONAL_CAPABILITIES_VERSION,
+        "trade_date": str(trade_date), "as_of": str(as_of),
+        "certification_scope": "domain_uses_do_not_replace_analysis_or_p0_acceptance",
+        "execution_ready": False,
+        "capabilities": {
+            "market_view": market,
+            "price_research": price,
+            "flow_observation": {
+                "ready": observation_ready, "stock": stock, "sector": sector,
+                "usage": "provider_observation_not_independent_confirmation",
+                "blockers": ([] if observation_ready else
+                    [name + "_observation_not_ready" for name, item in
+                     (("stock", stock), ("sector", sector)) if not item["ready"]]),
+            },
+            "flow_confirmation": {
+                "ready": flow_certified_ready is True,
+                "usage": "original_strict_independent_flow_contract",
+                "blockers": [] if flow_certified_ready is True else
+                    ["independent_flow_confirmation_not_ready"],
+            },
+        },
+    }
 
 
 def build_operator_state(

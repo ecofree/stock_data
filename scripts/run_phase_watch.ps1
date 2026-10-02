@@ -10,12 +10,17 @@ param(
     [string]$Python = "",
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
-    [string]$ReportsDirectory
+    [string]$ReportsDirectory,
+    [string]$EnvironmentFile=''
 )
 
 $ErrorActionPreference = "Continue"
 # Keep -Db usable; advanced parameters reserve that alias for -Debug.
 if (-not $CollectorContract -or -not $CollectorContractSha256 -or -not $ReportsDirectory) { throw 'Explicit collector contract, hash and reports directory required' }
+if ($EnvironmentFile) {
+    if (-not [IO.Path]::IsPathRooted($EnvironmentFile) -or -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {throw 'Explicit existing absolute provider environment file required'}
+    $env:KPL_ENV_FILE=$EnvironmentFile
+}
 $Root = Split-Path -Parent $PSScriptRoot
 $Once = Join-Path $Root "scripts\run_phase_once.ps1"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
@@ -67,6 +72,7 @@ function Invoke-WatchAttempt([DateTimeOffset]$Deadline, [string]$WindowId, [bool
         $onceArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Once, '-Db', $DbPath,
             '-Phase', $Phase, '-Python', $Python, '-CollectorContract', $CollectorContract,
             '-CollectorContractSha256', $CollectorContractSha256, '-ReportsDirectory', $ReportsDirectory)
+        if ($EnvironmentFile) { $onceArgs += @('-EnvironmentFile', $EnvironmentFile) }
         if ($Prepare) { $onceArgs += '-PrepareReference' }
         & PowerShell.exe @onceArgs
         $script:runCode = $LASTEXITCODE

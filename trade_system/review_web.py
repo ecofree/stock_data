@@ -1211,6 +1211,48 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
             f"<tbody>{''.join(source_rows)}</tbody></table></div>"
         )
     gaps = data_sources.get('daily_basic_gaps') or {}
+    capabilities = gaps.get('valuation_capabilities') or {}
+    if capabilities.get('rows'):
+        parts.append("<div class='sec-title'><strong>逐证券估值能力</strong></div>"
+            "<p>仅限制估值与 PB 筛选用途；证券仍在应采范围，行情、成交及主资金分别核验。"
+            "单证券可用不代表全市场基本面或 P0 验收通过。总市值、流通市值单位为万元。</p>"
+            f"<p>目标数据日 {_e(capabilities.get('trade_date'))}；"
+            f"实际观察时点 {_e(capabilities.get('observed_at'))}；"
+            f"{'历史数据，仅供该数据日回看，不能用作今天的估值资格。' if capabilities.get('historical_as_of') else '按目标日核验，其他能力不由估值结果授予。'}</p>")
+        for code, item in sorted(capabilities['rows'].items()):
+            fields = item.get('fields') or {}
+            cells = []
+            for field in ('pb', 'total_mv', 'circ_mv', 'pe', 'pe_ttm'):
+                entry = fields.get(field) or {}
+                display = ('不适用或未定义' if entry.get('known_undefined') else
+                           str(entry.get('value')) if entry.get('numeric_qualified_for_session') else '未知')
+                cells.append(f"<td>{_e(display)}<br><span class='dim'>{_e(entry.get('status') or 'unknown')}</span></td>")
+            screen = ('历史资格，当前筛选不可用' if item.get('historical_as_of') else
+                      '可用' if item.get('value_screen_eligible') else '不可用')
+            scope = ('在应采范围' if item.get('included_in_expected_universe') is True else
+                     '范围未确认' if item.get('included_in_expected_universe') is None else '不在目标日应采范围')
+            parts.append(f"<details><summary>{_e(code)}：PB 筛选 {_e(screen)}；{_e(scope)}</summary>"
+                "<div class='table-scroll'><table><thead><tr><th>PB</th><th>总市值</th>"
+                "<th>流通市值</th><th>静态 PE</th><th>TTM PE</th></tr></thead>"
+                f"<tbody><tr>{''.join(cells)}</tr></tbody></table></div>"
+                f"<p>字段缺口 {_e(json.dumps(item.get('reasons') or {}, ensure_ascii=False))}；"
+                f"利润输入缺口 {_e(json.dumps(item.get('earnings_missing_inputs') or {}, ensure_ascii=False))}；"
+                f"原始 PB 状态 {_e(item.get('native_pb_status'))}；"
+                f"原始估值到达 {_e(item.get('native_received_at') or '未知')}；"
+                f"最早输入 {_e(item.get('input_received_at_min') or '未知')}；"
+                f"最晚输入 {_e(item.get('input_received_at_max') or '未知')}</p>")
+            reference = item.get('financial_reference') or {}
+            if reference:
+                other = reference.get('other_equity_tools_yuan')
+                parts.append("<p>历史净资产参考，不供给当前 PB 或当前资格："
+                    f"合并归母权益（元）{_e(reference.get('parent_equity_yuan') if reference.get('parent_equity_yuan') is not None else '未知')}；"
+                    f"其他权益工具（元）{_e(other if other is not None else '未知')}；"
+                    f"财报期末 {_e(reference.get('report_period'))}；"
+                    f"披露日期 {_e(reference.get('announcement_date'))}；"
+                    f"原到达 {_e(reference.get('received_at'))}；"
+                    f"原回执 {_e(reference.get('receipt_sha256'))}；"
+                    f"状态 {_e(reference.get('status'))}</p>")
+            parts.append('</details>')
     reviewed = gaps.get('reviewed_valuation') or {}
     if reviewed:
         parts.append("<div class='sec-title'><strong>经证据核验的派生估值</strong></div>"

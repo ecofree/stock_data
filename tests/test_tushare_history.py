@@ -13,6 +13,73 @@ class FakeClient:
         return [{"ts_code": "000001.SZ", "trade_date": "20260714", "adj_factor": 139.008}]
 
 
+def test_per_security_valuation_capability_does_not_exclude_quote_or_flow(tmp_path):
+    import hashlib
+    import json
+    class NoRequests:
+        def query_rows(self, *args, **kwargs):
+            raise AssertionError('capability reads cannot acquire data')
+    with TushareHistoryCollector(tmp_path/'capabilities.duckdb', client=NoRequests()) as c:
+        con = c.store.conn
+        codes = ['000001.SZ', '000002.SZ', '000003.SZ']
+        con.executemany('INSERT INTO tushare_stock_basic(ts_code) VALUES (?)', [(code,) for code in codes])
+        con.executemany("INSERT INTO tushare_daily(ts_code,date,close) VALUES (?,'2026-07-01',10)",
+                        [(code,) for code in codes])
+        con.executemany("INSERT INTO tushare_moneyflow(ts_code,date,net_mf_amount) VALUES (?,'2026-07-01',7)",
+                        [(code,) for code in codes])
+        con.execute("INSERT INTO tushare_daily_basic(ts_code,date,pb,total_mv,circ_mv,fetched_at) VALUES "
+                    "('000001.SZ','2026-07-01',2,100,50,'2026-07-01 16:00:00'),"
+                    "('000003.SZ','2026-07-01',9,100,50,'2026-07-01 16:00:00')")
+        def retain(api, rows):
+            raw = json.dumps(dict(api=api,params={'trade_date':'20260701'},rows=rows))
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            con.execute("INSERT INTO multi_source_observation(data_type,provider,payload_json,payload_hash,observed_at) "
+                        "VALUES (?,'custom',?,?,TIMESTAMP '2026-07-01 16:00:00')", ['tushare_'+api, raw, digest])
+            return digest
+        raw_pb = retain('daily_basic', [dict(ts_code=code,trade_date='20260701',pb=2,total_mv=100,circ_mv=50,pe=None)
+                                       for code in ('000001.SZ','000003.SZ','600001.SH')])
+        balance = retain('balancesheet',[dict(ts_code='000002.SZ',report_type='1',end_date='20251231',
+            ann_date='20260430',total_hldr_eqy_exc_min_int=6000000,oth_eqt_tools=None)])
+        before = {t: con.execute(f'SELECT count(*) FROM {t}').fetchone()[0] for t in
+                  ('tushare_daily','tushare_moneyflow','tushare_daily_basic','multi_source_observation')}
+        result = c.valuation_capability_report('20260701',codes+['600001.SH'],observed_at='2026-07-01T17:00:00+08:00')
+        a,b,conflict,outside = (result['rows'][code] for code in (*codes,'600001.SH'))
+        assert a['qualified_core_for_session'] and a['current_core_available'] and a['value_screen_eligible']
+        assert a['fields']['pb']['value'] == 2 and a['fields']['pb']['receipt_sha256'] == raw_pb
+        assert a['fields']['pe']['value'] is None and a['fields']['pe_ttm']['value'] is None
+        assert not b['qualified_core_for_session'] and not b['value_screen_eligible']
+        assert b['native_pb_status'] == 'row_absent' and b['included_in_expected_universe'] is True
+        assert b['financial_reference']['parent_equity_yuan'] == 6000000
+        assert b['financial_reference']['other_equity_tools_yuan'] is None
+        assert b['financial_reference']['report_period'] == '2025-12-31'
+        assert b['financial_reference']['announcement_date'] == '2026-04-30'
+        assert b['financial_reference']['received_at'] == '2026-07-01T16:00:00+08:00'
+        assert b['financial_reference']['receipt_sha256'] == balance
+        assert not b['financial_reference']['supplies_numeric_qualification']
+        assert not conflict['fields']['pb']['numeric_qualified_for_session']
+        assert conflict['fields']['pb']['value'] is None  # No raw/committed conflict can become green.
+        assert not outside['qualified_core_for_session'] and outside['included_in_expected_universe'] is False
+        assert c._expected_stock_codes('20260701','daily_basic') == set(codes)
+        assert not c._is_complete_stock_table('tushare_daily_basic','date','20260701')
+        assert all(before[t] == con.execute(f'SELECT count(*) FROM {t}').fetchone()[0] for t in before)
+        assert con.execute('SELECT close FROM tushare_daily WHERE ts_code=?',[codes[1]]).fetchone() == (10,)
+        assert con.execute('SELECT net_mf_amount FROM tushare_moneyflow WHERE ts_code=?',[codes[1]]).fetchone() == (7,)
+        earlier = c.valuation_capability_report('20260701',codes,observed_at='2026-07-01T15:30:00+08:00')
+        assert not any(row['qualified_core_for_session'] for row in earlier['rows'].values())
+        assert earlier['rows'][codes[1]]['financial_reference'] is None
+        later = c.valuation_capability_report('20260701',codes,observed_at='2026-07-02T17:00:00+08:00')
+        assert later['historical_as_of'] and later['rows'][codes[0]]['qualified_core_for_session']
+        assert not later['rows'][codes[0]]['current_core_available'] and not later['rows'][codes[0]]['value_screen_eligible']
+        assert later['rows'][codes[0]]['value_screen_eligible_for_session']
+        assert later['rows'][codes[0]]['native_received_at'] == a['native_received_at']
+        con.execute("UPDATE multi_source_observation SET payload_hash='changed' WHERE data_type='tushare_balancesheet'")
+        revoked = c.valuation_capability_report('20260701',codes,observed_at='2026-07-02T17:00:00+08:00')
+        assert revoked['rows'][codes[1]]['financial_reference'] is None
+        assert not revoked['rows'][codes[1]]['qualified_core_for_session']
+        assert result['scope'] == 'valuation_only' and not result['certifies_daily_basic']
+        assert result['market_requests'] == result['business_rows_written'] == 0
+
+
 def test_large_repeated_valuation_batch_preserves_keys_clocks_and_rollback(tmp_path):
     from datetime import datetime
     from trade_system.tushare_store import bulk_replace
@@ -1421,6 +1488,13 @@ def test_reviewed_valuation_intake_revalidates_receipts_and_keeps_raw_null(tmp_p
         assert report['rows'][code]['valuation_eligible']
         assert report['rows'][code]['native_pb_status'] == 'row_absent'  # Raw receipt not manufactured by intake.
         assert not report['certifies_daily_basic']
+        capabilities = c.valuation_capability_report('20260701',[code])
+        assert capabilities['rows'][code]['qualified_core_for_session']
+        assert capabilities['rows'][code]['fields']['pb']['value'] == 2
+        assert capabilities['rows'][code]['fields']['pe']['value'] is None
+        assert capabilities['rows'][code]['historical_as_of'] and not capabilities['rows'][code]['value_screen_eligible']
+        as_known_before_intake = c.valuation_capability_report('20260701',[code],observed_at='2026-07-01T17:00:00+08:00')
+        assert not as_known_before_intake['rows'][code]['qualified_core_for_session']
         for field, native, value in [('total_mv','circ_mv',500),('circ_mv','total_mv',1000)]:
             altered = deepcopy(review)
             altered['inputs'][field].update(value_path=['rows',0,native],value=value)
@@ -1574,6 +1648,13 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
         assert result['input_received_at_max'] == catalogue['received_at']
         assert not result['value_screen_eligible'] and result['valuation_risk'] == 'negative_equity'
         assert result['field_status']['pe'] == 'unknown' and result['field_status']['pe_ttm'] == 'unknown'
+        capabilities = c.valuation_capability_report(day,[code])['rows'][code]
+        assert not capabilities['qualified_core_for_session']  # Valuation cannot grant identity membership.
+        c.store.conn.execute('INSERT INTO tushare_stock_basic(ts_code) VALUES (?)',[code])
+        capabilities = c.valuation_capability_report(day,[code])['rows'][code]
+        assert capabilities['qualified_core_for_session'] and capabilities['fields']['pb']['value'] < 0
+        assert not capabilities['value_screen_eligible_for_session']
+        assert capabilities['fields']['pe']['value'] is None and capabilities['fields']['pe_ttm']['value'] is None
         # A bare qualified assertion cannot make equity into annual earnings.
         forged = deepcopy(review)
         forged['earnings_reviews'] = {'static': dict(qualified=True,

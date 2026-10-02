@@ -187,7 +187,7 @@ def configured_market(output, prediction):
     from .market_workspace import latest_snapshot
     config=read_json(path)[0]
     return latest_snapshot(config['market_database'],now_utc().isoformat(),
-                    [r['instrument'] for r in prediction['rows']])
+                    [r['instrument'] for r in prediction['rows']],research_workspace=output)
 
 
 def calendar_covers_clock(reg, parsed, today):

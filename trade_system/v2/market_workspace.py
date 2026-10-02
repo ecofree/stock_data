@@ -13,7 +13,7 @@ from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSH
 from .domain import identity
 
 
-def latest_snapshot(source, as_of, research_codes=()):
+def latest_snapshot(source, as_of, research_codes=(), *, research_workspace=None):
     from zoneinfo import ZoneInfo
     clock=datetime.fromisoformat(as_of)
     if clock.tzinfo is None:raise ValueError('aware market clock required')
@@ -27,7 +27,7 @@ def latest_snapshot(source, as_of, research_codes=()):
         end=today.isoformat()
         rows=con.execute("SELECT max(cal_date) FROM tushare_trade_cal WHERE exchange='SSE' AND is_open=1 AND (cal_date<? OR (cal_date=? AND ?>=16))",[end,end,local.hour]).fetchone()
         if not rows[0]:raise ValueError('no certified closed market session')
-        result=project(con,str(rows[0])[:10],as_of,set(research_codes))
+        result=project(con,str(rows[0])[:10],as_of,set(research_codes),research_workspace=research_workspace)
         result.pop('snapshot_id')
         result['session_state']=state
         result['calendar_checked_date']=end
@@ -148,7 +148,7 @@ def collection_diagnostics(con, day, clock):
         'scope':'retained_receipts_not_independent_funds_or_observation_acceptance'}
 
 
-def project(con, day, as_of, research_codes):
+def project(con, day, as_of, research_codes, *, research_workspace=None):
     clock=datetime.fromisoformat(as_of)
     if clock.tzinfo is not None:
         from zoneinfo import ZoneInfo
@@ -196,6 +196,27 @@ def project(con, day, as_of, research_codes):
         'membership_time_scope':'retained_quality_gated_snapshot_not_historical_arrival_certification',
         'account_state':'unknown','missing':['account_snapshot','verified_intraday_quotes','point_in_time_membership'],
         'execution_ready':False}
+    # Capabilities are inline factual assessments, not permission to replace
+    # the original full-data/P0 gate. Their absence never hides the existing
+    # bounded market facts or starts a model update/provider request.
+    from trade_system.readiness import assess_trade_date_readiness
+    from trade_system.gate_contract import build_operational_capabilities
+    try:
+        assessed=assess_trade_date_readiness(con,day,stage='postmarket',now=clock,
+                                            research_workspace=research_workspace)
+        result['operational_capabilities']=assessed['operational_capabilities']
+    except (duckdb.Error,ValueError,TypeError,KeyError):
+        result['operational_capabilities']=build_operational_capabilities(
+            trade_date=day,as_of=as_of)
+    from trade_system.review_queries import _valuation_capability_review
+    try:
+        valuation=_valuation_capability_review(con,day,now=as_of)
+        result['valuation_capabilities']=valuation.get('valuation_capabilities') or {
+            'scope':'valuation_only','status':'not_assessed','rows':{},'certifies_daily_basic':False}
+    except (duckdb.Error,ValueError,TypeError,KeyError,ImportError) as exc:
+        result['valuation_capabilities']={
+            'scope':'valuation_only','status':'unknown','rows':{},'certifies_daily_basic':False,
+            'reason':'valuation_evidence_unavailable','error_type':type(exc).__name__}
     calendar={}
     for exchange,opened,d in con.execute("""SELECT exchange,is_open,cal_date
         FROM tushare_trade_cal WHERE exchange IN ('SSE','SZSE')

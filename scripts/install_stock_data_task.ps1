@@ -11,6 +11,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 if ($Register -or $RegisterAll) { throw 'Legacy task registration retired. Confirm recovery, protected release and a new maintenance window before cutover.' }
+if (-not $EnvironmentFile -or -not [IO.Path]::IsPathRooted($EnvironmentFile) -or -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {throw 'Explicit existing absolute provider environment file required'}
 foreach ($value in @($BaselineDirectory,$BaselineInventorySha256,$CollectorContract,$CollectorContractSha256,$AdapterPython,$ResearchPython,$ResearchReleaseDirectory,$ResearchReleaseManifestSha256,$EnvironmentFile,$Workspace,$Output)) {
     if (-not $value -or $value -match '["\r\n]') { throw 'Explicit safe baseline, release, environment, interpreter, workspace and output arguments required' }
 }
@@ -61,7 +62,7 @@ if ($identity.UserId -notmatch '^S-1-5-21-' -or $identity.LogonType -ne 'Passwor
     ($identity.RunLevel -and $identity.RunLevel -ne 'LeastPrivilege')) { throw 'Retained dedicated Limited/Password identity required, never SYSTEM' }
 }
 $repo=Split-Path -Parent $PSScriptRoot
-$common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'"'
+$common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'" -EnvironmentFile "'+$EnvironmentFile+'"'
 $prefix='-NoProfile -NonInteractive -File "'
 $research=$prefix+(Join-Path $PSScriptRoot 'run_research_daily.ps1')+'" -Python "'+$ResearchPython+'" -Workspace "'+$Workspace+'" -ReleaseDirectory "'+$ResearchReleaseDirectory+'" -ReleaseManifestSha256 '+$ResearchReleaseManifestSha256
 $actions=@{
@@ -100,6 +101,7 @@ $proposal=[ordered]@{Schema=2;Scope='task_handover_proposal_only';CapturedAt=[Da
     CollectorContract=[IO.Path]::GetFullPath($CollectorContract);ResearchReleaseDirectory=[IO.Path]::GetFullPath($ResearchReleaseDirectory);
     BaselineInventorySha256=$BaselineInventorySha256;BaselineXmlSha256=$hashByName;
     CollectionContractSha256=$CollectorContractSha256;ResearchManifestSha256=$ResearchReleaseManifestSha256;
+    EnvironmentFile=[IO.Path]::GetFullPath($EnvironmentFile);
     MonthlyCompact='retain disabled; no changes';
     Blockers=@('baseline is historical: compare the complete live inventory and captured XML definitions immediately before cutover',
         'fresh recovery and ACL rollback verification required',

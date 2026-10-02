@@ -116,3 +116,24 @@ def test_query_failure_blocks_every_review_state_even_when_old_readiness_is_gree
     for state in (ctx["readiness"],ctx["readiness"]["operator_state"],ctx["execution_control"]):
         assert state["operator_status"]=="blocked" and not state["execution_ready"] and not state["analysis_ready"]
     assert ctx["execution_control"]["effective_position_pct"]==0
+
+
+def test_review_separates_qualified_price_view_from_missing_fund_confirmation():
+    from trade_system.daily_review import build_review_narrative
+    from trade_system.gate_contract import build_operational_capabilities
+    uses = build_operational_capabilities(trade_date='2026-09-29', as_of='2026-09-29T17:00:00',
+        market_view={'ready':True, 'breadth':{'rise':1,'fall':0,'flat':0,'samples':1}},
+        stock_observation={'ready':True}, sector_observation={'ready':False})
+    context = dict(trade_date='2026-09-29', readiness={'analysis_ready':False, 'flow_certified_ready':False,
+        'missing_groups':['stock_capital_flow']}, operational_capabilities=uses,
+        execution_control={'effective_position_pct':0}, capital_flow={
+            'stock_inflow':[{'stock_name':'甲'}], 'stock_outflow':[{'stock_name':'乙'}]},
+        market_context={'breadth':{'rise':5000,'fall':5000}})
+    narrative = build_review_narrative(context)
+    assert narrative['stance_label'] == '行情事实可观察'
+    assert '合格行情' in narrative['headline']
+    assert '收盘源或链路尚未完成' not in narrative['lede']
+    assert any('供应商资金观察（未独立确认）' in line for line in narrative['bullets'])
+    assert not any(line.startswith('资金确认：') for line in narrative['bullets'])
+    assert not narrative['execution_ready'] and context['execution_control']['effective_position_pct'] == 0
+    assert any('上涨 1 / 下跌 0' in line for line in narrative['bullets'])

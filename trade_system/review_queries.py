@@ -749,43 +749,71 @@ def _market_context_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> d
     return context
 
 
-def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> dict[str, Any]:
-    """Expose same-date provider checkpoints and research evidence in the review."""
-    result: dict[str, Any] = {
-        "tushare": [], "kline": [], "ths": {}, "flow_features": {}, "outcomes": 0, "qlib": [], "strategy": [],
-    }
+def _valuation_capability_review(con: duckdb.DuckDBPyConnection, trade_date: str, *, now=None) -> dict[str, Any]:
+    """Read retained valuation gaps and reviews; no acquisition, DDL or writes."""
+    result: dict[str, Any] = {}
     if table_exists(con, 'multi_source_observation'):
         import hashlib
         import json
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        clock = now if isinstance(now, datetime) else datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        if clock.tzinfo is None:
+            raise ValueError('explicit review timezone required')
+        local_clock = clock.astimezone(ZoneInfo('Asia/Shanghai')).replace(tzinfo=None)
         gap = con.execute("SELECT payload_json,payload_hash,observed_at FROM multi_source_observation "
             "WHERE data_type='tushare_daily_basic_gaps_snapshot' AND status='qualified' "
             "AND provider='xiaodefa' AND json_extract_string(payload_json,'$.trade_date')=? "
-            "ORDER BY observed_at DESC LIMIT 1", [trade_date]).fetchone()
+            "AND observed_at<=? ORDER BY observed_at DESC LIMIT 1", [trade_date, local_clock]).fetchone()
         if gap and hashlib.sha256(gap[0].encode()).hexdigest() == gap[1]:
             result['daily_basic_gaps'] = dict(json.loads(gap[0]), evidence_recorded_at=str(gap[2]))
         review_codes = [row[0] for row in con.execute(
             "SELECT DISTINCT asset_code FROM multi_source_observation WHERE data_type='valuation_review' "
-            "AND json_extract_string(payload_json,'$.review.trade_date')=?", [trade_date]).fetchall() if row[0]]
-        if review_codes:
-            from trade_system.tushare_history import TushareHistoryCollector
-            collector = None
+            "AND json_extract_string(payload_json,'$.review.trade_date')=? AND observed_at<=?",
+            [trade_date, local_clock]).fetchall() if row[0]]
+        requested = set(review_codes)
+        requested.update((result.get('daily_basic_gaps') or {}).get('missing_codes') or [])
+        requested.update((result.get('daily_basic_gaps') or {}).get('reviewed_valuation') or {})
+        # An unresolved security may never have a reviewed bundle. The retained
+        # completion worklist supplies its identity, never numeric qualification.
+        for raw, digest in con.execute(
+                "SELECT payload_json,payload_hash FROM multi_source_observation "
+                "WHERE data_type='valuation_completion' AND observed_at<=? "
+                "AND json_extract_string(payload_json,'$.trade_date')=?",
+                [local_clock, trade_date]).fetchall():
+            if hashlib.sha256(raw.encode()).hexdigest() == digest:
+                requested.update(json.loads(raw).get('rows') or {})
+        if requested:
+            from trade_system.tushare_store import RetainedValuationReader
             try:
                 # Rendering owns no acquisition or database writes. Revalidate
                 # original bytes so an old snapshot cannot hide revoked input.
-                collector = TushareHistoryCollector('', offline=True, connection=con)
-                qualified = collector.qualified_valuation_reviews(trade_date)
+                reader = RetainedValuationReader(con)
+                capabilities = reader.valuation_capability_report(trade_date, requested, observed_at=clock.isoformat())
+                qualified = capabilities.pop('reviewed_valuation')
                 details = result.setdefault('daily_basic_gaps', {})
                 details['reviewed_valuation'] = qualified
                 details['revoked_review_codes'] = sorted(set(review_codes)-set(qualified))
                 details['qualification_scope'] = 'core_pb_market_value_pe_separate'
-            except (ValueError, KeyError, OSError, duckdb.Error) as exc:
+                details['valuation_capabilities'] = capabilities
+            except (ValueError, KeyError, TypeError, AttributeError, ImportError, OSError, duckdb.Error) as exc:
                 details = result.setdefault('daily_basic_gaps', {})
                 details['reviewed_valuation'] = {}
                 details['review_revalidation_error'] = str(exc)
                 details['revoked_review_codes'] = sorted(review_codes)
-            finally:
-                if collector is not None:
-                    collector.close()
+                details['valuation_capabilities'] = {'scope': 'valuation_only', 'rows': {},
+                    'status': 'unknown', 'error': str(exc), 'certifies_daily_basic': False}
+    return result.get('daily_basic_gaps', {})
+
+
+def _data_source_review(con: duckdb.DuckDBPyConnection, trade_date: str, *, now=None) -> dict[str, Any]:
+    """Expose same-date provider checkpoints and research evidence in the review."""
+    result: dict[str, Any] = {
+        "tushare": [], "kline": [], "ths": {}, "flow_features": {}, "outcomes": 0, "qlib": [], "strategy": [],
+    }
+    valuation = _valuation_capability_review(con, trade_date, now=now)
+    if valuation:
+        result['daily_basic_gaps'] = valuation
     if table_exists(con, "history_fetch_checkpoint"):
         result["tushare"] = _rows(
             con,

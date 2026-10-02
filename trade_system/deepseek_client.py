@@ -73,16 +73,51 @@ def validate_review_output(output: dict[str, Any], snapshot: dict[str, Any]) -> 
         if not isinstance(output.get(key), list):
             raise DeepSeekReviewError(f"{key} must be a list")
     allowed = _evidence_ids(snapshot)
+    gate = snapshot.get('data_gate') or {}
+    nested_gate = gate.get('gate') or {}
+    ai_contract = snapshot.get('ai_contract') or {}
+    confirmed_analysis = (
+        gate.get('data_certified_ready') is True
+        and gate.get('flow_certified_ready') is True
+        and gate.get('analysis_ready') is True
+        and all(nested_gate.get(key, gate.get(key)) is True
+                for key in ('data_certified_ready', 'flow_certified_ready', 'analysis_ready'))
+        and ai_contract.get('scope') == 'certified_analysis'
+        and ai_contract.get('watchlist_allowed') is True
+    )
+    capabilities = snapshot.get('operational_capabilities') or {}
+    market_facts = (
+        capabilities.get('schema') == 'operational_capabilities_v1'
+        and capabilities.get('capabilities', {}).get('market_view', {}).get('ready') is True
+        and bool(capabilities.get('capabilities', {}).get('market_view', {}).get('breadth'))
+    )
+    # Validate use as well as ID existence. Old/unfiltered catalogs must not
+    # restore an unavailable domain, even if their entries claim AI permission.
+    if not confirmed_analysis:
+        allowed &= {'data_gate', *({'market.breadth'} if market_facts else set())}
     referenced = {str(value) for value in output["evidence_ids"]}
     unknown = sorted(referenced - allowed)
     if unknown:
         raise DeepSeekReviewError("unknown evidence_ids: " + ", ".join(unknown[:5]))
+    if output['watchlist'] and not confirmed_analysis:
+        raise DeepSeekReviewError('watchlist unavailable without qualified signal evidence')
+    usage = {
+        str(item['evidence_id']): set(item.get('usage') or [])
+        for item in snapshot.get('evidence_catalog', [])
+        if isinstance(item, dict) and item.get('evidence_id')
+    }
     for item in output["watchlist"]:
         if not isinstance(item, dict):
             raise DeepSeekReviewError("watchlist items must be objects")
         item_refs = item.get("evidence_ids", [])
         if not isinstance(item_refs, list) or any(str(value) not in allowed for value in item_refs):
             raise DeepSeekReviewError("watchlist contains unknown evidence_ids")
+        if not item_refs or any('watchlist' not in usage.get(str(value), set()) for value in item_refs):
+            raise DeepSeekReviewError('watchlist evidence is not qualified for that use')
+    if not confirmed_analysis and (
+        output.get('sector_rotation') or output.get('stock_observations')
+    ):
+        raise DeepSeekReviewError('signal observations unavailable without qualified signal evidence')
     return output
 
 
@@ -112,6 +147,10 @@ class DeepSeekReviewClient:
                         "你是A股盘后复盘助手。只根据用户提供的事实快照输出JSON。"
                         "不得补造缺失数据、不得改变任何数据门禁、不得把影子分数变成订单。"
                         "所有数值结论必须用evidence_ids引用事实。输出必须是JSON对象。"
+                        "严格遵守ai_contract.scope与evidence_catalog.usage。"
+                        "price_observation仅总结已给出的价格事实；data_limitations_only仅说明缺口。"
+                        "watchlist_allowed为false时watchlist、sector_rotation、stock_observations必须为空。"
+                        "不得用资金未确认的观察、未知特征候选或数据门禁说明生成信号。"
                     ),
                 },
                 {

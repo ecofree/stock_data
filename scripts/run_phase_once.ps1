@@ -8,12 +8,17 @@ param(
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
+    [string]$EnvironmentFile='',
     [ValidateSet('', 'StockData-ResearchDaily')][string]$PublicationTask=''
 )
 
 $ErrorActionPreference = "Stop"
 # Keep this a simple script: advanced parameters reserve -Db for -Debug.
 if (-not $CollectorContract -or -not $CollectorContractSha256 -or -not $ReportsDirectory) { throw 'Explicit collector contract, hash and reports directory required' }
+if ($EnvironmentFile) {
+    if (-not [IO.Path]::IsPathRooted($EnvironmentFile) -or -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {throw 'Explicit existing absolute provider environment file required'}
+    $env:KPL_ENV_FILE=$EnvironmentFile
+}
 if ($PublicationTask -and $Phase -ne 'supplemental') { throw 'Only supplemental collection can request follow-up publication' }
 if (-not $TradeDate) {
     $TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')

@@ -257,6 +257,28 @@ def test_health_and_cli_share_partial_unit_and_taxonomy_gate(tmp_path, monkeypat
     assert not result['source_ready'] and not result['flow_certified_ready']
 
 
+def test_qualified_primary_flow_can_be_observed_without_independent_confirmation(tmp_path):
+    from test_readiness import _qualified_stock, _qualified_sector
+    day = '2026-09-29'
+    db = tmp_path / 'raw-observation.duckdb'
+    with duckdb.connect(str(db)) as con:
+        _qualified_stock(con, day, ('000001', '000002'))
+        _qualified_sector(con, day)
+    result = assess_capital_flow_health(db, day, max_age_seconds=7200, now=datetime(2026, 9, 29, 10, 1))
+    uses = result['operational_capabilities']['capabilities']
+    assert uses['flow_observation']['stock']['ready']
+    assert uses['flow_observation']['sector']['ready']
+    assert uses['flow_observation']['ready']
+    assert not uses['flow_confirmation']['ready']
+    assert not result['flow_certified_ready'] and not result['analysis_ready']
+    assert not result['execution_ready']
+    with duckdb.connect(str(db)) as con:
+        con.execute("UPDATE multi_source_stock_flow SET amount_unit='unknown'")
+    damaged = assess_capital_flow_health(db, day, max_age_seconds=7200, now=datetime(2026, 9, 29, 10, 1))
+    assert not damaged['operational_capabilities']['capabilities']['flow_observation']['stock']['ready']
+    assert not damaged['operational_capabilities']['capabilities']['flow_confirmation']['ready']
+
+
 def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path, monkeypatch):
     import json
     import trade_system.flow_contract as contract

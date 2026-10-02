@@ -96,6 +96,32 @@ def test_partial_receipts_stay_inline_without_turning_available_prices_into_cove
     assert diagnostic['products'][0]['committed_upserts']==1
     assert diagnostic['taxonomies'][0]['expected_rows'] is None
     assert diagnostic['taxonomies'][0]['coverage_pct'] is None
+    capabilities = result['operational_capabilities']
+    assert capabilities['schema'] == 'operational_capabilities_v1'
+    assert not capabilities['capabilities']['flow_confirmation']['ready']
+    assert not capabilities['capabilities']['price_research']['ready']
+    assert not capabilities['execution_ready']
+    assert result['valuation_capabilities']['scope']=='valuation_only'
+    assert not result['valuation_capabilities']['certifies_daily_basic']
+
+
+def test_market_snapshot_inlines_valuation_limits_without_hiding_qualified_prices(con, monkeypatch):
+    from trade_system import review_queries
+    monkeypatch.setattr(review_queries,'_valuation_capability_review',lambda *a,**kw: {
+        'valuation_capabilities':{'scope':'valuation_only','status':'unavailable','rows':{
+            '000001':{'current_core_available':False,'value_screen_eligible':False}},'certifies_daily_basic':False}})
+    result=project(con)
+    assert result['breadth']['samples']==1
+    assert result['valuation_capabilities']['rows']['000001']['value_screen_eligible'] is False
+    assert not result['execution_ready']
+    def missing_parser(*args, **kwargs):
+        raise ImportError('optional PDF parser unavailable')
+    monkeypatch.setattr(review_queries,'_valuation_capability_review',missing_parser)
+    unavailable=project(con)
+    assert unavailable['breadth']['samples']==1
+    assert unavailable['valuation_capabilities']['status']=='unknown'
+    assert unavailable['valuation_capabilities']['error_type']=='ImportError'
+    assert not unavailable['execution_ready']
 
 
 def test_normalized_turnover_is_not_converted_twice_for_old_view_labels(con):
@@ -159,9 +185,10 @@ def test_market_failure_prevents_half_publication(tmp_path,monkeypatch):
 def test_configured_market_uses_its_own_calendar_not_prediction_date(tmp_path,monkeypatch):
     write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic.duckdb','read_only':True})
     calls=[]
-    monkeypatch.setattr(market,'latest_snapshot',lambda *args:calls.append(args) or {'trade_date':'2026-09-14'})
+    monkeypatch.setattr(market,'latest_snapshot',lambda *args,**kwargs:calls.append((args,kwargs)) or {'trade_date':'2026-09-14'})
     assert product.configured_market(tmp_path,{'date':'2026-09-11','rows':[{'instrument':'000001'}]})['trade_date']=='2026-09-14'
-    assert calls[0][0]=='synthetic.duckdb' and calls[0][2]==['000001']
+    assert calls[0][0][0]=='synthetic.duckdb' and calls[0][0][2]==['000001']
+    assert calls[0][1]['research_workspace']==tmp_path
     assert read_json(tmp_path/'workspace-config.json')[0]['read_only']
 
 

@@ -10,7 +10,7 @@ import duckdb
 
 from trade_system.quality import table_columns, table_exists
 from trade_system.capital_flow_health import assess_capital_flow_health
-from trade_system.gate_contract import build_operator_state
+from trade_system.gate_contract import build_operator_state, build_operational_capabilities
 from trade_system.logging_setup import get_logger
 from trade_system.readiness import assess_trade_date_readiness
 from trade_system.reports.real_data_backfill import build_real_data_backfill_status
@@ -89,6 +89,12 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     trade_date = str(context.get("trade_date") or "")
     regime = context.get("regime") or {}
     readiness = context.get("readiness") or {}
+    capability_envelope = context.get("operational_capabilities") or readiness.get("operational_capabilities") or {}
+    capabilities = capability_envelope.get("capabilities", {}) if capability_envelope.get("schema") == "operational_capabilities_v1" else {}
+    market_available = capabilities.get("market_view", {}).get("ready") is True
+    stock_observable = capabilities.get("flow_observation", {}).get("stock", {}).get("ready") is True
+    sector_observable = capabilities.get("flow_observation", {}).get("sector", {}).get("ready") is True
+    flow_confirmed = capabilities.get("flow_confirmation", {}).get("ready") is True and readiness.get("flow_certified_ready") is True
     control = context.get("execution_control") or {}
     risk = context.get("risk") or {}
     concepts = (context.get("concept_limit_up") or {}).get("groups") or []
@@ -98,7 +104,12 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     plans = context.get("plans") or []
     journal = context.get("journal") or []
     watchlist = context.get("watchlist") or []
-    breadth = _breadth_snapshot(context)
+    if market_available:
+        # Do not borrow an unrelated market summary's breadth just because
+        # another price subset qualified for factual display.
+        breadth = dict(capabilities["market_view"].get("breadth") or {})
+    else:
+        breadth = _breadth_snapshot(context)
 
     regime_name = str(regime.get("regime_name") or regime.get("regime") or "未知")
     from .review_queries import _BROAD_TRAIL_CONCEPTS as BROAD_CONCEPTS
@@ -129,7 +140,12 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     sector_in = _first_named(flow.get("sector_inflow") or [], "sector_name")
     sector_out = _first_named(flow.get("sector_outflow") or [], "sector_name")
 
-    if blocked:
+    if blocked and market_available:
+        stance = "observe"
+        stance_label = "行情事实可观察"
+        headline = "合格行情可复盘，资金确认与完整认证仍待通过"
+        lede = "本页可展示已核验范围内的价格事实。未通过的估值或独立资金只限制对应分析；原完整认证、五日验收和执行门禁仍未开放。"
+    elif blocked:
         stance = "blocked"
         stance_label = "仅可复盘"
         if missing:
@@ -178,20 +194,22 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
         bullets.append(f"主线证据：{top_concept}{extra}。概念排序只作复盘，不等于买入名单。")
     else:
         bullets.append("主线证据：当日没有足够干净的概念—涨停映射，主线按分散处理。")
-    if inflow and outflow:
+    if inflow and outflow and stock_observable:
         bullets.append(
-            "资金确认：个股净流入首位 "
+            ("资金确认：" if flow_confirmed else "供应商资金观察（未独立确认）：") + "个股净流入首位 "
             f"{inflow.get('stock_name') or inflow.get('stock_code')}，"
             "净流出首位 "
             f"{outflow.get('stock_name') or outflow.get('stock_code')}。"
         )
-    if sector_in or sector_out:
+    if (sector_in or sector_out) and sector_observable:
         bits = []
         if sector_in:
             bits.append(f"概念流入 {sector_in.get('sector_name')}")
         if sector_out:
             bits.append(f"流出 {sector_out.get('sector_name')}")
-        bullets.append("板块资金：" + "，".join(bits) + "。")
+        bullets.append(("板块资金确认：" if flow_confirmed else "板块资金观察（未独立确认）：") + "，".join(bits) + "。")
+    if not flow_confirmed:
+        bullets.append("独立资金确认未通过：资金观察不能用作资金信号或晋级完整验收。")
     if alerts:
         first = alerts[0]
         bullets.append(
@@ -279,6 +297,7 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
         "regime": regime_name,
         "mainline": top_concept or "暂无可靠主线",
         "effective_position_pct": cap,
+        "execution_ready": False,
         "suggested_position_pct": suggested,
         "missing": missing,
         "bullets": bullets,
@@ -298,6 +317,7 @@ def build_daily_review_context(
     *,
     con: duckdb.DuckDBPyConnection | None = None,
     as_of: datetime | str | None = None,
+    research_workspace: str | Path | None = None,
 ) -> dict:
     review_now = datetime.fromisoformat(as_of) if isinstance(as_of, str) and as_of else as_of
     owns_connection = con is None
@@ -376,7 +396,7 @@ def build_daily_review_context(
         capital_flow = _capital_flow_review(con, selected_date, now=review_now)
         concept_limit_up = _concept_limit_up_review(con, selected_date)
         market_context = _market_context_review(con, selected_date)
-        data_sources = _data_source_review(con, selected_date)
+        data_sources = _data_source_review(con, selected_date, now=review_now)
         ecology = _ecology_review(con, selected_date)
         sector_trail = _sector_trail_review(con, selected_date)
         sector_periods = _sector_period_review(con, selected_date)
@@ -398,6 +418,7 @@ def build_daily_review_context(
                 stage="postmarket",
                 max_age_seconds=7200,
                 now=review_now,
+                research_workspace=research_workspace,
             )
         except Exception as exc:
             readiness = {
@@ -470,6 +491,19 @@ def build_daily_review_context(
     )
     readiness.update(operator_state)
     readiness["operator_state"] = dict(operator_state)
+    operational_capabilities = readiness.get("operational_capabilities")
+    if not operational_capabilities or operational_capabilities.get("schema") != "operational_capabilities_v1":
+        operational_capabilities = build_operational_capabilities(
+            trade_date=selected_date, as_of=str(readiness.get("as_of") or review_now or "unassessed"))
+    # Re-assess only the confirmation dimension after the canonical flow
+    # assessor runs. Factual price and raw-product capabilities retain their
+    # own input evidence and cannot upgrade the strict operator aliases.
+    operational_capabilities["capabilities"]["flow_confirmation"] = {
+        "ready": flow_certified is True,
+        "usage": "original_strict_independent_flow_contract",
+        "blockers": [] if flow_certified is True else ["independent_flow_confirmation_not_ready"],
+    }
+    readiness["operational_capabilities"] = operational_capabilities
 
     suggested = regime[0].get("suggested_position_pct") if regime else None
     risk_position = risk[0].get("total_position_pct") if risk else None
@@ -516,6 +550,7 @@ def build_daily_review_context(
         "market_context": market_context,
         "data_sources": data_sources,
         "capital_flow_health": flow_health,
+        "operational_capabilities": operational_capabilities,
         "ecology": ecology,
         "sector_trail": sector_trail,
         "sector_periods": sector_periods,

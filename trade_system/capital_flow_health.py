@@ -7,8 +7,8 @@ from pathlib import Path
 
 import duckdb
 
-from trade_system.data_store import connect_duckdb
-from trade_system.gate_contract import build_operator_state
+from trade_system.db_utils import legacy_connect as connect_duckdb
+from trade_system.gate_contract import build_operator_state, build_operational_capabilities
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
 from trade_system.readiness import capital_flow_coverage, qualified_stock_flow_scope
@@ -465,9 +465,21 @@ def assess_capital_flow_health(
                if not independent_reconciliation_ready else [])
         ),
     )
+    operational_capabilities = build_operational_capabilities(
+        trade_date=trade_date, as_of=now.isoformat(),
+        stock_observation={"ready": stock_ready and stock_qualification.get("passed") is True,
+            "qualification": stock_qualification,
+            "blockers": [] if stock_ready else [stock_qualification.get("reason") or "stock_flow_not_ready"]},
+        sector_observation={"ready": sector_ready and not sector_taxonomy_stale and sector_qualification.get("passed") is True,
+            "qualification": sector_qualification,
+            "blockers": [] if sector_ready and not sector_taxonomy_stale else
+                [sector_qualification.get("reason") or "sector_flow_or_taxonomy_not_ready"]},
+        flow_certified_ready=flow_certified_ready,
+    )
     return {
         **operator_state,
         "operator_state": dict(operator_state),
+        "operational_capabilities": operational_capabilities,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "trade_date": trade_date,
         "collection_started_at": collected_after.isoformat(timespec="seconds")

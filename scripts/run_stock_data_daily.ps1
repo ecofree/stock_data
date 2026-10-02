@@ -16,7 +16,8 @@ param(
     [string]$Python = "",
     [string]$CollectorContract,
     [string]$CollectorContractSha256,
-    [string]$ReportsDirectory
+    [string]$ReportsDirectory,
+    [string]$EnvironmentFile=''
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,6 +66,10 @@ function Invoke-CloseNotification([string]$Event,[string]$Message='') {
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 "DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath" | Write-CloseLog
 try {
+    if ($EnvironmentFile) {
+        if (-not [IO.Path]::IsPathRooted($EnvironmentFile) -or -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {throw 'Explicit existing absolute provider environment file required'}
+        $env:KPL_ENV_FILE=$EnvironmentFile
+    }
     if ($BackupKeep -lt 1 -or $WeeklyKeep -lt 0) {throw 'Positive daily and nonnegative weekly backup retention required'}
     foreach ($path in @($Python,$DbPath,$IntegratedRunner)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {throw "Required runtime/database/runner not found: $path"}

@@ -63,7 +63,7 @@ def _ps(script, *args, executable='powershell.exe'):
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows scheduler adapter')
-@pytest.mark.parametrize('case', ['valid', 'compiled', 'compiled_pwsh', 'missing', 'xml_mismatch', 'enabled_compact', 'hash_mismatch', 'wrong_runtime'])
+@pytest.mark.parametrize('case', ['valid', 'compiled', 'compiled_pwsh', 'missing', 'xml_mismatch', 'enabled_compact', 'hash_mismatch', 'wrong_runtime', 'missing_environment', 'relative_environment'])
 def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     if case=='compiled_pwsh' and not shutil.which('pwsh.exe'):
         pytest.skip('PowerShell 7 is optional; Windows PowerShell 5.1 remains the deployment target')
@@ -91,10 +91,12 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     release=tmp_path/'release';release.mkdir();manifest=release/'research-release.json';manifest.write_text('{"version":"0.3.26"}')
     sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
     output=tmp_path/'proposal.json'
+    environment=tmp_path/'protected.env'
+    if case!='missing_environment':environment.write_text('# synthetic fixture; never read by the proposal generator')
     args=['-BaselineDirectory',baseline,'-BaselineInventorySha256',sha(inventory) if case!='hash_mismatch' else '0'*64,
         '-CollectorContract',contract,'-CollectorContractSha256',sha(contract),'-AdapterPython',sys.executable,
         '-ResearchPython',sys.executable,'-ResearchReleaseDirectory',release,'-ResearchReleaseManifestSha256',sha(manifest),
-        '-EnvironmentFile',tmp_path/'protected.env','-Workspace',tmp_path/'workspace','-Output',output]
+        '-EnvironmentFile','protected.env' if case=='relative_environment' else environment,'-Workspace',tmp_path/'workspace','-Output',output]
     if case.startswith('compiled'):args+=['-ResearchStartBoundary','2026-09-18T19:30:00+08:00']
     result=_ps(ROOT/'scripts/install_stock_data_task.ps1',*args)
     if case not in ('valid','compiled','compiled_pwsh'):
@@ -103,9 +105,13 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     assert result.returncode==0,result.stderr
     saved=output.read_bytes();proposal=json.loads(saved)
     assert proposal['SystemChanges']==0 and proposal['ProductionCutover'] is False
+    assert Path(proposal['EnvironmentFile'])==environment
     rows={r['Name']:r for r in proposal['Actions']}
     assert len(rows)==len(tasks) and len(proposal['BaselineXmlSha256'])==len(tasks)
     assert len(proposal['AbsentTasks']) == 7-len(tasks)
+    for suffix in ('Auction','Intraday','DailyClose','SupplementalRetry'):
+        if 'StockData-'+suffix in rows:
+            assert f'-EnvironmentFile "{environment}"' in rows['StockData-'+suffix]['Arguments']
     if 'StockData-QLibResearch' in rows:
         assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
         assert '-RefreshResearch' in rows['StockData-QLibResearch']['Arguments']
@@ -278,6 +284,27 @@ def test_collectors_bind_db_and_fail_missing_contract_before_side_effects(tmp_pa
     assert result.returncode != 0 and 'Explicit collector contract' in result.stderr
     assert 'ParameterNameConflictsWithAlias' not in result.stderr
     assert not (tmp_path/'must-not-exist.duckdb').exists()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows environment inheritance')
+@pytest.mark.parametrize('explicit', [True, False])
+def test_collector_provider_environment_path_reaches_child_without_copying_contents(tmp_path, monkeypatch, explicit):
+    scripts=tmp_path/'scripts';scripts.mkdir()
+    for name in ('run_phase_once.ps1','native_process.ps1'):
+        (scripts/name).write_text(_read(name))
+    child=scripts/'run_integrated_daily.py'
+    child.write_text("import os,sys\nprint('PROVIDER_ENV_PATH='+os.environ.get('KPL_ENV_FILE',''))\nsys.exit(3)\n")
+    inherited=tmp_path/'inherited.env';inherited.write_text('SYNTHETIC=not-a-credential')
+    selected=tmp_path/'selected.env';selected.write_text('SYNTHETIC=not-a-credential')
+    monkeypatch.setenv('KPL_ENV_FILE', str(inherited))
+    args=['-Python',sys.executable,'-Db',tmp_path/'not-created.duckdb','-Phase','intraday',
+          '-CollectorContract','fixture','-CollectorContractSha256','a'*64,'-ReportsDirectory',tmp_path/'reports']
+    if explicit:args+=['-EnvironmentFile',selected]
+    result=_ps(scripts/'run_phase_once.ps1',*args)
+    assert result.returncode==3,result.stdout+result.stderr
+    assert 'PROVIDER_ENV_PATH='+str(selected if explicit else inherited) in result.stdout
+    assert 'SYNTHETIC=' not in result.stdout+result.stderr
+    assert not (tmp_path/'.env').exists() and not (tmp_path/'not-created.duckdb').exists()
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows close entry startup evidence')

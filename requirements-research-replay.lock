@@ -2715,6 +2715,11 @@ pyparsing==3.3.2 \
     --hash=sha256:c777f4d763f140633dcb6d8a3eda953bf7a214dc4eff598413c070bcdc117cbc
     # via matplotlib
 
+pypdf==6.19.0 \
+    --hash=sha256:7e5d6e730e7dae87d560a2cee218b852f6498c8be61966f3cd02ead971e48d14 \
+    --hash=sha256:bbc43aca292369ccc6cbc8a921991ecf2538a3587ab5a116eff06c321d647155
+    # reviewed original PyPI artifacts; retained valuation PDF qualification
+
 pyqlib==0.9.7 \
     --hash=sha256:0935778655d471e8e7cf9efc58f942cc0b58b495fc03d98e80bb5b97e17d54cb \
     --hash=sha256:118c364b896c6594d719b47ab84bf86ee65dcbe9d48dd3a58535d37ecb94de08 \
