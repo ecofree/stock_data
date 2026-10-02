@@ -13,6 +13,39 @@ from scripts.run_integrated_daily import (
 )
 
 
+@pytest.fixture(params=['2026-10-02T15:34:00+00:00', '2026-10-02T16:34:00+00:00'],
+                ids=['before-shanghai-midnight', 'after-shanghai-midnight'])
+def china_session_clock(request, monkeypatch):
+    """Keep the actual local intake and runner on one explicit market clock.
+
+    UTC-hosted CI crosses the China session boundary eight hours before its
+    date.today(). The session restriction must stay real; only the test clock
+    is frozen, including the receipt producer's aware UTC arrival clock.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from scripts import run_integrated_daily as runner
+    from trade_system import pipeline_runtime, p0_observation, tushare_history
+
+    instant = datetime.fromisoformat(request.param)
+    local = instant.astimezone(ZoneInfo('Asia/Shanghai'))
+
+    class ChinaDate(date):
+        @classmethod
+        def today(cls):
+            return local.date()
+
+    class ChinaDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return local.replace(tzinfo=None) if tz is None else instant.astimezone(tz)
+
+    monkeypatch.setattr(runner, 'date', ChinaDate)
+    for module in (runner, pipeline_runtime, p0_observation, tushare_history):
+        monkeypatch.setattr(module, 'datetime', ChinaDateTime)
+    return local.date().isoformat()
+
+
 
 
 
@@ -234,7 +267,7 @@ def test_manifest_upsert_step_transitions_running_to_completed(tmp_path):
     assert data["steps"][0]["duration_seconds"] == 1.5
 
 
-def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
+def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch, china_session_clock):
     import json
     from trade_system.pipeline_runtime import RunManifest
 
@@ -254,7 +287,7 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
     with duckdb.connect(str(source)) as con:
         con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
         con.executemany('INSERT INTO tushare_trade_cal VALUES (?,?,true)',
-                        [(x,date.today().isoformat()) for x in ('SSE','SZSE')])
+                        [(x,china_session_clock) for x in ('SSE','SZSE')])
     migration=tmp_path/'migration'
     verified=backup_verify(source,migration)
     fail_core=False;cooldown=False
@@ -274,7 +307,7 @@ def test_manifest_finish_persists_informational_warnings(tmp_path, monkeypatch):
         fail_core=case=='core';cooldown=case=='cooldown'
         monkeypatch.setattr(sys,'argv',['run_integrated_daily.py','--migration-root',str(migration),
             '--db',str(verified['backup']),'--reports-dir',str(migration/'reports'),
-            '--phase','close' if case=='pending' else 'intraday','--run-id',case,'--trade-date',date.today().isoformat()])
+            '--phase','close' if case=='pending' else 'intraday','--run-id',case,'--trade-date',china_session_clock])
         assert main()==expected
         receipt=json.loads((migration/'reports'/'runs'/case/'run.json').read_text())
         assert receipt['status']==('awaiting_publication' if case=='pending' else 'completed_with_warnings' if expected==0 else 'completed_with_degradation')
@@ -301,14 +334,14 @@ def test_only_explicit_financial_quality_results_are_separate_from_operation_fai
     assert _certification_gap(name, code, out, err, '2026-09-29') is expected
 
 
-def test_runner_financial_gap_preserves_operational_completion_and_strict_failure(tmp_path, monkeypatch):
+def test_runner_financial_gap_preserves_operational_completion_and_strict_failure(tmp_path, monkeypatch, china_session_clock):
     import json
     from types import SimpleNamespace
     from scripts import run_integrated_daily as runner
     from trade_system import collection_profiles, pipeline_runtime
     from trade_system.p0_observation import phase_evidence_errors
     from tools.v2.backup_verify import backup_verify
-    day = date.today().isoformat()
+    day = china_session_clock
     source = tmp_path / 'source.duckdb'
     with duckdb.connect(str(source)) as con:
         con.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,cal_date DATE,is_open BOOLEAN)')
@@ -343,6 +376,11 @@ def test_runner_financial_gap_preserves_operational_completion_and_strict_failur
     assert local['status'] == 'completed' and local['local_valuation_evidence']['market_requests'] == 0
     assert local['local_valuation_evidence']['valuation_complete'] is False
     assert Path(local['local_valuation_evidence']['report_path']).is_file()
+    local_report = json.loads(Path(local['local_valuation_evidence']['report_path']).read_text(encoding='utf-8'))
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    assert local_report['trade_date'] == day
+    assert datetime.fromisoformat(local_report['observed_at']).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() == day
     assert not any('--valuation-session' in command for command in commands)
     with duckdb.connect(str(verified['backup']), read_only=True) as con:
         assert con.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_daily_session'").fetchone() == (1,)
