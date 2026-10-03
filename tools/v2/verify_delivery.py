@@ -31,6 +31,24 @@ def source_files():
             and not p.startswith(('docs/','reports/','tmp/','backups/','.workbuddy/'))}
 
 
+def _captured_text(value):
+    # TimeoutExpired retains bytes even when subprocess.run requested text=True.
+    if value is None:
+        return ''
+    return value.decode('utf-8',errors='replace') if isinstance(value,bytes) else value
+
+
+def _run_check(output,name,command,*,timeout):
+    log=output/(name+'.log')
+    try:
+        result=subprocess.run(command,cwd=ROOT,text=True,encoding='utf-8',errors='replace',capture_output=True,timeout=timeout)
+        log.write_text(result.stdout+'\n'+result.stderr,encoding='utf-8')
+        return {'returncode':result.returncode,'log_sha256':digest(log)}
+    except subprocess.TimeoutExpired as exc:
+        log.write_text(_captured_text(exc.stdout)+'\n'+_captured_text(exc.stderr),encoding='utf-8')
+        return {'status':'timeout','timeout_seconds':timeout,'log_sha256':digest(log)}
+
+
 def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=False):
     output.mkdir(parents=True,exist_ok=False)
     start=datetime.now(timezone.utc).isoformat()
@@ -52,7 +70,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
         'lint':[sys.executable,'-m','ruff','check','--select','E9,F63,F7,F82,F401,F841','.'],
         'migrations':[sys.executable,'scripts/lint_migrations.py'],
         'writer_boundary':[sys.executable,'tools/v2/closure_readiness.py','--writer-gate'],
-        'tests':[sys.executable,'-m','pytest','-o','addopts=','-q','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml')],
+        'tests':[sys.executable,'-m','pytest','-o','addopts=','-v','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml')],
         'installed_dependencies':[str(installed_python),'-m','pip','check'],
         'installed_core':[str(installed_python),'-I',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
     if data_lane:
@@ -61,15 +79,10 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
     report['test_lane']='data' if data_lane else 'complete_local'
     success=True
     for name,command in commands.items():
-        try:
-            result=subprocess.run(command,cwd=ROOT,text=True,encoding='utf-8',errors='replace',capture_output=True,timeout=900 if name=='tests' else 120)
-            (output/(name+'.log')).write_text(result.stdout+'\n'+result.stderr,encoding='utf-8')
-            report['checks'][name]={'returncode':result.returncode,'log_sha256':digest(output/(name+'.log'))}
-            success=success and result.returncode==0
-            print(json.dumps({'check':name,'returncode':result.returncode}),flush=True)
-        except subprocess.TimeoutExpired:
-            report['checks'][name]={'status':'timeout'}
-            success=False
+        check=_run_check(output,name,command,timeout=900 if name=='tests' else 120)
+        report['checks'][name]=check
+        success=success and check.get('returncode')==0
+        print(json.dumps({'check':name,**check}),flush=True)
     if (output/'tests.xml').exists():
         suites=ET.parse(output/'tests.xml').getroot().iter('testsuite')
         totals={k:0 for k in ('tests','errors','failures','skipped')}

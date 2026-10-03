@@ -1,4 +1,5 @@
 import os
+import sys
 import duckdb
 import pandas as pd
 import pytest
@@ -62,3 +63,18 @@ def test_inventory_includes_tool_alias_and_dynamic_sql(tmp_path):
     assert not result['all_authority_closed']
     from tools.v2.closure_readiness import writer_gate
     with pytest.raises(ValueError,match='unclassified'):writer_gate(tmp_path)
+
+
+def test_delivery_timeout_preserves_real_child_output_and_failure(tmp_path):
+    from tools.v2.verify_delivery import _run_check, digest
+
+    command=[sys.executable,'-u','-c',
+        "import os,time; os.write(1,b'current_test_name\\xff\\n'); "
+        "os.write(2,b'waiting_thread_stack\\n'); time.sleep(30)"]
+    result=_run_check(tmp_path,'tests',command,timeout=1)
+    log=tmp_path/'tests.log'
+    assert result=={'status':'timeout','timeout_seconds':1,'log_sha256':digest(log)}
+    assert 'returncode' not in result
+    retained=log.read_text(encoding='utf-8')
+    assert 'current_test_name\ufffd' in retained
+    assert 'waiting_thread_stack' in retained

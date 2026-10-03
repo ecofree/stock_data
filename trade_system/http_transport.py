@@ -385,7 +385,7 @@ def open_verified_once(request: urllib.request.Request, *, timeout: float):
 
 
 def _retained_response_metadata(response):
-    """Hash original header pairs, retain only bounded non-credential fields."""
+    """Hash the ordered public header pairs exactly as retained after truncation."""
     import hashlib
     import json
     getcode = getattr(response, 'getcode', None)
@@ -394,16 +394,16 @@ def _retained_response_metadata(response):
                'age', 'vary', 'etag', 'last-modified', 'content-encoding'}
     metadata = {'http_status': status, 'response_headers': [],
         'response_headers_available': False, 'response_headers_sha256': None,
-        'response_headers_scope': 'bounded_public_allowlist_original_header_pairs_hash'}
+        'response_headers_scope': 'retained_public_header_pairs_ascii_json_ordered_value_2048_chars_v1'}
     # Header decoding/iteration is a separate evidence boundary. Its failure
     # must not discard an HTTP status that was already received.
     try:
         headers = getattr(response, 'headers', None)
         if headers is not None:
             pairs = list(headers.items())
-            digest = hashlib.sha256(json.dumps(pairs, ensure_ascii=True,
-                separators=(',', ':')).encode('ascii')).hexdigest()
             public = [(str(k), str(v)[:2048]) for k, v in pairs if k.lower() in allowed]
+            digest = hashlib.sha256(json.dumps(public, ensure_ascii=True,
+                separators=(',', ':')).encode('ascii')).hexdigest()
             metadata.update(response_headers=public, response_headers_available=True,
                             response_headers_sha256=digest)
     except Exception as exc:

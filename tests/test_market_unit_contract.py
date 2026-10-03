@@ -466,9 +466,44 @@ def test_verified_worker_keeps_actual_http_status_and_redacts_headers(monkeypatc
     metadata=json.loads(status)
     assert raw == b' {"raw": 1} ' and metadata['http_status'] == (201 if with_metadata else None)
     assert metadata['response_headers'] == ([['Content-Type','application/json']] if with_metadata else [])
-    assert metadata['response_headers_sha256'] == (hashlib.sha256(json.dumps(list(headers.items()),
+    assert metadata['response_headers_sha256'] == (hashlib.sha256(json.dumps(metadata['response_headers'],
         ensure_ascii=True,separators=(',',':')).encode('ascii')).hexdigest() if with_metadata else None)
     assert not any(v in status for v in [b'private-cookie', b'private-auth', b'private-token'])
+
+
+def test_retained_public_header_digest_covers_saved_order_and_bounded_values():
+    import hashlib
+    import json
+    from types import SimpleNamespace
+    from trade_system import http_transport as transport
+
+    long_etag = '\u6d4b' * 2048 + 'unretained-tail'
+    pairs = [('Date', 'Sat, 03 Oct 2026 02:28:58 GMT'),
+             ('Set-Cookie', 'private-cookie'), ('X-Internal', 'private-unknown'),
+             ('ETag', long_etag), ('Date', 'Sat, 03 Oct 2026 02:28:59 GMT'),
+             ('Authorization', 'private-auth')]
+
+    def retained(values):
+        headers = SimpleNamespace(items=lambda: values)
+        return transport._retained_response_metadata(SimpleNamespace(status=201, headers=headers))
+
+    metadata = retained(pairs)
+    expected = [pairs[0], ('ETag', '\u6d4b' * 2048), pairs[4]]
+    assert metadata['http_status'] == 201 and metadata['response_headers_available'] is True
+    assert metadata['response_headers'] == expected
+    digest_payload = json.dumps(metadata['response_headers'], ensure_ascii=True,
+                                separators=(',', ':')).encode('ascii')
+    assert metadata['response_headers_sha256'] == hashlib.sha256(digest_payload).hexdigest()
+    assert metadata['response_headers_scope'] == 'retained_public_header_pairs_ascii_json_ordered_value_2048_chars_v1'
+    assert all(value not in digest_payload for value in
+               [b'private-cookie', b'private-unknown', b'private-auth', b'unretained-tail'])
+
+    changed_private_and_tail = [pairs[0], ('Set-Cookie', 'different-cookie'),
+                                ('X-Internal', 'different-unknown'),
+                                ('ETag', '\u6d4b' * 2048 + 'different-tail'), pairs[4],
+                                ('Authorization', 'different-auth')]
+    assert retained(changed_private_and_tail)['response_headers_sha256'] == metadata['response_headers_sha256']
+    assert retained(list(reversed(pairs)))['response_headers_sha256'] != metadata['response_headers_sha256']
 
 
 @pytest.mark.parametrize('status', [200,201,403])
