@@ -5,7 +5,7 @@ import time
 import pytest
 
 from trade_system.v2 import journal_index as index, research_journal as journal
-from trade_system.v2.domain import identity
+from trade_system.v2.domain import canonical, identity
 
 
 def note(number):
@@ -42,6 +42,22 @@ def test_changed_selected_event_is_not_hidden_by_index(tmp_path):
     with pytest.raises(ValueError):index.rebuild(tmp_path)
 
 
+def test_durable_event_does_not_commit_when_fsync_fails(tmp_path,monkeypatch):
+    import os
+    value=note(1); folder=tmp_path/'notes'; calls=[]
+    def fail_sync(fd):
+        calls.append(fd)
+        raise OSError('synthetic fsync failure')
+    with monkeypatch.context() as patch:
+        patch.setattr(os,'fsync',fail_sync)
+        with pytest.raises(OSError,match='synthetic fsync failure'):
+            journal.durable_event(folder,value['note_id'],value)
+    assert len(calls)==1
+    assert not (folder/(value['note_id']+'.json')).exists()
+    pending=list(folder.glob('.pending-*'))
+    assert len(pending)==1 and pending[0].read_text(encoding='utf-8')==canonical(value)
+
+
 def test_read_only_legacy_workspace_and_keyset_pagination(tmp_path):
     for i in range(13):
         value=note(i);journal.durable_event(tmp_path/'notes',value['note_id'],value)
@@ -65,8 +81,12 @@ def test_read_only_legacy_workspace_and_keyset_pagination(tmp_path):
 
 def test_long_history_reads_do_not_enumerate_event_directories(tmp_path,monkeypatch,record_property):
     start=time.perf_counter()
+    folder=tmp_path/'notes';folder.mkdir()
     for i in range(10000):
-        value=note(i);journal.durable_event(tmp_path/'notes',value['note_id'],value)
+        # This fixture measures indexed reads of an existing large history.
+        # Durability/atomic commits are tested separately through the real writer.
+        value=note(i)
+        (folder/(value['note_id']+'.json')).write_text(canonical(value),encoding='utf-8')
     index.rebuild(tmp_path)
     record_property('synthetic_event_count',10000)
     record_property('prepare_seconds',round(time.perf_counter()-start,3))
