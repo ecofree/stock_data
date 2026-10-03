@@ -201,7 +201,8 @@ def summarize_requests(records):
             'first_received_at':None,'last_received_at':None,'consumers':set()})
         item['transport_attempts']+=1
         item['responses_received']+=row['status']=='response_received'
-        item['errors']+=bool(row.get('error_category') or row.get('http_status'))
+        item['errors']+=bool(row.get('error_category') or (
+            type(row.get('http_status')) is int and row['http_status'] >= 400))
         if context.get('consumer'):item['consumers'].add(context['consumer'])
         if row['status']=='response_received' and row.get('finished_at'):
             received=row['finished_at']
@@ -383,8 +384,37 @@ def open_verified_once(request: urllib.request.Request, *, timeout: float):
         raise
 
 
-def _read_verified_response(request, timeout, max_bytes):
+def _retained_response_metadata(response):
+    """Hash original header pairs, retain only bounded non-credential fields."""
+    import hashlib
+    import json
+    getcode = getattr(response, 'getcode', None)
+    status = getcode() if callable(getcode) else getattr(response, 'status', None)
+    allowed = {'content-type', 'content-length', 'date', 'server', 'cache-control',
+               'age', 'vary', 'etag', 'last-modified', 'content-encoding'}
+    metadata = {'http_status': status, 'response_headers': [],
+        'response_headers_available': False, 'response_headers_sha256': None,
+        'response_headers_scope': 'bounded_public_allowlist_original_header_pairs_hash'}
+    # Header decoding/iteration is a separate evidence boundary. Its failure
+    # must not discard an HTTP status that was already received.
+    try:
+        headers = getattr(response, 'headers', None)
+        if headers is not None:
+            pairs = list(headers.items())
+            digest = hashlib.sha256(json.dumps(pairs, ensure_ascii=True,
+                separators=(',', ':')).encode('ascii')).hexdigest()
+            public = [(str(k), str(v)[:2048]) for k, v in pairs if k.lower() in allowed]
+            metadata.update(response_headers=public, response_headers_available=True,
+                            response_headers_sha256=digest)
+    except Exception as exc:
+        metadata['response_headers_error_type'] = type(exc).__name__
+    return metadata
+
+
+def _read_verified_response(request, timeout, max_bytes, *, metadata=None):
     with open_verified_once(request, timeout=timeout) as response:
+        if metadata is not None:
+            metadata.update(_retained_response_metadata(response))
         raw = response.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError('response byte budget exceeded')
@@ -401,17 +431,29 @@ def _response_worker():
         headers=data['headers'], method=data['method'])
     raw = b''
     try:
-        raw = _read_verified_response(request, data['timeout'], data['max_bytes'])
         status = {'ok': True}
+        raw = _read_verified_response(request, data['timeout'], data['max_bytes'], metadata=status)
     except urllib.error.HTTPError as exc:
-        status = {'http_status': exc.code}
+        status = dict(_retained_response_metadata(exc), ok=False, http_error=True)
+        if getattr(exc, 'response_body_unavailable', False) or exc.fp is None:
+            status['response_body_unavailable'] = True
+        else:
+            try:
+                raw = exc.read(data['max_bytes']+1)
+                if len(raw) > data['max_bytes']:
+                    raw = b''
+                    status['error'] = 'response byte budget exceeded'
+                    status['response_body_unavailable'] = True
+            except Exception:
+                raw = b''
+                status['response_body_unavailable'] = True
     except ValueError:
-        status = {'error': 'response byte budget exceeded'}
+        status.update(ok=False, error='response byte budget exceeded', response_body_unavailable=True)
     except Exception as exc:
         cause = getattr(exc, 'reason', exc)
-        status = {'error': classify_transport_error(exc),
-                  'cause_type': type(cause).__name__,
-                  'os_error': getattr(cause, 'winerror', None) or getattr(cause, 'errno', None)}
+        status.update(ok=False, error=classify_transport_error(exc),
+                      response_body_unavailable=True, cause_type=type(cause).__name__,
+                      os_error=getattr(cause, 'winerror', None) or getattr(cause, 'errno', None))
     sys.stdout.buffer.write(json.dumps(status).encode('ascii') + b'\n' + raw)
 
 
@@ -457,10 +499,36 @@ def read_verified_once(request, *, timeout, max_bytes):
             raise urllib.error.URLError('invalid transport worker response') from None
         if not separator:
             raise urllib.error.URLError('incomplete transport worker response')
-        if 'http_status' in status:
+        if type(status.get('http_status')) is int:
+            receipt.update({key: status[key] for key in ('http_status', 'response_headers',
+                'response_headers_sha256', 'response_headers_scope', 'response_headers_available',
+                'response_headers_error_type') if key in status})
+        if status.get('response_body_unavailable') is True:
+            receipt['response_body_unavailable'] = True
+        if status.get('http_error') is True:
             if status['http_status'] in (401, 403, 429):
                 stop_diagnostic({401: 'authentication_failed', 403: 'permission_denied', 429: 'rate_limited'}[status['http_status']])
-            raise urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed', None, None)
+            import hashlib
+            import io
+            body_unavailable = status.get('response_body_unavailable') is True or len(raw) > max_bytes
+            if body_unavailable:
+                receipt['response_body_unavailable'] = True
+            else:
+                receipt.update(response_sha256=hashlib.sha256(raw).hexdigest(), response_bytes=len(raw))
+            error = urllib.error.HTTPError(request.full_url, status['http_status'], 'request failed',
+                dict(status.get('response_headers', [])),
+                None if body_unavailable else io.BytesIO(raw))
+            if body_unavailable:
+                # HTTPError(None) otherwise installs an empty BytesIO itself,
+                # which callers could mistake for an acquired empty body.
+                error.response_body_unavailable = True
+                error.fp = None
+
+                def unavailable_body_read(*args, **kwargs):
+                    raise OSError('response body unavailable')
+
+                error.read = unavailable_body_read
+            raise error
         if status.get('error') == 'response byte budget exceeded' or len(raw) > max_bytes:
             raise ValueError('response byte budget exceeded')
         if status.get('ok') is not True:

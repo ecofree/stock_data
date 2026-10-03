@@ -1,6 +1,12 @@
 import duckdb
+from datetime import datetime
+import io
+import json
+
+import pytest
 
 from trade_system.data_store import DuckDBStore
+from trade_system import data_store as base
 from collectors.collect_index import (
     collect_index_full_info,
     collect_index_intraday,
@@ -58,9 +64,9 @@ def test_collect_l2_tick_history_and_orders_are_idempotent(tmp_path):
     store, db_path = _store(tmp_path)
     client = FakeClient(
         {
-            "/l2/tick-history": {"data": [{"time": "09:31", "price": 10.1, "volume": 100, "direction": "buy"}]},
-            "/l2/tick-orders": {"data": [{"time": "09:31", "price": 10.1, "volume": 100, "order_type": "buy"}]},
-            "/l2/tick-orders-all": {"data": [{"time": "09:31", "price": 10.1, "volume": 100, "order_type": "buy"}]},
+            "/l2/tick-history": {"date": "20260706", "data": [{"time": "09:31", "price": 10.1, "volume": 100, "direction": "buy"}]},
+            "/l2/tick-orders": {"date": "20260706", "data": [{"time": "09:31", "price": 10.1, "volume": 100, "order_type": "buy"}]},
+            "/l2/tick-orders-all": {"date": "20260706", "data": [{"time": "09:31", "price": 10.1, "volume": 100, "order_type": "buy"}]},
         }
     )
     try:
@@ -76,6 +82,232 @@ def test_collect_l2_tick_history_and_orders_are_idempotent(tmp_path):
     assert _count(db_path, "l2_tick_history") == 1
     assert _count(db_path, "l2_tick_orders") == 1
     assert _count(db_path, "l2_tick_orders_all") == 1
+
+
+@pytest.mark.parametrize("endpoint,collector,table", [
+    ("/l2/tick-history", collect_l2_tick_history, "l2_tick_history"),
+    ("/l2/tick-orders", collect_l2_tick_orders, "l2_tick_orders"),
+    ("/l2/tick-orders-all", collect_l2_tick_orders_all, "l2_tick_orders_all"),
+])
+def test_l2_preserves_full_response_before_withholding_same_second_events(tmp_path, endpoint, collector, table):
+    store, _ = _store(tmp_path)
+    payload = {
+        "stock_code": "000001", "date": "20260706", "total_count": 2, "fetched_count": 3,
+        "data": [
+            {"time": "09:31", "order_id": "order-A", "price": 10.1, "volume": 100, "flag1": "2"},
+            {"time": "09:31:00.200", "order_id": "order-B", "price": 10.1, "volume": 100, "flag1": "1"},
+            {"time": "09:31:00", "price": 10.2, "volume": 200},
+        ],
+    }
+    client = FakeClient({endpoint: payload})
+    try:
+        assert collector(client, store, "2026-07-06", ["000001"]) == 0
+        assert store.fetchall(f"SELECT count(*) FROM {table}")[0][0] == 0
+        saved_endpoint, raw = store.fetchall("SELECT endpoint,raw_json FROM raw_api_data")[0]
+        receipt = json.loads(raw)
+        assert saved_endpoint == endpoint
+        assert receipt["response"] == payload
+        assert "order_id" not in receipt["response"]["data"][2]
+        assert receipt["request_params"] == {"code": "000001", "date": "2026-07-06"}
+        assert receipt["requested_trade_date"] == "2026-07-06"
+        assert receipt["source_trade_date"] == "20260706"
+        requested = datetime.fromisoformat(receipt["requested_at"])
+        observed = datetime.fromisoformat(receipt["response_observed_at"])
+        assert requested.tzinfo is not None and observed.tzinfo is not None and observed >= requested
+        assert receipt["qualification"]["pagination_complete"] is None
+        assert receipt["qualification"]["same_definition_independent_funds_eligible"] is False
+        assert "same_time_events_retained_in_raw" in store.fetchall("SELECT status FROM _collect_log")[-1][0]
+        assert client.calls == [(endpoint, {"code": "000001", "date": "2026-07-06"})]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("metadata,row_metadata,reason", [
+    ({}, {}, "source_date_unverified"),
+    ({"date": "20260707"}, {}, "response_date_mismatch"),
+    ({"date": "20260706", "stock_code": "000002"}, {}, "response_security_mismatch"),
+    ({"date": "not-a-date"}, {}, "invalid_response_date"),
+    ({"date": "20260706"}, {"date": "20260707"}, "source_date_unverified_or_mismatch"),
+    ({"date": "20260706"}, {"stock_code": "000002"}, "row_security_mismatch"),
+])
+def test_l2_never_assigns_requested_identity_or_day_to_conflicting_response(tmp_path, metadata, row_metadata, reason):
+    store, _ = _store(tmp_path)
+    payload = {**metadata, "data": [{"time": "09:31", "price": 10, "volume": 100, **row_metadata}]}
+    try:
+        assert collect_l2_tick_orders_all(FakeClient({"/l2/tick-orders-all": payload}), store, "2026-07-06", ["000001"]) == 0
+        assert store.fetchall("SELECT count(*) FROM l2_tick_orders_all")[0][0] == 0
+        receipt = json.loads(store.fetchall("SELECT raw_json FROM raw_api_data")[0][0])
+        assert receipt["response"] == payload
+        assert reason in store.fetchall("SELECT status FROM _collect_log")[-1][0]
+    finally:
+        store.close()
+
+
+def test_l2_projection_conflict_keeps_historical_row_and_original_order_ids(tmp_path):
+    store, _ = _store(tmp_path)
+    store.conn.execute("INSERT INTO l2_tick_orders_all(date,stock_code,time,price,volume,order_type) "
+                       "VALUES ('2026-07-06','000001','09:31:00',11,100,'buy')")
+    payload = {"date": "20260706", "data": [
+        {"time": "09:31:00", "order_id": "order-A", "price": 10, "volume": 100, "order_type": "buy"},
+        {"time": "09:32:00", "order_id": "order-B", "price": 12, "volume": 200, "order_type": "sell"},
+    ]}
+    try:
+        assert collect_l2_tick_orders_all(FakeClient({"/l2/tick-orders-all": payload}), store, "2026-07-06", ["000001"]) == 1
+        assert store.fetchall("SELECT time,price FROM l2_tick_orders_all ORDER BY time") == [("09:31:00", 11), ("09:32:00", 12)]
+        receipt = json.loads(store.fetchall("SELECT raw_json FROM raw_api_data")[0][0])
+        assert receipt["response"] == payload
+        assert "existing_projection_conflict_retained_in_raw" in store.fetchall("SELECT status FROM _collect_log")[-1][0]
+    finally:
+        store.close()
+
+
+def test_l2_raw_persistence_precedes_projection_and_survives_projection_failure(tmp_path, monkeypatch):
+    store, _ = _store(tmp_path)
+    payload = {"date": "20260706", "data": [{"time": "09:31", "order_id": "order-A", "price": 10, "volume": 100}]}
+
+    def fail_projection(*_args, **_kwargs):
+        assert store.fetchall("SELECT count(*) FROM raw_api_data")[0][0] == 1
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(store, "insert_rows", fail_projection)
+    try:
+        with pytest.raises(RuntimeError, match="projection failed"):
+            collect_l2_tick_orders(FakeClient({"/l2/tick-orders": payload}), store, "2026-07-06", ["000001"])
+        assert json.loads(store.fetchall("SELECT raw_json FROM raw_api_data")[0][0])["response"] == payload
+        assert store.fetchall("SELECT count(*) FROM l2_tick_orders")[0][0] == 0
+        assert store.fetchall("SELECT rows_inserted,status FROM _collect_log")[-1] == (0, "projection_failed_raw_retained")
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("write_limit", [0, 1])
+def test_l2_reports_actual_projection_write_count_when_writer_accepts_fewer_rows(tmp_path, monkeypatch, write_limit):
+    store, _ = _store(tmp_path)
+    payload = {"date": "20260706", "data": [
+        {"time": "09:31", "order_id": "order-A", "price": 10, "volume": 100},
+        {"time": "09:32", "order_id": "order-B", "price": 10, "volume": 100},
+    ]}
+    original_insert = store.insert_rows
+
+    def partial_insert(table, rows, columns, **kwargs):
+        return original_insert(table, rows[:write_limit], columns, **kwargs)
+
+    monkeypatch.setattr(store, "insert_rows", partial_insert)
+    try:
+        assert collect_l2_tick_orders(FakeClient({"/l2/tick-orders": payload}), store, "2026-07-06", ["000001"]) == write_limit
+        assert store.fetchall("SELECT count(*) FROM l2_tick_orders")[0][0] == write_limit
+        written, status = store.fetchall("SELECT rows_inserted,status FROM _collect_log")[-1]
+        assert written == write_limit
+        assert "projection_write_incomplete_raw_retained" in status
+        assert json.loads(store.fetchall("SELECT raw_json FROM raw_api_data")[0][0])["response"] == payload
+    finally:
+        store.close()
+
+
+def test_l2_idless_return_stays_idless_and_invalid_numeric_fields_stay_raw(tmp_path):
+    store, _ = _store(tmp_path)
+    payload = {"date": "20260706", "data": [
+        {"time": "09:31", "price": 10, "volume": 100},
+        {"time": "09:32", "volume": 100},
+        {"time": "09:33", "price": 10, "volume": 1.5},
+    ]}
+    try:
+        assert collect_l2_tick_orders(FakeClient({"/l2/tick-orders": payload}), store, "2026-07-06", ["000001"]) == 1
+        receipt = json.loads(store.fetchall("SELECT raw_json FROM raw_api_data")[0][0])
+        assert receipt["response"] == payload
+        assert all("order_id" not in row for row in receipt["response"]["data"])
+        assert store.fetchall("SELECT time,price,volume,order_type FROM l2_tick_orders") == [("09:31:00", 10, 100, None)]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("endpoint,collector,table", [
+    ("/l2/tick-history", collect_l2_tick_history, "l2_tick_history"),
+    ("/l2/tick-orders", collect_l2_tick_orders, "l2_tick_orders"),
+    ("/l2/tick-orders-all", collect_l2_tick_orders_all, "l2_tick_orders_all"),
+])
+@pytest.mark.parametrize("source_date,expected_count", [("20260707", 0), (None, 0), ("20260706", 1)])
+def test_real_l2_client_preserves_decoded_payload_before_date_validation(
+    tmp_path, monkeypatch, endpoint, collector, table, source_date, expected_count,
+):
+    store, _ = _store(tmp_path)
+    payload = {"stock_code": "000001", "data": [
+        {"time": "09:31", "order_id": "provider-order-A", "price": 10, "volume": 100},
+    ]}
+    if source_date is not None:
+        payload["date"] = source_date
+    calls = []
+
+    def response(*_args, **_kwargs):
+        calls.append(1)
+        return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(base, "open_verified", response)
+    monkeypatch.setattr(base.shared_host_limiter, "acquire", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(base, "API_KEY", "synthetic-header-key-must-not-be-retained")
+    client = base.KPLClient(max_attempts=5, total_budget_seconds=30)
+    try:
+        assert collector(client, store, "2026-07-06", ["000001"]) == expected_count
+        assert calls == [1]
+        assert store.fetchall(f"SELECT count(*) FROM {table}")[0][0] == expected_count
+        raw_rows = store.fetchall("SELECT raw_json FROM raw_api_data")
+        assert len(raw_rows) == 1  # The collector must not save a successful callback twice.
+        receipt = json.loads(raw_rows[0][0])
+        assert receipt["response"] == payload
+        assert receipt["request_params"] == {"code": "000001", "date": "2026-07-06"}
+        assert receipt["arrival_time_basis"] == "after_client_json_decode_before_semantic_validation"
+        assert datetime.fromisoformat(receipt["requested_at"]).tzinfo is not None
+        assert datetime.fromisoformat(receipt["response_observed_at"]).tzinfo is not None
+        assert "synthetic-header-key-must-not-be-retained" not in raw_rows[0][0]
+        assert receipt["qualification"]["same_definition_independent_funds_eligible"] is False
+        status = store.fetchall("SELECT status FROM _collect_log")[-1][0]
+        if source_date == "20260707":
+            assert client.stats["semantic_error"] == 1
+            assert client.stats["success"] == 0
+            assert status == "semantic_response_rejected_raw_retained"
+        elif source_date is None:
+            assert "source_date_unverified" in status
+    finally:
+        store.close()
+
+
+def test_real_l2_client_raw_persistence_failure_stops_before_retry_or_projection(tmp_path, monkeypatch):
+    store, _ = _store(tmp_path)
+    payload = {"date": "20260706", "data": [
+        {"time": "09:31", "order_id": "provider-order-A", "price": 10, "volume": 100},
+    ]}
+    calls = []
+
+    def response(*_args, **_kwargs):
+        calls.append(1)
+        return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    def fail_raw(*_args, **_kwargs):
+        raise OSError("isolated evidence persistence failed")
+
+    def forbidden_retry(*_args, **_kwargs):
+        raise AssertionError("raw persistence failure must not retry")
+
+    monkeypatch.setattr(base, "open_verified", response)
+    monkeypatch.setattr(base.shared_host_limiter, "acquire", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(store, "insert_raw", fail_raw)
+    client = base.KPLClient(max_attempts=5, total_budget_seconds=30)
+    monkeypatch.setattr(client, "_sleep_retry", forbidden_retry)
+    try:
+        with pytest.raises(base.KPLDecodedObserverError, match="evidence persistence failed") as raised:
+            collect_l2_tick_orders(client, store, "2026-07-06", ["000001", "000002"])
+        assert isinstance(raised.value.__cause__, OSError)
+        assert calls == [1]
+        assert store.fetchall(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name='raw_api_data'"
+        )[0][0] == 0
+        assert store.fetchall("SELECT count(*) FROM l2_tick_orders")[0][0] == 0
+        assert client.stats["success"] == 0
+        assert client._circuit_open_reason == "decoded_observer_failed"
+        assert client.get("/l2/tick-orders", {"code": "000002", "date": "2026-07-06"}) is None
+        assert calls == [1]
+    finally:
+        store.close()
 
 
 def test_collect_l2_index_trend_and_sector_volume(tmp_path):

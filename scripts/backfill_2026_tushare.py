@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -97,6 +98,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Re-fetch successful checkpoints.")
     parser.add_argument("--report", default="reports/tushare_2026_backfill_latest.md")
     valuation = parser.add_mutually_exclusive_group()
+    valuation.add_argument('--cninfo-pagination', action='store_true',
+        help='Explicit isolated two-page protocol only; plan-only is offline, execution requires a newly approved exact plan SHA.')
     valuation.add_argument('--valuation-prepare', action='store_true',
         help='Offline daily valuation worklist; original finance is reusable but new session evidence and review are required.')
     valuation.add_argument('--valuation-diagnostic', action='store_true',
@@ -108,7 +111,53 @@ def main() -> int:
     parser.add_argument('--valuation-workspace', help='Workspace with valuation-intake/YYYYMMDD/manifest.json and manifest.sha256.')
     parser.add_argument('--valuation-intake-manifest', help='Exact local daily intake manifest, already reviewed.')
     parser.add_argument('--valuation-intake-sha256', help='Approved SHA256 of that exact daily manifest.')
+    parser.add_argument('--cninfo-org-id', help='Previously retained official issuer org_id; never looked up automatically.')
+    parser.add_argument('--cninfo-plan', help='Exact new two-page CNINFO request plan, not a bulk collection authorization.')
+    parser.add_argument('--cninfo-plan-sha256', help='Reviewed SHA256; caller must separately verify explicit new request-budget approval.')
+    parser.add_argument('--cninfo-output', help='Fresh isolated reports/_scratch directory for original request/response evidence.')
     args = parser.parse_args()
+    if args.cninfo_pagination:
+        from trade_system.adapters.cninfo_sources import cninfo_pagination_plan, diagnose_cninfo_pagination
+        if any((args.valuation_evidence_sha256, args.valuation_workspace,
+                args.valuation_intake_manifest, args.valuation_intake_sha256)):
+            parser.error('CNINFO protocol cannot combine with valuation intake options')
+        if args.plan_only:
+            if (not args.stock_codes or ',' in args.stock_codes or not args.cninfo_org_id
+                    or args.cninfo_plan or args.cninfo_plan_sha256 or args.cninfo_output
+                    or '--report' not in sys.argv or '--start-date' not in sys.argv
+                    or '--end-date' not in sys.argv):
+                parser.error('offline CNINFO plan requires one code, explicit org_id/date window and a new --report plan path')
+            try:
+                start, end = args.start_date, args.end_date
+                if len(start) == 8:
+                    start = start[:4]+'-'+start[4:6]+'-'+start[6:]
+                if len(end) == 8:
+                    end = end[:4]+'-'+end[4:6]+'-'+end[6:]
+                result = cninfo_pagination_plan(args.stock_codes.strip(), args.cninfo_org_id, start, end)
+                raw = (json.dumps(result, ensure_ascii=False, indent=2)+'\n').encode('utf-8')
+                report = Path(args.report)
+                report.parent.mkdir(parents=True, exist_ok=True)
+                with report.open('xb') as stream:
+                    stream.write(raw)
+            except (ValueError, OSError) as exc:
+                parser.error(str(exc))
+            print(f'cninfo_plan offline_requests=0 sha256={hashlib.sha256(raw).hexdigest()} report={report}')
+            return 0
+        if (not args.cninfo_plan or not args.cninfo_plan_sha256 or not args.cninfo_output
+                or args.stock_codes or args.cninfo_org_id):
+            parser.error('CNINFO execution requires exact --cninfo-plan/--cninfo-plan-sha256/--cninfo-output without scope overrides')
+        output = Path(args.cninfo_output).resolve()
+        if not any(output.is_relative_to(ROOT/name) for name in ('reports', '_scratch')):
+            parser.error('CNINFO evidence output must be isolated under this candidate reports or _scratch')
+        try:
+            result = diagnose_cninfo_pagination(args.cninfo_plan, args.cninfo_plan_sha256, output)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            parser.error(str(exc))
+        print(f"cninfo_protocol status={result['status']} actual_requests={result['actual_requests']} "
+              f"catalogue_complete={result['catalogue_complete']} financial_qualification=False report={output/'verification.json'}")
+        return 0 if result['protocol_verified'] else 2
+    if any((args.cninfo_org_id, args.cninfo_plan, args.cninfo_plan_sha256, args.cninfo_output)):
+        parser.error('CNINFO options require the explicit --cninfo-pagination mode')
     if args.valuation_prepare or args.valuation_diagnostic or args.valuation_evidence or args.valuation_session:
         if args.plan_only or args.start_date != args.end_date:
             parser.error('valuation mode requires one explicit session and cannot combine with plan-only')

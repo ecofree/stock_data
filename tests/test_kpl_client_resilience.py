@@ -1,4 +1,8 @@
+import io
+import json
 import urllib.error
+
+import pytest
 
 from trade_system import data_store as base
 from trade_system.source_validation import ValidationResult
@@ -132,3 +136,45 @@ def test_forbidden_optional_route_does_not_poison_core_client(monkeypatch):
     assert client.stats["auth_error"] == 1
     assert client.stats["circuit_open"] == 0
     assert len(calls) == 2
+
+
+def test_tick_decoded_observer_cannot_change_semantic_rejection(monkeypatch):
+    calls = []
+    observed = []
+    payload = {"date": "20260707", "data": [{"time": "09:31", "order_id": "provider-order-A"}]}
+
+    def response(*_args, **_kwargs):
+        calls.append(1)
+        return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    def observer(decoded, metadata):
+        observed.append((decoded, metadata))
+        decoded["date"] = "20260706"
+        metadata["request_params"]["date"] = "2026-07-07"
+
+    monkeypatch.setattr(base, "open_verified", response)
+    monkeypatch.setattr(base.shared_host_limiter, "acquire", lambda *_args, **_kwargs: None)
+    client = base.KPLClient(max_attempts=5, total_budget_seconds=30)
+    params = {"code": "000001", "date": "2026-07-06"}
+
+    assert client.get("/l2/tick-orders", params, decoded_observer=observer) is None
+    assert calls == [1]
+    assert len(observed) == 1
+    assert params["date"] == "2026-07-06"
+    assert client.stats["semantic_error"] == 1
+    assert client.stats["success"] == 0
+    assert set(observed[0][1]) == {
+        "endpoint", "request_params", "requested_at", "response_observed_at", "arrival_time_basis",
+    }
+
+
+def test_decoded_observer_is_explicitly_scoped_to_three_tick_endpoints(monkeypatch):
+    def forbidden_request(*_args, **_kwargs):
+        raise AssertionError("invalid observer must be rejected before a request")
+
+    monkeypatch.setattr(base, "open_verified", forbidden_request)
+    client = base.KPLClient(max_attempts=1)
+    with pytest.raises(ValueError, match="scoped to the three L2 tick endpoints"):
+        client.get("/market/rise-fall", {"date": "2026-07-06"}, decoded_observer=lambda *_args: None)
+    with pytest.raises(TypeError, match="must be callable"):
+        client.get("/l2/tick-history", {"date": "2026-07-06"}, decoded_observer=True)

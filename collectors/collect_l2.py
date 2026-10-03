@@ -1,4 +1,8 @@
 """L2 data collectors (11 endpoints)."""
+from datetime import datetime, timezone
+import math
+from zoneinfo import ZoneInfo
+
 from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
@@ -85,6 +89,139 @@ def _matches_trade_date(item: dict, date: str) -> bool:
 
 def _response_matches_trade_date(data, date: str) -> bool:
     return not isinstance(data, dict) or _matches_trade_date(data, date)
+
+
+def _tick_source_date(item, *, allow_epoch=True) -> str | None:
+    """Use a returned date/epoch, never the requested date or receipt clock."""
+    if not isinstance(item, dict):
+        return None
+    value = _field(item, "date", "trade_date", "day", "dt", "datetime")
+    if value is not None:
+        compact = _compact_date(value)
+        if len(compact) != 8:
+            return None
+        try:
+            return datetime.strptime(compact, "%Y%m%d").strftime("%Y%m%d")
+        except ValueError:
+            return None
+    stamp = item.get("timestamp")
+    if allow_epoch and stamp is not None and str(stamp).isdigit() and len(str(stamp)) in (10, 13):
+        try:
+            seconds = int(stamp) / (1000 if len(str(stamp)) == 13 else 1)
+            return datetime.fromtimestamp(seconds, timezone.utc).astimezone(
+                ZoneInfo("Asia/Shanghai")
+            ).strftime("%Y%m%d")
+        except (ValueError, OverflowError, OSError):
+            return None
+    return None
+
+
+def _tick_matches_security(item, code: str) -> bool:
+    if not isinstance(item, dict):
+        return True
+    value = _field(item, "stock_code", "stock_id", "code")
+    if value is None:
+        return True
+    identity = str(value).upper().split(".")[0]
+    if identity.startswith(("SH", "SZ", "BJ")):
+        identity = identity[2:]
+    return identity == str(code)
+
+
+def _tick_time(value) -> str | None:
+    for pattern in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(value), pattern).strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def _collect_tick_projection(store, table_name, direction_column, date, code, data):
+    """Old tables can represent only one unambiguous observation per second.
+
+    The complete receipt is the event archive.  Collision groups, undated
+    observations and conflicting old rows stay there instead of overwriting
+    curated history or inventing an order identifier for the old projection.
+    """
+    columns = ["date", "stock_code", "time", "price", "volume", direction_column]
+    source_date = _tick_source_date(data, allow_epoch=False)
+    requested_date = _compact_date(date)
+    if not _tick_matches_security(data, code):
+        return [], {"response_security_mismatch"}
+    if isinstance(data, dict) and any(
+        data.get(key) is not None for key in ("date", "trade_date", "day", "dt", "datetime")
+    ) and source_date is None:
+        return [], {"invalid_response_date"}
+    if source_date is not None and source_date != requested_date:
+        return [], {"response_date_mismatch"}
+    groups = {}
+    issues = set()
+    for item in _items(data, "ticks", "orders", "history"):
+        item_date = _tick_source_date(item)
+        if isinstance(item, dict) and any(
+            item.get(key) is not None for key in ("date", "trade_date", "day", "dt", "datetime", "timestamp")
+        ) and item_date is None:
+            issues.add("invalid_source_date")
+            continue
+        if (item_date or source_date) != requested_date:
+            issues.add("source_date_unverified_or_mismatch")
+            continue
+        if not _tick_matches_security(item, code):
+            issues.add("row_security_mismatch")
+            continue
+        if isinstance(item, dict):
+            point_time = _field(item, "time", "t")
+            price = _field(item, "price", "p")
+            volume = _field(item, "volume", "v")
+            direction = _field(item, direction_column, "direction", "order_type", "side", "type")
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            point_time, price, volume = item[:3]
+            direction = item[3] if len(item) > 3 else None
+        else:
+            issues.add("invalid_row")
+            continue
+        point_time = _tick_time(point_time)
+        # Count every observation before validating its projection. Two orders
+        # with identical values still are not one event, and unknown duplicates
+        # do not prove a safe deduplication rule.
+        groups.setdefault(point_time, []).append(None)
+        try:
+            if isinstance(price, bool) or isinstance(volume, bool):
+                raise ValueError("boolean numeric field")
+            price, volume = float(price), float(volume)
+            if not point_time or not math.isfinite(price) or price <= 0:
+                raise ValueError("invalid price/time")
+            if not math.isfinite(volume) or volume < 0 or not volume.is_integer():
+                raise ValueError("invalid volume")
+        except (TypeError, ValueError, OverflowError):
+            issues.add("invalid_projection_fields")
+            continue
+        groups[point_time][-1] = (
+            date, code, point_time, price, int(volume),
+            str(direction) if direction is not None else None,
+        )
+    existing = {}
+    if store.fetchall("SELECT count(*) FROM information_schema.tables WHERE table_name=?", [table_name])[0][0]:
+        for row in store.fetchall(
+            f"SELECT {','.join(columns)} FROM {table_name} WHERE date=CAST(? AS DATE) AND stock_code=?",
+            [date, code],
+        ):
+            existing.setdefault(_tick_time(row[2]), []).append((date, code, *row[2:]))
+    rows = []
+    for point_time, candidates in groups.items():
+        if len(candidates) != 1:
+            issues.add("same_time_events_retained_in_raw")
+            continue
+        row = candidates[0]
+        if row is None:
+            continue
+        previous = existing.get(point_time, [])
+        if previous and (len(previous) != 1 or previous[0] != row):
+            issues.add("existing_projection_conflict_retained_in_raw")
+            continue
+        rows.append(row)
+    return rows, issues
 
 
 def collect_l2_stock_intraday(client: KPLClient, store: DuckDBStore, date: str, stock_codes: list) -> int:
@@ -305,41 +442,77 @@ def _collect_l2_tick_like(
 ) -> int:
     total = 0
     for code in stock_codes[:30]:
-        data = client.get(endpoint, {"code": code, "date": date})
-        rows = []
-        for item in _items(data, "ticks", "orders", "history"):
-            if isinstance(item, dict):
-                rows.append(
-                    (
-                        date,
-                        code,
-                        str(_field(item, "time", "t", "timestamp", default="")),
-                        _to_float(_field(item, "price", "p", default=0)),
-                        int(_to_float(_field(item, "volume", "v", default=0))),
-                        str(
-                            _field(
-                                item,
-                                direction_column,
-                                "direction",
-                                "order_type",
-                                "side",
-                                "type",
-                                default="",
-                            )
-                        ),
-                    )
+        params = {"code": code, "date": date}
+        requested_at = datetime.now(timezone.utc).isoformat()
+        observations = 0
+
+        def retain_decoded_response(decoded, observation):
+            nonlocal observations
+            # The real client invokes this before semantic rejection. Preserve
+            # IDs/flags/repeated rows without giving the payload return eligibility.
+            # This is decoded evidence, not a byte-identical HTTP body.
+            store.insert_raw(endpoint, {
+                "schema": "kpl-l2-decoded-response-v1",
+                "provider": "kpl",
+                "endpoint": endpoint,
+                "request_params": observation["request_params"],
+                "requested_trade_date": date,
+                "requested_at": observation["requested_at"],
+                "response_observed_at": observation["response_observed_at"],
+                "source_trade_date": _tick_source_date(decoded, allow_epoch=False),
+                "arrival_time_basis": observation["arrival_time_basis"],
+                "payload_kind": "complete_client_decoded_return_not_http_bytes",
+                "response": decoded,
+                "qualification": {
+                    "original_producer_verified": False,
+                    "definition_verified": False,
+                    "pagination_complete": None,
+                    "session_complete": None,
+                    "same_definition_independent_funds_eligible": False,
+                    "standard_table_role": "legacy_unambiguous_observation_projection",
+                },
+            })
+            observations += 1
+
+        if isinstance(client, KPLClient):
+            data = client.get(endpoint, dict(params), decoded_observer=retain_decoded_response)
+        else:
+            # Existing simple FakeClients do not implement the client callback;
+            # do not retry a get() after TypeError or introduce a second request.
+            data = client.get(endpoint, dict(params))
+        if data is None:
+            if observations:
+                store.log_collect(table_name, endpoint, 0, "semantic_response_rejected_raw_retained")
+            continue
+        if not observations:
+            retain_decoded_response(data, {
+                "request_params": dict(params),
+                "requested_at": requested_at,
+                "response_observed_at": datetime.now(timezone.utc).isoformat(),
+                "arrival_time_basis": "immediate_observation_of_client_return_not_wire_receipt",
+            })
+        rows, issues = _collect_tick_projection(
+            store, table_name, direction_column, date, code, data
+        )
+        written = 0
+        try:
+            if rows:
+                written = store.insert_rows(
+                    table_name,
+                    rows,
+                    ["date", "stock_code", "time", "price", "volume", direction_column],
+                    replace_on=["date", "stock_code", "time"],
                 )
-            elif isinstance(item, (list, tuple)) and len(item) >= 3:
-                rows.append((date, code, str(item[0]), item[1], item[2], str(item[3]) if len(item) > 3 else ""))
-        if rows:
-            total += store.insert_rows(
-                table_name,
-                rows,
-                ["date", "stock_code", "time", "price", "volume", direction_column],
-                replace_on=["date", "stock_code", "time"],
-            )
-    if total:
-        store.log_collect(table_name, endpoint, total, "ok")
+        except Exception:
+            store.log_collect(table_name, endpoint, 0, "projection_failed_raw_retained")
+            raise
+        total += written
+        if written < len(rows):
+            issues.add("projection_write_incomplete_raw_retained")
+        status = "unqualified_definition_and_page_scope"
+        if issues:
+            status += ":" + ",".join(sorted(issues))
+        store.log_collect(table_name, endpoint, written, status)
     return total
 
 

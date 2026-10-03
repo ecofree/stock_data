@@ -12,6 +12,10 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Check runtime
 $Root = Split-Path -Parent $PSScriptRoot
 Push-Location $Root
 try {
+    & $Python -c "import sys, pytest, ruff, pypdf, lightgbm, qlib; from importlib.metadata import version; parts=version('pypdf').split('.'); sys.exit('patched pypdf 6.19 or newer required') if tuple(int(x) for x in parts[:2]) < (6, 19) else None; print('pre_push_environment: OK')"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Check environment is incomplete. Use -Python or STOCKDATA_CHECK_PYTHON to select an environment with the project's existing test dependencies. No tests were started."
+    }
     & $Python -m pytest -q -p no:cacheprovider
     if ($LASTEXITCODE -ne 0) { throw "pytest failed" }
     # Same rule set as pyproject.toml / .github/workflows/ci.yml.

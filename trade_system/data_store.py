@@ -1,5 +1,6 @@
 """HTTP client and DuckDB store for KPL data collection."""
 import contextlib
+import copy
 import json
 import time
 import logging
@@ -7,7 +8,7 @@ import os
 import urllib.request
 import urllib.error
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 from trade_system.config import (
@@ -92,6 +93,10 @@ def _attach_cold_storage(conn):
         logger.warning("could not attach cold storage %s: %s", cold_path, exc)
 
 
+class KPLDecodedObserverError(RuntimeError):
+    """Decoded evidence could not be retained; this is never a network retry."""
+
+
 class KPLClient:
     """HTTP client with rate-limiting, retry, empty-response detection, and exponential backoff."""
 
@@ -160,6 +165,7 @@ class KPLClient:
         *,
         critical=False,
         accept_source_date=False,
+        decoded_observer=None,
     ):
         """Fetch an endpoint with adaptive rate limiting.
 
@@ -169,7 +175,14 @@ class KPLClient:
             critical: if True, empty responses trigger longer backoff (for data-critical endpoints)
             accept_source_date: allow a dated response to be returned only for
                 collectors that persist every row at its own source date.
+            decoded_observer: explicit three-tick evidence callback, called
+                before semantic validation; receives no headers or credentials.
         """
+        if decoded_observer is not None:
+            if endpoint not in {"/l2/tick-history", "/l2/tick-orders", "/l2/tick-orders-all"}:
+                raise ValueError("decoded observer is scoped to the three L2 tick endpoints")
+            if not callable(decoded_observer):
+                raise TypeError("decoded observer must be callable")
         if self._circuit_open_reason is not None:
             self.stats["skipped"] += 1
             return None
@@ -243,8 +256,20 @@ class KPLClient:
                 timeout = self.request_timeout
                 if remaining is not None:
                     timeout = max(0.1, min(timeout, remaining))
+                requested_at = datetime.now(timezone.utc).isoformat()
                 with open_verified(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                    if decoded_observer is not None:
+                        try:
+                            decoded_observer(copy.deepcopy(data), {
+                                "endpoint": endpoint,
+                                "request_params": dict(params or {}),
+                                "requested_at": requested_at,
+                                "response_observed_at": datetime.now(timezone.utc).isoformat(),
+                                "arrival_time_basis": "after_client_json_decode_before_semantic_validation",
+                            })
+                        except Exception as exc:
+                            raise KPLDecodedObserverError("decoded response evidence persistence failed") from exc
                     semantic = validate_kpl(endpoint, params, data)
                     empty = self._is_empty_response(data)
                     if not semantic.ok or empty:
@@ -305,6 +330,10 @@ class KPLClient:
                         del self._cooldown_until[endpoint]
                     return data
 
+            except KPLDecodedObserverError:
+                self.stats["error"] += 1
+                self._open_circuit("decoded_observer_failed")
+                raise
             except urllib.error.HTTPError as e:
                 body = ""
                 try:

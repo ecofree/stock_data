@@ -167,3 +167,52 @@ def test_kpl_ranking_history_keeps_concepts_and_members(tmp_path):
         assert collector.store.conn.execute("select concept_code,concept_name from kpl_concept_daily").fetchone() == ("C001", "银行概念")
         assert collector.store.conn.execute("select stock_code from kpl_concept_stock_history").fetchone()[0] == "000001"
         assert collector.store.conn.execute("select date_verified from kpl_concept_daily").fetchone()[0] is False
+
+
+def test_cninfo_cli_plan_is_offline_and_never_opens_database(tmp_path, monkeypatch, capsys):
+    import hashlib
+    import json
+    import sys
+    import pytest
+    from scripts import backfill_2026_tushare as cli
+    from trade_system.adapters import cninfo_sources as cn
+    def forbidden(*a, **k): pytest.fail('offline protocol planning opened a database or provider')
+    monkeypatch.setattr(cli, 'TushareHistoryCollector', forbidden)
+    monkeypatch.setattr(cli, 'PipelineLock', forbidden)
+    monkeypatch.setattr(cn, 'read_verified_once', forbidden)
+    plan = tmp_path/'request-plan.json'
+    monkeypatch.setattr(sys, 'argv', ['backfill', '--cninfo-pagination', '--plan-only',
+        '--stock-codes', '000016.SZ', '--cninfo-org-id', 'gssz0000016',
+        '--start-date', '20250101', '--end-date', '20260929', '--report', str(plan)])
+    assert cli.main() == 0
+    body = json.loads(plan.read_bytes())
+    assert body['org_lookup_requests'] == 0 and body['max_actual_requests'] == 2
+    assert body['window_from'] == '2025-01-01' and body['window_through'] == '2026-09-29'
+    assert hashlib.sha256(plan.read_bytes()).hexdigest() in capsys.readouterr().out
+    with pytest.raises(SystemExit): cli.main()  # Cannot silently overwrite an approved plan.
+
+
+def test_cninfo_cli_execute_uses_only_exact_plan_without_database(tmp_path, monkeypatch):
+    import sys
+    import pytest
+    from scripts import backfill_2026_tushare as cli
+    from trade_system.adapters import cninfo_sources as cn
+    monkeypatch.setattr(cli, 'ROOT', tmp_path)
+    def forbidden(*a, **k): pytest.fail('CNINFO mode opened a database')
+    monkeypatch.setattr(cli, 'TushareHistoryCollector', forbidden)
+    monkeypatch.setattr(cli, 'PipelineLock', forbidden)
+    calls=[]
+    def execute(plan, fingerprint, out):
+        calls.append((plan, fingerprint, out))
+        return dict(status='pagination_verified', actual_requests=2,
+                    catalogue_complete=False, protocol_verified=True)
+    monkeypatch.setattr(cn, 'diagnose_cninfo_pagination', execute)
+    out=tmp_path/'reports'/'isolated-new-budget'
+    monkeypatch.setattr(sys, 'argv', ['backfill', '--cninfo-pagination',
+        '--cninfo-plan', str(tmp_path/'plan.json'), '--cninfo-plan-sha256', 'a'*64,
+        '--cninfo-output', str(out)])
+    assert cli.main() == 0
+    assert calls == [(str(tmp_path/'plan.json'), 'a'*64, out)]
+    sys.argv.extend(['--stock-codes', '600000.SH'])
+    with pytest.raises(SystemExit): cli.main()
+    assert len(calls) == 1
