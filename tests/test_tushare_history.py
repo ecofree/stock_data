@@ -709,6 +709,109 @@ def test_sparse_pdf_column_requires_actual_geometry_and_never_shifts_prior_zero(
     _validate_page_value(content,fingerprint,blank,'pdf')
 
 
+@pytest.mark.parametrize('title', [
+    '关于预计无法在规定期限内披露2025年年度报告暨股票可能被终止上市暨无法在预约日期及预计无法在法定期限内披露2026年半年度报告的风险提示公告',
+    '延期披露2026年半年度报告',
+    '预计无法披露2026年半年度报告',
+    '未披露2026年半年度报告',
+    '2026年半年度报告披露进展',
+    '2026年半年度报告预约披露时间变更公告',
+    '关于2025年年度报告的更正公告',
+    '关于2026年半年度报告的补充公告',
+    '2025年年度报告问询函的回复',
+    '董事会审议2026年半年度报告',
+    '2026年半年度报告摘要',
+    '2025年年度报告审计报告',
+])
+def test_latest_income_period_does_not_invent_reports_from_notices(tmp_path, title):
+    import json
+    from trade_system.tushare_store import RetainedValuationReader
+    page = tmp_path/'notice-catalogue.json'
+    page.write_text(json.dumps({'announcements': [
+        {'announcementTitle': title, 'announcement_date': '2026-09-29'}]},
+        ensure_ascii=False), encoding='utf-8')
+    for mode in ('static', 'ttm'):
+        with pytest.raises(ValueError, match='latest applicable income period not evidenced'):
+            RetainedValuationReader._latest_income_period(
+                [{'document': {'path': str(page)}}], '2026-09-29', mode)
+
+
+@pytest.mark.parametrize('title,period', [
+    ('2025年年度报告', '2025-12-31'),
+    ('2025年度报告全文', '2025-12-31'),
+    ('发行人股份有限公司2025年年度报告（修订版）', '2025-12-31'),
+    ('发行人：2025年年度报告全文(更新后)', '2025-12-31'),
+    ('威领股份2025年半年度报告（更正后）', '2025-06-30'),
+    ('正平股份2025年第三季度报告(修订版)', '2025-09-30'),
+    ('东兴证券股份有限公司2026年半年度报告', '2026-06-30'),
+    ('未名医药2026年半年度报告', '2026-06-30'),
+    ('未来电器：2026年半年度报告', '2026-06-30'),
+    ('2026 年 半年度报告全文（更正后）', '2026-06-30'),
+    ('2026年第一季度报告', '2026-03-31'),
+    ('2026年一季度报告', '2026-03-31'),
+    ('2025年第三季度报告', '2025-09-30'),
+    ('2025年三季度报告', '2025-09-30'),
+])
+def test_latest_income_period_accepts_full_reports_and_revised_full_text(tmp_path, title, period):
+    import json
+    from trade_system.tushare_store import RetainedValuationReader
+    page = tmp_path/'full-report-catalogue.json'
+    page.write_text(json.dumps({'announcements': [
+        {'announcementTitle': title, 'announcement_date': '2026-08-30'}]},
+        ensure_ascii=False), encoding='utf-8')
+    catalogues = [{'document': {'path': str(page)}}]
+    assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'ttm') == period
+    if period.endswith('-12-31'):
+        assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'static') == period
+    else:
+        with pytest.raises(ValueError, match='not evidenced'):
+            RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'static')
+
+
+@pytest.mark.parametrize('title', [
+    '2025年年度报告及2026年半年度报告',
+    '2025年年度报告；2026年半年度报告',
+    '2025年年度报告，2026年半年度报告',
+    '2025年年度报告更正2026年半年度报告',
+    '2025年年度报告。2026年半年度报告',
+])
+def test_latest_income_period_never_combines_separate_report_years(tmp_path, title):
+    import json
+    from trade_system.tushare_store import RetainedValuationReader
+    page = tmp_path/'ambiguous-catalogue.json'
+    page.write_text(json.dumps({'announcements': [
+        {'announcementTitle': title, 'announcement_date': '2026-09-29'}]},
+        ensure_ascii=False), encoding='utf-8')
+    with pytest.raises(ValueError, match='not evidenced'):
+        RetainedValuationReader._latest_income_period(
+            [{'document': {'path': str(page)}}], '2026-09-29', 'ttm')
+
+
+def test_latest_income_period_uses_observed_report_date_and_original_page_set(tmp_path):
+    import json
+    from datetime import datetime
+    from trade_system.tushare_store import RetainedValuationReader
+    rows = [
+        ('2025年年度报告', '2026-04-30'),
+        ('2026年半年度报告', '2026-08-30'),
+        ('2026年半年度报告（更正后）', '2026-09-15'),
+        ('关于2025年年度报告及2026年第三季度报告的风险提示公告', '2026-09-28'),
+        ('2026年第三季度报告', '2026-10-30'),
+    ]
+    page = tmp_path/'dated-catalogue-page.json'
+    page.write_text(json.dumps({'announcements': [
+        {'announcementTitle': title,
+         'announcementTime': int(datetime.fromisoformat(day+'T00:00:00+08:00').timestamp()*1000)}
+        for title, day in rows]}, ensure_ascii=False), encoding='utf-8')
+    manifest = tmp_path/'dated-catalogue.json'
+    manifest.write_text(json.dumps({'schema': 'official_disclosure_page_set_v1',
+        'source_pages': [{'path': str(page)}]}), encoding='utf-8')
+    catalogues = [{'document': {'path': str(manifest)}}]
+    assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'static') == '2025-12-31'
+    assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'ttm') == '2026-06-30'
+    assert RetainedValuationReader._latest_income_period(catalogues, '2026-11-01', 'ttm') == '2026-09-30'
+
+
 def test_direct_income_intake_latest_catalogue_and_known_at_corrections(tmp_path):
     import hashlib
     from copy import deepcopy
@@ -1699,11 +1802,16 @@ def test_official_absence_review_requires_dated_inventory_and_revalidates_file(t
                 assert daily.store.conn.execute("SELECT count(*) FROM multi_source_observation WHERE data_type='valuation_review'").fetchone()[0] == 1
         # A bare qualified assertion cannot make equity into annual earnings.
         forged = deepcopy(review)
-        forged['earnings_reviews'] = {'static': dict(qualified=True,
+        forged['earnings_reviews'] = {mode: dict(qualified=True,
             definition='ordinary_shareholder_profit_v1',periods=[dict(period_start='2025-01-01',
-                period_end='2025-12-31',parent_profit=6000000,other_equity_profit_distribution=0)])}
+                period_end='2025-12-31',parent_profit=6000000,other_equity_profit_distribution=0)])
+            for mode in ('static', 'ttm')}
         forged_result = c._valuation_review(forged,day,'2026-07-02T17:00:00+08:00')
         assert forged_result['valuation_eligible'] and forged_result['field_status']['pe'] == 'unknown'
+        assert forged_result['field_status']['pe_ttm'] == 'unknown'
+        assert forged_result['values']['pb'] == result['values']['pb']
+        assert forged_result['values']['total_mv'] == result['values']['total_mv']
+        assert forged_result['values']['circ_mv'] == result['values']['circ_mv']
         calls_before = len(c.client.calls)
         worklist = c.prepare_valuation_reviews('2026-07-02',[code,'002731.SZ'],
                                                observed_at='2026-07-02T17:00:00+08:00')

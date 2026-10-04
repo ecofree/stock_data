@@ -1182,8 +1182,23 @@ class RetainedValuationReader:
 
     @staticmethod
     def _latest_income_period(catalogues, day, mode):
-        """Derive reported periods from the hash-checked, complete original catalogue."""
+        """Recognize full reports, not notices mentioning an undisclosed report.
+
+        The year and report type must belong to one complete title. Unknown or
+        multi-report titles cannot establish a latest published income period.
+        Original statement and correction checks still qualify the amounts.
+        """
         from zoneinfo import ZoneInfo
+        report_title = re.compile(
+            r'(?P<issuer>[^\d。；;!?！？《》]*?)'
+            r'(?P<year>(?:19|20)\d{2})\s*年?\s*'
+            r'(?P<kind>半年度报告|第一季度报告|第三季度报告|年度报告|一季度报告|三季度报告)'
+            r'(?:\s*全文)?(?:\s*[（(](?:更正|修订|更新)(?:后|版|稿)?[）)])?\s*')
+        notice_terms = ('关于', '公告', '通知', '风险', '提示', '无法', '不能', '未披露', '未能', '尚未',
+                        '延期', '延迟', '推迟', '暂缓', '披露', '预约', '预告', '审议',
+                        '问询', '回复', '审计', '说明', '摘要', '董事会', '监事会')
+        period_ends = {'半年度报告': '06-30', '第一季度报告': '03-31', '一季度报告': '03-31',
+                       '第三季度报告': '09-30', '三季度报告': '09-30', '年度报告': '12-31'}
         periods = []
         for catalogue in catalogues:
             body = json.loads(Path(catalogue['document']['path']).read_text(encoding='utf-8'))
@@ -1193,9 +1208,9 @@ class RetainedValuationReader:
                          for p in body['source_pages']]
             for page in pages:
                 for row in page.get('announcements', []):
-                    title = str(row.get('announcementTitle', ''))
-                    year = re.search(r'((?:19|20)\d{2})\s*年?', title)
-                    if not year:
+                    title = str(row.get('announcementTitle', '')).strip()
+                    report = report_title.fullmatch(title)
+                    if not report or any(term in report['issuer'] for term in notice_terms):
                         continue
                     announcement = row.get('announcementTime')
                     if isinstance(announcement, (int, float)) and not isinstance(announcement, bool):
@@ -1207,19 +1222,10 @@ class RetainedValuationReader:
                         announced = _iso(row.get('announcement_date') or announcement or '')
                     if announced > day:
                         continue
-                    if '半年度报告' in title:
-                        end = '06-30'
-                    elif '第一季度报告' in title or '一季度报告' in title:
-                        end = '03-31'
-                    elif '第三季度报告' in title or '三季度报告' in title:
-                        end = '09-30'
-                    elif '年度报告' in title:
-                        end = '12-31'
-                    else:
-                        continue
+                    end = period_ends[report['kind']]
                     if mode == 'static' and end != '12-31':
                         continue
-                    period = f'{year[1]}-{end}'
+                    period = f'{report["year"]}-{end}'
                     if period < announced:
                         periods.append(period)
         if not periods:
