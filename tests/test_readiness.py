@@ -166,6 +166,219 @@ def _qualified_sector(con, day):
                 "(?, 'ths_concept',1,1,100,'success','derived_ths_stock_aggregate',NULL)", [day, day])
 
 
+def _frozen_operation(tmp_path, monkeypatch, phase, *, price_view=False):
+    from datetime import timedelta
+    import time
+    from trade_system import pipeline_runtime as runtime
+    from trade_system.collection_profiles import operational_readiness
+    from trade_system.p0_observation import operational_evidence_identity
+    day = '2026-09-29'
+    observed = datetime.fromisoformat(day + ('T09:16:30' if phase == 'auction' else
+                                            'T10:02:00' if phase == 'intraday' else 'T17:30:00'))
+    source = tmp_path / 'live.duckdb'
+    with duckdb.connect(str(source)) as con:
+        if phase == 'auction':
+            con.execute('CREATE TABLE daily_summary(date DATE,fetched_at TIMESTAMP,source_kind VARCHAR)')
+            con.execute("INSERT INTO daily_summary VALUES (?,?,'native')", [day, observed])
+            con.execute('CREATE VIEW v_market_state_inputs AS SELECT date trade_date,fetched_at,source_kind FROM daily_summary')
+            con.execute('CREATE TABLE v_limit_pool(trade_date DATE,fetched_at TIMESTAMP)')
+            con.execute('INSERT INTO v_limit_pool VALUES (?,?)', [day, observed])
+            con.execute('CREATE TABLE auction_tick(date DATE,fetched_at TIMESTAMP,price DOUBLE)')
+            con.execute('INSERT INTO auction_tick VALUES (?,?,10)', [day, observed])
+            con.execute('CREATE VIEW v_auction_status AS SELECT date trade_date,fetched_at,price FROM auction_tick')
+        else:
+            (_qualified_stock if phase == 'intraday' else _qualified_prices)(con, day)
+            if price_view:
+                con.execute('ALTER TABLE v_kline_daily RENAME TO tushare_daily')
+                con.execute('INSERT INTO tushare_daily SELECT * REPLACE (2 AS change_pct) FROM tushare_daily')
+                con.execute('CREATE VIEW v_kline_daily AS SELECT * FROM (SELECT *,row_number() OVER '
+                            '(PARTITION BY trade_date,stock_code ORDER BY fetched_at DESC,rowid DESC) n '
+                            'FROM tushare_daily) WHERE n=1')
+            _qualified_sector(con, day)
+            received = day + (' 10:00:00' if phase == 'intraday' else ' 16:00:00')
+            con.execute('UPDATE multi_source_stock_flow SET fetched_at=?', [received])
+            for code, encoded in con.execute('SELECT sector_code,raw_json FROM multi_source_sector_flow').fetchall():
+                row = json.loads(encoded)
+                row['raw'].update(input_received_min=received, input_received_max=received)
+                con.execute('UPDATE multi_source_sector_flow SET fetched_at=?,raw_json=? WHERE sector_code=?',
+                            [received, json.dumps(row), code])
+            for table in ('intraday_stock_flow_batch', 'intraday_sector_flow_batch', 'intraday_sector_flow_taxonomy'):
+                con.execute('ALTER TABLE ' + table + ' ADD COLUMN updated_at TIMESTAMP')
+                con.execute('UPDATE ' + table + ' SET updated_at=?', [received])
+    assessed = operational_readiness(source, day, phase, observed.isoformat())
+    assert assessed['ready'], assessed
+    sha = 'a' * 64
+    assessed['collector_contract_sha256'] = sha
+    assessed['evidence_identity_sha256'] = operational_evidence_identity(assessed)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed + timedelta(seconds=1)
+    monkeypatch.setattr(runtime, 'datetime', Clock)
+    folder = tmp_path / 'run-one'
+    folder.mkdir()
+    snapshot = runtime.freeze_operational_inputs(source, folder, run_id='run-one', trade_date=day,
+        phase=phase, evaluated_at=observed.isoformat(), collector_contract_sha256=sha,
+        deadline_epoch=time.time() + 15)
+    manifest = {'run_id': 'run-one', 'trade_date': day, 'phase': phase, '_run_dir': str(folder),
+        'started_at': (observed - timedelta(seconds=20)).isoformat(),
+        'completed_at': (observed + timedelta(seconds=10)).isoformat(),
+        'operational_assessment': assessed, 'operational_input_snapshot': snapshot,
+        'operational_completion': {'completed': True, 'failures': [], 'pending': []}}
+    return source, manifest, sha
+
+
+@pytest.mark.parametrize('phase', ['auction', 'intraday', 'close', 'supplemental'])
+def test_window_evidence_survives_later_market_auction_and_batch_refresh(tmp_path, monkeypatch, phase):
+    from trade_system.p0_observation import _operational_receipt_errors
+    from trade_system.collection_profiles import operational_readiness
+    source, manifest, sha = _frozen_operation(tmp_path, monkeypatch, phase)
+    assert _operational_receipt_errors(manifest, manifest['trade_date'], sha, source) == []
+    with duckdb.connect(str(source)) as con:
+        if phase == 'auction':
+            con.execute("UPDATE daily_summary SET fetched_at='2026-09-30 20:00:00'")
+            con.execute("UPDATE auction_tick SET fetched_at='2026-09-29 09:24:00',price=20")
+        else:
+            con.execute("UPDATE intraday_stock_flow_batch SET updated_at='2026-09-30 20:00:00'")
+            con.execute("UPDATE intraday_sector_flow_taxonomy SET updated_at='2026-09-30 20:00:00'")
+            con.execute("UPDATE multi_source_stock_flow SET fetched_at='2026-09-30 20:00:00',main_net=200")
+    assert not operational_readiness(source, manifest['trade_date'], phase,
+        manifest['operational_assessment']['evaluated_at'])['ready']
+    assert _operational_receipt_errors(manifest, manifest['trade_date'], sha, source) == []
+
+
+def test_snapshot_rebuilds_price_view_only_from_frozen_dated_raw_rows_and_original_rowids(tmp_path, monkeypatch):
+    from pathlib import Path
+    from trade_system.p0_observation import _operational_receipt_errors
+    source, manifest, sha = _frozen_operation(tmp_path, monkeypatch, 'close', price_view=True)
+    path = Path(manifest['_run_dir']) / manifest['operational_input_snapshot']['path']
+    with duckdb.connect(str(path), read_only=True) as con:
+        assert con.execute('SELECT rowid,change_pct FROM tushare_daily ORDER BY rowid').fetchall() == [(0, 1.0), (1, 2.0)]
+        assert con.execute('SELECT change_pct FROM v_kline_daily').fetchall() == [(2.0,)]
+        assert len(con.execute('PRAGMA database_list').fetchall()) == 1
+    # Removing the original database demonstrates there is no live fallback.
+    source.rename(source.with_suffix('.retained'))
+    assert _operational_receipt_errors(manifest, manifest['trade_date'], sha, source) == []
+
+
+@pytest.mark.parametrize('damage', ['missing', 'bytes', 'raw_values', 'run', 'day', 'contract', 'path', 'forged_green'])
+def test_operational_snapshot_rejects_tampering_and_missing_historical_evidence(tmp_path, monkeypatch, damage):
+    from pathlib import Path
+    from trade_system.p0_observation import _operational_receipt_errors
+    source, manifest, sha = _frozen_operation(tmp_path, monkeypatch, 'auction')
+    snapshot = manifest['operational_input_snapshot']
+    path = Path(manifest['_run_dir']) / snapshot['path']
+    if damage == 'missing':
+        manifest.pop('operational_input_snapshot')
+    elif damage == 'bytes':
+        path.write_bytes(path.read_bytes() + b'changed')
+    elif damage in {'raw_values', 'forged_green'}:
+        with duckdb.connect(str(path)) as con:
+            con.execute('UPDATE auction_tick SET price=99')
+            if damage == 'forged_green':
+                con.execute("UPDATE daily_summary SET fetched_at='2026-09-30 20:00:00'")
+                con.execute("UPDATE v_market_state_inputs SET fetched_at='2026-09-30 20:00:00'")
+        if damage == 'forged_green':
+            # Even a recomputed file hash cannot turn the stored green flag
+            # into evidence: replay must reject the actual future input.
+            snapshot.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest(), bytes=path.stat().st_size)
+    elif damage == 'run':
+        manifest['run_id'] = 'another-run'
+    elif damage == 'day':
+        snapshot['trade_date'] = '2026-09-28'
+    elif damage == 'contract':
+        snapshot['collector_contract_sha256'] = 'b' * 64
+    else:
+        snapshot['path'] = '../other.duckdb'
+    assert _operational_receipt_errors(manifest, manifest['trade_date'], sha, source)
+
+
+def test_operational_snapshot_budget_and_historical_capture_fail_closed(tmp_path, monkeypatch):
+    import time
+    from trade_system import pipeline_runtime as runtime
+    source, manifest, sha = _frozen_operation(tmp_path, monkeypatch, 'auction')
+    folder = tmp_path / 'next-run'
+    folder.mkdir()
+    kwargs = dict(run_id='next-run', trade_date=manifest['trade_date'], phase='auction',
+        evaluated_at=manifest['operational_assessment']['evaluated_at'], collector_contract_sha256=sha)
+    with pytest.raises(ValueError, match='budget exhausted'):
+        runtime.freeze_operational_inputs(source, folder, **kwargs, deadline_epoch=time.time()-1)
+    monkeypatch.setattr(runtime, 'OPERATIONAL_SNAPSHOT_MAX_BYTES', 1)
+    with pytest.raises(ValueError, match='size budget'):
+        runtime.freeze_operational_inputs(source, folder, **kwargs, deadline_epoch=time.time()+15)
+    assert not list(folder.iterdir())
+    kwargs['evaluated_at'] = '2026-09-28T09:16:30'
+    with pytest.raises(ValueError, match='only current'):
+        runtime.freeze_operational_inputs(source, folder, **kwargs, deadline_epoch=time.time()+15)
+
+
+@pytest.mark.parametrize('external', [False, True])
+def test_snapshot_price_view_rejects_cross_catalog_and_external_dependencies(tmp_path, monkeypatch, external):
+    import time
+    from trade_system import pipeline_runtime as runtime
+    source, manifest, sha = _frozen_operation(tmp_path, monkeypatch, 'close', price_view=True)
+    with duckdb.connect(str(source)) as con:
+        con.execute('DROP VIEW v_kline_daily')
+        if external:
+            outside = tmp_path / 'outside.csv'
+            outside.write_text('value\n1\n', encoding='utf-8')
+            con.execute("CREATE VIEW v_kline_daily AS SELECT * FROM read_csv('" + outside.as_posix() + "')")
+        else:
+            con.execute('CREATE VIEW v_kline_daily AS SELECT * FROM live.main.tushare_daily')
+    folder = tmp_path / 'rejected-run'
+    folder.mkdir()
+    with pytest.raises((ValueError, duckdb.Error), match='unsealed input|file system operations are disabled'):
+        runtime.freeze_operational_inputs(source, folder, run_id='rejected-run',
+            trade_date=manifest['trade_date'], phase='close',
+            evaluated_at=manifest['operational_assessment']['evaluated_at'],
+            collector_contract_sha256=sha, deadline_epoch=time.time()+15)
+    assert not list(folder.iterdir())
+
+
+def test_snapshot_replay_restricts_the_actual_evaluator_and_interrupts_even_swallowed_timeout(tmp_path, monkeypatch):
+    import time
+    from pathlib import Path
+    from trade_system import pipeline_runtime as runtime, collection_profiles
+    _, manifest, _ = _frozen_operation(tmp_path, monkeypatch, 'auction')
+    path = Path(manifest['_run_dir']) / manifest['operational_input_snapshot']['path']
+    def evaluator(con, *args):
+        assert con.execute("SELECT current_setting('enable_external_access')").fetchone() == (False,)
+        with pytest.raises(duckdb.Error, match='file system operations are disabled'):
+            con.execute("SELECT * FROM read_text('unavailable-outside-file')")
+        # Readiness diagnostics may catch SQL errors; later queries must still
+        # be interrupted and their fabricated success must remain unqualified.
+        for _ in range(2):
+            with pytest.raises(duckdb.InterruptException):
+                con.execute('SELECT sum(i*j) FROM range(1000000000) t(i),range(1000000000) s(j)')
+        return {'ready': True}
+    monkeypatch.setattr(collection_profiles, 'operational_readiness', evaluator)
+    started = time.time()
+    with pytest.raises(ValueError, match='replay budget exhausted'):
+        runtime.replay_operational_snapshot(path, manifest['trade_date'], 'auction',
+            manifest['operational_assessment']['evaluated_at'], deadline_epoch=started+.15)
+    assert time.time()-started < 2
+
+
+def test_snapshot_replay_deadline_reaches_borrowed_capital_flow_diagnostics(tmp_path, monkeypatch):
+    import time
+    from pathlib import Path
+    from trade_system import pipeline_runtime as runtime, capital_flow_health as health
+    _, manifest, _ = _frozen_operation(tmp_path, monkeypatch, 'auction')
+    path = Path(manifest['_run_dir']) / manifest['operational_input_snapshot']['path']
+    visited = []
+    def expensive_diagnostic(con, *args, **kwargs):
+        visited.append(con.execute("SELECT current_setting('enable_external_access')").fetchone())
+        con.execute('SELECT sum(i*j) FROM range(1000000000) t(i),range(1000000000) s(j)')
+        raise AssertionError('deadline must interrupt the actual borrowed diagnostic')
+    monkeypatch.setattr(health, '_relation_health', expensive_diagnostic)
+    started = time.time()
+    with pytest.raises(ValueError, match='replay budget exhausted'):
+        runtime.replay_operational_snapshot(path, manifest['trade_date'], 'auction',
+            manifest['operational_assessment']['evaluated_at'], deadline_epoch=started+.5)
+    assert visited == [(False,)]
+    assert time.time()-started < 3
+
+
 def test_unknown_required_sector_denominator_never_borrows_other_product_coverage():
     from trade_system.readiness import required_sector_taxonomy_coverage
     con=duckdb.connect(':memory:')

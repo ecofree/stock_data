@@ -83,11 +83,23 @@ try {
     $valuationArgs=if ($ValuationWorkspace) {@('--valuation-workspace',$ValuationWorkspace)} else {@()}
     $preflight=Invoke-StockDataProcess -Executable $Python -Arguments (@($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') + $valuationArgs) -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
     if ($preflight.ExitCode -ne 0) {throw ('Collection contract rejected before backup: '+$preflight.Stderr)}
+    $calendarCode="import json,sys; from trade_system.trading_calendar import trading_session_status; s=trading_session_status(sys.argv[1],sys.argv[2]); print(json.dumps({'state':s.state,'reason':s.reason}))"
+    $calendarResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-B','-c',$calendarCode,$DbPath,$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 30 -ProgressPath $processState
+    if ($calendarResult.ExitCode -ne 0) {throw ('Trading calendar could not be read: '+$calendarResult.Stderr)}
+    $calendar=$calendarResult.Stdout | ConvertFrom-Json
+    if ($calendar.state -eq 'closed') {
+        "DAILY_RUN_MARKET_CLOSED trade_date=$TradeDate backup_status=not_attempted collection_started=false" | Write-CloseLog
+        $code=0
+        exit 0
+    }
+    if ($calendar.state -ne 'open') {throw ('Trading calendar unverified; no backup or collection started: '+$calendar.reason)}
     $windowCode="import json,sys; from trade_system.pipeline_runtime import load_observation_contract,observation_windows; print(json.dumps(observation_windows(load_observation_contract(sys.argv[1],sys.argv[2]),sys.argv[3],'close')[0]))"
     $windowResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$windowCode,$CollectorContract,$CollectorContractSha256,$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 30 -ProgressPath $processState
     if ($windowResult.ExitCode -ne 0) {throw ('Accepted close observation window unavailable: '+$windowResult.Stderr)}
     $window=$windowResult.Stdout | ConvertFrom-Json
-    $closeDeadline=[DateTimeOffset]::Parse($window.deadline_at).ToUnixTimeSeconds()
+    # ToUnixTimeSeconds returns Int64, whose formatter rejects "R" in Windows
+    # PowerShell 5.1. Keep all deadline arithmetic/serialization explicitly Double.
+    [double]$closeDeadline=[DateTimeOffset]::Parse($window.deadline_at).ToUnixTimeSeconds()
     if ($previousDeadline) {
         $parsed=[double]::Parse($previousDeadline,[Globalization.CultureInfo]::InvariantCulture)
         if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {throw 'Finite inherited close deadline required'}
@@ -98,7 +110,7 @@ try {
     # Copy is guarded with PipelineLock's owner protocol. No metadata-only
     # Test-Path refusal, PID probing, deletion, or separate incompatible lock.
     # Reserve 90s before the latest start for the actual collector preflight.
-    $copyDeadline=[Math]::Min($closeDeadline,[DateTimeOffset]::Parse($window.start_latest_at).ToUnixTimeSeconds()-90)
+    [double]$copyDeadline=[Math]::Min($closeDeadline,[DateTimeOffset]::Parse($window.start_latest_at).ToUnixTimeSeconds()-90)
     $prepareCode="import json,sys; from trade_system.pipeline_runtime import prepare_daily_backup; print(json.dumps(prepare_daily_backup(sys.argv[1],sys.argv[2],sys.argv[3],deadline_epoch=float(sys.argv[4]))))"
     try {
         $prepared=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$prepareCode,$DbPath,$BackupDir,$backupRunId,$copyDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) -WorkingDirectory $Root -DeadlineEpoch $copyDeadline -TimeoutSeconds 120 -ProgressPath $processState

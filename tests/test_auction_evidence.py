@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from trade_system.schema import init_schema
 from scripts.collect_auction_evidence import (
@@ -14,6 +15,56 @@ from trade_system.auction_evidence import (
     render_auction_evidence_report,
     resolve_auction_trade_date,
 )
+
+
+@pytest.mark.parametrize('failure_stage', ['tick_before_commit', 'quote_after_commit'])
+def test_collector_error_preserves_only_returned_committed_tick_counts(tmp_path, monkeypatch, failure_stage):
+    from datetime import datetime
+    from types import SimpleNamespace
+    import scripts.collect_auction_evidence as collector
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 9, 9, 24)
+
+    class Store:
+        def __init__(self, path):
+            self.conn=duckdb.connect(str(path))
+        def close(self):
+            self.conn.close()
+
+    def schema(con):
+        con.execute('CREATE TABLE auction_tick(date DATE,stock_code VARCHAR,volume_unit VARCHAR)')
+
+    def ticks(client, store, day, codes):
+        store.conn.execute('BEGIN')
+        store.conn.execute("INSERT INTO auction_tick VALUES (?,?,'unknown')", [day,codes[0]])
+        if failure_stage=='tick_before_commit':
+            store.conn.execute('ROLLBACK')
+            raise TimeoutError('tick budget exhausted before commit')
+        store.conn.execute('COMMIT')
+        return 1
+
+    def quotes(*args):
+        raise TimeoutError('quote budget exhausted after tick commit')
+
+    monkeypatch.setattr(collector,'datetime',Clock)
+    monkeypatch.setattr(collector,'_codes',lambda *a, **kw:['000001'])
+    monkeypatch.setattr(collector,'require_api_key',lambda *a:None)
+    monkeypatch.setattr(collector,'KPLClient',lambda **kw:SimpleNamespace(stats={'success':1}))
+    monkeypatch.setattr(collector,'DuckDBStore',Store)
+    monkeypatch.setattr(collector,'init_schema',schema)
+    monkeypatch.setattr(collector,'collect_auction_tick',ticks)
+    monkeypatch.setattr(collector,'_collect_tencent_auction_quotes',quotes)
+    path=tmp_path/'auction-failure.duckdb'
+    result=collector.collect(str(path),'2026-10-09')
+    committed=int(failure_stage=='quote_after_commit')
+    assert result['status']=='error' and result['tick_rows']==committed
+    assert not result.get('qualified_tick') and result['quote_rows']==0
+    with duckdb.connect(str(path),read_only=True) as con:
+        assert con.execute('SELECT count(*) FROM auction_tick').fetchone()[0]==committed
+        assert con.execute('SELECT tick_rows,quote_rows,status FROM auction_collection_batch').fetchone()==(committed,0,'error')
 
 
 def test_auction_evidence_prefers_tick_over_fallback_sources(tmp_path):

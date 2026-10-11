@@ -47,7 +47,12 @@ $prefix=if ($ReleaseDirectory) { @('-I','-X','utf8','-B',$launcher) } else { @('
 # Daily market publication is local-data-only. It never waits for provider
 # acquisition, retraining, or promotion of a research model.
 $market=Invoke-StockDataProcess -Executable $Python -Arguments ($prefix+@('market-update','--output',$Workspace,'--expected-date',$ExpectedTradeDate)) -WorkingDirectory $projectPath
-($market.Stdout+$market.Stderr) | Tee-Object -FilePath $runLog -Append
+# Tee-Object appends UTF-16 in Windows PowerShell 5.1, which corrupts the
+# UTF-8 dependency log above. Keep the original stdout visible and append the
+# same text with an explicit encoding rather than rewriting earlier evidence.
+$marketText=$market.Stdout+$market.Stderr
+[IO.File]::AppendAllText($runLog,$marketText+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
+Write-Output $marketText
 if ($market.ExitCode -ne 0) { throw "Market publication failed ($($market.ExitCode)); prior verified page retained. Log: $runLog" }
 $marketReceipt=$market.Stdout.Trim() | ConvertFrom-Json
 if ($marketReceipt.status -eq 'market_closed') {

@@ -78,6 +78,11 @@ def test_intraday_plan_excludes_after_close_fanout():
     assert "evaluate_qlib_shadow" not in names
     assert "run_news_radar" not in names
     assert not {'generate_signals','generate_intraday_stage_signals','run_daily_operator_loop'} & set(names)
+    auction = [name for name, _, _ in command_plan(
+        'sample.duckdb', '2026-07-15', include_collection=True, phase='auction')]
+    assert auction == ['collect_realtime_limit_pool', 'collect_auction_evidence',
+                       'build_auction_evidence', 'build_normalized_views',
+                       'check_data_readiness', 'collect_market_context']
 
 
 def test_migration_plans_do_not_call_retired_decision_or_terminal_entries():

@@ -130,7 +130,11 @@ def reconcile(
         amount_match_pct = (n-len(disagreements))*100.0/n if n else 0.0
         clocks = {}
         close_at = datetime.combine(date.fromisoformat(trade_date), time(15))
-        for provider in (primary_provider, reference_provider):
+        # Absence is already represented by reference_provider/selection_reason.
+        # Do not invent evidence for it, or emit an empty object key that the
+        # Windows PowerShell 5.1 handoff cannot deserialize.
+        evidence_providers = tuple(p for p in (primary_provider, reference_provider) if p)
+        for provider in evidence_providers:
             minimum, maximum, absent = con.execute('''SELECT min(fetched_at),max(fetched_at),
                 count(*) FILTER (WHERE fetched_at IS NULL) FROM multi_source_stock_flow
                 WHERE source_date=? AND provider=? AND is_stale=FALSE''', [trade_date,provider]).fetchone()
@@ -151,7 +155,7 @@ def reconcile(
             'rule_version':RULE_VERSION,
             'expected_codes_sha256':hashlib.sha256(json.dumps(sorted(universe)).encode()).hexdigest(),
             'source_fingerprints':{p:stock_flow_evidence_fingerprint(con,trade_date,p)
-                                   for p in (primary_provider,reference_provider)},
+                                   for p in evidence_providers},
             'comparison_contract': comparison,
             'expected_rows':len(universe), 'coverage_denominator':'dated_approved_stock_universe',
             'input_arrival_times':clocks, 'absolute_tolerance_yuan':absolute_tolerance,
@@ -160,7 +164,7 @@ def reconcile(
             "scope": "declared_data_origin_comparison_not_independent_transport_attestation",
             "trade_date": trade_date,
             "primary_provider": primary_provider,
-            "reference_provider": reference_provider,
+            "reference_provider": reference_provider or None,
             "primary_rows": len(primary),
             "reference_rows": len(reference),
             "overlap_rows": len(overlap_codes),

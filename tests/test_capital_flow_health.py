@@ -316,6 +316,21 @@ def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path,
     assert result['reconciliation']['independent_reconciliation_ready']
     assert result['flow_certified_ready']
     assert result['stock_independent_certified_ready']
+    import trade_system.capital_flow_health as health
+    from trade_system.readiness import assess_trade_date_readiness
+    with duckdb.connect(str(db), read_only=True, config={'enable_external_access': False,
+            'memory_limit': '512MB', 'max_temp_directory_size': '0B', 'threads': 1}) as restricted:
+        with monkeypatch.context() as isolated:
+            def unexpected_reopen(*args, **kwargs):
+                raise AssertionError('borrowed restricted connection must not reopen its database')
+            isolated.setattr(health, 'connect_duckdb', unexpected_reopen)
+            borrowed = assess_capital_flow_health(restricted, day, now=datetime(2026,9,29,18), session_close=True)
+            assert borrowed == result
+            assessed = assess_trade_date_readiness(restricted, day, 'close', now=datetime(2026,9,29,18))
+            assert assessed['flow_certified_ready']
+            assert assessed['capital_flow_health']['reconciliation']['independent_reconciliation_ready']
+            assert restricted.execute("SELECT current_setting('enable_external_access')").fetchone() == (False,)
+            assert restricted.execute('SELECT 1').fetchone() == (1,)
     with duckdb.connect(str(db)) as con:
         con.execute('DROP TABLE intraday_stock_flow_reconciliation')
     without_relay = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)

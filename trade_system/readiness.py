@@ -1123,18 +1123,8 @@ def assess_trade_date_readiness(
     try:
         from trade_system.capital_flow_health import assess_capital_flow_health
 
-        flow_db_path = db_path
-        if isinstance(db_path, duckdb.DuckDBPyConnection):
-            db_rows = db_path.execute("PRAGMA database_list").fetchall()
-            persisted = next(
-                (str(row[2]) for row in db_rows if len(row) > 2 and row[2]),
-                "",
-            )
-            if not persisted:
-                raise ValueError("capital flow certification requires a persisted database")
-            flow_db_path = persisted
         flow_health = assess_capital_flow_health(
-            flow_db_path,
+            db_path,
             trade_date,
             max_age_seconds=max_age_seconds,
             now=now,

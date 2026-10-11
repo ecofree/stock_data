@@ -206,6 +206,9 @@ def test_two_strict_sessions_unlock_configured_observation_window(tmp_path,monke
                 'phase': phase, 'evaluated_at': observed, 'ready': True,
                 'scope': 'isolated_test_verified_core_input_facts'}
     monkeypatch.setattr(collection_profiles, 'operational_readiness', operational_assessor)
+    from trade_system import pipeline_runtime
+    monkeypatch.setattr(pipeline_runtime, 'verified_operational_snapshot', lambda *a: 'isolated-scheduling-fixture')
+    monkeypatch.setattr(pipeline_runtime, 'replay_operational_snapshot', operational_assessor)
     # This test isolates scheduling/publication from the separately exercised
     # actual source and definition validator below.
     for trade_date in ("2026-07-23", "2026-07-24"):
@@ -653,6 +656,9 @@ def test_operational_revalidation_ignores_strict_progress_but_rejects_changed_fa
         'completed_at': '2026-09-29T18:00:00+08:00', 'operational_assessment': saved,
         'operational_completion': {'completed': True, 'failures': [], 'pending': []}}
     monkeypatch.setattr(collection_profiles, 'operational_readiness', lambda *a, **k: dict(assessment))
+    from trade_system import pipeline_runtime
+    monkeypatch.setattr(pipeline_runtime, 'verified_operational_snapshot', lambda *a: 'isolated-identity-fixture')
+    monkeypatch.setattr(pipeline_runtime, 'replay_operational_snapshot', lambda *a, **k: dict(assessment))
     assessment.update(strict_data_certified_ready=True, strict_missing_groups=[])
     assert p0._operational_receipt_errors(manifest, '2026-09-29', CONTRACT_SHA, 'unused') == []
     assessment['capabilities'] = {'market_view': {'ready': True, 'source_sha256': 'b' * 64},

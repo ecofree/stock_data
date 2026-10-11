@@ -139,6 +139,17 @@ def test_independent_amount_gate_rejects_unit_scale_and_shrunk_denominator(tmp_p
     result = entry.reconcile(db,'2026-07-09',primary_provider='primary',reference_provider='reference')
     assert result['status'] == 'warning' and result['expected_rows'] == 3
     assert result['overlap_reference_pct'] < 67
+    with duckdb.connect(str(db)) as con:
+        con.execute("DELETE FROM multi_source_stock_flow WHERE provider='reference'")
+    result = entry.reconcile(db,'2026-07-09',primary_provider='primary')
+    assert result['status'] == 'incomparable'
+    assert result['last_error'] == 'no_reviewed_reference_product'
+    assert result['reference_provider'] is None and result['reference_rows'] == 0
+    assert set(result['source_fingerprints']) == {'primary'}
+    assert set(result['input_arrival_times']) == {'primary'}
+    with duckdb.connect(str(db), read_only=True) as con:
+        saved = json.loads(con.execute('SELECT evidence_json FROM intraday_stock_flow_independent_reconciliation').fetchone()[0])
+    assert saved == result
 
 
 def test_bj_tushare_moneyflow_zero_is_not_proof_of_field_capability():

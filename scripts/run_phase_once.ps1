@@ -67,13 +67,39 @@ if ($null -eq $code) { $code = 1 }
 # receipt, not console text or an old latest file, permits a publication request.
 if ($PublicationTask -and $code -in @(0,2)) {
     $receiptPath=Join-Path $ReportsDirectory ('runs\'+$runId+'\run.json')
-    $receipt=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+    # Legacy evidence can contain an unknown provider as an empty JSON key.
+    # Windows PowerShell 5.1 cannot deserialize that object. Read original bytes
+    # with Python and project only this handoff's scalar fields; never rewrite
+    # the saved receipt or rename its unknown source into a fabricated provider.
+    $receiptHash=(Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $readReceiptCode=@'
+import hashlib,json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+if p.stat().st_size>20000000: raise ValueError('Collection receipt exceeds read budget')
+raw=p.read_bytes()
+digest=hashlib.sha256(raw).hexdigest()
+if digest!=sys.argv[2]: raise ValueError('Collection receipt changed before handoff')
+r=json.loads(raw.decode('utf-8-sig'))
+ready=r.get('publication_readiness') or {}
+result={k:r.get(k) for k in ('run_id','trade_date','phase','scope','collector_contract_sha256','status')}
+if any(v is not None and not isinstance(v,str) for v in result.values()): raise ValueError('Invalid collection receipt binding')
+result.update(receipt_sha256=digest,
+    normalized_count=sum(s.get('name')=='build_normalized_views' and s.get('status')=='completed' and type(s.get('return_code')) is int and s['return_code']==0 for s in r.get('steps',[])),
+    publication_readiness={k:ready.get(k) for k in ('passed','trade_date','reason')})
+if any(isinstance(v,(dict,list)) for v in result['publication_readiness'].values()): raise ValueError('Invalid publication readiness handoff')
+if ready.get('passed') is not None and type(ready['passed']) is not bool: raise ValueError('Boolean publication readiness required')
+print(json.dumps(result,ensure_ascii=True))
+'@
+    $readResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-B','-c',$readReceiptCode,$receiptPath,$receiptHash) -WorkingDirectory $Root -TimeoutSeconds 30
+    if ($readResult.ExitCode -ne 0) {throw ('Collection receipt handoff failed; no publication requested: '+$readResult.Stderr)}
+    $receipt=$readResult.Stdout | ConvertFrom-Json
+    if ($receipt.receipt_sha256 -ne $receiptHash) {throw 'Collection receipt SHA mismatch; no publication requested'}
     if ($receipt.run_id -ne $runId -or $receipt.trade_date -ne $TradeDate -or $receipt.phase -ne $Phase -or
         $receipt.scope -ne 'transitional_market_collection_only' -or
         $receipt.collector_contract_sha256 -ne $CollectorContractSha256) { throw 'Collection receipt binding mismatch; no publication requested' }
-    $normalized=@($receipt.steps | Where-Object { $_.name -eq 'build_normalized_views' -and $_.status -eq 'completed' -and $_.return_code -eq 0 })
     $ready=$receipt.publication_readiness
-    if ($receipt.status -in @('completed','completed_with_warnings','completed_with_certification_gaps','completed_with_degradation') -and $normalized.Count -eq 1 -and
+    if ($receipt.status -in @('completed','completed_with_warnings','completed_with_certification_gaps','completed_with_degradation') -and $receipt.normalized_count -eq 1 -and
         $ready.passed -eq $true -and $ready.trade_date -eq $TradeDate) {
         $task=Get-ScheduledTask -TaskName $PublicationTask -TaskPath '\' -ErrorAction Stop
         if ($task.State -eq 'Running') { throw 'Publication task already running; request not queued. Retry publication after completion.' }
@@ -83,8 +109,9 @@ if ($PublicationTask -and $code -in @(0,2)) {
             $action[0].Arguments -notmatch 'run_research_daily\.ps1"' -or $action[0].Arguments -match '-RefreshResearch') {
             throw 'Unified local publication task is not ready; no request made'
         }
+        if ((Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash -ne $receiptHash) {throw 'Collection receipt changed during handoff; no publication requested'}
         Start-ScheduledTask -TaskName $PublicationTask -TaskPath '\' -ErrorAction Stop
-        "PUBLICATION_REQUESTED task=$PublicationTask run_id=$runId; publication_verified=false" | Tee-Object -FilePath $Log -Append
+        "PUBLICATION_REQUESTED task=$PublicationTask run_id=$runId receipt_sha256=$receiptHash; publication_verified=false" | Tee-Object -FilePath $Log -Append
     } else {
         "PUBLICATION_NOT_REQUESTED run_id=$runId status=$($receipt.status) reason=$($ready.reason)" | Tee-Object -FilePath $Log -Append
     }

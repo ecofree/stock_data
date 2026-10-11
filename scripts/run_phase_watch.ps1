@@ -177,16 +177,18 @@ $unattempted = $windows.Count - $attempts - $missed
 # Let the final original budget close before classifying it. This wait starts
 # no new work and permits only an already authorized bounded recovery receipt.
 if ($unattempted -eq 0) { Wait-WatchUntil ([DateTimeOffset]::Parse($windows[-1].deadline_at)) }
-$readResult = "import json,sys; from trade_system.pipeline_runtime import load_observation_contract,all_manifests; from trade_system.p0_observation import audit_phase_windows; p=load_observation_contract(sys.argv[1],sys.argv[2]); r=audit_phase_windows(all_manifests(sys.argv[5]),sys.argv[3],sys.argv[4],sys.argv[2],p); print(json.dumps({'passed':r['passed'],'required':r['required_window_count'],'qualified':r['qualified_window_count'],'errors':r['evidence_errors']}))"
+$readResult = "import json,sys; from trade_system.pipeline_runtime import load_observation_contract,all_manifests; from trade_system.p0_observation import audit_phase_windows; p=load_observation_contract(sys.argv[1],sys.argv[2]); m=all_manifests(sys.argv[5]); r=audit_phase_windows(m,sys.argv[3],sys.argv[4],sys.argv[2],p); o=audit_phase_windows(m,sys.argv[3],sys.argv[4],sys.argv[2],p,operational=True,db_path=sys.argv[6]); print(json.dumps({'passed':r['passed'],'required':r['required_window_count'],'qualified':r['qualified_window_count'],'errors':r['evidence_errors'],'operational_passed':o['passed'],'operational_required':o['required_window_count'],'operational_qualified':o['qualified_window_count'],'operational_errors':o['evidence_errors']}))"
 Push-Location $Root
 try {
-    $resultOutput = & $Python -c $readResult $CollectorContract $CollectorContractSha256 $day $Phase $ReportsDirectory
+    $resultOutput = & $Python -c $readResult $CollectorContract $CollectorContractSha256 $day $Phase $ReportsDirectory $DbPath
     if ($LASTEXITCODE -ne 0) { throw 'Observation receipts could not be verified; watch remains unqualified' }
     $windowResult = ($resultOutput -join "`n") | ConvertFrom-Json
 } finally { Pop-Location }
 Write-WatchEvent "PHASE_WATCH_COMPLETE phase=$Phase required_windows=$($windows.Count) attempts=$attempts successes=$successes deferred=$deferred failures=$failures missed=$missed unattempted=$unattempted prepare_attempts=$prepareAttempts prepare_failures=$prepareFailures end=$EndAt"
 Write-WatchEvent "PHASE_WATCH_QUALIFICATION phase=$Phase qualified_windows=$($windowResult.qualified)/$($windowResult.required) passed=$($windowResult.passed) errors=$($windowResult.errors -join ',')"
+Write-WatchEvent "PHASE_WATCH_OPERATIONAL phase=$Phase qualified_windows=$($windowResult.operational_qualified)/$($windowResult.operational_required) passed=$($windowResult.operational_passed) strict_passed=$($windowResult.passed) errors=$($windowResult.operational_errors -join ',')"
 # Closed sessions and lunch have no declared slots. On an open day, every
-# declared slot must qualify; a green latest receipt cannot hide another slot.
-if ($windowResult.passed -eq $true) { exit 0 }
+# declared slot must qualify for factual operation; independent certification
+# stays visible separately and never borrows an operational success.
+if ($windowResult.operational_passed -eq $true) { exit 0 }
 exit 1

@@ -56,7 +56,7 @@ def test_old_registration_is_physically_removed_and_proposal_preserves_identity(
     assert 'SystemChanges=0;ProductionCutover=$false' in installer
 
 
-def _ps(script, *args, executable='powershell.exe'):
+def _ps(script, *args, executable=r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'):
     return subprocess.run([executable, '-NoProfile', '-NonInteractive', '-File', str(script), *map(str, args)],
         capture_output=True, text=True, encoding='utf-8' if Path(executable).stem.lower() == 'pwsh' else None, timeout=30,
         env={k:v for k,v in os.environ.items() if k.upper() != 'PSMODULEPATH'})
@@ -195,7 +195,8 @@ Assert-WindowBounds '2026-09-17T10:00:00+08:00' '2026-09-17T11:00:00+08:00' ([Da
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows scheduler adapter')
 @pytest.mark.parametrize('case,code,requested', [('success',0,True),('degraded',2,True),('closed',0,False),
     ('unknown_calendar',2,False),('lock',3,False),('normalize_failed',2,False),('wrong_receipt',1,False),
-    ('running',1,False),('unsafe_task',1,False)])
+    ('running',1,False),('unsafe_task',1,False),('legacy_empty_key',0,True),
+    ('wrong_sha',1,False),('changed_receipt',1,False),('string_readiness',1,False)])
 def test_supplemental_publication_uses_exact_receipt_and_mocked_task(tmp_path,case,code,requested):
     scripts=tmp_path/'scripts';scripts.mkdir()
     (scripts/'run_phase_once.ps1').write_text(_read('run_phase_once.ps1'))
@@ -204,7 +205,11 @@ def test_supplemental_publication_uses_exact_receipt_and_mocked_task(tmp_path,ca
     # scheduler, provider, database, account or live runtime is used.
     native=r'''
 function Invoke-StockDataProcess {
- param($Executable,$Arguments,$WorkingDirectory)
+ param($Executable,$Arguments,$WorkingDirectory,$TimeoutSeconds)
+ if ($Arguments -contains '-c') {
+   $out=& $Executable @Arguments
+   return [pscustomobject]@{ExitCode=$LASTEXITCODE;Stdout=($out -join "`n");Stderr=''}
+ }
  $id=$Arguments[[Array]::IndexOf($Arguments,'--run-id')+1]
  $reports=$Arguments[[Array]::IndexOf($Arguments,'--reports-dir')+1]
  $path=Join-Path $reports ('runs\'+$id+'\run.json')
@@ -216,10 +221,15 @@ function Invoke-StockDataProcess {
  publication_readiness=@{passed=$true;trade_date='2026-09-17';reason='current_qualified_prices_available'};
  steps=@(@{name='build_normalized_views';status=$normal;return_code=0},@{name='collect_lhb_daily';status='completed';return_code=0})}
  if ('__CASE__' -eq 'wrong_receipt') {$receipt.trade_date='2026-09-16'}
+ if ('__CASE__' -eq 'wrong_sha') {$receipt.collector_contract_sha256=('b'*64)}
+ if ('__CASE__' -eq 'string_readiness') {$receipt.publication_readiness.passed='true'}
+ if ('__CASE__' -eq 'legacy_empty_key') {$receipt.legacy_evidence=@{source_fingerprints=@{''='unknown'};label='unknown source'}}
+ $script:savedReceipt=$path
  $receipt | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path
  [pscustomobject]@{ExitCode=__EXIT__;Stdout='fixture';Stderr=''}
 }
 function Get-ScheduledTask {
+ if ('__CASE__' -eq 'changed_receipt') {Add-Content -LiteralPath $script:savedReceipt -Value ' '}
  [pscustomobject]@{State=$(if('__CASE__' -eq 'running'){'Running'}else{'Ready'});Settings=@{Enabled=$true};
  Principal=@{UserId='fixture';LogonType='Password';RunLevel=$(if('__CASE__' -eq 'unsafe_task'){'Highest'}else{'Limited'})};
  Actions=@(@{Arguments='-File "C:\fixture\run_research_daily.ps1"'})}
@@ -343,3 +353,212 @@ def test_close_entry_uses_shared_owner_and_only_qualified_backup_retention():
     assert 'Remove-Item' not in close and 'Stop-Process' not in close
     assert close.index('$result=Invoke-StockDataProcess') < close.index('finalize_daily_backup')
     assert 'start_latest_at' in close and 'deadline_at' in close
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows 5.1 close deadline and calendar')
+@pytest.mark.parametrize('calendar_state', ['open', 'closed', 'unverified'])
+@pytest.mark.parametrize('inherited', [False, True])
+def test_close_ps51_calendar_and_all_deadline_serializers(tmp_path, monkeypatch, calendar_state, inherited):
+    scripts=tmp_path/'scripts';scripts.mkdir()
+    (scripts/'run_stock_data_daily.ps1').write_text(_read('run_stock_data_daily.ps1'))
+    (scripts/'run_integrated_daily.py').write_text('# injected collector boundary; no market access')
+    db=tmp_path/'fixture.duckdb';db.write_bytes(b'isolated serializer fixture')
+    # Freeze only external process receipts. The actual PS5 wrapper must traverse
+    # preflight, calendar, backup, collection, finalization and retention itself.
+    # Separate native-process and pipeline-runtime tests exercise those owners.
+    native=r'''function Invoke-StockDataProcess {
+ param($Executable,$Arguments,$WorkingDirectory,$DeadlineEpoch,$TimeoutSeconds,$ProgressPath)
+ $step=if ($Arguments -contains '--dry-run') {'preflight'}
+ elseif ($Arguments[0] -like '*run_integrated_daily.py') {'collection'}
+ elseif (($Arguments -join ' ') -like '*trading_session_status*') {'calendar'}
+ elseif (($Arguments -join ' ') -like '*observation_windows*') {'window'}
+ elseif (($Arguments -join ' ') -like '*prepare_daily_backup*') {'prepare'}
+ elseif (($Arguments -join ' ') -like '*finalize_daily_backup*') {'finalize'}
+ elseif (($Arguments -join ' ') -like '*retain_qualified_backups*') {'retention'}
+ else {throw 'Unexpected fixture process'}
+ Add-Content -LiteralPath '__CALLS__' -Value $step
+ $body=switch ($step) {
+   'calendar' {@{state='__STATE__';reason='explicit synthetic fixture'}}
+   'window' {@{deadline_at=[DateTimeOffset]::UtcNow.AddMinutes(10).ToString('o');start_latest_at=[DateTimeOffset]::UtcNow.AddMinutes(7).ToString('o')}}
+   'prepare' {@{raw='fixture-raw'}}
+   'finalize' {@{status='qualified';qualified_recovery_point=$true;archive='fixture-archive';cleanup_errors=@()}}
+   default {@{status='fixture'}}
+ }
+ if ($step -in @('prepare','finalize','retention')) {
+   $number=[double]::Parse($Arguments[-1],[Globalization.CultureInfo]::InvariantCulture)
+   if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) {throw 'Invalid serialized deadline'}
+ }
+ [pscustomobject]@{ExitCode=0;Stdout=($body|ConvertTo-Json -Compress);Stderr=''}
+}
+'''.replace('__STATE__',calendar_state).replace('__CALLS__',str(tmp_path/'calls'))
+    (scripts/'native_process.ps1').write_text(native)
+    monkeypatch.delenv('STOCKDATA_PHASE_DEADLINE_EPOCH',raising=False)
+    if inherited:
+        import time
+        monkeypatch.setenv('STOCKDATA_PHASE_DEADLINE_EPOCH',str(time.time()+900))
+    result=_ps(scripts/'run_stock_data_daily.ps1','-Db',db,'-Python',sys.executable,
+        '-TradeDate','2026-10-09','-CollectorContract','fixture','-CollectorContractSha256','a'*64,
+        '-ReportsDirectory',tmp_path/'reports')
+    assert (result.returncode==0)==(calendar_state!='unverified'),result.stdout+result.stderr
+    calls=(tmp_path/'calls').read_text().splitlines()
+    if calendar_state=='open':
+        assert calls==['preflight','calendar','window','prepare','collection','finalize','retention']
+        assert 'qualified_recovery_point=true' in result.stdout
+    else:
+        assert calls==['preflight','calendar']
+        assert not (tmp_path/'backups').exists()
+        assert ('DAILY_RUN_MARKET_CLOSED' in result.stdout)==(calendar_state=='closed')
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows 5.1 watch exit contract')
+@pytest.mark.parametrize('strict,operational', [(False,True),(True,False),(False,False),(True,True)])
+def test_watch_ps51_exit_uses_operational_audit_without_overwriting_strict(tmp_path, strict, operational):
+    # Execute the actual watch final-audit adapter with a deterministic auditor
+    # fixture. Domain identity/window/snapshot checks are exercised separately.
+    package=tmp_path/'trade_system';package.mkdir();(package/'__init__.py').write_text('')
+    (package/'pipeline_runtime.py').write_text('def load_observation_contract(*a): return {}\ndef all_manifests(*a): return []\n')
+    (package/'p0_observation.py').write_text(
+        'def audit_phase_windows(*a, operational=False, db_path=None):\n'
+        "    assert (db_path=='fixture.duckdb') == operational\n"
+        f"    return dict(passed=({operational!r} if operational else {strict!r}), required_window_count=2, qualified_window_count=(2 if operational else 0), evidence_errors=[])\n")
+    tail=_read('run_phase_watch.ps1').split('$readResult = ',1)[1]
+    prelude=f'''$ErrorActionPreference='Stop'
+$Root='{tmp_path}'
+$Python='{sys.executable}'
+$CollectorContract='fixture';$CollectorContractSha256=('a'*64);$day='2026-10-09'
+$Phase='intraday';$ReportsDirectory='{tmp_path}';$DbPath='fixture.duckdb'
+$windows=@(1,2);$attempts=2;$successes=2;$deferred=0;$failures=0;$missed=0;$unattempted=0
+$prepareAttempts=0;$prepareFailures=0;$EndAt='15:05'
+function Write-WatchEvent([string]$Message) {{Write-Output $Message}}
+'''
+    script=tmp_path/'watch-tail.ps1';script.write_text(prelude+'$readResult = '+tail)
+    result=_ps(script)
+    assert result.returncode==(0 if operational else 1),result.stdout+result.stderr
+    lines=result.stdout.splitlines()
+    strict_line=next(line for line in lines if 'PHASE_WATCH_QUALIFICATION' in line)
+    operational_line=next(line for line in lines if 'PHASE_WATCH_OPERATIONAL' in line)
+    assert f'passed={strict}' in strict_line
+    assert f'passed={operational}' in operational_line and f'strict_passed={strict}' in operational_line
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows 5.1 isolated engineering chain')
+def test_ps51_close_commit_supplemental_handoff_and_real_local_publication(tmp_path, monkeypatch):
+    """Synthetic clocks/data/task request; real PS5, owners, DuckDB and publisher."""
+    import duckdb
+    from trade_system.pipeline_runtime import default_observation_policy
+    from trade_system.v2.publisher import read_current
+    from trade_system.p0_observation import _publications
+    core=os.environ.get('STOCKDATA_TEST_CORE_PYTHON',sys.executable)
+    research=os.environ.get('STOCKDATA_TEST_RESEARCH_PYTHON',sys.executable)
+    scripts=tmp_path/'scripts';scripts.mkdir()
+    for name in ('run_stock_data_daily.ps1','run_phase_once.ps1','run_research_daily.ps1'):
+        (scripts/name).write_text(_read(name),encoding='utf-8')
+    # Freeze only clocks in this copied helper, retaining actual process logic.
+    native=_read('native_process.ps1').replace('[DateTimeOffset]::UtcNow',
+        "([DateTimeOffset]'2026-10-09T09:31:00+00:00')")
+    package=tmp_path/'trade_system';package.mkdir()
+    (package/'__init__.py').write_text('__path__.append('+repr(str(ROOT/'trade_system'))+')\n')
+    (package/'pipeline_runtime.py').write_text(
+        'exec(compile(open('+repr(str(ROOT/'trade_system/pipeline_runtime.py'))+
+        ",encoding='utf-8').read(),"+repr(str(ROOT/'trade_system/pipeline_runtime.py'))+",'exec'))\n"
+        'class FixtureClock:\n'
+        '    def time(self): return 1791538260.0\n'
+        'clock=FixtureClock()\n')
+    monkeypatch.setenv('PYTHONPATH',str(tmp_path)+os.pathsep+str(ROOT))
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE','1')
+    for name in ('STOCKDATA_PHASE_DEADLINE_EPOCH','STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH'):
+        monkeypatch.delenv(name,raising=False)
+    db=tmp_path/'market.duckdb'
+    with duckdb.connect(str(db)) as c:
+        c.execute('CREATE TABLE fixture_commits(phase VARCHAR,run_id VARCHAR)')
+        c.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,is_open INTEGER,cal_date DATE)')
+        c.execute("INSERT INTO tushare_trade_cal VALUES ('SSE',1,'2026-10-08'),('SZSE',1,'2026-10-08'),('SSE',1,'2026-10-09'),('SZSE',1,'2026-10-09')")
+        c.execute('CREATE TABLE v_kline_daily(trade_date VARCHAR,stock_code VARCHAR,change_pct DOUBLE,provider VARCHAR,adjustment VARCHAR,volume_unit VARCHAR,amount_unit VARCHAR,fetched_at TIMESTAMP,close DOUBLE)')
+        c.execute('CREATE TABLE v_default_concept_daily(trade_date DATE,concept_code VARCHAR,concept_name VARCHAR,stock_count INTEGER)')
+        c.execute('CREATE TABLE v_default_concept_stock_history(trade_date DATE,concept_code VARCHAR,stock_code VARCHAR,stock_name VARCHAR)')
+    contract=tmp_path/'contract.json'
+    contract.write_text(json.dumps({'observation_windows':default_observation_policy()}))
+    digest=hashlib.sha256(contract.read_bytes()).hexdigest()
+    # The response fixture commits under the actual PipelineLock. All database
+    # targets are explicitly confined to this fixture; there is no provider API.
+    (scripts/'run_integrated_daily.py').write_text(r"""import sys,json
+from pathlib import Path
+import duckdb
+from datetime import datetime
+from trade_system.pipeline_runtime import load_observation_contract,observation_windows,PipelineLock
+args=sys.argv[1:]
+def value(key,default=None): return args[args.index(key)+1] if key in args else default
+policy=load_observation_contract(value('--collector-contract'),value('--collector-contract-sha256'))
+if '--dry-run' in args: sys.exit(0)
+db=Path(value('--db')).resolve();root=Path(__file__).resolve().parents[1]
+assert db.parent==root
+phase=value('--phase');day=value('--trade-date');run=value('--run-id','fixture_close')
+assert day=='2026-10-09'
+if phase=='close':
+ window=observation_windows(policy,day,phase)[0]
+ assert datetime.fromisoformat(window['start_at']) <= datetime.fromisoformat(day+'T17:31:00+08:00') <= datetime.fromisoformat(window['start_latest_at'])
+with PipelineLock(db,run):
+ with duckdb.connect(str(db)) as con:
+  con.execute('INSERT INTO fixture_commits VALUES (?,?)',[phase,run])
+  if phase=='close':
+   con.execute("INSERT INTO v_kline_daily VALUES ('2026-10-08','000001',1,'fixture','none','shares','yuan','2026-10-08 16:00',10),('2026-10-09','000001',2,'fixture','none','shares','yuan','2026-10-09 17:31',10.2)")
+  else: con.execute("UPDATE v_kline_daily SET change_pct=3,close=10.3 WHERE trade_date='2026-10-09'")
+  count=con.execute('SELECT count(*) FROM v_kline_daily WHERE trade_date=?',[day]).fetchone()[0]
+receipt={'run_id':run,'phase':phase,'trade_date':day,'scope':'transitional_market_collection_only',
+ 'status':'completed_with_certification_gaps','collector_contract_sha256':value('--collector-contract-sha256'),
+ 'steps':[{'name':'build_normalized_views','status':'completed','return_code':0}],
+ 'publication_readiness':{'passed':count==1,'trade_date':day,'reason':'synthetic_committed_price'},
+ 'legacy_evidence':{'source_fingerprints':{'':'unknown'},'label':'\u5408\u6210\u56de\u6267'},'execution_ready':False}
+path=Path(value('--reports-dir'))/'runs'/run/'run.json';path.parent.mkdir(parents=True,exist_ok=True)
+path.write_text(json.dumps(receipt,ensure_ascii=False),encoding='utf-8')
+print(json.dumps({'committed_rows':count,'run_id':run,'fixture':True}))
+""",encoding='utf-8')
+    workspace=tmp_path/'workspace';workspace.mkdir()
+    (workspace/'workspace-config.json').write_text(json.dumps({'market_database':str(db),'read_only':True}))
+    release=tmp_path/'fixture-release';release.mkdir()
+    (release/'research-release.json').write_text('{"scope":"synthetic_clock_fixture_not_release_acceptance"}')
+    release_sha=hashlib.sha256((release/'research-release.json').read_bytes()).hexdigest()
+    (release/'run_research.py').write_text(
+        'import sys\nsys.path.insert(0,'+repr(str(ROOT))+')\n'
+        'from datetime import datetime\nfrom trade_system.v2 import daily_workspace\n'
+        "daily_workspace.now_utc=lambda:datetime.fromisoformat('2026-10-09T12:30:00+00:00')\n"
+        'from trade_system.v2.research_product import main\nmain()\n')
+    native += r'''
+function Get-ScheduledTask {
+ [pscustomobject]@{State='Ready';Settings=@{Enabled=$true};Principal=@{UserId='synthetic';LogonType='Password';RunLevel='Limited'};
+ Actions=@(@{Arguments='-File "C:\fixture\run_research_daily.ps1"'})}
+}
+function Start-ScheduledTask {
+ Add-Content -LiteralPath '__REQUESTS__' -Value 'synthetic-request'
+ & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -NonInteractive -File '__RESEARCH_PS__' -Python '__PYTHON__' -Workspace '__WORKSPACE__' -ExpectedTradeDate '2026-10-09' -ReleaseDirectory '__RELEASE__' -ReleaseManifestSha256 '__SHA__'
+ if ($LASTEXITCODE -ne 0) {throw 'Actual isolated publication failed'}
+}
+'''.replace('__REQUESTS__',str(tmp_path/'requests')).replace('__RESEARCH_PS__',str(scripts/'run_research_daily.ps1')).replace('__PYTHON__',research).replace('__WORKSPACE__',str(workspace)).replace('__RELEASE__',str(release)).replace('__SHA__',release_sha)
+    (scripts/'native_process.ps1').write_text(native,encoding='utf-8')
+    args=['-Db',db,'-Python',core,'-TradeDate','2026-10-09','-CollectorContract',contract,
+        '-CollectorContractSha256',digest,'-ReportsDirectory',tmp_path/'reports']
+    closed=_ps(scripts/'run_stock_data_daily.ps1',*args)
+    assert closed.returncode==0,closed.stdout+closed.stderr
+    assert 'BACKUP_COMPLETE' in closed.stdout and 'DAILY_RUN_COMPLETE' in closed.stdout
+    original=(tmp_path/'reports/runs/fixture_close/run.json').read_bytes()
+    supplement=_ps(scripts/'run_phase_once.ps1',*args,'-Phase','supplemental','-PublicationTask','StockData-ResearchDaily')
+    assert supplement.returncode==0,supplement.stdout+supplement.stderr
+    assert 'PUBLICATION_REQUESTED' in supplement.stdout and 'DAILY_WORKSPACE_COMPLETE' in supplement.stdout
+    supplemental_receipt=next((tmp_path/'reports/runs').glob('supplemental_*/run.json')).read_bytes()
+    assert json.loads(supplemental_receipt)['legacy_evidence']=={'source_fingerprints':{'':'unknown'},'label':'合成回执'}
+    assert 'receipt_sha256='+hashlib.sha256(supplemental_receipt).hexdigest() in supplement.stdout
+    assert (tmp_path/'requests').read_text().splitlines()==['synthetic-request']
+    assert (tmp_path/'reports/runs/fixture_close/run.json').read_bytes()==original
+    with duckdb.connect(str(db),read_only=True) as c:
+        assert c.execute('SELECT phase FROM fixture_commits ORDER BY rowid').fetchall()==[('close',),('supplemental',)]
+    manifest,files=read_current(workspace/'publication')
+    desk=json.loads(files['desk.json'])
+    assert desk['market']['trade_date']=='2026-10-09' and desk['market']['breadth']['samples']==1
+    assert desk['market']['stocks']['000001']['change_pct']==3
+    assert not desk['execution_ready']
+    research_log=next((workspace/'scheduled-logs').glob('*.log')).read_bytes()
+    assert b'\x00' not in research_log
+    log_text=research_log.decode('utf-8-sig')
+    assert 'No broken requirements found.' in log_text and 'market_published' in log_text
+    published,error=_publications(workspace,['2026-10-09'])
+    assert not error and published['2026-10-09']['passed'],published

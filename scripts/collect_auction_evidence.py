@@ -275,6 +275,13 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
         quote_rows = 0
         # Scoped ticks are not full-market coverage; anomalies remain separate.
         anomaly_rows = 0
+        # The tick collector commits each accepted stock before returning. Keep
+        # those facts in the failure receipt if a later independent source
+        # exhausts its budget; an error must not rewrite committed counts to 0.
+        result.update(tick_rows=tick_rows, qualified_tick=qualified_tick,
+                      unknown_unit_rows=unknown, observed_codes=observed,
+                      source_errors=failures,
+                      scope="bounded_current_candidate_pool_not_full_market")
         if not qualified_tick:
             # The bounded fallback stays in the quote table and never supplies
             # missing tick units or sequence completeness.
@@ -327,13 +334,15 @@ def collect(db_path: str, trade_date: str, *, max_stocks: int = 20, out: str | P
                 """
                 INSERT INTO auction_collection_batch
                 (trade_date,attempted_at,stock_codes,tick_rows,anomaly_rows,quote_rows,status,last_error)
-                VALUES (?,current_timestamp,?,0,0,0,'error',?)
+                VALUES (?,current_timestamp,?,?,?,?,'error',?)
                 ON CONFLICT(trade_date) DO UPDATE SET
                   attempted_at=excluded.attempted_at,stock_codes=excluded.stock_codes,
-                  tick_rows=0,anomaly_rows=0,quote_rows=0,status='error',
+                  tick_rows=excluded.tick_rows,anomaly_rows=excluded.anomaly_rows,
+                  quote_rows=excluded.quote_rows,status='error',
                   last_error=excluded.last_error
                 """,
-                [trade_date, len(codes), str(exc)[:1000]],
+                [trade_date, len(codes), result['tick_rows'], result['anomaly_rows'],
+                 result['quote_rows'], str(exc)[:1000]],
             )
         finally:
             con.close()

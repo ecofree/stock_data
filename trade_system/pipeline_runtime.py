@@ -513,6 +513,264 @@ def load_observation_contract(path: str | Path, expected_sha256: str) -> dict:
     return policy
 
 
+OPERATIONAL_SNAPSHOT_SCHEMA = 'operational_input_snapshot_v1'
+OPERATIONAL_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def freeze_operational_inputs(db_path, run_dir, *, run_id, trade_date, phase,
+                              evaluated_at, collector_contract_sha256, deadline_epoch,
+                              observation_window_id=None):
+    """Retain actual bounded inputs while the collection caller still owns its guard.
+
+    Views are materialized with their original SQL, and reference payloads and
+    canonical raw_json are retained, not just counts or readiness booleans. A
+    historical receipt can never be backfilled from today's mutable tables.
+    """
+    import threading
+    import duckdb
+    from trade_system.readiness import GROUPS, _previous_open_session
+    from trade_system.ths_quality import canonical_ths_snapshot
+    from trade_system.time_utils import as_local_naive
+
+    observed = as_local_naive(evaluated_at)
+    now = datetime.now()
+    if (phase not in {'auction', 'intraday', 'close', 'supplemental'} or observed is None
+            or observed.date().isoformat() != trade_date or now.date().isoformat() != trade_date
+            or not 0 <= (now - observed).total_seconds() <= 60
+            or len(collector_contract_sha256) != 64
+            or any(c not in '0123456789abcdef' for c in collector_contract_sha256)):
+        raise ValueError('only current contract-bound operational inputs can be frozen')
+    deadline = min(float(deadline_epoch), clock.time() + 15)
+    if not math.isfinite(deadline) or deadline - clock.time() < 1:
+        raise ValueError('operational snapshot budget exhausted')
+    folder = Path(run_dir).resolve(strict=True)
+    target = folder / 'operational-inputs.duckdb'
+    if target.exists():
+        raise ValueError('operational input snapshot already exists; never overwrite evidence')
+    source = Path(db_path).resolve(strict=True)
+    partial = folder / ('operational-inputs.' + uuid.uuid4().hex + '.partial.duckdb')
+    binding = {'schema': OPERATIONAL_SNAPSHOT_SCHEMA, 'run_id': run_id,
+               'trade_date': trade_date, 'phase': phase, 'evaluated_at': evaluated_at,
+               'observation_window_id': observation_window_id,
+               'collector_contract_sha256': collector_contract_sha256,
+               'source_database': str(source)}
+    output = duckdb.connect(str(partial))
+    completed = False
+    timer = threading.Timer(max(.01, deadline - clock.time()), output.interrupt)
+    timer.daemon = True
+    timer.start()
+    try:
+        output.execute("SET memory_limit='512MB'")
+        output.execute("SET max_temp_directory_size='0B'")
+        output.execute('SET preserve_insertion_order=false')
+        output.execute('SET threads=1')
+        target_catalog = output.execute('SELECT current_database()').fetchone()[0]
+        output.execute("ATTACH '" + str(source).replace("'", "''") + "' AS observed (READ_ONLY)")
+        # Source views may only read this already attached database. Disable
+        # files, extensions and further attachments before binding their SQL.
+        output.execute('SET enable_external_access=false')
+        # The attached source is read-only. A transaction fixes all relation
+        # reads to one snapshot even if an unrelated reader is active.
+        output.execute('BEGIN TRANSACTION')
+        output.execute('USE observed')
+        previous = _previous_open_session(output, trade_date) if phase == 'auction' else None
+        ths = canonical_ths_snapshot(output, trade_date) if phase != 'auction' else None
+        output.execute('USE "' + target_catalog.replace('"', '""') + '"')
+        relations = {'tushare_trade_cal'}
+        if phase == 'auction':
+            relations.update(name for group in ('market_state', 'candidate_pool', 'auction')
+                             for name in GROUPS[group].relations)
+            relations.add('realtime_candidate_pool_snapshot')
+        else:
+            relations.update(('tushare_stock_basic', 'multi_source_observation',
+                              'intraday_stock_flow_batch', 'intraday_sector_flow_batch',
+                              'intraday_sector_flow_taxonomy', 'multi_source_stock_flow',
+                              'multi_source_sector_flow', 'ths_concept_daily',
+                              'ths_concept_stock_history', 'ths_concept_member_checkpoint',
+                              'ths_concept_snapshot_expectation'))
+            if phase in {'close', 'supplemental'}:
+                relations.add('v_kline_daily')
+        price_view = None
+        price_inputs = set()
+        if 'v_kline_daily' in relations:
+            view_row = output.execute("SELECT sql FROM duckdb_views() WHERE database_name='observed' "
+                "AND schema_name='main' AND view_name='v_kline_daily'").fetchone()
+            if view_row:
+                price_view = view_row[0].split(' AS ', 1)[1]
+                price_inputs = output.get_table_names(price_view, qualified=True)
+                # This canonical view is partitioned by date. Copy its exact
+                # dated raw sources first; expanding the global source view
+                # before pushing down the date can use GB of working memory.
+                if not price_inputs or not price_inputs <= {
+                        'tushare_daily', 'multi_source_kline', 'kline',
+                        'advanced_kline_today', 'advanced_gujia_kline'}:
+                    raise ValueError('canonical price view has an unsealed input dependency')
+                relations.update(price_inputs)
+        inventory = []
+        for name in sorted(relations):
+            if clock.time() >= deadline:
+                raise ValueError('operational snapshot budget exhausted')
+            present = output.execute("SELECT table_type FROM information_schema.tables "
+                "WHERE table_catalog='observed' AND table_schema='main' AND table_name=?", [name]).fetchone()
+            if not present:
+                if name in price_inputs:
+                    raise ValueError('canonical price view input is missing: ' + name)
+                inventory.append({'relation': name, 'present': False})
+                continue
+            if name == 'v_kline_daily' and price_view is not None:
+                # Dependencies above are local tables only. Preserve source
+                # rowids for exact tie-breaking and retain the original SQL.
+                output.execute('CREATE VIEW v_kline_daily AS ' + price_view)
+                count = output.execute('SELECT count(*) FROM v_kline_daily').fetchone()[0]
+                if count > 300000:
+                    raise ValueError('operational price snapshot row budget exceeded')
+                inventory.append({'relation': name, 'present': True, 'rows': count,
+                                  'source_kind': 'VIEW', 'source_view_sql': view_row[0]})
+                continue
+            columns = {r[0] for r in output.execute('DESCRIBE observed.main."' + name + '"').fetchall()}
+            date_column = next((c for c in ('trade_date', 'date', 'source_date', 'cal_date') if c in columns), None)
+            clause, params = '', []
+            if name == 'multi_source_observation':
+                # The stock reference validator selects its latest qualified
+                # receipt (including its full original payload); the industry
+                # catalogue is dated and constrained by the saved as-of clock.
+                clause = " WHERE (data_type='tushare_stock_basic_snapshot' AND provider='xiaodefa' " \
+                    "AND status='qualified') OR (data_type='em_industry_catalogue' AND provider='xiaodefa' " \
+                    "AND source_date=CAST(? AS DATE) AND observed_at<=?) " \
+                    "QUALIFY row_number() OVER (PARTITION BY data_type ORDER BY observed_at DESC)=1"
+                params = [trade_date, observed]
+            elif name.startswith('ths_concept_'):
+                clause = ' WHERE CAST(trade_date AS DATE)=CAST(? AS DATE)'
+                params = [(ths or {}).get('snapshot_date')]
+            elif date_column:
+                dates = [trade_date]
+                if phase == 'auction' and previous and (name == 'tushare_trade_cal'
+                        or name in GROUPS['market_state'].relations):
+                    dates.append(previous)
+                clause = ' WHERE CAST("' + date_column + '" AS DATE) IN (' + ','.join('CAST(? AS DATE)' for _ in dates) + ')'
+                params = dates
+            # Materialize bounded full rows before evaluating any admission.
+            # An over-limit relation is rejected, never silently truncated.
+            if name in price_inputs and present[0] != 'BASE TABLE':
+                raise ValueError('canonical price input must be a raw table: ' + name)
+            projection = 'rowid AS rowid,*' if name in price_inputs and 'rowid' not in columns else '*'
+            query = 'SELECT ' + projection + ' FROM observed.main."' + name + '"' + clause
+            try:
+                output.execute('CREATE TABLE "' + name + '" AS SELECT * FROM (' + query + ') LIMIT 300001', params)
+            except duckdb.Error as exc:
+                raise ValueError('operational snapshot relation unavailable: ' + name + ': ' + str(exc)) from exc
+            count = output.execute('SELECT count(*) FROM "' + name + '"').fetchone()[0]
+            if count > 300000:
+                raise ValueError('operational snapshot row budget exceeded: ' + name)
+            definition = None
+            if present[0] == 'VIEW':
+                definition = output.execute("SELECT sql FROM duckdb_views() WHERE database_name='observed' "
+                    "AND schema_name='main' AND view_name=?", [name]).fetchone()[0]
+            inventory.append({'relation': name, 'present': True, 'rows': count,
+                              'source_kind': present[0], 'source_view_sql': definition})
+        binding['relations'] = inventory
+        output.execute('CREATE TABLE operational_snapshot_binding(payload VARCHAR)')
+        output.execute('INSERT INTO operational_snapshot_binding VALUES (?)',
+                       [json.dumps(binding, sort_keys=True, ensure_ascii=False)])
+        output.execute('COMMIT')
+        output.execute('CHECKPOINT')
+        completed = True
+    finally:
+        timer.cancel()
+        output.close()
+        if not completed:
+            for unfinished in (partial, Path(str(partial) + '.wal')):
+                if unfinished.exists():
+                    unfinished.unlink()
+    try:
+        if clock.time() >= deadline or partial.stat().st_size > OPERATIONAL_SNAPSHOT_MAX_BYTES:
+            raise ValueError('operational snapshot time/size budget exceeded')
+        digest = hashlib.sha256(partial.read_bytes()).hexdigest()
+        partial.rename(target)
+        return {**binding, 'path': target.name, 'sha256': digest, 'bytes': target.stat().st_size}
+    finally:
+        # Only this call's unfinished artifact may be removed. Completed
+        # snapshots and production database/guard files are never rewritten.
+        if partial.exists():
+            partial.unlink()
+
+
+def verified_operational_snapshot(manifest, trade_date, collector_sha, db_path):
+    """Resolve one run-local immutable snapshot and verify its complete bytes."""
+    import duckdb
+    saved = manifest.get('operational_input_snapshot')
+    assessed = manifest.get('operational_assessment') or {}
+    if not isinstance(saved, dict) or not manifest.get('_run_dir'):
+        raise ValueError('operational input snapshot missing; historical windows cannot be reconstructed')
+    binding = {k: saved.get(k) for k in ('schema', 'run_id', 'trade_date', 'phase', 'evaluated_at',
+                                        'observation_window_id', 'collector_contract_sha256',
+                                        'source_database', 'relations')}
+    if (binding['schema'] != OPERATIONAL_SNAPSHOT_SCHEMA or binding['run_id'] != manifest.get('run_id')
+            or binding['trade_date'] != trade_date or binding['phase'] != manifest.get('phase')
+            or binding['evaluated_at'] != assessed.get('evaluated_at')
+            or binding['observation_window_id'] != manifest.get('observation_window_id')
+            or binding['collector_contract_sha256'] != collector_sha.lower()
+            or (db_path is not None and binding['source_database'] != str(Path(db_path).resolve()))
+            or saved.get('path') != 'operational-inputs.duckdb'):
+        raise ValueError('operational input snapshot binding mismatch')
+    folder = Path(manifest['_run_dir']).resolve(strict=True)
+    candidate = folder / saved['path']
+    if candidate.is_symlink() or candidate.resolve(strict=True).parent != folder:
+        raise ValueError('operational input snapshot must be a run-local regular file')
+    size = candidate.stat().st_size
+    if not 0 < size <= OPERATIONAL_SNAPSHOT_MAX_BYTES or size != saved.get('bytes'):
+        raise ValueError('operational input snapshot size mismatch')
+    if hashlib.sha256(candidate.read_bytes()).hexdigest() != saved.get('sha256'):
+        raise ValueError('operational input snapshot SHA256 mismatch')
+    with duckdb.connect(str(candidate), read_only=True, config={'enable_external_access': False}) as con:
+        kind = con.execute("SELECT table_type FROM information_schema.tables WHERE table_schema='main' "
+                           "AND table_name='operational_snapshot_binding'").fetchone()
+        if kind != ('BASE TABLE',):
+            raise ValueError('operational input snapshot binding must be a local table')
+        rows = con.execute('SELECT payload FROM operational_snapshot_binding LIMIT 2').fetchall()
+        if len(rows) != 1 or json.loads(rows[0][0]) != binding:
+            raise ValueError('operational input snapshot internal binding mismatch')
+    return candidate
+
+
+def replay_operational_snapshot(snapshot_path, trade_date, phase, evaluated_at, *, deadline_epoch=None):
+    """Recompute admission on sealed local inputs with bounded, offline SQL.
+
+    The same restricted connection reaches every readiness query. Interrupts
+    continue after the deadline because some diagnostics catch SQL exceptions.
+    A swallowed interrupt can never turn an expired evaluation into admission.
+    """
+    import threading
+    import duckdb
+    from trade_system.collection_profiles import operational_readiness
+
+    deadline = min(clock.time() + 10, float(deadline_epoch)) if deadline_epoch is not None else clock.time() + 10
+    if not math.isfinite(deadline) or clock.time() >= deadline:
+        raise ValueError('operational replay budget exhausted')
+    with duckdb.connect(str(snapshot_path), read_only=True, config={
+            'enable_external_access': False, 'memory_limit': '512MB',
+            'max_temp_directory_size': '0B', 'threads': 1}) as con:
+        finished = threading.Event()
+
+        def interrupt_expired_queries():
+            if finished.wait(max(0, deadline - clock.time())):
+                return
+            while not finished.is_set():
+                con.interrupt()
+                finished.wait(.01)
+
+        watcher = threading.Thread(target=interrupt_expired_queries, daemon=True)
+        watcher.start()
+        try:
+            result = operational_readiness(con, trade_date, phase, evaluated_at)
+            if clock.time() >= deadline:
+                raise ValueError('operational replay budget exhausted')
+            return result
+        finally:
+            finished.set()
+            watcher.join()
+
+
 class RunManifest:
     def __init__(
         self,
@@ -572,7 +830,7 @@ class RunManifest:
         warnings: list[str] | None = None,
     ) -> None:
         self.data["status"] = status
-        self.data["completed_at"] = datetime.now().isoformat(timespec="seconds")
+        self.data["completed_at"] = datetime.now().isoformat()
         if error:
             self.data["error"] = error
         if warnings:

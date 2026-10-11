@@ -139,7 +139,6 @@ def command_plan(
         # Phase mode is intentionally narrow and is the only collection path.
         if phase == "auction":
             collection_steps = [
-                ("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path, "--date", selected_date], False),
                 ("collect_realtime_limit_pool", [py, "scripts/collect_realtime_limit_pool.py", "--db", db_path, "--date", selected_date, "--out", report("realtime_candidate_pool_latest.md")], False),
                 ("collect_auction_evidence", [py, "scripts/collect_auction_evidence.py", "--db", db_path, "--date", selected_date, "--max-stocks", str(signal_limit), "--out", report("auction_collection_latest.json")], False),
                 ("build_auction_evidence", [py, "scripts/build_auction_evidence.py", "--db", db_path, "--trade-date", selected_date, "--out", report("auction_evidence_latest.md")], False),
@@ -281,6 +280,11 @@ def command_plan(
         "--date", selected_date, "--stage", selected_phase, "--gate", "data", "--max-age-seconds", str(age),
         "--out", report("data_readiness_"+selected_phase+"_latest.md"),
         *(["--as-of", as_of_time] if as_of_time else [])], False))
+    if phase == "auction" and include_collection:
+        # Optional market context must not consume the observation window before
+        # candidate auction evidence and its local qualification are complete.
+        steps.append(("collect_market_context", [py, "collectors/collect_market.py", "--db", db_path,
+                      "--date", selected_date], False))
     # No signal/action writer, report renderer, model refresh or old dashboard
     # remains in this plan. The daily workspace owns all user publications.
     return validate_plan(steps)

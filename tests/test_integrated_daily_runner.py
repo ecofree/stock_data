@@ -334,6 +334,22 @@ def test_only_explicit_financial_quality_results_are_separate_from_operation_fai
     assert _certification_gap(name, code, out, err, '2026-09-29') is expected
 
 
+def test_auction_budget_keeps_original_request_and_final_evidence_time():
+    from scripts.run_integrated_daily import _auction_step_deadline
+    # A typical seven-second pool fetch no longer follows a 30-second context
+    # call. The auction request can keep its full 45 seconds plus commit time.
+    deadline = 90.0
+    auction = _auction_step_deadline('collect_auction_evidence', deadline, 10, 900)
+    assert auction - 10 - 5 == 45
+    assert deadline - auction >= 25
+    # At the end of the required local checks, optional market context has no
+    # usable request budget and must leave the final assessment/snapshot intact.
+    late = _auction_step_deadline('collect_market_context', deadline, 81, 900)
+    assert late - 81 <= 6
+    # Starting late never renews a request to the next observation window.
+    assert _auction_step_deadline('collect_auction_evidence', deadline, 80, 900) <= deadline - 25
+
+
 def test_runner_financial_gap_preserves_operational_completion_and_strict_failure(tmp_path, monkeypatch, china_session_clock):
     import json
     from types import SimpleNamespace

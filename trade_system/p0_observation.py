@@ -479,15 +479,16 @@ def _operational_receipt_errors(manifest: dict, trade_date: str, collector_sha: 
                 or saved.get('collector_contract_sha256') != collector_sha.lower()
                 or end > datetime.now(ZoneInfo('Asia/Shanghai'))):
             return ['operational_day_clock_or_contract_unbound']
-        from trade_system.collection_profiles import operational_readiness
-        current = operational_readiness(db_path, trade_date, manifest['phase'], saved['evaluated_at'])
+        from trade_system.pipeline_runtime import verified_operational_snapshot, replay_operational_snapshot
+        snapshot = verified_operational_snapshot(manifest, trade_date, collector_sha, db_path)
+        current = replay_operational_snapshot(snapshot, trade_date, manifest['phase'], saved['evaluated_at'])
         current['collector_contract_sha256'] = collector_sha.lower()
         current['evidence_identity_sha256'] = operational_evidence_identity(current)
         if (current['evidence_identity_sha256'] != saved.get('evidence_identity_sha256')
                 or operational_evidence_identity(saved) != saved.get('evidence_identity_sha256')
                 or current.get('ready') is not True):
             return ['operational_actual_inputs_changed_or_unqualified']
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, OSError, duckdb.Error) as exc:
         return ['operational_receipt_invalid:' + str(exc)]
     return []
 

@@ -178,7 +178,7 @@ def _relation_health(
 
 
 def assess_capital_flow_health(
-    db_path: str | Path,
+    db_path: str | Path | duckdb.DuckDBPyConnection,
     trade_date: str,
     expected_stock_codes: int = 0,
     expected_sector_codes: int = 0,
@@ -203,7 +203,10 @@ def assess_capital_flow_health(
         # Earlier intraday rows and future fetches remain excluded; coverage,
         # taxonomy and independent reconciliation gates still apply.
         effective_max_age_seconds = int((now - close_boundary).total_seconds())
-    con = connect_duckdb(str(db_path), read_only=True)
+    # A caller's restricted snapshot connection carries its read-only,
+    # external-access and interruption policy through every diagnostic.
+    owns_connection = not isinstance(db_path, duckdb.DuckDBPyConnection)
+    con = connect_duckdb(str(db_path), read_only=True) if owns_connection else db_path
     primary_stock_provider = None
     primary_stock_codes = None
     try:
@@ -238,7 +241,8 @@ def assess_capital_flow_health(
             for relation in SECTOR_FLOW_RELATIONS
         ]
     finally:
-        con.close()
+        if owns_connection:
+            con.close()
 
     gated = collected_after is not None or effective_max_age_seconds is not None
     code_field = "recent_codes" if gated else "codes"
@@ -277,7 +281,7 @@ def assess_capital_flow_health(
     derived_membership_snapshots: list[str] = []
     membership_batch_consistent = True
     try:
-        con = connect_duckdb(str(db_path), read_only=True)
+        con = connect_duckdb(str(db_path), read_only=True) if owns_connection else db_path
         if table_exists(con, "intraday_sector_flow_taxonomy"):
             stale_row = con.execute(
                 "SELECT status, last_error FROM intraday_sector_flow_taxonomy "
@@ -321,10 +325,12 @@ def assess_capital_flow_health(
                     f"{derived_membership_snapshots} do not match canonical "
                     f"{canonical_membership_snapshot or 'none'}"
                 )
-        con.close()
     except Exception as exc:
         sector_taxonomy_stale = True
         sector_taxonomy_note = "taxonomy verification failed: " + type(exc).__name__
+    finally:
+        if owns_connection:
+            con.close()
     # P1-2: surface independent-source reconciliation.  Coverage alone can pass while
     # accuracy rests on a single (delayed) Eastmoney source; the reconciliation status
     # and whether an independent provider (TuShare moneyflow) exists for the date must
@@ -343,7 +349,7 @@ def assess_capital_flow_health(
     independent_sign_agreement_pct = None
     comparison_contract = {'eligible': False, 'reason': 'not_observed'}
     try:
-        con = connect_duckdb(str(db_path), read_only=True)
+        con = connect_duckdb(str(db_path), read_only=True) if owns_connection else db_path
         if table_exists(con, "intraday_stock_flow_reconciliation"):
             columns = set(table_columns(con, "intraday_stock_flow_reconciliation"))
             select_columns = ["status", "reference_rows"]
@@ -423,9 +429,11 @@ def assess_capital_flow_health(
                             stock_flow_evidence_fingerprint(con,trade_date,p) for p in independent_row[4:6]))
                 if qualified and stored_status.lower() == 'pass':
                     independent_status = 'pass'
-        con.close()
     except Exception:
         pass
+    finally:
+        if owns_connection:
+            con.close()
     # A primary/reference comparison from the same Eastmoney family is useful
     # for transport consistency, but it is not independent accuracy evidence.
     # Keep it visible; only the saved, reviewed reference product can qualify.

@@ -170,6 +170,24 @@ def _certification_gap(name: str, code: int, out: str, err: str, trade_date: str
     return False
 
 
+def _auction_step_deadline(name, phase_deadline, now, timeout):
+    """Spend the original 90-second window without starving final evidence.
+
+    The HTTP child receives five seconds less than its writer budget. Keep
+    50 seconds for the auction writer so the existing 45-second request is
+    still possible; optional context consumes only surplus time at the end.
+    """
+    cap, reserve = {
+        'collect_realtime_limit_pool': (12, 70),
+        'collect_auction_evidence': (50, 25),
+        'build_auction_evidence': (5, 20),
+        'build_normalized_views': (5, 15),
+        'check_data_readiness': (8, 8),
+        'collect_market_context': (30, 8),
+    }.get(name, (timeout, 8))
+    return min(phase_deadline - reserve, now + min(timeout, cap))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Transitional market collection adapter; no legacy decisions or user-page publication.")
     parser.add_argument("--db", default="kpl_data.duckdb")
@@ -359,6 +377,17 @@ def main() -> int:
                     if awaiting:
                         pending.append(name)
                     continue
+                step_clock = time.time()
+                step_deadline = min(phase_deadline, step_clock + args.step_timeout)
+                if selected_phase == 'auction' and not args.prepare_reference:
+                    step_deadline = _auction_step_deadline(name, phase_deadline, step_clock, args.step_timeout)
+                    minimum = 6 if name == 'collect_market_context' else 1
+                    if step_deadline - step_clock <= minimum:
+                        manifest.add_step(name, 'deadline_exhausted' if required[name] else 'warning',
+                            command, required=required[name],
+                            reason='original auction budget reserved for core validation and immutable evidence')
+                        (failed if required[name] else warnings).append(name)
+                        continue
                 started = datetime.now()
                 log = artifact_dir / (name+".log")
                 manifest.upsert_step(name, "running", command, started_at=started.isoformat(), log_path=str(log))
@@ -373,7 +402,6 @@ def main() -> int:
                         'coverage_before':reason}
                     env=_utf8_subprocess_env()
                     env['STOCKDATA_REQUEST_CONTEXT']=json.dumps(context,sort_keys=True)
-                    step_deadline = min(phase_deadline, time.time()+args.step_timeout)
                     # Leave time for response validation and transaction commit.
                     env['STOCKDATA_REQUEST_DEADLINE_EPOCH'] = str(step_deadline-5)
                     if name == 'prepare_valuation_session':
@@ -459,6 +487,29 @@ def main() -> int:
             manifest.data['operational_assessment']['evidence_identity_sha256'] = operational_evidence_identity(manifest.data['operational_assessment'])
             if manifest.data['operational_assessment']['ready'] is not True:
                 failed.append('supported_operational_inputs')
+            elif args.collector_contract and not args.prepare_reference and not failed and not pending:
+                # Capture before releasing the writer guard. Later five-minute
+                # refreshes must not overwrite the evidence for this window.
+                import duckdb
+                from trade_system.pipeline_runtime import freeze_operational_inputs, replay_operational_snapshot
+                try:
+                    assessed = manifest.data['operational_assessment']
+                    snapshot = freeze_operational_inputs(args.db, manifest.run_dir,
+                        run_id=run_id, trade_date=args.trade_date, phase=selected_phase,
+                        evaluated_at=assessed['evaluated_at'],
+                        collector_contract_sha256=str(args.collector_contract_sha256).lower(),
+                        deadline_epoch=phase_deadline - 2,
+                        observation_window_id=manifest.data.get('observation_window_id'))
+                    replay = replay_operational_snapshot(manifest.run_dir / snapshot['path'], args.trade_date,
+                        selected_phase, assessed['evaluated_at'], deadline_epoch=phase_deadline)
+                    replay['collector_contract_sha256'] = assessed['collector_contract_sha256']
+                    if (replay.get('ready') is not True or time.time() >= phase_deadline
+                            or operational_evidence_identity(replay) != assessed['evidence_identity_sha256']):
+                        raise ValueError('frozen operational inputs do not reproduce this window within its deadline')
+                    manifest.data['operational_input_snapshot'] = snapshot
+                except (OSError, ValueError, TypeError, duckdb.Error) as exc:
+                    failed.append('operational_evidence_snapshot')
+                    manifest.data['operational_snapshot_error'] = str(exc)
             if selected_phase == 'supplemental' and not failed and not pending:
                 from trade_system.pipeline_runtime import latest_manifests
                 prior = latest_manifests(args.reports_dir).get((args.trade_date, 'close'))

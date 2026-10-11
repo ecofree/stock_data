@@ -660,11 +660,15 @@ def collect_full_sector_flow(
                     [provider, expected, observed, tax_coverage,
                      tax_status, tax_error, trade_date, taxonomy],
                 )
-            expected_rows = sum(item[0] for item in taxonomy_rows.values())
-            fetched_rows = sum(item[1] for item in taxonomy_rows.values())
-            known_coverages = [item[2] for item in taxonomy_rows.values() if item[0]]
-            coverage = min(known_coverages) if known_coverages else 0.0
             required_names = {"em_industry", "ths_concept"}
+            # The batch denominator covers only the required products. Optional
+            # relay observations keep their own unknown denominator below; they
+            # must not inflate the required numerator above its universe.
+            required_taxonomies = [taxonomy_rows[name] for name in required_names]
+            expected_rows = sum(item[0] for item in required_taxonomies)
+            fetched_rows = sum(item[1] for item in required_taxonomies)
+            known_coverages = [item[2] for item in required_taxonomies if item[0]]
+            coverage = min(known_coverages) if known_coverages else 0.0
             taxonomy_status = {
                 taxonomy: {"expected_rows": item[0], "fetched_rows": item[1],
                            "coverage_pct": item[2] if item[0] else None,
@@ -674,7 +678,6 @@ def collect_full_sector_flow(
                            "status": item[3]}
                 for taxonomy, item in taxonomy_rows.items()
             }
-            required_taxonomies = [taxonomy_rows[name] for name in required_names]
             optional_gap = any(name not in required_names and item[3] != "success"
                                for name, item in taxonomy_rows.items())
             required_complete = bool(required_taxonomies) and all(
@@ -696,7 +699,9 @@ def collect_full_sector_flow(
             error = str(exc)[:500]
             fetched_rows = int(con.execute(
                 "SELECT count(DISTINCT sector_code) FROM multi_source_sector_flow "
-                "WHERE source_date=CAST(? AS DATE) AND is_stale=FALSE AND provider IN ('eastmoney_sector_full','tushare_sector_full','derived_ths_stock_aggregate')",
+                "WHERE source_date=CAST(? AS DATE) AND is_stale=FALSE "
+                "AND (provider='derived_ths_stock_aggregate' OR (sector_type='em_industry' "
+                "AND provider IN ('eastmoney_sector_full','tushare_sector_full')))",
                 [trade_date],
             ).fetchone()[0])
             coverage = min(100.0, round(fetched_rows * 100.0 / expected_rows, 2)) if expected_rows else 0.0
@@ -729,7 +734,7 @@ def collect_full_sector_flow(
         "reconciliation_pages": reconciliation_pages,
         "taxonomy_status": taxonomy_status,
         "coverage_scope": "minimum_known_taxonomy_not_full_market",
-        "row_count_scope": "sum_product_rows_not_unique_industries",
+        "row_count_scope": "sum_required_product_rows_not_unique_industries",
         "full_coverage": status in {"success", "success_with_optional_gap"},
         "ths_membership_snapshot": str(ths_snap) if ths_snap else None,
         "ths_membership_age_days": ths_age,
@@ -747,7 +752,7 @@ def render_report(result: dict) -> str:
         f"- provider: `{result['provider']}`",
         f"- status: `{result['status']}`",
         f"- pages: `{result['fetched_pages']}/{result['expected_pages']}`",
-        f"- product rows (separate classifications, not unique industries): `{result['fetched_rows']}/{result['expected_rows']}`",
+        f"- required product rows (separate classifications, not unique industries): `{result['fetched_rows']}/{result['expected_rows']}`",
         f"- full required coverage: `{result.get('full_coverage', False)}`",
         f"- reverse-code reconciliation pages: `{result.get('reconciliation_pages', 0)}`",
         f"- error: `{result.get('error') or ''}`",

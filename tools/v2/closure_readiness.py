@@ -12,6 +12,61 @@ from trade_system.v2.research_product import read_prediction,saved_projection
 from tools.v2.verify_delivery import source_files
 
 
+def classified_snapshot_writer_calls(relative, tree):
+    """Classify one reviewed run-local writer, not every writer in its module.
+
+    This deliberately recognizes the current AST contract instead of attempting
+    general Python data-flow or claiming an OS sandbox. Any changed construction
+    remains unclassified until it is reviewed.
+    """
+    if relative != 'trade_system/pipeline_runtime.py':
+        return set()
+    functions=[node for node in tree.body
+        if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))
+        and node.name=='freeze_operational_inputs']
+    if len(functions)!=1 or not isinstance(functions[0],ast.FunctionDef):
+        return set()
+    function=functions[0]
+    if 'run_dir' not in {arg.arg for arg in function.args.posonlyargs+function.args.args}:
+        return set()
+    patterns=[
+        'folder = Path(run_dir).resolve(strict=True)',
+        "partial = folder / ('operational-inputs.' + uuid.uuid4().hex + '.partial.duckdb')",
+        'output = duckdb.connect(str(partial))',
+    ]
+    matched=[]
+    for text in patterns:
+        expected=ast.dump(ast.parse(text).body[0])
+        matches=[(index,node) for index,node in enumerate(function.body)
+            if ast.dump(node)==expected]
+        if len(matches)!=1:
+            return set()
+        matched.append(matches[0])
+    if not matched[0][0] < matched[1][0] < matched[2][0]:
+        return set()
+    from collections import Counter
+    protected={'folder','partial','run_dir'}
+    bindings=Counter(node.id for node in ast.walk(function)
+        if isinstance(node,ast.Name) and isinstance(node.ctx,(ast.Store,ast.Del))
+        and node.id in protected)
+    if bindings!=Counter({'folder':1,'partial':1}):
+        return set()
+    # Some binding forms use strings rather than Name(Store), e.g. except/import.
+    arguments=set(function.args.posonlyargs+function.args.args+function.args.kwonlyargs)
+    for node in ast.walk(function):
+        names=[]
+        if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.ExceptHandler)):
+            names=[node.name]
+        elif isinstance(node,ast.alias):names=[node.asname or node.name.split('.')[0]]
+        elif isinstance(node,ast.arg) and node not in arguments:names=[node.arg]
+        elif isinstance(node,(ast.Global,ast.Nonlocal)):names=node.names
+        elif isinstance(node,(ast.MatchAs,ast.MatchStar)):names=[node.name]
+        elif isinstance(node,ast.MatchMapping):names=[node.rest]
+        if protected.intersection(names):
+            return set()
+    return {matched[2][1].value}
+
+
 def inventory(root):
     paths=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=root).decode().split('\0')
     sites=[];files=0
@@ -20,6 +75,7 @@ def inventory(root):
         if not name.endswith('.py') or name.startswith(('reports/','tmp/','data/','build/')) or not path.is_file():continue
         tree=ast.parse(path.read_text(encoding='utf-8-sig'));files+=1
         modules={'duckdb'};connects=set()
+        snapshot_calls=classified_snapshot_writer_calls(name,tree)
         for node in ast.walk(tree):
             if isinstance(node,ast.Import):modules.update(a.asname or a.name for a in node.names if a.name=='duckdb')
             if isinstance(node,ast.ImportFrom) and node.module=='duckdb':connects.update(a.asname or a.name for a in node.names if a.name=='connect')
@@ -30,7 +86,11 @@ def inventory(root):
             if direct:
                 readonly=any(k.arg=='read_only' and isinstance(k.value,ast.Constant) and k.value.value is True for k in node.keywords)
                 memory=bool(node.args and isinstance(node.args[0],ast.Constant) and node.args[0].value==':memory:')
-                sites.append({'file':name,'line':node.lineno,'kind':'readonly' if readonly else 'memory' if memory else 'potential_disk_writer','test':name.startswith('tests/'),'sha256':file_hash(path)})
+                kind=('readonly' if readonly else 'memory' if memory else
+                    'run_local_operational_snapshot_writer' if node in snapshot_calls else 'potential_disk_writer')
+                site={'file':name,'line':node.lineno,'kind':kind,'test':name.startswith('tests/'),'sha256':file_hash(path)}
+                if node in snapshot_calls:site['function']='freeze_operational_inputs'
+                sites.append(site)
             elif isinstance(f,ast.Attribute) and f.attr in ('execute','executemany','sql') and node.args:
                 statement=node.args[0]
                 if not isinstance(statement,ast.Constant):
@@ -47,6 +107,8 @@ def writer_gate(root):
     if any(name not in allowed or count>allowed[name] for name,count in actual.items()):
         raise ValueError('new unclassified direct writer: '+canonical(dict(actual)))
     return {'direct_writer_gate_passed':True,'non_test_sites':dict(actual),
+        'classified_writer_sites':[s for s in result['sites'] if not s['test']
+            and s['kind']=='run_local_operational_snapshot_writer'],
         'limitations':'static_direct_imports_only_not_dynamic_python_or_OS_sandbox'}
 
 
@@ -83,7 +145,7 @@ def build(root,workspace,output,tasks_path):
             'do_not_repoint_existing_collection_tasks':'research distribution does not replace full-market ingestion',
             'rollback':'restore exact backed-up task XML and prior verified release pointer; do not roll back user notes or raw receipts'}}
     (output/'readiness.json').write_text(canonical(report),encoding='utf-8')
-    return {'status':report['status'],'writer_sites':sum(s['kind']=='potential_disk_writer' for s in inv['sites']),
+    return {'status':report['status'],'writer_sites':sum(s['kind'] in ('potential_disk_writer','run_local_operational_snapshot_writer') for s in inv['sites']),
         'dynamic_sql_sites':sum(s['kind'].startswith('dynamic') for s in inv['sites']),
         'pending_review_groups':len(queue),'cutover_blockers':reasons,'production_cutover':False}
 

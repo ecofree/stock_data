@@ -8,7 +8,7 @@ function Invoke-StockDataProcess {
           [ValidateRange(50,5000)][int]$PollMilliseconds=1000,
           [string]$ProgressPath='')
     $nowEpoch=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0
-    $effectiveDeadline=$nowEpoch+$TimeoutSeconds
+    [double]$effectiveDeadline=$nowEpoch+$TimeoutSeconds
     foreach ($value in @($DeadlineEpoch,$env:STOCKDATA_PHASE_DEADLINE_EPOCH,$env:STOCKDATA_OBSERVATION_WINDOW_DEADLINE_EPOCH)) {
         if ($null -eq $value -or [string]$value -eq '' -or [string]$value -eq '0') {continue}
         $parsed=0.0

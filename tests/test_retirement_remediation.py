@@ -87,6 +87,7 @@ def test_unknown_requires_full_paper_journal_reconciliation(tmp_path,delivered):
 def test_no_unguarded_legacy_duckdb_writer_calls():
     import ast
     from pathlib import Path
+    from tools.v2.closure_readiness import classified_snapshot_writer_calls
     root=Path(__file__).resolve().parents[1]
     files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard','--','*.py'],cwd=root).decode().split('\0')
     offenders=[]
@@ -96,12 +97,13 @@ def test_no_unguarded_legacy_duckdb_writer_calls():
         if relative.startswith(('tests/','tools/v2/','trade_system/v2/','trade_system/vendor/')) or relative=='trade_system/db_utils.py':
             continue
         tree=ast.parse((root/relative).read_text(encoding='utf-8-sig'))
+        snapshot_calls=classified_snapshot_writer_calls(relative,tree)
         for node in ast.walk(tree):
             if isinstance(node,ast.ImportFrom) and node.module=='duckdb' and any(a.name=='connect' for a in node.names):
                 offenders.append((relative,node.lineno,'unreviewed connection alias'))
             if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==('duckdb','connect'):
                 readonly=any(k.arg=='read_only' and isinstance(k.value,ast.Constant) and k.value.value is True for k in node.keywords)
-                if not readonly:
+                if not readonly and node not in snapshot_calls:
                     offenders.append((relative,node.lineno,'unguarded writer'))
     assert not offenders,offenders
 

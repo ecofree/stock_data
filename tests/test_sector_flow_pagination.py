@@ -220,10 +220,17 @@ def test_sector_same_source_identity_cannot_silently_change_taxonomy(tmp_path):
         assert store.con.execute('SELECT * FROM multi_source_sector_flow').fetchall()==before
 
 
-def test_collector_and_recovery_share_ths_publication_guard(tmp_path, monkeypatch):
+@pytest.mark.parametrize('optional_rows', [535, 536])
+def test_collector_and_recovery_share_ths_publication_guard(tmp_path, monkeypatch, optional_rows):
     db = tmp_path/'shared-guard.duckdb'
     with MultiSourceStore(db) as store:
         _ths_fixture(store)
+        # The October 8/9 supplemental receipts had 535/536 optional relay
+        # rows with no independent denominator. They must remain visible but
+        # must not enter the required industry + THS batch numerator.
+        store.store('sector_flow', None,
+            [dict(_row(f'OPTIONAL-{i}'), sector_type='em_concept') for i in range(optional_rows)],
+            {'source':'tushare_sector_full','status':'live'}, trade_date='2026-09-11')
     # Frozen view fixture bypasses schema regeneration, not the publication
     # guard. The actual two entrypoints and actual transactional store run.
     monkeypatch.setattr(collector, 'init_schema', lambda con: None)
@@ -238,7 +245,15 @@ def test_collector_and_recovery_share_ths_publication_guard(tmp_path, monkeypatc
     result = collector.collect_full_sector_flow(db,'2026-09-11',expected_codes=['EM'],
         catalogue_version='fixture',max_pages=1,pause_seconds=0)
     assert result['ths_aggregation']['promoted']
+    assert result['status']=='success_with_optional_gap' and result['full_coverage']
+    assert (result['expected_rows'], result['fetched_rows'], result['coverage_pct'])==(2, 2, 100.0)
+    assert result['taxonomy_status']['tushare_dc_sector']['fetched_rows']==optional_rows
+    assert not result['taxonomy_status']['tushare_dc_sector']['denominator_known']
     with MultiSourceStore(db) as store:
+        from trade_system.readiness import _coverage_fact
+        batch=store.con.execute('SELECT expected_rows,fetched_rows,coverage_pct,status '
+                                'FROM intraday_sector_flow_batch').fetchone()
+        assert _coverage_fact(*batch, {'success','success_with_optional_gap'})['passed']
         before=store.con.execute("SELECT * FROM multi_source_sector_flow WHERE provider='derived_ths_stock_aggregate'").fetchall()
         store.con.execute("DELETE FROM multi_source_stock_flow WHERE stock_code='000002'")
     recovered = collector.rebuild_ths_derived_flow(db,'2026-09-11')
