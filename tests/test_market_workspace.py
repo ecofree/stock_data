@@ -192,23 +192,80 @@ def test_configured_market_uses_its_own_calendar_not_prediction_date(tmp_path,mo
     assert read_json(tmp_path/'workspace-config.json')[0]['read_only']
 
 
-def test_scheduled_publication_refuses_yesterday_and_separates_research(tmp_path,monkeypatch):
+def test_scheduled_publication_refuses_yesterday_and_separates_research(tmp_path,monkeypatch,con):
     from trade_system.v2.daily_workspace import update_market
     write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic','read_only':True})
-    snap={'trade_date':'2026-09-15','snapshot_id':'fixture','session_state':'open_session','calendar_checked_date':'2026-09-16'}
+    snap=project(con)
     calls=[]
     monkeypatch.setattr(market,'latest_snapshot',lambda *a:snap)
-    monkeypatch.setattr(product,'publish_desk',lambda *a,**k:calls.append(k))
+    publish=product.publish_desk
+    def tracked_publish(*args,**kwargs):
+        calls.append(kwargs)
+        return publish(*args,**kwargs)
+    monkeypatch.setattr(product,'publish_desk',tracked_publish)
     with pytest.raises(ValueError,match='expected market session 2026-09-16'):
         update_market(tmp_path,expected_date='2026-09-16')
     assert calls==[]
-    snap['trade_date']='2026-09-16'
-    result=update_market(tmp_path,expected_date='2026-09-16')
+    result=update_market(tmp_path,expected_date='2026-09-11')
     assert result['status']=='market_published' and len(calls)==1
     assert result['provider_requests']==result['fits']==0 and not result['execution_ready']
-    snap.update(trade_date='2026-09-16',calendar_checked_date='2026-09-19',session_state='closed')
+    snap.update(calendar_checked_date='2026-09-19',session_state='closed')
     assert update_market(tmp_path,expected_date='2026-09-19')['status']=='market_closed'
     assert len(calls)==1
+
+
+def test_market_update_receipt_reads_only_its_published_generation(tmp_path,monkeypatch,con):
+    import json
+    from trade_system.v2 import daily_workspace
+    from trade_system.v2.publisher import read_bundle,read_current
+    from trade_system.v2.domain import identity
+    snapshot=project(con)
+    write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic','read_only':True})
+    monkeypatch.setattr(market,'latest_snapshot',lambda *a:snapshot)
+    history=daily_workspace.period_history
+    history_calls=[]
+    def tracked_history(*args):
+        history_calls.append(args[1]['snapshot_id'])
+        return history(*args)
+    monkeypatch.setattr(daily_workspace,'period_history',tracked_history)
+    publish=product.publish_desk
+    first_pointer=[]
+    def publish_then_advance(*args,**kwargs):
+        pointer=publish(*args,**kwargs)
+        first_pointer.append(pointer)
+        assert len(history_calls)==1
+        newer=dict(snapshot,as_of='2026-09-12T13:00:00+08:00')
+        newer.pop('snapshot_id');newer['snapshot_id']=identity(newer)
+        publish(tmp_path,market=newer)
+        return pointer
+    monkeypatch.setattr(product,'publish_desk',publish_then_advance)
+    receipt=daily_workspace.update_market(tmp_path,expected_date='2026-09-11')
+    manifest,files=read_bundle(tmp_path/'publication',receipt['publication'])
+    data=json.loads(files['desk.json'])
+    current,current_files=read_current(tmp_path/'publication')
+    assert receipt['publication']==first_pointer[0]
+    assert manifest['generation']==1 and current['generation']==2
+    assert len(history_calls)==2, 'one enrichment per each of the two actual publications'
+    assert receipt['snapshot_id']==data['market']['snapshot_id']
+    assert receipt['report_id']==data['report_id']
+    assert receipt['snapshot_id']!=json.loads(current_files['desk.json'])['market']['snapshot_id']
+    assert receipt['snapshot_id']!=snapshot['snapshot_id']
+
+
+def test_market_update_refuses_a_changed_published_generation(tmp_path,monkeypatch,con):
+    from trade_system.v2.daily_workspace import update_market
+    snapshot=project(con)
+    write_json(tmp_path/'workspace-config.json',{'market_database':'synthetic','read_only':True})
+    monkeypatch.setattr(market,'latest_snapshot',lambda *a:snapshot)
+    publish=product.publish_desk
+    def publish_then_corrupt(*args,**kwargs):
+        pointer=publish(*args,**kwargs)
+        manifest=tmp_path/'publication/runs'/pointer['run_id']/'manifest.json'
+        manifest.write_bytes(manifest.read_bytes()+b' ')
+        return pointer
+    monkeypatch.setattr(product,'publish_desk',publish_then_corrupt)
+    with pytest.raises(ValueError,match='manifest checksum mismatch'):
+        update_market(tmp_path,expected_date='2026-09-11')
 
 
 def test_one_metadata_authority_and_conflicting_legacy_rejected(tmp_path):

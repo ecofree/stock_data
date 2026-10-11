@@ -128,11 +128,15 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
         assert proposal['LiveBackendEnabled'] is False and proposal['AuthenticationVerified'] is False
         assert rows['StockData-MonthlyCompact']['AfterXml']==rows['StockData-MonthlyCompact']['BeforeXml']
         ns={'t':'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+        enabled=set()
         for name,row in rows.items():
             after=ET.fromstring(row['AfterXml'])
+            if after.find('t:Settings/t:Enabled',ns).text=='true':
+                enabled.add(name)
             if name.endswith('MonthlyCompact'):continue
             assert after.find('t:Actions/t:Exec/t:Arguments',ns).text==row['Arguments']
             assert after.find('t:Settings/t:StartWhenAvailable',ns).text=='false'
+        assert enabled==set(rows)-{'StockData-QLibResearch','StockData-MonthlyCompact'}
         assert proposal['Version']=='0.3.26'
         if 'StockData-ResearchDaily' in rows:
             research=ET.fromstring(rows['StockData-ResearchDaily']['AfterXml'])
@@ -161,6 +165,18 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
             assert results[failure]['fixture_writes']==0 and not (rehearsal/(failure+'.json')).exists()
         assert run_engine('-Mode','Rehearse','-Plan',output,'-PlanSha256',sha(output),'-OutputDirectory',rehearsal).returncode!=0
         assert run_engine('-Mode','Check','-Plan',output,'-PlanSha256','0'*64).returncode!=0
+        if 'StockData-QLibResearch' in rows:
+            # A reviewed activation allowlist cannot be contradicted by the
+            # compiled task XML, even when its own file hash is supplied.
+            tampered=json.loads(saved)
+            qlib=next(row for row in tampered['Actions'] if row['Name']=='StockData-QLibResearch')
+            xml=ET.fromstring(qlib['AfterXml'])
+            xml.find('t:Settings/t:Enabled',ns).text='true'
+            qlib['AfterXml']=ET.tostring(xml,encoding='unicode')
+            unsafe=tmp_path/'enabled-retired-task.json'
+            unsafe.write_text(json.dumps(tampered),encoding='utf-8')
+            rejected=run_engine('-Mode','Check','-Plan',unsafe,'-PlanSha256',sha(unsafe))
+            assert rejected.returncode!=0 and 'Compiled task XML mismatch' in rejected.stderr
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows engineering transaction policy')
@@ -553,6 +569,15 @@ function Start-ScheduledTask {
         assert c.execute('SELECT phase FROM fixture_commits ORDER BY rowid').fetchall()==[('close',),('supplemental',)]
     manifest,files=read_current(workspace/'publication')
     desk=json.loads(files['desk.json'])
+    publication_receipts=[json.loads(line) for line in supplement.stdout.splitlines()
+        if line.strip().startswith('{') and 'market_published' in line]
+    assert len(publication_receipts)==1
+    publication_receipt=publication_receipts[0]
+    assert publication_receipt['publication']==json.loads((workspace/'publication/current.json').read_bytes())
+    assert publication_receipt['publication']['run_id']==manifest['run_id']
+    assert publication_receipt['publication']['generation']==manifest['generation']
+    assert publication_receipt['snapshot_id']==desk['market']['snapshot_id']
+    assert publication_receipt['report_id']==desk['report_id']
     assert desk['market']['trade_date']=='2026-10-09' and desk['market']['breadth']['samples']==1
     assert desk['market']['stocks']['000001']['change_pct']==3
     assert not desk['execution_ready']

@@ -31,7 +31,9 @@ function Replacement-Xml($Row,[string]$ResearchStartBoundary,[string]$AuctionSta
         Xml-Child $exec $field[0] ([string]$Row.($field[1]))
     }
     $settings=$task.SelectSingleNode('*[local-name()="Settings"]')
-    Xml-Child $settings 'Enabled' 'true'
+    # The retired research task is never an activation candidate, including in
+    # compiled plans; live staging still independently disables every task.
+    Xml-Child $settings 'Enabled' $(if ($Row.Name -eq 'StockData-QLibResearch') {'false'} else {'true'})
     # Registering an old trigger must not replay a missed close while committing.
     Xml-Child $settings 'StartWhenAvailable' 'false'
     if ($Row.Name -in @('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-SupplementalRetry')) {

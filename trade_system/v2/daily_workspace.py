@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .domain import identity, now_utc
 from .gap_evidence import read_json
-from .publisher import read_current
+from .publisher import read_current, read_bundle
 
 
 def empty_projection():
@@ -115,9 +115,22 @@ def update_market(output, *, expected_date=None):
                 return {'status':'market_closed','date':market['trade_date'],
                         'expected_date':expected_date,'provider_requests':0,'fits':0,'execution_ready':False}
             raise ValueError(f"expected market session {expected_date}, received {market['trade_date']}; keep last publication")
-        market=period_history(output,market)
-        publish_desk(output,market=market)
-        return {'status':'market_published','date':market['trade_date'],'snapshot_id':market['snapshot_id'],
+        # The publisher enriches period history exactly once. Read its immutable
+        # returned generation, never a newer current pointer or the input snapshot.
+        pointer=publish_desk(output,market=market)
+        manifest,files=read_bundle(output/'publication',pointer)
+        if set(manifest['artifacts'])!={'desk.json','index.html'}:
+            raise ValueError('published market receipt requires the exact desk bundle')
+        data=json.loads(files['desk.json'])
+        published=data.get('market') or {}
+        if (data.get('report_id')!=identity({k:v for k,v in data.items() if k!='report_id'})
+                or published.get('snapshot_id')!=identity({k:v for k,v in published.items() if k!='snapshot_id'})
+                or published.get('trade_date')!=market['trade_date']
+                or published.get('scope')!='read_only_market_review_not_execution'
+                or data.get('execution_ready') is not False or published.get('execution_ready') is not False):
+            raise ValueError('published market receipt content differs from the requested session')
+        return {'status':'market_published','date':published['trade_date'],'snapshot_id':published['snapshot_id'],
+                'report_id':data['report_id'],'publication':pointer,
                 'provider_requests':0,'fits':0,'execution_ready':False}
 
 

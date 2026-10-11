@@ -281,6 +281,8 @@ def test_qualified_primary_flow_can_be_observed_without_independent_confirmation
 
 def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path, monkeypatch):
     import json
+    from datetime import timedelta
+    import trade_system.capital_flow_health as health
     import trade_system.flow_contract as contract
     from test_readiness import _qualified_stock, _qualified_sector
     from scripts.reconcile_independent_stock_flow import reconcile
@@ -310,13 +312,21 @@ def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path,
                  amount_precision=dict(primary_quantum_yuan=1,reference_quantum_yuan=1))
     monkeypatch.setitem(contract.VERIFIED_FLOW_COMPARISONS, signatures, proof)
     assert reconcile(db,day,reference_provider='ifind_fixture')['status'] == 'pass'
+    # The report-generation clock is separate from the historical input as-of
+    # clock. Force the two calls across a second without depending on CPU speed.
+    audit_clock = [datetime.now().replace(microsecond=0)]
+    class AuditClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return audit_clock[0] if tz is None else audit_clock[0].astimezone(tz)
+    monkeypatch.setattr(health, 'datetime', AuditClock)
     result = assess_capital_flow_health(db,day,now=datetime(2026,9,29,18),session_close=True)
+    assert result['generated_at'] == audit_clock[0].isoformat(timespec='seconds')
     assert result['reconciliation']['independent_reference_provider'] == 'ifind_fixture'
     assert result['reconciliation']['independent_source_present']
     assert result['reconciliation']['independent_reconciliation_ready']
     assert result['flow_certified_ready']
     assert result['stock_independent_certified_ready']
-    import trade_system.capital_flow_health as health
     from trade_system.readiness import assess_trade_date_readiness
     with duckdb.connect(str(db), read_only=True, config={'enable_external_access': False,
             'memory_limit': '512MB', 'max_temp_directory_size': '0B', 'threads': 1}) as restricted:
@@ -324,8 +334,12 @@ def test_reviewed_non_tushare_reference_is_consumed_without_brand_gate(tmp_path,
             def unexpected_reopen(*args, **kwargs):
                 raise AssertionError('borrowed restricted connection must not reopen its database')
             isolated.setattr(health, 'connect_duckdb', unexpected_reopen)
+            audit_clock[0] += timedelta(seconds=1)
             borrowed = assess_capital_flow_health(restricted, day, now=datetime(2026,9,29,18), session_close=True)
-            assert borrowed == result
+            assert borrowed['generated_at'] == audit_clock[0].isoformat(timespec='seconds')
+            assert borrowed['generated_at'] != result['generated_at']
+            assert {key: value for key, value in borrowed.items() if key != 'generated_at'} == {
+                key: value for key, value in result.items() if key != 'generated_at'}
             assessed = assess_trade_date_readiness(restricted, day, 'close', now=datetime(2026,9,29,18))
             assert assessed['flow_certified_ready']
             assert assessed['capital_flow_health']['reconciliation']['independent_reconciliation_ready']
