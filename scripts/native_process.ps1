@@ -1,3 +1,12 @@
+# Process-local layout selection, not deployment or writer authorization.
+function Set-StockDataRuntimeRoot([string]$RuntimeRoot) {
+    if (-not $RuntimeRoot -or $RuntimeRoot -match '["\r\n]' -or
+        $RuntimeRoot -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)') {
+        throw 'Explicit absolute runtime root required'
+    }
+    $env:STOCKDATA_RUNTIME_ROOT=[IO.Path]::GetFullPath($RuntimeRoot)
+}
+
 # Capture the actual process exit code independently of PowerShell error streams.
 # A provider logging INFO to stderr must not turn exit 0 into a failed task.
 function Invoke-StockDataProcess {

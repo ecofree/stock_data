@@ -24,8 +24,9 @@ from trade_system.http_transport import request_budget, request_deadline
 logger = logging.getLogger(__name__)
 
 # ---- 路径 / 环境 ----
-WORKSPACE = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(WORKSPACE, ".stock_cache")
+from trade_system.config import ACQUISITION_STATE_DIR
+
+CACHE_DIR = str(ACQUISITION_STATE_DIR)
 os.makedirs(CACHE_DIR, exist_ok=True)
 DB_PATH = os.path.join(CACHE_DIR, "resilient.db")
 LOCAL_MODE = os.environ.get("STOCK_DATA_LOCAL") == "1"

@@ -537,7 +537,7 @@ def _save_note(output, values):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market','register-sampling','request-metrics','journal-index','journal-history'])
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('command',choices=['build','update','market-update','observe','serve','stop','status','preflight','price-study','utility','render','present','configure-market','register-sampling','request-metrics','journal-index','journal-history','identity'])
     p.add_argument('--kind',choices=['note','review','plan'],default='note');p.add_argument('--before')
     p.add_argument('--ensure-index',action='store_true',help='Rebuild event cache only when missing or invalidated; creates no human events')
     p.add_argument('--config',default='config/research_delivery.json');p.add_argument('--output',default='reports/research-delivery')
@@ -554,7 +554,10 @@ def main():
     p.add_argument('--quote-receipts',help='Replay a sealed real quote receipt folder without network')
     p.add_argument('--port',type=int,default=8766);p.add_argument('--open-browser',action='store_true')
     a=p.parse_args();root=Path(__file__).resolve().parents[2];output=(root/a.output).resolve()
-    if a.command=='journal-history':
+    if a.command=='identity':
+        from .research_product_server import service_identity
+        result=service_identity(root,output)
+    elif a.command=='journal-history':
         from .journal_index import history
         result=history(output,a.kind,a.before)
     elif a.command=='journal-index':

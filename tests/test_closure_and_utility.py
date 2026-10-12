@@ -8,6 +8,14 @@ from trade_system import db_utils
 from trade_system.v2.utility_verification import evaluate
 
 
+@pytest.fixture(autouse=True)
+def isolate_temporary_git_repositories(request, monkeypatch):
+    # These cases create their own Git fixtures, not the source build context.
+    if request.node.name.startswith(('test_inventory_', 'test_writer_gate_', 'test_snapshot_writer_')):
+        for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
+            monkeypatch.delenv(name, raising=False)
+
+
 def test_installed_legacy_disk_writes_are_denied_but_reads_and_memory_work(tmp_path,monkeypatch):
     target=tmp_path/'not-created.duckdb'
     monkeypatch.setattr(db_utils,'primary_checkout',lambda:None)

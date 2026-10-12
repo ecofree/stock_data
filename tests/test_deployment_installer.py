@@ -85,9 +85,11 @@ def test_probe_inspection_checks_actual_database_and_frozen_pointer_without_writ
 
 def test_workspace_launcher_uses_dedicated_runtime_before_any_mutation():
     text=(ROOT/'scripts/start_research_workbench.ps1').read_text()
-    assert ".venv\\Scripts\\python.exe" in text
+    assert 'DeploymentState' in text and 'ReleaseManifestSha256' in text
+    assert '.venv\\Scripts\\python.exe' not in text
+    assert "D:\\accio\\stock_data\\.env" not in text
     assert "[string]$Python='D:\\anaconda\\python.exe'" not in text
-    assert text.index('& $Python -m pip check') < text.index('if ($Build)')
+    assert text.index('Release manifest differs') < text.index("'-m','pip','check'")
     assert 'Runtime dependency check failed' in text
     assert 'local-v3' not in text and 'surface_sha256' in text and 'workspace_id' in text
     assert 'ExecutionPolicy Bypass' not in (ROOT/'Start Research.cmd').read_text(encoding='utf-8')

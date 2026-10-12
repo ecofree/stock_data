@@ -6,8 +6,41 @@ from typing import Any
 import duckdb
 
 
+def _source_distribution_root(root):
+    """Recognize a Git-free source archive, not an installed core or permission.
+
+    These identity members replace Git's source-location metadata only. The
+    scheduled adapter still verifies its complete collector contract, exact
+    database, interpreter and writer guard. OS permissions remain independent.
+    """
+    import hashlib
+    import json
+    try:
+        marker = root/'source-distribution.json'
+        if marker.stat().st_size > 1_000_000:
+            return None
+        value = json.loads(marker.read_text(encoding='utf-8'))
+        if (not isinstance(value, dict) or not isinstance(value.get('files'), dict)
+                or value.get('schema') != 'source_distribution_v1'
+                or value.get('scope') != 'source_identity_only_not_deployment_authority'):
+            return None
+        for name in ('pyproject.toml', 'scripts/run_integrated_daily.py',
+                     'trade_system/db_utils.py', 'trade_system/config.py', 'trade_system/migration_boundary.py'):
+            path = root/name
+            for member in (path, marker, *path.parents):
+                if member.is_symlink() or getattr(member, 'is_junction', lambda: False)():
+                    return None
+            if path.stat().st_size > 2_000_000:
+                return None
+            if hashlib.sha256(path.read_bytes()).hexdigest() != value['files'][name]:
+                return None
+        return root
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def primary_checkout():
-    """Resolve the shared Git checkout from this source tree, without config secrets."""
+    """Resolve the protected source root from Git or a verified source identity."""
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     marker = root/'.git'
@@ -22,7 +55,7 @@ def primary_checkout():
                 shared = (gitdir/common.read_text(encoding='utf-8').strip()).resolve()
                 if shared.name == '.git':
                     return shared.parent
-    return None
+    return _source_distribution_root(root)
 
 
 def refuse_primary_legacy_write(database):
@@ -34,6 +67,15 @@ def refuse_primary_legacy_write(database):
     primary = primary_checkout()
     if primary is None:
         raise ValueError('installed runtime refuses legacy disk writes; use the V2 owned store')
+    from trade_system.config import configured_runtime_root
+    runtime = configured_runtime_root()
+    if runtime is not None:
+        original = Path(database).absolute()
+        if any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)()
+               for p in (original, *original.parents)):
+            raise ValueError('released collector refuses linked database target')
+        if path != runtime/'market/kpl_data.duckdb':
+            raise ValueError('released collector refuses unbound database target')
     if primary and (path==primary or primary in path.parents):
         raise ValueError('legacy writer refuses primary checkout; use an isolated migration copy')
     live=primary/'kpl_data.duckdb'

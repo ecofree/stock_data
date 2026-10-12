@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any
 
+from trade_system.config import runtime_path
+
 
 class EastmoneyClistUnavailable(RuntimeError):
     """Raised when the clist circuit is cooling down after upstream resets."""
@@ -32,10 +34,9 @@ class EastmoneyClistGuard:
     _cooldowns = (30, 60, 120, 300, 900)
 
     def __init__(self, path: str | Path | None = None):
-        self.path = Path(path or os.environ.get(
-            "EASTMONEY_CLIST_GUARD_PATH",
-            Path(__file__).resolve().parent / ".stock_cache" / "eastmoney_clist_guard.json",
-        ))
+        self.path = Path(path) if path is not None else runtime_path(
+            'trade_system/.stock_cache/eastmoney_clist_guard.json',
+            'state/acquisition/eastmoney_clist_guard.json', os.getenv('EASTMONEY_CLIST_GUARD_PATH', ''))
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -116,17 +117,16 @@ class EastmoneyClistGuard:
             return state
 
 
-_CACHE_DIR = Path(__file__).resolve().parent / ".stock_cache"
+_CACHE_DIR = runtime_path('trade_system/.stock_cache', 'state/acquisition')
 
 # Keep the primary and delayed front doors isolated.  A provider-side reset on
 # push2 must not suppress a healthy push2delay probe, and a delayed-route
 # failure must not extend the primary route's cooldown.
 PRIMARY_CLIST_GUARD = EastmoneyClistGuard()
 DELAY_CLIST_GUARD = EastmoneyClistGuard(
-    os.environ.get(
-        "EASTMONEY_DELAY_CLIST_GUARD_PATH",
-        _CACHE_DIR / "eastmoney_clist_delay_guard.json",
-    )
+    runtime_path('trade_system/.stock_cache/eastmoney_clist_delay_guard.json',
+                 'state/acquisition/eastmoney_clist_delay_guard.json',
+                 os.getenv('EASTMONEY_DELAY_CLIST_GUARD_PATH', ''))
 )
 
 # Backwards-compatible name for callers that explicitly mean the primary
@@ -135,5 +135,7 @@ DEFAULT_CLIST_GUARD = PRIMARY_CLIST_GUARD
 
 # trends2 has its own persistent budget; clist health cannot reset it.
 TRENDS_GUARD = EastmoneyClistGuard(
-    os.environ.get("EASTMONEY_TRENDS_GUARD_PATH", _CACHE_DIR / "eastmoney_trends_guard.json")
+    runtime_path('trade_system/.stock_cache/eastmoney_trends_guard.json',
+                 'state/acquisition/eastmoney_trends_guard.json',
+                 os.getenv('EASTMONEY_TRENDS_GUARD_PATH', ''))
 )

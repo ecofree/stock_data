@@ -88,7 +88,8 @@ def collection_source_files(root):
         selected.update(p for p in (root / folder).rglob('*') if p.is_file()
                         and p.suffix in ('.sql', '.json', '.toml', '.yaml', '.yml'))
     selected.update(p for p in root.glob('requirements*.lock') if p.is_file())
-    selected.update(p for p in (root / 'pyproject.toml', root / 'setup.py') if p.is_file())
+    selected.update(p for p in (root / 'pyproject.toml', root / 'setup.py',
+                                 root / 'source-distribution.json') if p.is_file())
     return selected
 
 
@@ -110,6 +111,11 @@ def collection_contract(source_root, database, reports, python):
         if any(p.is_symlink() or (p.exists() and getattr(p, 'is_junction', lambda: False)()) for p in (path, *path.parents)):
             raise ValueError('collector paths must not traverse links or junctions')
     root, database, reports, python = (p.resolve() for p in inputs)
+    from trade_system.config import configured_runtime_root
+    layout = configured_runtime_root()
+    if layout is not None and (database != layout/'market/kpl_data.duckdb'
+                               or reports != layout/'collection-reports'):
+        raise ValueError('collector runtime layout database/report target mismatch')
     if not root.is_dir() or not python.is_file() or not database.is_file():
         raise ValueError('existing collector source, interpreter and market database required')
     if reports == root or reports == database.parent or database in reports.parents:
@@ -130,7 +136,8 @@ def collection_contract(source_root, database, reports, python):
         'import importlib.metadata as m,json,sys; print(json.dumps([list(sys.version_info[:3]),sorted((d.metadata["Name"],d.version) for d in m.distributions())]))'],
         capture_output=True, text=True, timeout=30, check=True)
     from trade_system.pipeline_runtime import default_observation_policy
-    return {'schema': 1, 'scope': 'transitional_market_collection_only', 'source_root': str(root),
+    return {**({'runtime_root': str(layout)} if layout is not None else {}),
+        'schema': 1, 'scope': 'transitional_market_collection_only', 'source_root': str(root),
         'database': str(database), 'reports': str(reports), 'python': str(python),
         'python_sha256': hashlib.sha256(python.read_bytes()).hexdigest(),
         'runtime_sha256': hashlib.sha256(json.dumps(json.loads(runtime.stdout), sort_keys=True).encode()).hexdigest(),

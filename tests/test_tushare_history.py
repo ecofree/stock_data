@@ -7,6 +7,11 @@ from trade_system.tushare_history import TushareHistoryCollector
 from trade_system.xiaodefa_source import XiaodefaClient, XiaodefaError
 
 
+def _original_file_reference(path):
+    import hashlib
+    return {'path':str(path), 'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
 class FakeClient:
     def query_rows(self, api_name, params=None, fields=""):
         assert api_name == "adj_factor"
@@ -733,7 +738,7 @@ def test_latest_income_period_does_not_invent_reports_from_notices(tmp_path, tit
     for mode in ('static', 'ttm'):
         with pytest.raises(ValueError, match='latest applicable income period not evidenced'):
             RetainedValuationReader._latest_income_period(
-                [{'document': {'path': str(page)}}], '2026-09-29', mode)
+                [{'document': _original_file_reference(page)}], '2026-09-29', mode)
 
 
 @pytest.mark.parametrize('title,period', [
@@ -759,7 +764,7 @@ def test_latest_income_period_accepts_full_reports_and_revised_full_text(tmp_pat
     page.write_text(json.dumps({'announcements': [
         {'announcementTitle': title, 'announcement_date': '2026-08-30'}]},
         ensure_ascii=False), encoding='utf-8')
-    catalogues = [{'document': {'path': str(page)}}]
+    catalogues = [{'document': _original_file_reference(page)}]
     assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'ttm') == period
     if period.endswith('-12-31'):
         assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'static') == period
@@ -784,7 +789,7 @@ def test_latest_income_period_never_combines_separate_report_years(tmp_path, tit
         ensure_ascii=False), encoding='utf-8')
     with pytest.raises(ValueError, match='not evidenced'):
         RetainedValuationReader._latest_income_period(
-            [{'document': {'path': str(page)}}], '2026-09-29', 'ttm')
+            [{'document': _original_file_reference(page)}], '2026-09-29', 'ttm')
 
 
 def test_latest_income_period_uses_observed_report_date_and_original_page_set(tmp_path):
@@ -805,11 +810,49 @@ def test_latest_income_period_uses_observed_report_date_and_original_page_set(tm
         for title, day in rows]}, ensure_ascii=False), encoding='utf-8')
     manifest = tmp_path/'dated-catalogue.json'
     manifest.write_text(json.dumps({'schema': 'official_disclosure_page_set_v1',
-        'source_pages': [{'path': str(page)}]}), encoding='utf-8')
-    catalogues = [{'document': {'path': str(manifest)}}]
+        'source_pages': [_original_file_reference(page)]}), encoding='utf-8')
+    catalogues = [{'document': _original_file_reference(manifest)}]
     assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'static') == '2025-12-31'
     assert RetainedValuationReader._latest_income_period(catalogues, '2026-09-29', 'ttm') == '2026-06-30'
     assert RetainedValuationReader._latest_income_period(catalogues, '2026-11-01', 'ttm') == '2026-09-30'
+
+
+def test_financial_originals_and_periods_read_by_hash_without_legacy_path_access(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from pathlib import Path
+    from trade_system.tushare_store import _read_valuation_document_original, RetainedValuationReader
+    root = tmp_path/'runtime'; objects = root/'evidence/objects'; objects.mkdir(parents=True)
+    old = tmp_path/'old-worktree'; old.mkdir()
+    def retain(name, raw):
+        digest = hashlib.sha256(raw).hexdigest()
+        (objects/digest).write_bytes(raw)
+        # A same-named but different file must not be consulted or repaired.
+        path = old/name; path.write_bytes(b'wrong legacy bytes')
+        return {'path':str(path), 'sha256':digest}
+    pdf = retain('statement.pdf', b'%PDF-original-statement')
+    statement = {'ts_code':'002731.SZ', 'as_of':'2026-09-29', 'document':dict(pdf,
+        url='https://static.cninfo.com.cn/statement.pdf', format='pdf')}
+    page = retain('page.json', json.dumps({'announcements':[
+        {'announcementTitle':'2026年半年度报告', 'announcement_date':'2026-08-30'}]}).encode())
+    catalogue = retain('catalogue.json', json.dumps({'schema':'official_disclosure_page_set_v1',
+        'source_pages':[page]}).encode())
+    monkeypatch.setenv('STOCKDATA_RUNTIME_ROOT', str(root))
+    original_open = Path.open
+    def no_old_access(path, *args, **kwargs):
+        if path == old or old in path.parents:
+            raise AssertionError('legacy worktree accessed')
+        return original_open(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', no_old_access)
+    assert _read_valuation_document_original(statement)[0] == b'%PDF-original-statement'
+    assert RetainedValuationReader._latest_income_period(
+        [{'document':catalogue}], '2026-09-29', 'ttm') == '2026-06-30'
+    (objects/pdf['sha256']).write_bytes(b'%PDF-tampered')
+    with pytest.raises(ValueError, match='changed|hash'):
+        _read_valuation_document_original(statement)
+    missing = dict(statement, document=dict(statement['document'], sha256='0'*64))
+    with pytest.raises((ValueError, OSError)):
+        _read_valuation_document_original(missing)
 
 
 def test_direct_income_intake_latest_catalogue_and_known_at_corrections(tmp_path):

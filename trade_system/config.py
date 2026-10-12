@@ -13,6 +13,38 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
+def configured_runtime_root() -> Path | None:
+    """Explicit deployed layout; never infer it from a checkout or a cwd."""
+    raw = os.environ.get('STOCKDATA_RUNTIME_ROOT', '').strip()
+    if not raw:
+        return None  # Existing developer/isolated callers retain their explicit paths.
+    path = Path(raw)
+    if not path.is_absolute() or any(c in raw for c in ('\n', '\r', '\x00')):
+        raise ValueError('runtime root must be an explicit absolute directory')
+    for member in (path, *path.parents):
+        if member.is_symlink() or getattr(member, 'is_junction', lambda: False)():
+            raise ValueError('runtime root must not traverse a link or junction')
+    path = path.resolve()
+    if path == PROJECT_DIR or PROJECT_DIR in path.parents or (path.exists() and not path.is_dir()):
+        raise ValueError('runtime root must be outside the source directory')
+    return path
+
+
+def runtime_path(legacy_relative: str, deployed_relative: str, override: str = '') -> Path:
+    """One mutable layout shared by all consumers, without creating directories."""
+    root = configured_runtime_root()
+    expected = (root / deployed_relative) if root else (PROJECT_DIR / legacy_relative)
+    if root and any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)()
+                    for p in (expected, *expected.parents)):
+        raise ValueError('runtime root mutable paths must not traverse links or junctions')
+    if override:
+        supplied = Path(override)
+        if root and (not supplied.is_absolute() or supplied.resolve() != expected.resolve()):
+            raise ValueError('runtime root conflicts with a mutable-path override')
+        return supplied
+    return expected
+
+
 def _parse_dotenv(path: Path) -> dict:
     values: dict[str, str] = {}
     if not path.exists():
@@ -32,7 +64,7 @@ def _settings() -> dict:
     paths = (
         [Path(configured_env)]
         if configured_env
-        else [PROJECT_DIR / ".env", Path.cwd() / ".env"]
+        else [] if configured_runtime_root() else [PROJECT_DIR / ".env", Path.cwd() / ".env"]
     )
     for path in paths:
         merged.update(_parse_dotenv(path))
@@ -94,7 +126,7 @@ def _get_deepseek(name: str, default: str = "") -> str:
 
 API_BASE = _get("KPL_API_BASE", "https://www.kpl-api.cn/api")
 API_KEY = _get("KPL_API_KEY", "")
-DB_PATH = _get("KPL_DB_PATH", str(PROJECT_DIR / "kpl_data.duckdb"))
+DB_PATH = str(runtime_path('kpl_data.duckdb', 'market/kpl_data.duckdb', _get('KPL_DB_PATH', '')))
 # Operator-facing concept/member queries use 同花顺 first.  KPL remains a
 # per-date compatibility fallback in v_default_concept_* views.
 DEFAULT_CONCEPT_SOURCE = "ths"
@@ -132,7 +164,7 @@ MAX_EMPTY_RETRIES = int(float(_get("KPL_MAX_EMPTY_RETRIES", "2")))   # fast-fail
 # Allocation failure".  Bounds are env-tunable.
 DUCKDB_MEMORY_LIMIT = _get("KPL_DUCKDB_MEMORY_LIMIT", "6GB")
 DUCKDB_THREADS = _get("KPL_DUCKDB_THREADS", "8")
-DUCKDB_TEMP_DIR = _get("KPL_DUCKDB_TEMP_DIR", str(PROJECT_DIR / "tmp" / "duckdb_spill"))
+DUCKDB_TEMP_DIR = str(runtime_path('tmp/duckdb_spill', 'tmp/duckdb_spill', _get('KPL_DUCKDB_TEMP_DIR', '')))
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
@@ -157,4 +189,5 @@ def default_trade_date(db_path: str | Path | None = None) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 # Logging
-LOG_DIR = str(PROJECT_DIR / "logs")
+LOG_DIR = str(runtime_path('logs', 'logs'))
+ACQUISITION_STATE_DIR = runtime_path('trade_system/.stock_cache', 'state/acquisition')

@@ -63,8 +63,16 @@ if ($identity.UserId -notmatch '^S-1-5-21-' -or $identity.LogonType -ne 'Passwor
 }
 $repo=Split-Path -Parent $PSScriptRoot
 $common=' -Db "'+$contract.database+'" -Python "'+$AdapterPython+'" -CollectorContract "'+$CollectorContract+'" -CollectorContractSha256 '+$CollectorContractSha256+' -ReportsDirectory "'+$contract.reports+'" -EnvironmentFile "'+$EnvironmentFile+'" -ValuationWorkspace "'+$Workspace+'"'
+$layoutArgument=''
+if ($contract.runtime_root) {
+    $layout=[string]$contract.runtime_root
+    if (-not [IO.Path]::IsPathRooted($layout) -or $layout -match '["\r\n]') { throw 'Explicit safe absolute runtime root required' }
+    $layoutArgument=' -RuntimeRoot "'+$layout+'"'
+    $common += $layoutArgument
+}
 $prefix='-NoProfile -NonInteractive -File "'
 $research=$prefix+(Join-Path $PSScriptRoot 'run_research_daily.ps1')+'" -Python "'+$ResearchPython+'" -Workspace "'+$Workspace+'" -ReleaseDirectory "'+$ResearchReleaseDirectory+'" -ReleaseManifestSha256 '+$ResearchReleaseManifestSha256
+$research += $layoutArgument
 $actions=@{
     'StockData-Auction'=$prefix+(Join-Path $PSScriptRoot 'run_phase_watch.ps1')+'" -Phase auction -IntervalSeconds 120 -EndAt 09:27 -ContinueOnFailure'+$common
     'StockData-Intraday'=$prefix+(Join-Path $PSScriptRoot 'run_phase_watch.ps1')+'" -Phase intraday -IntervalSeconds 300 -EndAt 15:05 -SkipLunch -ContinueOnFailure'+$common

@@ -486,6 +486,24 @@ def test_supplemental_recovers_close_facts_under_shared_plan():
     assert health[health.index('--stage')+1]=='close'
 
 
+def test_collection_contract_runtime_layout_cannot_bind_a_different_database(tmp_path, monkeypatch):
+    import subprocess
+    from trade_system.migration_boundary import collection_contract
+    source=tmp_path/'source'; (source/'scripts').mkdir(parents=True)
+    (source/'scripts/run_integrated_daily.py').write_text('# isolated source fixture')
+    runtime=tmp_path/'runtime'; (runtime/'market').mkdir(parents=True)
+    database=runtime/'market/kpl_data.duckdb'
+    with duckdb.connect(str(database)) as con:
+        con.execute('CREATE TABLE tushare_trade_cal(cal_date DATE)')
+        con.execute('CREATE TABLE v_kline_daily(trade_date DATE)')
+    monkeypatch.setattr(subprocess,'run',lambda *a,**k:subprocess.CompletedProcess(a,0,stdout='[[3,12,4],[]]'))
+    monkeypatch.setenv('STOCKDATA_RUNTIME_ROOT',str(runtime))
+    reports=runtime/'collection-reports'
+    assert collection_contract(source,database,reports,sys.executable)['runtime_root']==str(runtime)
+    with pytest.raises(ValueError,match='runtime layout'):
+        collection_contract(source,database,tmp_path/'other-reports',sys.executable)
+
+
 def test_collection_handover_binds_sources_runtime_and_exact_targets(tmp_path, monkeypatch):
     import hashlib
     import json

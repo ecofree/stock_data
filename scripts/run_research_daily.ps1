@@ -4,6 +4,7 @@ param([Parameter(Mandatory=$true)][string]$Python,
       [string]$ExpectedTradeDate='',
       [switch]$RefreshResearch,
       [string]$Workspace='',
+      [string]$RuntimeRoot='',
       [string]$ReleaseDirectory='',
       [string]$ReleaseManifestSha256='')
 $ErrorActionPreference='Stop'
@@ -33,6 +34,7 @@ if ($ReleaseDirectory) {
 }
 $env:PYTHONUTF8='1'
 . (Join-Path $PSScriptRoot 'native_process.ps1')
+if ($RuntimeRoot) { Set-StockDataRuntimeRoot $RuntimeRoot }
 $runLogDirectory=Join-Path $Workspace 'scheduled-logs'
 New-Item -ItemType Directory -Path $runLogDirectory -Force | Out-Null
 $runLog=Join-Path $runLogDirectory ((Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'.log')

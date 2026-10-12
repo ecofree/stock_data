@@ -15,12 +15,12 @@ import re
 import time
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from threading import RLock
 from typing import Any
 
 import duckdb
 from trade_system.units import _number
+from trade_system.evidence_files import read_original
 
 _num = _number
 
@@ -854,12 +854,7 @@ def _read_valuation_document_original(payload):
     if (url.scheme != 'https' or (not official_catalogue and url.hostname not in
             {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'})):
         raise ValueError('official valuation document origin required')
-    path = Path(document['path'])
-    if path.stat().st_size > _PDF_MAX_BYTES:
-        raise ValueError('valuation document exceeds size limit')
-    raw = path.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != document['sha256']:
-        raise ValueError('official valuation document changed')
+    raw = read_original(document, max_bytes=_PDF_MAX_BYTES)
     if document.get('format') == 'pdf' and not raw.startswith(b'%PDF-'):
         raise ValueError('official valuation PDF format mismatch')
     if not payload.get('ts_code') or not payload.get('as_of'):
@@ -885,10 +880,7 @@ def _validate_valuation_document(payload):
         raise ValueError('original corporate action documents required')
     for source in related:
         origin = urlparse(source['url'])
-        source_path = Path(source['path'])
-        if source_path.stat().st_size > _PDF_MAX_BYTES:
-            raise ValueError('corporate action document exceeds size limit')
-        source_raw = source_path.read_bytes()
+        source_raw = read_original(source, max_bytes=_PDF_MAX_BYTES)
         if (origin.scheme != 'https' or origin.hostname not in
                 {'static.cninfo.com.cn','disc.static.szse.cn','www.sse.com.cn','static.sse.com.cn'}
                 or source.get('code') != payload['ts_code']
@@ -927,7 +919,7 @@ def _validate_valuation_document(payload):
                     or page.get('http_status') != 200):
                 raise ValueError('disclosure catalogue query scope mismatch')
             org = org_id
-            page_raw = Path(page['path']).read_bytes()
+            page_raw = read_original(page, max_bytes=_PDF_MAX_BYTES)
             if hashlib.sha256(page_raw).hexdigest() != page['sha256']:
                 raise ValueError('official disclosure catalogue page changed')
             body = json.loads(page_raw)
@@ -1050,11 +1042,11 @@ def _verified_native_balance_date_conflicts(proofs, documents, code, day):
             if (isinstance(native_value,bool) or isinstance(actual,bool) or _num(native_value) is None
                     or _num(actual) is None or abs(Decimal(str(native_value))-Decimal(str(actual)))>Decimal('0.01')):
                 raise ValueError('native disclosure date conflict amount differs from official statement')
-        manifest=json.loads(Path(catalogue['document']['path']).read_text(encoding='utf-8'))
+        manifest=json.loads(read_original(catalogue['document'], max_bytes=_PDF_MAX_BYTES))
         matched=[]
         official_path=urlparse(statement['document']['url']).path.lstrip('/')
         for page in manifest['source_pages']:
-            for announcement in json.loads(Path(page['path']).read_text(encoding='utf-8')).get('announcements') or []:
+            for announcement in json.loads(read_original(page, max_bytes=_PDF_MAX_BYTES)).get('announcements') or []:
                 stamp=announcement.get('announcementTime')
                 if isinstance(stamp,(int,float)) and not isinstance(stamp,bool) and math.isfinite(stamp):
                     announced=datetime.fromtimestamp(stamp/1000,timezone.utc).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
@@ -1201,10 +1193,10 @@ class RetainedValuationReader:
                        '第三季度报告': '09-30', '三季度报告': '09-30', '年度报告': '12-31'}
         periods = []
         for catalogue in catalogues:
-            body = json.loads(Path(catalogue['document']['path']).read_text(encoding='utf-8'))
+            body = json.loads(read_original(catalogue['document'], max_bytes=_PDF_MAX_BYTES))
             pages = [body]
             if body.get('schema') == 'official_disclosure_page_set_v1':
-                pages = [json.loads(Path(p['path']).read_text(encoding='utf-8'))
+                pages = [json.loads(read_original(p, max_bytes=_PDF_MAX_BYTES))
                          for p in body['source_pages']]
             for page in pages:
                 for row in page.get('announcements', []):

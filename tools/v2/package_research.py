@@ -73,12 +73,14 @@ def build(output, root=ROOT):
     if output.exists():
         raise ValueError('new research distribution path required')
     files = source_closure(root)
-    for name in ('requirements-research-replay.lock','config/research_delivery.json','config/research_inference_compatibility.json'):
+    for name in ('requirements-core.lock','requirements-research-replay.lock','config/research_delivery.json','config/research_inference_compatibility.json'):
         files[name] = (root/name).read_bytes()
     files['run_research.py'] = LAUNCHER.encode('utf-8')
     files['README.txt'] = (
-        'Research release, separate from operational core. No broker commands.\n'
-        'Use a dedicated environment: python -m pip install --require-hashes -r requirements-research-replay.lock\n'
+        'Read-only market publication and explicit historical research source distribution. No broker commands.\n'
+        'Daily publication/identity/serve: use a dedicated requirements-core.lock environment.\n'
+        'Set STOCKDATA_RUNTIME_ROOT to the explicit stable mutable root; no development .env is read implicitly.\n'
+        'Historical research only, in a separate optional environment: python -m pip install --require-hashes -r requirements-research-replay.lock\n'
         'Existing frozen model replay is verified ONLY on Windows CPython 3.12.\n'
         'Then run: python -m pip check. Keep experiment runtime validation enabled.\n'
         'This single profile matches the old frozen model; no install-then-downgrade/uninstall sequence is required.\n'
@@ -95,6 +97,8 @@ def build(output, root=ROOT):
         'base_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
         'files':{n:hashlib.sha256(v).hexdigest() for n,v in sorted(files.items())},
         'scope':'isolated_research_source_distribution_not_operational_core',
+        'runtime_profiles':{'market_publication':'requirements-core.lock',
+                            'explicit_historical_research':'requirements-research-replay.lock'},
         'execution_ready':False,'production_cutover':False}
     files['research-release.json'] = json.dumps(manifest,sort_keys=True,indent=2).encode('utf-8')
     output.parent.mkdir(parents=True,exist_ok=True)

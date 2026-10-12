@@ -12,6 +12,7 @@ param(
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
     [string]$ValuationWorkspace='',
+    [string]$RuntimeRoot='',
     [string]$EnvironmentFile=''
 )
 
@@ -23,6 +24,8 @@ if ($EnvironmentFile) {
     $env:KPL_ENV_FILE=$EnvironmentFile
 }
 $Root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'native_process.ps1')
+if ($RuntimeRoot) { Set-StockDataRuntimeRoot $RuntimeRoot }
 $Once = Join-Path $Root "scripts\run_phase_once.ps1"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }
 $LogDir = Join-Path $ReportsDirectory "scheduled-logs"
@@ -73,6 +76,7 @@ function Invoke-WatchAttempt([DateTimeOffset]$Deadline, [string]$WindowId, [bool
         $onceArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Once, '-Db', $DbPath,
             '-Phase', $Phase, '-Python', $Python, '-CollectorContract', $CollectorContract,
             '-CollectorContractSha256', $CollectorContractSha256, '-ReportsDirectory', $ReportsDirectory)
+        if ($RuntimeRoot) { $onceArgs += @('-RuntimeRoot', $RuntimeRoot) }
         if ($ValuationWorkspace) { $onceArgs += @('-ValuationWorkspace', $ValuationWorkspace) }
         if ($EnvironmentFile) { $onceArgs += @('-EnvironmentFile', $EnvironmentFile) }
         if ($Prepare) { $onceArgs += '-PrepareReference' }

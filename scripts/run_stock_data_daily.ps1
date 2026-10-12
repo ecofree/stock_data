@@ -18,6 +18,7 @@ param(
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
     [string]$ValuationWorkspace='',
+    [string]$RuntimeRoot='',
     [string]$EnvironmentFile=''
 )
 
@@ -77,6 +78,7 @@ try {
     }
     $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
     . (Join-Path $PSScriptRoot 'native_process.ps1')
+    if ($RuntimeRoot) { Set-StockDataRuntimeRoot $RuntimeRoot }
     if (-not $TradeDate) {$TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')}
     # Contract verification is read-only. Backup and collection use its same
     # original close deadline; preflight/copy may never renew the phase budget.

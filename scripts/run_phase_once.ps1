@@ -9,6 +9,7 @@ param(
     [string]$CollectorContractSha256,
     [string]$ReportsDirectory,
     [string]$ValuationWorkspace='',
+    [string]$RuntimeRoot='',
     [string]$EnvironmentFile='',
     [ValidateSet('', 'StockData-ResearchDaily')][string]$PublicationTask=''
 )
@@ -27,6 +28,7 @@ if (-not $TradeDate) {
 $runId=$Phase+'_'+[Guid]::NewGuid().ToString('N')
 $Root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'native_process.ps1')
+if ($RuntimeRoot) { Set-StockDataRuntimeRoot $RuntimeRoot }
 if (-not $Python) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
 $DbPath = if ([System.IO.Path]::IsPathRooted($Db)) { $Db } else { Join-Path $Root $Db }

@@ -178,6 +178,16 @@ def test_cli_retired_commands_do_not_create_output(tmp_path,monkeypatch,command)
     assert not output.exists()
 
 
+def test_cli_identity_is_local_readonly_and_matches_server(tmp_path, monkeypatch, capsys):
+    from pathlib import Path
+    output = tmp_path/'not-created'
+    monkeypatch.setattr('sys.argv', ['run_research.py','identity','--output',str(output)])
+    product.main()
+    value = json.loads(capsys.readouterr().out)
+    assert value == server.service_identity(Path(product.__file__).resolve().parents[2], output)
+    assert not output.exists()
+
+
 @pytest.mark.parametrize('legacy_html_only',[False,True])
 def test_http_current_view_cannot_reactivate_retained_forecast_or_legacy_html(tmp_path,legacy_html_only):
     from tests.test_model_independent_workspace import _retained_forecast_publication

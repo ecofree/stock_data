@@ -63,7 +63,7 @@ def _ps(script, *args, executable=r'C:\Windows\System32\WindowsPowerShell\v1.0\p
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows scheduler adapter')
-@pytest.mark.parametrize('case', ['valid', 'compiled', 'compiled_pwsh', 'missing', 'xml_mismatch', 'enabled_compact', 'hash_mismatch', 'wrong_runtime', 'missing_environment', 'relative_environment'])
+@pytest.mark.parametrize('case', ['valid', 'runtime_layout', 'compiled', 'compiled_pwsh', 'missing', 'xml_mismatch', 'enabled_compact', 'hash_mismatch', 'wrong_runtime', 'missing_environment', 'relative_environment'])
 def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     if case=='compiled_pwsh' and not shutil.which('pwsh.exe'):
         pytest.skip('PowerShell 7 is optional; Windows PowerShell 5.1 remains the deployment target')
@@ -87,7 +87,8 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
     inventory=baseline/'tasks.json';inventory.write_text(json.dumps(tasks))
     contract=tmp_path/'contract.json';contract.write_text(json.dumps({'scope':'transitional_market_collection_only',
         'execution_ready':False,'python':str(tmp_path/'wrong.exe') if case=='wrong_runtime' else sys.executable,
-        'database':str(tmp_path/'db.duckdb'),'reports':str(tmp_path/'data')}))
+        'database':str(tmp_path/'db.duckdb'),'reports':str(tmp_path/'data'),
+        **({'runtime_root':str(tmp_path/'runtime')} if case=='runtime_layout' else {})}))
     release=tmp_path/'release';release.mkdir();manifest=release/'research-release.json';manifest.write_text('{"version":"0.3.26"}')
     sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
     output=tmp_path/'proposal.json'
@@ -99,7 +100,7 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
         '-EnvironmentFile','protected.env' if case=='relative_environment' else environment,'-Workspace',tmp_path/'workspace','-Output',output]
     if case.startswith('compiled'):args+=['-ResearchStartBoundary','2026-09-18T19:30:00+08:00']
     result=_ps(ROOT/'scripts/install_stock_data_task.ps1',*args)
-    if case not in ('valid','compiled','compiled_pwsh'):
+    if case not in ('valid','runtime_layout','compiled','compiled_pwsh'):
         assert result.returncode != 0 and not output.exists()
         return
     assert result.returncode==0,result.stderr
@@ -118,6 +119,9 @@ def test_seven_task_proposal_from_readonly_export(tmp_path, case):
         assert '-Phase supplemental -PublicationTask StockData-ResearchDaily' in rows['StockData-SupplementalRetry']['Arguments']
         assert '-RefreshResearch' not in rows['StockData-QLibResearch']['Arguments']
         assert rows['StockData-QLibResearch']['Principal']['RunLevel']=='Limited'
+    if case=='runtime_layout':
+        assert all('-RuntimeRoot "'+str(tmp_path/'runtime')+'"' in row['Arguments']
+                   for name,row in rows.items() if name!='StockData-MonthlyCompact')
     assert rows['StockData-MonthlyCompact']['Arguments']=='old'
     assert rows['StockData-MonthlyCompact']['Disposition']=='preserve_disabled'
     assert _ps(ROOT/'scripts/install_stock_data_task.ps1',*args).returncode != 0
@@ -326,17 +330,18 @@ def test_collector_provider_environment_path_reaches_child_without_copying_conte
     for name in ('run_phase_once.ps1','native_process.ps1'):
         (scripts/name).write_text(_read(name))
     child=scripts/'run_integrated_daily.py'
-    child.write_text("import os,sys\nprint('PROVIDER_ENV_PATH='+os.environ.get('KPL_ENV_FILE',''))\nprint('VALUATION_WORKSPACE='+sys.argv[sys.argv.index('--valuation-workspace')+1])\nsys.exit(3)\n")
+    child.write_text("import os,sys\nprint('PROVIDER_ENV_PATH='+os.environ.get('KPL_ENV_FILE',''))\nprint('RUNTIME_ROOT='+os.environ.get('STOCKDATA_RUNTIME_ROOT',''))\nprint('VALUATION_WORKSPACE='+sys.argv[sys.argv.index('--valuation-workspace')+1])\nsys.exit(3)\n")
     inherited=tmp_path/'inherited.env';inherited.write_text('SYNTHETIC=not-a-credential')
     selected=tmp_path/'selected.env';selected.write_text('SYNTHETIC=not-a-credential')
     monkeypatch.setenv('KPL_ENV_FILE', str(inherited))
     args=['-Python',sys.executable,'-Db',tmp_path/'not-created.duckdb','-Phase','intraday',
           '-CollectorContract','fixture','-CollectorContractSha256','a'*64,'-ReportsDirectory',tmp_path/'reports',
-          '-ValuationWorkspace',tmp_path/'valuation-workspace']
+          '-ValuationWorkspace',tmp_path/'valuation-workspace','-RuntimeRoot',tmp_path/'runtime']
     if explicit:args+=['-EnvironmentFile',selected]
     result=_ps(scripts/'run_phase_once.ps1',*args)
     assert result.returncode==3,result.stdout+result.stderr
     assert 'PROVIDER_ENV_PATH='+str(selected if explicit else inherited) in result.stdout
+    assert 'RUNTIME_ROOT='+str(tmp_path/'runtime') in result.stdout
     assert 'VALUATION_WORKSPACE='+str(tmp_path/'valuation-workspace') in result.stdout
     assert 'SYNTHETIC=' not in result.stdout+result.stderr
     assert not (tmp_path/'.env').exists() and not (tmp_path/'not-created.duckdb').exists()

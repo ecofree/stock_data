@@ -9,7 +9,9 @@ import time
 from contextlib import contextmanager
 
 
-DEFAULT_DB = Path(__file__).resolve().parent / ".stock_cache" / "resilient.db"
+from trade_system.config import runtime_path
+
+DEFAULT_DB = runtime_path('trade_system/.stock_cache/resilient.db', 'state/acquisition/resilient.db')
 
 
 class SharedHostLimiter:
@@ -22,7 +24,9 @@ class SharedHostLimiter:
     """
 
     def __init__(self, db_path: str | Path | None = None):
-        self.db_path = Path(db_path or os.getenv("KPL_SHARED_RATE_DB", str(DEFAULT_DB)))
+        self.db_path = Path(db_path) if db_path is not None else runtime_path(
+            'trade_system/.stock_cache/resilient.db', 'state/acquisition/resilient.db',
+            os.getenv('KPL_SHARED_RATE_DB', ''))
 
     @staticmethod
     def _remaining(deadline):

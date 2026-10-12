@@ -22,6 +22,45 @@ def test_shared_writer_refuses_primary_before_creating_file(tmp_path,monkeypatch
         con.execute('CREATE TABLE allowed(x INTEGER)')
 
 
+def test_git_free_source_identity_preserves_installed_and_database_boundaries(tmp_path, monkeypatch):
+    import json
+    from trade_system import db_utils
+    original = Path(db_utils.__file__).resolve().parents[1]
+    source = tmp_path/'release'; source.mkdir()
+    identity_files = ('pyproject.toml', 'scripts/run_integrated_daily.py',
+                      'trade_system/db_utils.py', 'trade_system/config.py', 'trade_system/migration_boundary.py')
+    files = {}
+    for name in identity_files:
+        target = source/name; target.parent.mkdir(parents=True, exist_ok=True)
+        raw = (original/name).read_bytes(); target.write_bytes(raw)
+        files[name] = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(db_utils, '__file__', str(source/'trade_system/db_utils.py'))
+    target = tmp_path/'fixture.duckdb'
+    with pytest.raises(ValueError, match='installed runtime refuses'):
+        db_utils.legacy_connect(target)
+    assert not target.exists()
+    manifest = source/'source-distribution.json'
+    manifest.write_text(json.dumps({'schema':'source_distribution_v1',
+        'scope':'source_identity_only_not_deployment_authority', 'files':files}), encoding='utf-8')
+    assert db_utils.primary_checkout() == source
+    with db_utils.legacy_connect(target) as con:
+        con.execute('CREATE TABLE fixture(x INTEGER)')
+    with pytest.raises(ValueError, match='primary checkout'):
+        db_utils.legacy_connect(source/'wrong.duckdb')
+    runtime = tmp_path/'runtime'; (runtime/'market').mkdir(parents=True)
+    monkeypatch.setenv('STOCKDATA_RUNTIME_ROOT', str(runtime))
+    with pytest.raises(ValueError, match='unbound database'):
+        db_utils.legacy_connect(target)
+    bound = runtime/'market/kpl_data.duckdb'
+    with db_utils.legacy_connect(bound) as con:
+        con.execute('CREATE TABLE v2_schema(version INTEGER)')
+    with pytest.raises(ValueError, match='refuses V2'):
+        db_utils.legacy_connect(bound)
+    (source/'trade_system/db_utils.py').write_text('# changed source')
+    with pytest.raises(ValueError, match='installed runtime refuses'):
+        db_utils.legacy_connect(bound)
+
+
 def test_direct_schema_calls_reject_v2_even_with_runtime_flag(tmp_path,monkeypatch):
     from trade_system.schema import init_schema,_refresh_default_concept_views,_ensure_business_indexes
     monkeypatch.setenv('KPL_RUNTIME_SCHEMA_READY','1')
