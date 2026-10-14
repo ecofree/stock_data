@@ -7,7 +7,8 @@ param(
     [string]$AdapterPython, [string]$ResearchPython,
     [string]$ResearchReleaseDirectory, [string]$ResearchReleaseManifestSha256,
     [string]$EnvironmentFile, [string]$Workspace, [string]$Output,
-    [string]$ResearchStartBoundary, [string]$AuctionStartBoundary
+    [string]$ResearchStartBoundary, [string]$AuctionStartBoundary,
+    [ValidateSet('legacy-seven-v1','active-five-v1')][string]$TaskSet='legacy-seven-v1'
 )
 $ErrorActionPreference='Stop'
 if ($Register -or $RegisterAll) { throw 'Legacy task registration retired. Confirm recovery, protected release and a new maintenance window before cutover.' }
@@ -29,12 +30,15 @@ if ($contract.scope -ne 'transitional_market_collection_only' -or $contract.exec
 if (-not $contract.python -or [IO.Path]::GetFullPath($contract.python) -ne [IO.Path]::GetFullPath($AdapterPython)) { throw 'Adapter Python differs from collector contract' }
 foreach ($value in @($contract.database,$contract.reports)) { if (-not $value -or $value -match '["\r\n]') { throw 'Unsafe collection target' } }
 $expected=@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-SupplementalRetry','StockData-QLibResearch','StockData-ResearchDaily','StockData-MonthlyCompact')
+$retiredTaskNames=@('StockData-QLibResearch','StockData-MonthlyCompact')
+$activeFive=$TaskSet -eq 'active-five-v1'
+if ($activeFive) {$expected=@($expected | Where-Object {$_ -notin $retiredTaskNames})}
 $baseline=Get-Content -LiteralPath $inventory -Raw | ConvertFrom-Json
 $baseline=@($baseline)
-$required=@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-MonthlyCompact')
+$required=if ($activeFive) {$expected} else {@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-MonthlyCompact')}
 if ($baseline.Count -ne @($baseline.Name | Select-Object -Unique).Count -or
     @($baseline.Name | Where-Object {$_ -notin $expected}).Count -or
-    @($required | Where-Object {$_ -notin $baseline.Name}).Count) { throw 'Complete captured baseline with all four retained tasks required' }
+    @($required | Where-Object {$_ -notin $baseline.Name}).Count) { throw 'Complete captured baseline required for the explicitly selected task set' }
 $xmlByName=@{}; $hashByName=@{}
 foreach ($task in $baseline) {
     $path=Join-Path $BaselineDirectory ($task.Name+'.xml')
@@ -104,13 +108,14 @@ foreach ($relative in @('scripts/install_stock_data_task.ps1','scripts/deploy_cu
 }
 $proposal=[ordered]@{Schema=2;Scope='task_handover_proposal_only';CapturedAt=[DateTimeOffset]::UtcNow.ToString('o');
     SystemChanges=0;ProductionCutover=$false;Actions=$rows;AdapterFiles=$files;
+    TaskSet=$TaskSet;RetiredTaskNames=$(if($activeFive){$retiredTaskNames}else{@()});
     AbsentTasks=@($expected | Where-Object {$_ -notin $baseline.Name});
     MissingRequiredTasks=@('StockData-ResearchDaily' | Where-Object {$_ -notin $baseline.Name});
     CollectorContract=[IO.Path]::GetFullPath($CollectorContract);ResearchReleaseDirectory=[IO.Path]::GetFullPath($ResearchReleaseDirectory);
     BaselineInventorySha256=$BaselineInventorySha256;BaselineXmlSha256=$hashByName;
     CollectionContractSha256=$CollectorContractSha256;ResearchManifestSha256=$ResearchReleaseManifestSha256;
     EnvironmentFile=[IO.Path]::GetFullPath($EnvironmentFile);
-    MonthlyCompact='retain disabled; no changes';
+    MonthlyCompact=$(if($activeFive){'retired absent; no recreation by version rollback'}else{'retain disabled; no changes'});
     Blockers=@('baseline is historical: compare the complete live inventory and captured XML definitions immediately before cutover',
         'fresh recovery and ACL rollback verification required',
         'protect exact collector/research runtimes, release and provider environment before enabling tasks',

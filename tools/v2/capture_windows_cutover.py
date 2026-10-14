@@ -65,7 +65,15 @@ def capture_probe(output):
     return {'diagnostic_saved':str(output),'system_changes':0}
 
 
-def capture(output):
+def capture(output, task_set='legacy-seven-v1', source_database=None):
+    if task_set not in ('legacy-seven-v1', 'active-five-v1'):
+        raise ValueError('explicit supported task set required')
+    if task_set == 'active-five-v1' and source_database is None:
+        raise ValueError('five-task snapshot requires the explicit current source database')
+    database = Path(source_database or 'D:/accio/stock_data/kpl_data.duckdb')
+    if not database.is_absolute() or any(c in str(database) for c in ('\r', '\n', '\x00')):
+        raise ValueError('explicit absolute source database path required')
+    database_literal = str(database).replace("'", "''")
     output=Path(output).resolve();output.mkdir(parents=True,exist_ok=False)
     command="""@(Get-ScheduledTask -TaskName 'StockData-*' | ForEach-Object {
         $info=$_ | Get-ScheduledTaskInfo
@@ -96,19 +104,26 @@ def capture(output):
         target=output/(name+'.xml')
         target.write_text(xml,encoding='utf-16')
         ET.parse(target)
-    acl=powershell("$acl=Get-Acl -LiteralPath 'D:/accio/stock_data/kpl_data.duckdb'; [pscustomobject]@{Owner=$acl.Owner;Access=@($acl.Access | Select-Object IdentityReference,FileSystemRights,AccessControlType,IsInherited)} | ConvertTo-Json -Depth 5")
+    acl=powershell("$acl=Get-Acl -LiteralPath '"+database_literal+"'; [pscustomobject]@{Owner=$acl.Owner;Access=@($acl.Access | Select-Object IdentityReference,FileSystemRights,AccessControlType,IsInherited)} | ConvertTo-Json -Depth 5")
     parsed_acl=json.loads(acl)
     if not parsed_acl.get('Owner') or not parsed_acl.get('Access'):
         raise ValueError('ACL owner and access rules unavailable; snapshot is not deployment evidence')
     (output/'source-database-acl.json').write_text(acl,encoding='utf-8')
     expected={'StockData-Auction','StockData-Intraday','StockData-DailyClose',
               'StockData-ResearchDaily','StockData-MonthlyCompact'}
+    if task_set == 'active-five-v1':
+        expected.remove('StockData-MonthlyCompact')
+        expected.add('StockData-SupplementalRetry')
+    actual={task['Name'] for task in tasks}
     return {'tasks_exported':len(tasks),'task_changes':0,'acl_changes':0,
-            'missing_expected_tasks':sorted(expected-{task['Name'] for task in tasks})}
+            'task_set':task_set,'missing_expected_tasks':sorted(expected-actual),
+            'unexpected_tasks':sorted(actual-expected) if task_set == 'active-five-v1' else []}
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--output',required=True)
     parser.add_argument('--retained-probe',action='store_true')
+    parser.add_argument('--task-set', choices=('legacy-seven-v1','active-five-v1'), default='legacy-seven-v1')
+    parser.add_argument('--source-database')
     args=parser.parse_args()
-    print(json.dumps((capture_probe if args.retained_probe else capture)(args.output)))
+    print(json.dumps(capture_probe(args.output) if args.retained_probe else capture(args.output,args.task_set,args.source_database)))

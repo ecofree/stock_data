@@ -110,11 +110,20 @@ function Assert-WindowBounds([string]$Start,[string]$End,[DateTimeOffset]$Now=[D
         ($finish-$begin).TotalMinutes -le 0 -or ($finish-$begin).TotalMinutes -gt 60 -or $Now -lt $begin -or $Now -ge $finish) {throw 'Outside explicit new China maintenance window; no renewal permitted'}
 }
 function Assert-EngineeringPlan($Candidate) {
+    # Missing profile means the historical contract, never permission to omit tasks.
+    $taskSet=if ($null -ne $Candidate.TaskSet) {[string]$Candidate.TaskSet} else {'legacy-seven-v1'}
+    if ($taskSet -notin @('legacy-seven-v1','active-five-v1')) {throw 'Unknown explicit task set'}
+    $retired=@('StockData-QLibResearch','StockData-MonthlyCompact')
+    $required=if ($taskSet -eq 'active-five-v1') {@($script:TaskNames | Where-Object {$_ -notin $retired})} else {@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-MonthlyCompact')}
+    if ($taskSet -eq 'active-five-v1' -and (@($Candidate.Actions).Count -ne 5 -or
+        @($Candidate.RetiredTaskNames).Count -ne 2 -or
+        @(Compare-Object @($Candidate.RetiredTaskNames | Sort-Object) @($retired | Sort-Object)).Count -or
+        @($Candidate.Actions.Name | Where-Object {$_ -in $retired}).Count)) {throw 'Exact five active tasks and explicit retired names required'}
     if ($Candidate.Schema -ne 3 -or $Candidate.Scope -ne 'task_handover_engineering_only' -or $Candidate.Version -notmatch '^0\.3\.\d+$' -or
         $Candidate.ProductionCutover -ne $false -or
         @($Candidate.Actions.Name | Select-Object -Unique).Count -ne @($Candidate.Actions).Count -or
         @($Candidate.Actions.Name | Where-Object {$_ -notin $script:TaskNames}).Count -or
-        @(@('StockData-Auction','StockData-Intraday','StockData-DailyClose','StockData-MonthlyCompact') | Where-Object {$_ -notin $Candidate.Actions.Name}).Count) {throw 'Complete captured-task engineering plan required'}
+        @($required | Where-Object {$_ -notin $Candidate.Actions.Name}).Count) {throw 'Complete captured-task engineering plan required'}
     foreach ($row in $Candidate.Actions) {
         $monthly=$row.Name -eq 'StockData-MonthlyCompact'
         if ($monthly -ne ($row.Disposition -eq 'preserve_disabled') -or
@@ -231,8 +240,8 @@ function Invoke-OfflineRehearsal($Candidate,[string]$Directory) {
         $state=if (Test-Path -LiteralPath $journalPath) {([IO.File]::ReadAllText($journalPath) | ConvertFrom-Json).status} else {'not_started'}
         $incomplete=$scenario -in @('rollback_auth_failure','independent_drift')
         $expectedState=if ($incomplete) {'rollback_incomplete'} elseif ($scenario -in @('running_before','missing_credential')) {'not_started'} else {'rolled_back'}
-        if ($state -ne $expectedState -or $caught -ne ($scenario -ne 'roundtrip') -or $restored -eq $incomplete -or
-            $case.xml['StockData-MonthlyCompact'] -cne @($Candidate.Actions | Where-Object Name -eq 'StockData-MonthlyCompact')[0].BeforeXml) {throw ('Offline scenario failed: '+$scenario)}
+        $preservedDrift=@($Candidate.Actions | Where-Object Disposition -eq 'preserve_disabled' | Where-Object {$case.xml[$_.Name] -cne $_.BeforeXml}).Count -ne 0
+        if ($state -ne $expectedState -or $caught -ne ($scenario -ne 'roundtrip') -or $restored -eq $incomplete -or $preservedDrift) {throw ('Offline scenario failed: '+$scenario)}
         $results+=@{scenario=$scenario;passed=$true;status=$state;fixture_writes=$case.writes;password_parameter_fixture_writes=$case.password_writes}
     }
     $receipt=[ordered]@{schema=1;scope='offline_task_transaction_fault_injection';plan_sha256=$Candidate.InputHash;
