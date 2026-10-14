@@ -51,6 +51,21 @@ def test_delivery_all_python_children_disable_bytecode(tmp_path, monkeypatch):
     assert '-I' in commands['installed_core']
 
 
+def test_full_suite_has_finite_ci_headroom_without_relaxing_other_checks(tmp_path, monkeypatch):
+    delivery, wheel, _ = delivery_fixture(tmp_path, monkeypatch)
+    original = delivery._run_check
+    limits = {}
+
+    def observe(output, name, command, *, timeout):
+        limits[name] = timeout
+        return original(output, name, command, timeout=timeout)
+
+    monkeypatch.setattr(delivery, '_run_check', observe)
+    assert delivery.capture(tmp_path / 'proof', Path(sys.executable), wheel, minimal_runtime=True)
+    assert limits['tests'] == 1800  # Complete Windows durability suite, not a per-test/production deadline.
+    assert {value for name, value in limits.items() if name != 'tests'} == {120}
+
+
 def test_delivery_zero_exit_without_junit_is_not_a_pass(tmp_path, monkeypatch):
     delivery, wheel, _ = delivery_fixture(tmp_path, monkeypatch, test_xml=False)
     assert not delivery.capture(tmp_path / 'proof', Path(sys.executable), wheel)

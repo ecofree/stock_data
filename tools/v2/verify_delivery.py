@@ -10,12 +10,16 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 import tomllib
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[2]
+# Whole synthetic regression budget only; production/maintenance and fixture
+# deadlines are unchanged. Two retained CI runs exhausted 900s without a failed case.
+FULL_SUITE_TIMEOUT_SECONDS = 1800
 sys.path.insert(0,str(ROOT))
 from trade_system.artifact_retention import reserve_test_run,finish_test_run,owned_test_root  # noqa: E402
 
@@ -58,13 +62,16 @@ def _captured_text(value):
 
 def _run_check(output,name,command,*,timeout):
     log=output/(name+'.log')
+    started=time.monotonic()
     try:
         result=subprocess.run(command,cwd=ROOT,text=True,encoding='utf-8',errors='replace',capture_output=True,timeout=timeout)
         log.write_text(result.stdout+'\n'+result.stderr,encoding='utf-8')
-        return {'returncode':result.returncode,'log_sha256':digest(log)}
+        return {'returncode':result.returncode,'log_sha256':digest(log),
+                'elapsed_seconds':round(time.monotonic()-started,3)}
     except subprocess.TimeoutExpired as exc:
         log.write_text(_captured_text(exc.stdout)+'\n'+_captured_text(exc.stderr),encoding='utf-8')
-        return {'status':'timeout','timeout_seconds':timeout,'log_sha256':digest(log)}
+        return {'status':'timeout','timeout_seconds':timeout,'log_sha256':digest(log),
+                'elapsed_seconds':round(time.monotonic()-started,3)}
 
 
 def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=False):
@@ -86,7 +93,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
         'lint':[sys.executable,'-B','-X','utf8','-m','ruff','check','--select','E9,F63,F7,F82,F401,F841','.'],
         'migrations':[sys.executable,'-B','-X','utf8','scripts/lint_migrations.py'],
         'writer_boundary':[sys.executable,'-B','-X','utf8','tools/v2/closure_readiness.py','--writer-gate'],
-        'tests':[sys.executable,'-B','-X','utf8','-X','pycache_prefix='+str(temporary/'bytecode-cache'),'-m','pytest','-o','addopts=','-v','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml'),'--basetemp='+str(temporary/'pytest-temp')],
+        'tests':[sys.executable,'-B','-X','utf8','-X','pycache_prefix='+str(temporary/'bytecode-cache'),'-m','pytest','-o','addopts=','-v','--durations=25','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml'),'--basetemp='+str(temporary/'pytest-temp')],
         'installed_dependencies':[str(installed_python),'-I','-B','-X','utf8','-m','pip','check'],
         'installed_core':[str(installed_python),'-I','-B','-X','utf8',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
     if data_lane:
@@ -94,7 +101,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
     report['test_lane']='data' if data_lane else 'complete_local'
     success=True
     for name,command in commands.items():
-        check=_run_check(output,name,command,timeout=900 if name=='tests' else 120)
+        check=_run_check(output,name,command,timeout=FULL_SUITE_TIMEOUT_SECONDS if name=='tests' else 120)
         report['checks'][name]=check
         success=success and check.get('returncode')==0
         print(json.dumps({'check':name,**check}),flush=True)
