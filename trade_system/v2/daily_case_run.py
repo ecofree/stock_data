@@ -54,7 +54,7 @@ a=Path(reg['plan']['adapter'])
 write_json(Path(sys.argv[3]),{'fields':r,'bundle':read_json(a/'frozen_inputs.json')[0],
  'parent_sha256':file_hash(p/'completed.json'),'adapter_sha256':file_hash(a/'completed.json')})
 '''
-        result = subprocess.run([sys.executable,'-I','-c',script,str(root),str(Path(plan['parent']).resolve()),str(root/'result.json')],
+        result = subprocess.run([sys.executable,'-I','-B','-c',script,str(root),str(Path(plan['parent']).resolve()),str(root/'result.json')],
             cwd=root,capture_output=True,text=True,timeout=60)
         if result.returncode:
             raise ValueError('retained-version parent verification failed: '+result.stderr[-1200:])

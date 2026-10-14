@@ -31,7 +31,7 @@ def source_inputs(plan):
         with tempfile.TemporaryDirectory(prefix='stock-data-reader-') as temporary:
             shutil.copytree(Path(__file__).resolve().parents[1],Path(temporary)/'trade_system',
                             ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-            proc = subprocess.run([str(data_python),'-I','-c',script,temporary],input=__import__('json').dumps(plan),
+            proc = subprocess.run([str(data_python),'-I','-B','-c',script,temporary],input=__import__('json').dumps(plan),
                 capture_output=True,text=True,timeout=90,cwd=temporary)
         if proc.returncode:
             raise ValueError('registered data process failed: '+proc.stderr[-1000:])

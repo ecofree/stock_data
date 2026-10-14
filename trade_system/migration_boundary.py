@@ -132,7 +132,7 @@ def collection_contract(source_root, database, reports, python):
     if any(p.is_symlink() or root not in p.resolve().parents for p in files):
         raise ValueError('collector source member escapes root')
     digests = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}
-    runtime = subprocess.run([str(python), '-I', '-c',
+    runtime = subprocess.run([str(python), '-I', '-B', '-c',
         'import importlib.metadata as m,json,sys; print(json.dumps([list(sys.version_info[:3]),sorted((d.metadata["Name"],d.version) for d in m.distributions())]))'],
         capture_output=True, text=True, timeout=30, check=True)
     from trade_system.pipeline_runtime import default_observation_policy

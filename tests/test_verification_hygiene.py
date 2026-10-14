@@ -94,3 +94,18 @@ def test_schema_diagnostics_do_not_pollute_machine_stdout(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {'ok': True}
     assert 'Schema initialized successfully' in result.stderr
+
+
+@pytest.mark.parametrize('relative', [
+    'trade_system/migration_boundary.py', 'trade_system/v2/daily_case_run.py',
+    'trade_system/v2/research_program.py', 'tools/v2/rehearse_research_release.py',
+])
+def test_other_isolated_runtime_children_cannot_ignore_bytecode_policy(relative):
+    import ast
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / relative).read_text('utf-8-sig'))
+    commands = [[item.value for item in node.elts if isinstance(item, ast.Constant)]
+                for node in ast.walk(tree) if isinstance(node, ast.List)]
+    isolated = [values for values in commands if '-I' in values]
+    assert isolated, 'expected runtime subprocess coverage'
+    assert all('-B' in values for values in isolated), relative
