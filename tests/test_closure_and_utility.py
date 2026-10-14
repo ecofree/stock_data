@@ -150,6 +150,9 @@ def test_delivery_timeout_preserves_real_child_output_and_failure(tmp_path):
         "os.write(2,b'waiting_thread_stack\\n'); time.sleep(30)"]
     result=_run_check(tmp_path,'tests',command,timeout=1)
     log=tmp_path/'tests.log'
+    import math
+    elapsed=result.pop('elapsed_seconds')
+    assert math.isfinite(elapsed) and elapsed >= 1
     assert result=={'status':'timeout','timeout_seconds':1,'log_sha256':digest(log)}
     assert 'returncode' not in result
     retained=log.read_text(encoding='utf-8')
