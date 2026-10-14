@@ -43,7 +43,7 @@ A股人工研究与复盘助手，保留合格行情、带来源的资金观察�
 - 冻结历史研究使用独立、显式的`requirements-research-replay.lock`环境，不是每日发布的前置条件。
 - 统一发布验证仍为`tools/v2/verify_delivery.py`及现有测试；日常`tools/v2/run_tests.py --profile quick --output <新证据目录>`只给短反馈，不能代替发布门。
 - `release`测试集合包含数据、历史恢复及压力案例；`history`/`research`/`stress`可按变更域单独运行。完整CI仍要求数据与历史研究共同通过，不删除安全反例。
-- 现有Git `pre-push`钩子默认使用独立开发环境运行完整数据集合（含历史恢复与压力反例），不再回退全局解释器。独立研究环境可显式指定；未指定时明确报告研究未在本地验收，仍须远端独立研究CI通过，不能以本地数据门代替。
+- 现有Git `pre-push`钩子默认使用独立开发环境运行完整数据集合（含历史恢复与压力反例），不再回退全局解释器。可显式提供两小时内同提交/同字节的完整验证回执及SHA，实际复读全部证据并核对当前测试集合后复用，不重复展开同一套测试；不接受旧XML或仅有通过标志。独立研究环境可显式指定；未指定时明确报告研究未在本地验收，仍须远端独立研究CI通过，不能以本地数据门代替。
 - 开发只使用当前唯一工作树中的独立`.venv/python.exe`。离线重建入口`tools/v2/prepare_development_runtime.py`，输入必须是保留的原始CPython ZIP与完整哈希锁定wheel，不依赖全局Anaconda。
 - 新测试展开目录位于源码之外，统一owner/finished记录和容量预算；参见[工件保留规则](docs/v2/ARTIFACT_RETENTION.md)。
 - 新原件的私有审核、精确SHA接收及权限边界见[估值接收规范](docs/v2/VALUATION_INTAKE.md)。接收文件不授予金融资格，不导入业务库。

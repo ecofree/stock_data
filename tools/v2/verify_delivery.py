@@ -25,12 +25,28 @@ def digest(path):
         return hashlib.file_digest(stream,'sha256').hexdigest()
 
 
-def source_files():
-    files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=ROOT).decode().split('\0')
+def source_files(*, env=None):
+    files=subprocess.check_output(['git','ls-files','-z','--cached','--others','--exclude-standard'],cwd=ROOT,env=env).decode().split('\0')
     return {p:digest(ROOT/p) for p in sorted(set(files)) if p and (ROOT/p).is_file()
             and (Path(p).suffix in ('.py','.ps1','.bat','.cmd','.toml','.sql','.lock','.in','.yml','.yaml','.json')
                  or p in ('.gitattributes','recovery/20260916.zip'))
             and not p.startswith(('docs/','reports/','tmp/','backups/','.workbuddy/'))}
+
+
+def data_lane_selectors():
+    return ['--ignore=tests/test_research_runtime_contract.py',
+            '--deselect=tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order']
+
+
+def validate_wheel_content(wheel, fingerprint, *, root=None):
+    root = ROOT if root is None else Path(root)
+    with zipfile.ZipFile(wheel) as archive:
+        expected = {m.replace('.', '/') + '.py' for m in tomllib.loads(
+            (root / 'pyproject.toml').read_text('utf-8'))['tool']['stock_data']['release']['modules']}
+        actual = {name for name in archive.namelist() if name.endswith('.py')}
+        if actual != expected or any(hashlib.sha256(archive.read(name)).hexdigest() != fingerprint.get(name)
+                                     for name in expected):
+            raise ValueError('wheel module closure/content does not match current source; rebuild required')
 
 
 def _captured_text(value):
@@ -62,11 +78,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
             'source_files':before,'source_sha256':hashlib.sha256(json.dumps(before,sort_keys=True).encode()).hexdigest(),
             'execution_ready':False,'production_cutover':False,'business_acceptance':'not_performed',
             'real_account_acceptance':'pending_user_has_no_export','checks':{}}
-    with zipfile.ZipFile(wheel) as archive:
-        expected={m.replace('.','/')+'.py' for m in tomllib.loads((ROOT/'pyproject.toml').read_text())['tool']['stock_data']['release']['modules']}
-        actual={name for name in archive.namelist() if name.endswith('.py')}
-        if actual!=expected or any(hashlib.sha256(archive.read(name)).hexdigest()!=before.get(name) for name in expected):
-            raise ValueError('wheel module closure/content does not match current source; rebuild required')
+    validate_wheel_content(wheel, before)
     temporary,owner=reserve_test_run(owned_test_root(),'release' if data_lane else 'all',report['source_sha256'])
     report['temporary_artifacts_owner']=str(temporary/'owner.json')
     (output/'started.json').write_text(json.dumps(report,sort_keys=True),encoding='utf-8')
@@ -78,8 +90,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
         'installed_dependencies':[str(installed_python),'-I','-B','-X','utf8','-m','pip','check'],
         'installed_core':[str(installed_python),'-I','-B','-X','utf8',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
     if data_lane:
-        commands['tests'] += ['--ignore=tests/test_research_runtime_contract.py',
-            '--deselect=tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order']
+        commands['tests'] += data_lane_selectors()
     report['test_lane']='data' if data_lane else 'complete_local'
     success=True
     for name,command in commands.items():

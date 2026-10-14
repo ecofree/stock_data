@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from contextlib import contextmanager
 import hashlib
 import gzip
 import json
 import math
 import os
 import platform
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -190,6 +192,46 @@ def _stream_digest(stream, deadline_epoch=None):
         size += len(chunk)
 
 
+BACKUP_MAX_BYTES = 32 * 1024**3
+BACKUP_MAX_FILES = 128
+BACKUP_FREE_RESERVE_BYTES = 2 * 1024**3
+BACKUP_FOLDER_GUARD = 'backup-maintenance.guard'
+
+
+def _backup_no_links(value):
+    path = Path(value).absolute()
+    for item in (path, *path.parents):
+        if item.is_symlink() or getattr(item, 'is_junction', lambda: False)():
+            raise ValueError('backup capacity paths must not traverse links')
+    return path.resolve()
+
+
+def _backup_capacity(folder, extra_bytes, extra_files, deadline_epoch):
+    """Caller holds the real folder guard throughout check and allocation."""
+    files, size, entries = 0, 0, 0
+    for path in folder.rglob('*'):
+        _before_deadline(deadline_epoch)
+        _backup_no_links(path)
+        entries += 1
+        if entries > BACKUP_MAX_FILES * 2:
+            raise ValueError('backup capacity metadata bound reached; retain existing files')
+        if path.is_file():
+            files += 1
+            size += path.stat().st_size
+    if (files + extra_files > BACKUP_MAX_FILES or size + extra_bytes > BACKUP_MAX_BYTES
+            or shutil.disk_usage(folder).free < extra_bytes + BACKUP_FREE_RESERVE_BYTES):
+        raise ValueError('backup capacity exhausted; no new copy, no automatic eviction of recovery points')
+    return {'files_before': files, 'bytes_before': size, 'max_files': BACKUP_MAX_FILES,
+            'max_bytes': BACKUP_MAX_BYTES, 'reserved_additional_bytes': extra_bytes,
+            'unknown_failed_and_partial_files_counted': True, 'automatic_eviction': False}
+
+
+@contextmanager
+def _backup_budget_owner(folder, extra_bytes, extra_files, deadline_epoch):
+    with FileLock(folder / BACKUP_FOLDER_GUARD):
+        yield _backup_capacity(folder, extra_bytes, extra_files, deadline_epoch)
+
+
 def prepare_daily_backup(db_path, backup_dir, run_id, *, deadline_epoch=None):
     """Copy a closed database under the same owner protocol as collection.
 
@@ -197,14 +239,18 @@ def prepare_daily_backup(db_path, backup_dir, run_id, *, deadline_epoch=None):
     call is not forcibly interrupted; the supervising runner exposes its owner.
     """
     import duckdb
-    db = Path(db_path).resolve(strict=True)
-    folder = Path(backup_dir).resolve()
+    db = _backup_no_links(db_path).resolve(strict=True)
+    folder = _backup_no_links(backup_dir)
     if not run_id or any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for ch in run_id):
         raise ValueError('safe backup run id required')
     folder.mkdir(parents=True, exist_ok=True)
     raw = folder / ('kpl_data_pre_daily_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + run_id + '.duckdb')
     partial = Path(str(raw) + '.partial')
-    with PipelineLock(db, 'backup_' + run_id) as owner:
+    reserve_bytes = lambda size: 2 * size + size // 100 + 1024**2
+    # Reserve before reclaiming any database ownership metadata. Copy and
+    # finalization share this actual folder guard, not a lookup/boolean lease.
+    with _backup_budget_owner(folder, reserve_bytes(db.stat().st_size), 4, deadline_epoch) as budget, \
+            PipelineLock(db, 'backup_' + run_id) as owner:
         # Even an interrupted or failed copy retains the prior-owner recovery
         # boundary. This receipt cannot qualify a restoration point.
         _runtime_json(Path(str(raw) + '.raw.json'), {'schema': 1, 'status': 'preparing',
@@ -212,6 +258,9 @@ def prepare_daily_backup(db_path, backup_dir, run_id, *, deadline_epoch=None):
             'prepared_at': datetime.now().isoformat(), 'recovered_owner': owner.recovered_owner,
             'qualified_recovery_point': False})
         _before_deadline(deadline_epoch)
+        # Recheck the now-locked source size; retain the preparing receipt and
+        # recovered-owner boundary if the source grew before acquiring its lock.
+        budget = _backup_capacity(folder, reserve_bytes(db.stat().st_size), 3, deadline_epoch)
         wal = Path(str(db) + '.wal')
         if wal.exists() and wal.stat().st_size:
             raise ValueError('nonempty source WAL requires coordinated backup; no incomplete database copy')
@@ -245,12 +294,21 @@ def prepare_daily_backup(db_path, backup_dir, run_id, *, deadline_epoch=None):
             'source_size': before.st_size, 'source_mtime_ns': before.st_mtime_ns,
             'catalogue': tables, 'prepared_at': datetime.now().isoformat(),
             'recovered_owner': owner.recovered_owner,
-            'deadline_is_cooperative': True, 'qualified_recovery_point': False}
+            'deadline_is_cooperative': True, 'qualified_recovery_point': False,
+            'backup_capacity': budget}
         _runtime_json(Path(str(raw) + '.raw.json'), receipt)
         return receipt
 
 
 def finalize_daily_backup(raw_path, *, deadline_epoch=None):
+    """Serialize budget claim/finalization; leave the verified raw on refusal."""
+    raw = _backup_no_links(raw_path).resolve(strict=True)
+    size = raw.stat().st_size
+    with _backup_budget_owner(raw.parent, size + size // 100 + 1024**2, 2, deadline_epoch):
+        return _finalize_daily_backup(raw, deadline_epoch=deadline_epoch)
+
+
+def _finalize_daily_backup(raw_path, *, deadline_epoch=None):
     """Qualify only a gzip whose complete decompressed bytes match the raw."""
     raw = Path(raw_path).resolve(strict=True)
     receipt = json.loads(Path(str(raw) + '.raw.json').read_text(encoding='utf-8'))
@@ -300,7 +358,19 @@ def finalize_daily_backup(raw_path, *, deadline_epoch=None):
 
 
 def retain_qualified_backups(backup_dir, keep=7, weekly_keep=4, *, deadline_epoch=None):
-    """Unknown, partial or changed archives never consume a retention slot."""
+    """Plan only: age/quantity never authorize deletion of a shared recovery input."""
+    if type(keep) is not int or keep < 1 or type(weekly_keep) is not int or weekly_keep < 0:
+        raise ValueError('positive daily and nonnegative weekly retention required')
+    folder = _backup_no_links(backup_dir)
+    if not folder.exists():
+        return {'status': 'planned_no_deletion', 'qualified_count': 0, 'deleted': [],
+                'kept': 0, 'candidates_requiring_explicit_review': [], 'automatic_deletion': False}
+    with FileLock(folder / BACKUP_FOLDER_GUARD):
+        return _plan_qualified_backups(folder, keep, weekly_keep, deadline_epoch=deadline_epoch)
+
+
+def _plan_qualified_backups(backup_dir, keep=7, weekly_keep=4, *, deadline_epoch=None):
+    """Unknown, partial or changed archives never consume a retention target slot."""
     if type(keep) is not int or keep < 1 or type(weekly_keep) is not int or weekly_keep < 0:
         raise ValueError('positive daily and nonnegative weekly retention required')
     folder = Path(backup_dir).resolve()
@@ -326,7 +396,7 @@ def retain_qualified_backups(backup_dir, keep=7, weekly_keep=4, *, deadline_epoc
                 ignored.append(record.name)
     except TimeoutError:
         return {'status': 'deferred', 'deleted': [], 'reason': 'retention verification deadline exhausted'}
-    kept, deleted, anchors = set(), [], 0
+    kept, anchors = set(), 0
     for index, (_, archive) in enumerate(eligible):
         stamp = archive.name[len('kpl_data_pre_daily_'):][:8]
         try:
@@ -339,16 +409,14 @@ def retain_qualified_backups(backup_dir, keep=7, weekly_keep=4, *, deadline_epoc
             kept.add(archive)
             if index >= keep:
                 anchors += 1
-    for record, archive in eligible:
-        if archive not in kept:
-            _before_deadline(deadline_epoch)
-            # Paths were resolved, bound to their qualification, and verified
-            # within this one folder before any deletion.
-            archive.unlink()
-            record.unlink()
-            deleted.append(archive.name)
-    return {'status': 'completed', 'qualified_count': len(eligible), 'deleted': deleted,
-            'kept': len(kept), 'ignored_qualification': ignored}
+    candidates = [archive.name for _, archive in eligible if archive not in kept]
+    # Current/unknown external references, actual restoration and exact destructive
+    # scope must be reviewed independently. The routine never erases a recovery
+    # point merely because a newer copy now fills a retention slot.
+    return {'status': 'planned_no_deletion', 'qualified_count': len(eligible), 'deleted': [],
+            'kept': len(eligible), 'recommended_kept': len(kept), 'ignored_qualification': ignored,
+            'candidates_requiring_explicit_review': candidates, 'automatic_deletion': False,
+            'shared_references_and_fixed_scope_required_before_retirement': True}
 
 
 def all_manifests(reports_dir: str | Path) -> list[dict]:

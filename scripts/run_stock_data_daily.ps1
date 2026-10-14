@@ -160,15 +160,16 @@ try {
     Invoke-CloseNotification 'failure' $_.Exception.Message
     throw
 } finally {
-    # Only qualified, hash-verified archives can be pruned. Never clean failed
-    # raw/partial files as an automatic side effect of a collection failure.
+    # Rotation is a plan, not deletion authority. Shared/current references and
+    # an explicit maintenance scope must be reviewed before retiring any archive.
+    # Raw/partial failures consume capacity but never become automatic cleanup.
     if ($compressed) {
         $retentionCode="import json,sys; from trade_system.pipeline_runtime import retain_qualified_backups; print(json.dumps(retain_qualified_backups(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),deadline_epoch=float(sys.argv[4]))))"
         try {
             $retained=Invoke-StockDataProcess -Executable $Python -Arguments @('-c',$retentionCode,$BackupDir,[string]$BackupKeep,[string]$WeeklyKeep,$closeDeadline.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) -WorkingDirectory $Root -DeadlineEpoch $closeDeadline -TimeoutSeconds 120 -ProgressPath $processState
             if ($retained.ExitCode -ne 0) {throw $retained.Stderr}
-            "BACKUP_RETENTION $($retained.Stdout.Trim())" | Write-CloseLog
-        } catch {"BACKUP_RETENTION_DEFERRED error=$($_.Exception.Message); no unqualified recovery points pruned" | Write-CloseLog}
+            "BACKUP_RETENTION_PLAN $($retained.Stdout.Trim()) automatic_deletion=false" | Write-CloseLog
+        } catch {"BACKUP_RETENTION_DEFERRED error=$($_.Exception.Message); no recovery point deleted" | Write-CloseLog}
     }
     $env:STOCKDATA_PHASE_DEADLINE_EPOCH=$previousDeadline
 }

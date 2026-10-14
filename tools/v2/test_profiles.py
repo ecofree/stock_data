@@ -17,6 +17,7 @@ QUICK_FILES = frozenset({
     'test_native_process.py', 'test_verification_hygiene.py',
     'test_valuation_intake_admission.py', 'test_valuation_assessment_scope.py',
     'test_artifact_retention.py', 'test_test_profiles.py', 'test_gate_contract.py',
+    'test_backup_retention_policy.py', 'test_pre_push_evidence.py',
     'test_architecture_research_contract.py', 'test_source_authority.py',
 })
 
