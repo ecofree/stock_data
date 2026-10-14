@@ -94,7 +94,7 @@ function Get-ScheduledTaskInfo {
         return '{"Owner":"synthetic","Access":[{"FileSystemRights":"Read"}]}'
     monkeypatch.setattr(windows,'powershell',read_only)
     out=tmp_path/'capture'
-    result=windows.capture(out)
+    result=windows.capture(out, source_database=tmp_path/'synthetic-source.duckdb')
     task=json.loads((out/'tasks.json').read_text())[0]
     assert task['Next'] is None and task['Triggers']==[]
     assert (task['LastRun'] is None)==(last_run=='$null')
@@ -107,17 +107,18 @@ def test_export_failure_retains_safe_receipt_without_overwriting(tmp_path,monkey
     def fail(command):raise RuntimeError('read-only Windows snapshot failed; InvokeMethodOnNull')
     monkeypatch.setattr(windows,'powershell',fail)
     out=tmp_path/'capture'
-    with pytest.raises(RuntimeError):windows.capture(out)
+    database=tmp_path/'synthetic-source.duckdb'
+    with pytest.raises(RuntimeError):windows.capture(out, source_database=database)
     saved=(out/'error.json').read_bytes()
     assert json.loads(saved)['system_changes']==0 and not (out/'tasks.json').exists()
-    with pytest.raises(FileExistsError):windows.capture(out)
+    with pytest.raises(FileExistsError):windows.capture(out, source_database=database)
     assert (out/'error.json').read_bytes()==saved
 
 
 def test_empty_acl_cannot_be_certified(tmp_path, monkeypatch):
     monkeypatch.setattr(windows, 'powershell', lambda command: '[]' if 'Get-ScheduledTask ' in command else '{"Owner":null,"Access":[]}')
     with pytest.raises(ValueError, match='ACL'):
-        windows.capture(tmp_path / 'capture')
+        windows.capture(tmp_path / 'capture', source_database=tmp_path/'synthetic-source.duckdb')
     assert not (tmp_path / 'capture' / 'source-database-acl.json').exists()
 
 
