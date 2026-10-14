@@ -16,6 +16,8 @@ import tomllib
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT))
+from trade_system.artifact_retention import reserve_test_run,finish_test_run,owned_test_root  # noqa: E402
 
 
 def digest(path):
@@ -65,14 +67,16 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
         actual={name for name in archive.namelist() if name.endswith('.py')}
         if actual!=expected or any(hashlib.sha256(archive.read(name)).hexdigest()!=before.get(name) for name in expected):
             raise ValueError('wheel module closure/content does not match current source; rebuild required')
+    temporary,owner=reserve_test_run(owned_test_root(),'release' if data_lane else 'all',report['source_sha256'])
+    report['temporary_artifacts_owner']=str(temporary/'owner.json')
     (output/'started.json').write_text(json.dumps(report,sort_keys=True),encoding='utf-8')
     commands={
-        'lint':[sys.executable,'-m','ruff','check','--select','E9,F63,F7,F82,F401,F841','.'],
-        'migrations':[sys.executable,'scripts/lint_migrations.py'],
-        'writer_boundary':[sys.executable,'tools/v2/closure_readiness.py','--writer-gate'],
-        'tests':[sys.executable,'-m','pytest','-o','addopts=','-v','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml')],
-        'installed_dependencies':[str(installed_python),'-m','pip','check'],
-        'installed_core':[str(installed_python),'-I',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
+        'lint':[sys.executable,'-B','-X','utf8','-m','ruff','check','--select','E9,F63,F7,F82,F401,F841','.'],
+        'migrations':[sys.executable,'-B','-X','utf8','scripts/lint_migrations.py'],
+        'writer_boundary':[sys.executable,'-B','-X','utf8','tools/v2/closure_readiness.py','--writer-gate'],
+        'tests':[sys.executable,'-B','-X','utf8','-X','pycache_prefix='+str(temporary/'bytecode-cache'),'-m','pytest','-o','addopts=','-v','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml'),'--basetemp='+str(temporary/'pytest-temp')],
+        'installed_dependencies':[str(installed_python),'-I','-B','-X','utf8','-m','pip','check'],
+        'installed_core':[str(installed_python),'-I','-B','-X','utf8',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
     if data_lane:
         commands['tests'] += ['--ignore=tests/test_research_runtime_contract.py',
             '--deselect=tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order']
@@ -91,6 +95,9 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
                 totals[key]+=int(suite.attrib.get(key,0))
         report['tests']=totals
         success=success and totals['tests']>0 and not totals['errors'] and not totals['failures']
+    else:
+        report['tests']={'status':'missing_junit_proof'}
+        success=False
     after=source_files()
     report['source_unchanged_during_checks']=before==after
     success=success and before==after
@@ -102,6 +109,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
     report['local_checks_passed']=success
     report['artifacts']={p.name:digest(p) for p in output.iterdir() if p.is_file()}
     (output/'verification.json').write_text(json.dumps(report,ensure_ascii=True,indent=2,sort_keys=True),encoding='utf-8')
+    finish_test_run(temporary,owner,{'passed':success,'evidence':str(output/'verification.json')})
     print(json.dumps({k:report[k] for k in ('local_checks_passed','source_sha256','source_unchanged_during_checks','checks','execution_ready')}))
     return success
 

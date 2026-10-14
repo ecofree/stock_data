@@ -1,5 +1,6 @@
 """Database schema definitions for KPL data storage."""
 import os
+import sys
 import duckdb
 from datetime import datetime
 
@@ -2627,7 +2628,7 @@ def init_schema(db: duckdb.DuckDBPyConnection):
     from trade_system.migrations import apply_pending
     _applied = apply_pending(db)
     if _applied:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Applied schema migrations: {_applied}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Applied schema migrations: {_applied}", file=sys.stderr)
 
     # Existing databases predate the dynamic THS expectation relation.  Seed
     # their historical official snapshots once, explicitly marked as an
@@ -2649,4 +2650,4 @@ def init_schema(db: duckdb.DuckDBPyConnection):
 
     _ensure_business_indexes(db)
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Schema initialized successfully")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Schema initialized successfully", file=sys.stderr)

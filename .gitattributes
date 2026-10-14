@@ -1,0 +1,4 @@
+# Preserve the exact installed-core bytes across Windows checkout and source export.
+trade_system/config.py text eol=lf
+trade_system/db_utils.py text eol=lf
+trade_system/host_limiter.py text eol=lf

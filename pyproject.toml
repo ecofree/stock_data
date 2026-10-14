@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-trading-assistant"
-version = "0.3.51"
+version = "0.3.52"
 description = "Manual A-share trading data, evidence, risk, and review assistant"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -45,7 +45,8 @@ select = [
 
 [tool.mypy]
 # Incremental adoption (not in CI yet): start from the already well-typed
-# core, then widen per-module.  Run: D:\anaconda\python.exe -m mypy trade_system
+# core, then widen per-module. Use the independent development interpreter;
+# mypy is an explicit optional development tool, not a production dependency.
 python_version = "3.11"
 ignore_missing_imports = true
 check_untyped_defs = true

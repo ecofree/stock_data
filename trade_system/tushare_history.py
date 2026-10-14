@@ -490,9 +490,9 @@ class TushareHistoryCollector(RetainedValuationReader):
         now = observed_at or datetime.now(timezone.utc).isoformat()
         self._check_valuation_deadline()
         wanted = sorted(set(codes))
-        completion = self.valuation_completion_report(day, wanted, observed_at=now)
-        qualified = self.qualified_valuation_reviews(day, observed_at=now)
-        capabilities = self.valuation_capability_report(day, wanted, observed_at=now)
+        capabilities, completion = self._valuation_capability_snapshot(day, wanted, observed_at=now)
+        qualified = {code: row for code, row in completion['rows'].items()
+                     if row.get('valuation_eligible')}
         templates, seen, invalid = {}, set(), {}
         for raw, digest in self.store.conn.execute(
                 "SELECT payload_json,payload_hash FROM multi_source_observation WHERE data_type='valuation_review' "
@@ -509,7 +509,10 @@ class TushareHistoryCollector(RetainedValuationReader):
                 seen.add(code)
                 if hashlib.sha256(raw.encode()).hexdigest() != digest:
                     raise ValueError('valuation review hash mismatch')
-                previous = self._valuation_review(review, review['trade_date'], now)
+                same_session = qualified.get(code, {})
+                previous = (same_session if review['trade_date'] == day
+                            and same_session.get('review_sha256') == digest else
+                            self._valuation_review(review, review['trade_date'], now))
                 if not previous['valuation_eligible']:
                     raise ValueError('previous finance review no longer qualified')
                 templates[code] = {'previous_session': review['trade_date'],

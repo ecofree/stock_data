@@ -7,6 +7,24 @@ import zipfile
 import pytest
 
 
+def pytest_addoption(parser):
+    from tools.v2.test_profiles import PROFILES
+    parser.addoption('--stockdata-profile', choices=PROFILES, default='all',
+                     help='Quick is not release acceptance; release includes all data/history/stress cases.')
+
+
+def pytest_collection_modifyitems(config, items):
+    from tools.v2.test_profiles import group, selected
+    profile = config.getoption('--stockdata-profile')
+    keep, excluded = [], []
+    for item in items:
+        item.user_properties.append(('stockdata_group', group(item.nodeid, item.fixturenames)))
+        (keep if selected(profile, item.nodeid, item.fixturenames) else excluded).append(item)
+    if excluded:
+        config.hook.pytest_deselected(items=excluded)
+    items[:] = keep
+
+
 @pytest.fixture(scope='session')
 def frozen_recovery(tmp_path_factory):
     archive = Path(__file__).resolve().parents[1] / 'recovery/20260916.zip'

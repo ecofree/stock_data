@@ -1,5 +1,6 @@
 """Export task definitions and current ACLs without changing either."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,10 +30,23 @@ def powershell(command):
     return result.stdout
 
 
-def capture_probe(output):
-    """Sanitized retained-probe evidence; no credentials, task changes or ACL writes."""
+def capture_probe(output, retained_root=None, journal_sha256=None):
+    """Inspect an explicitly restored historical journal, not a retired default root."""
+    if retained_root is None or not Path(retained_root).is_absolute():
+        raise ValueError('explicit isolated restored root required')
+    root=Path(retained_root).absolute()
+    journal=root/'recovery-probe-0312-once/journal.json'
+    for path in (journal,*journal.parents):
+        if path.is_symlink() or getattr(path,'is_junction',lambda:False)():
+            raise ValueError('linked retained journal rejected')
+    if (not isinstance(journal_sha256,str) or not re.fullmatch('[a-f0-9]{64}',journal_sha256)
+            or journal.stat().st_size>1_000_000
+            or hashlib.sha256(journal.read_bytes()).hexdigest()!=journal_sha256):
+        raise ValueError('exact retained journal SHA required')
+    if any(c in str(root) for c in ('\r','\n','\x00')):
+        raise ValueError('invalid restored root')
     command=r"""
-    $root='D:\accio\stock-data-runtime'
+    $root='__EXPLICIT_RESTORED_ROOT__'
     $attempt=Join-Path $root 'recovery-probe-0312-once'
     $j=Get-Content -LiteralPath (Join-Path $attempt 'journal.json') -Raw | ConvertFrom-Json
     $t=Get-ScheduledTask -TaskName 'StockData-ResearchDaily' -TaskPath '\'
@@ -57,7 +71,11 @@ def capture_probe(output):
         } | Select-Object ProcessId,ParentProcessId,Name,CreationDate);
         Directories=$acls} | ConvertTo-Json -Depth 8
     """
+    command=command.replace('__EXPLICIT_RESTORED_ROOT__',str(root).replace("'","''"))
     value=json.loads(powershell(command))
+    value.update(historical_journal_sha256=journal_sha256,
+                 current_machine_snapshot_is_not_original_historical_state=True,
+                 retained_root=str(root))
     output=Path(output).resolve()
     output.parent.mkdir(parents=True,exist_ok=True)
     with output.open('x',encoding='utf-8') as handle:
@@ -68,9 +86,9 @@ def capture_probe(output):
 def capture(output, task_set='legacy-seven-v1', source_database=None):
     if task_set not in ('legacy-seven-v1', 'active-five-v1'):
         raise ValueError('explicit supported task set required')
-    if task_set == 'active-five-v1' and source_database is None:
-        raise ValueError('five-task snapshot requires the explicit current source database')
-    database = Path(source_database or 'D:/accio/stock_data/kpl_data.duckdb')
+    if source_database is None:
+        raise ValueError('snapshot requires an explicit current source database')
+    database = Path(source_database)
     if not database.is_absolute() or any(c in str(database) for c in ('\r', '\n', '\x00')):
         raise ValueError('explicit absolute source database path required')
     database_literal = str(database).replace("'", "''")
@@ -123,7 +141,12 @@ def capture(output, task_set='legacy-seven-v1', source_database=None):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--output',required=True)
     parser.add_argument('--retained-probe',action='store_true')
+    parser.add_argument('--retained-root',type=Path)
+    parser.add_argument('--retained-journal-sha256')
     parser.add_argument('--task-set', choices=('legacy-seven-v1','active-five-v1'), default='legacy-seven-v1')
     parser.add_argument('--source-database')
     args=parser.parse_args()
-    print(json.dumps(capture_probe(args.output) if args.retained_probe else capture(args.output,args.task_set,args.source_database)))
+    if not args.retained_probe and (args.retained_root or args.retained_journal_sha256):
+        parser.error('retained root/journal belong only to the explicit retained-probe mode')
+    print(json.dumps(capture_probe(args.output,args.retained_root,args.retained_journal_sha256)
+                     if args.retained_probe else capture(args.output,args.task_set,args.source_database)))

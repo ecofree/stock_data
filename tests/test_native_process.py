@@ -8,6 +8,14 @@ import sys
 import pytest
 
 
+def _powershell_utf8(command, timeout):
+    # Set this child's console encoding before a parameter-validation error can
+    # emit localized PS5 diagnostics; never weaken assertions with decode loss.
+    prelude = '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;'
+    return subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',prelude+command],
+                          capture_output=True,text=True,encoding='utf-8',timeout=timeout)
+
+
 @pytest.mark.skipif(shutil.which('powershell.exe') is None,reason='Windows task host unavailable')
 @pytest.mark.parametrize('exit_code',[0,7])
 def test_stderr_does_not_replace_native_exit_code(tmp_path,exit_code):
@@ -15,8 +23,7 @@ def test_stderr_does_not_replace_native_exit_code(tmp_path,exit_code):
     command=(f". '{helper}'; $r=Invoke-StockDataProcess -Executable '{sys.executable}' "
              f"-Arguments @('-c','import sys; print(\"stdout\"); print(\"information on stderr\",file=sys.stderr); sys.exit({exit_code})') "
              f"-WorkingDirectory '{tmp_path}'; $r | ConvertTo-Json -Compress")
-    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',command],
-                          capture_output=True,text=True,timeout=20)
+    result=_powershell_utf8(command,20)
     assert result.returncode==0, result.stderr
     payload=json.loads(result.stdout)
     assert payload['ExitCode']==exit_code
@@ -33,8 +40,7 @@ def test_native_deadline_keeps_child_alive_until_safe_exit_and_persists_state(tm
              "-Arguments @('-c','import time; time.sleep(.5); print(\"safe transaction completed\")') "
              f"-WorkingDirectory '{tmp_path}' -DeadlineEpoch $deadline -DrainGraceSeconds 0 "
              f"-PollMilliseconds 50 -ProgressPath '{state}'; $r | ConvertTo-Json -Compress")
-    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',command],
-                          capture_output=True,text=True,timeout=10)
+    result=_powershell_utf8(command,10)
     assert result.returncode==0,result.stderr
     payload=json.loads(result.stdout)
     assert payload['ExitCode']==-1 and payload['NativeExitCode']==0
@@ -53,7 +59,6 @@ def test_native_invalid_deadline_never_starts_child(tmp_path):
     command=(f". '{helper}'; Invoke-StockDataProcess -Executable '{sys.executable}' "
              f"-Arguments @('-c','from pathlib import Path; Path(r\"{marker}\").touch()') "
              f"-WorkingDirectory '{tmp_path}' -DeadlineEpoch ([double]::NaN)")
-    result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',command],
-                          capture_output=True,text=True,timeout=10)
+    result=_powershell_utf8(command,10)
     assert result.returncode!=0 and 'Finite cooperative' in result.stderr
     assert not marker.exists()

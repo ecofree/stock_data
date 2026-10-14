@@ -62,17 +62,17 @@ def main():
         for research_dependency in ('numpy','pandas','qlib','akshare','pytest'):
             assert find_spec(research_dependency) is None, 'unexpected runtime dependency: '+research_dependency
     with tempfile.TemporaryDirectory(prefix='v2-release-probe-') as folder:
-        command = [sys.executable,'-I','-m','trade_system.v2','--db',str(Path(folder)/'paper.duckdb')]
+        command = [sys.executable,'-I','-B','-X','utf8','-m','trade_system.v2','--db',str(Path(folder)/'paper.duckdb')]
         proc = subprocess.run(command,input=json.dumps({'command':'status'})+'\n',
             text=True,capture_output=True,cwd=folder,timeout=40)
         if proc.returncode:
             raise RuntimeError(proc.stderr[-1000:])
         response = json.loads(proc.stdout.strip())
         assert response['ok'] and response['result']['execution_ready'] is False
-        desk = subprocess.run([sys.executable,'-I','-m','trade_system.v2.operator_workflow_cli','--help'],
+        desk = subprocess.run([sys.executable,'-I','-B','-X','utf8','-m','trade_system.v2.operator_workflow_cli','--help'],
             text=True,capture_output=True,cwd=folder,timeout=20)
         assert desk.returncode==0 and 'confirm' in desk.stdout
-        daily = subprocess.run([sys.executable,'-I','-m','trade_system.v2.daily_session_cli','--help'],
+        daily = subprocess.run([sys.executable,'-I','-B','-X','utf8','-m','trade_system.v2.daily_session_cli','--help'],
             text=True,capture_output=True,cwd=folder,timeout=20)
         assert daily.returncode==0 and 'capture' in daily.stdout and 'judge' in daily.stdout
         paper_restart_probe(folder)

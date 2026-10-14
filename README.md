@@ -39,9 +39,13 @@ A股人工研究与复盘助手，保留合格行情、带来源的资金观察�
 
 ## 安装与验证
 
-- 采集沿用`requirements-data.lock`；核心安装与日常发布使用`requirements-core.lock`。
+- 生产采集使用`requirements-collector.lock`的运行闭包；`requirements-data.lock`用于开发数据测试，不把pytest/ruff放入生产。核心安装与日常发布使用`requirements-core.lock`。
 - 冻结历史研究使用独立、显式的`requirements-research-replay.lock`环境，不是每日发布的前置条件。
-- 统一验证仍为`tools/v2/verify_delivery.py`及现有测试；不新增平行部署或测试框架。
+- 统一发布验证仍为`tools/v2/verify_delivery.py`及现有测试；日常`tools/v2/run_tests.py --profile quick --output <新证据目录>`只给短反馈，不能代替发布门。
+- `release`测试集合包含数据、历史恢复及压力案例；`history`/`research`/`stress`可按变更域单独运行。完整CI仍要求数据与历史研究共同通过，不删除安全反例。
+- 开发只使用当前唯一工作树中的独立`.venv/python.exe`。离线重建入口`tools/v2/prepare_development_runtime.py`，输入必须是保留的原始CPython ZIP与完整哈希锁定wheel，不依赖全局Anaconda。
+- 新测试展开目录位于源码之外，统一owner/finished记录和容量预算；参见[工件保留规则](docs/v2/ARTIFACT_RETENTION.md)。
+- 新原件的私有审核、精确SHA接收及权限边界见[估值接收规范](docs/v2/VALUATION_INTAKE.md)。接收文件不授予金融资格，不导入业务库。
 - Git-free源码包保留`source-distribution.json`身份，完整采集依赖由collector合同另行绑定。
   核心wheel不获得旧式磁盘写入权，V2/账户库继续拒绝旧写入。
 
