@@ -12,6 +12,7 @@ from trade_system.quality import table_columns, table_exists
 from trade_system.limit_rules import limit_threshold_sql
 from trade_system.source_authority import provider_rank, provider_rank_sql
 from trade_system.units import normalization_sql
+from trade_system.market_contract import count_valid_sql, market_daily_status_sql
 
 logger = get_logger(__name__)
 
@@ -87,95 +88,81 @@ def _canonical_kline_cte(table_name: str, order_col: str, value_column: str = "c
     )
 
 
+def _qualified_limit_totals_sql(con):
+    """Only a complete dated receipt can certify a total, including genuine zero.
+
+    EM row/snapshot existence alone has no complete-native receipt contract;
+    retain those rows for per-security observations, not an exchange-wide total.
+    """
+    empty = "SELECT NULL::DATE AS trade_date, NULL::INTEGER AS up_count, NULL::INTEGER AS consecutive_count, NULL::TIMESTAMP AS received_at WHERE false"
+    if not (_table_has_columns(con, 'official_limit_pool', ['trade_date', 'stock_code', 'source', 'continue_day_cnt'])
+            and _table_has_columns(con, 'history_fetch_checkpoint', ['dataset', 'trade_date', 'page_no', 'status', 'rows_written', 'last_error', 'updated_at'])):
+        return empty
+    return """
+        WITH receipts AS (
+            SELECT *, CASE WHEN json_valid(last_error) THEN last_error ELSE '{}' END AS receipt
+            FROM history_fetch_checkpoint WHERE dataset='hithink_limit_pool' AND page_no=0 AND status='success'
+        ), counts AS (
+            SELECT trade_date, count(*) AS n, count(DISTINCT stock_code) AS unique_n,
+                   count(*) FILTER (WHERE continue_day_cnt>=2) AS consecutive_n,
+                   count(*) FILTER (WHERE continue_day_cnt IS NULL OR continue_day_cnt<1) AS invalid_n
+            FROM official_limit_pool WHERE source='hithink' GROUP BY trade_date
+        )
+        SELECT r.trade_date, CAST(coalesce(c.n,0) AS INTEGER) AS up_count,
+               CAST(coalesce(c.consecutive_n,0) AS INTEGER) AS consecutive_count, r.updated_at AS received_at
+        FROM receipts r LEFT JOIN counts c USING(trade_date)
+        WHERE r.rows_written=coalesce(c.n,0) AND coalesce(c.invalid_n,0)=0
+          AND coalesce(c.n,0)=coalesce(c.unique_n,0)
+          AND json_extract_string(receipt,'$.path')='/api/a-share/special-data/limit-up-pool'
+          AND try_cast(json_extract_string(receipt,'$.params.date_ms') AS BIGINT)=epoch_ms(CAST(r.trade_date AS TIMESTAMP)-INTERVAL 8 HOUR)
+          AND try_cast(json_extract_string(receipt,'$.total') AS BIGINT)=r.rows_written
+          AND try_cast(json_extract_string(receipt,'$.pages') AS BIGINT)>=1
+          AND regexp_full_match(json_extract_string(receipt,'$.items_sha256'),'[0-9a-f]{64}')
+          AND (r.rows_written>0 OR json_extract_string(receipt,'$.items_sha256')=sha256('[]'))
+    """
+
+
 def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
-    cols = [
-        ("trade_date", "VARCHAR"),
-        ("limit_up_count", "INTEGER"),
-        ("limit_down_count", "INTEGER"),
-        ("rise_count", "INTEGER"),
-        ("fall_count", "INTEGER"),
-        ("consecutive_count", "INTEGER"),
-        ("fetched_at", "TIMESTAMP"),
-        ("market_daily_source", "VARCHAR"),
-        ("is_fallback", "BOOLEAN"),
-    ]
-    has_summary = table_exists(con, "daily_summary")
-    has_tushare = table_exists(con, "tushare_daily")
-    if not has_summary and not has_tushare:
-        con.execute(_empty_view_sql("v_market_daily", cols))
-        return
+    cols = [('trade_date','VARCHAR'), ('limit_up_count','INTEGER'), ('limit_down_count','INTEGER'),
+            ('rise_count','INTEGER'), ('fall_count','INTEGER'), ('consecutive_count','INTEGER'),
+            ('fetched_at','TIMESTAMP'), ('market_daily_source','VARCHAR'), ('is_fallback','BOOLEAN'),
+            ('market_daily_status','VARCHAR')]
     sources = []
-    if has_summary:
-        order_col = _timestamp_column(con, "daily_summary")
-        fetched_expr = order_col if order_col != "current_timestamp" else "current_timestamp"
-        summary_fallback = (
-            "lower(coalesce(source_kind,'')) IN "
-            "('fallback','derived','derived_current')"
-            if "source_kind" in set(table_columns(con, "daily_summary"))
-            else "false"
-        )
-        sources.append(
-            f"""
-            SELECT CAST(date AS VARCHAR) AS trade_date,
-                   limit_up_count, limit_down_count, rise_count, fall_count,
-                   consecutive_count, {fetched_expr} AS fetched_at,
-                   'daily_summary' AS market_daily_source,
-                   {summary_fallback} AS is_fallback,
-                   1 AS source_priority
-            FROM ({_latest_cte("daily_summary", ["date"], order_col)})
-            """
-        )
-    if has_tushare:
-        has_basic = table_exists(con, "tushare_stock_basic")
-        basic_join = (
-            "LEFT JOIN tushare_stock_basic b ON b.stock_code=d.stock_code"
-            if has_basic else ""
-        )
-        threshold = limit_threshold_sql("d.stock_code", "b.stock_name", "b.market") if has_basic else "9.8"
-        if table_exists(con, "eastmoney_limit_up_pool"):
-            limit_up_expr = (
-                "coalesce((SELECT count(DISTINCT e.stock_code) FROM eastmoney_limit_up_pool e "
-                "WHERE e.date=d.date), sum(CASE WHEN d.change_pct >= " + threshold + " THEN 1 ELSE 0 END))"
-            )
-            consecutive_expr = (
-                "coalesce((SELECT count(DISTINCT e.stock_code) FROM eastmoney_limit_up_pool e "
-                "WHERE e.date=d.date AND e.board_level>=2), 0)"
-            )
-            derived_source = "tushare_daily+eastmoney_limit_up_pool"
-        else:
-            limit_up_expr = "sum(CASE WHEN d.change_pct >= " + threshold + " THEN 1 ELSE 0 END)"
-            consecutive_expr = "0"
-            derived_source = "tushare_daily_threshold_fallback"
-        sources.append(
-            f"""
-            SELECT CAST(d.date AS VARCHAR) AS trade_date,
-                   CAST({limit_up_expr} AS INTEGER) AS limit_up_count,
-                   CAST(sum(CASE WHEN d.change_pct <= -({threshold}) THEN 1 ELSE 0 END) AS INTEGER) AS limit_down_count,
-                   CAST(sum(CASE WHEN d.change_pct>0 THEN 1 ELSE 0 END) AS INTEGER) AS rise_count,
-                   CAST(sum(CASE WHEN d.change_pct<0 THEN 1 ELSE 0 END) AS INTEGER) AS fall_count,
-                   CAST({consecutive_expr} AS INTEGER) AS consecutive_count,
-                   max(d.fetched_at) AS fetched_at,
-                   '{derived_source}' AS market_daily_source,
-                   true AS is_fallback,
-                   2 AS source_priority
-            FROM tushare_daily d
-            {basic_join}
-            GROUP BY d.date
-            """
-        )
-    combined = " UNION ALL ".join(sources)
-    con.execute(
-        f"""
-        CREATE OR REPLACE VIEW v_market_daily AS
-        SELECT trade_date, limit_up_count, limit_down_count, rise_count,
-               fall_count, consecutive_count, fetched_at, market_daily_source,
-               is_fallback
-        FROM ({combined})
-        QUALIFY row_number() OVER (
-            PARTITION BY trade_date ORDER BY source_priority, fetched_at DESC NULLS LAST
-        )=1
-        """
-    )
+    if table_exists(con, 'daily_summary'):
+        order = _timestamp_column(con, 'daily_summary')
+        fallback = "lower(coalesce(source_kind,'')) IN ('fallback','derived','derived_current')" if 'source_kind' in table_columns(con,'daily_summary') else 'false'
+        status = market_daily_status_sql(table_columns(con, 'daily_summary'))
+        sources.append(f"""SELECT CAST(date AS VARCHAR) AS trade_date,
+            limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,
+            {order} AS fetched_at, 'daily_summary' AS market_daily_source, {fallback} AS is_fallback,
+            {status} AS market_daily_status, 1 AS source_priority
+            FROM ({_latest_cte('daily_summary',['date'],order)})""")
+    if table_exists(con, 'tushare_daily'):
+        has_basic = table_exists(con, 'tushare_stock_basic')
+        basic_join = 'LEFT JOIN tushare_stock_basic b ON b.stock_code=d.stock_code' if has_basic else ''
+        threshold = limit_threshold_sql('d.stock_code','b.stock_name','b.market') if has_basic else '9.8'
+        sources.append(f"""SELECT CAST(d.date AS VARCHAR) AS trade_date,
+            p.up_count AS limit_up_count,
+            CAST(sum(CASE WHEN d.change_pct<=-({threshold}) THEN 1 ELSE 0 END) AS INTEGER) AS limit_down_count,
+            CAST(sum(CASE WHEN d.change_pct>0 THEN 1 ELSE 0 END) AS INTEGER) AS rise_count,
+            CAST(sum(CASE WHEN d.change_pct<0 THEN 1 ELSE 0 END) AS INTEGER) AS fall_count,
+            p.consecutive_count,
+            greatest(max(d.fetched_at),p.received_at) AS fetched_at,
+            CASE WHEN p.up_count IS NULL THEN 'tushare_daily+limit_pool_missing'
+                 ELSE 'tushare_daily+qualified_hithink_limit_pool' END AS market_daily_source,
+            true AS is_fallback,
+            CASE WHEN p.up_count IS NULL THEN 'partial' ELSE 'estimated' END AS market_daily_status,
+            2 AS source_priority
+            FROM tushare_daily d {basic_join}
+            LEFT JOIN ({_qualified_limit_totals_sql(con)}) p ON p.trade_date=d.date
+            GROUP BY d.date,p.up_count,p.consecutive_count,p.received_at""")
+    if not sources:
+        con.execute(_empty_view_sql('v_market_daily',cols));return
+    con.execute(f"""CREATE OR REPLACE VIEW v_market_daily AS
+        SELECT trade_date,limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,
+               fetched_at,market_daily_source,is_fallback,market_daily_status
+        FROM ({' UNION ALL '.join(sources)})
+        QUALIFY row_number() OVER (PARTITION BY trade_date ORDER BY source_priority,fetched_at DESC NULLS LAST)=1""")
 
 
 def _create_sector_daily(con: duckdb.DuckDBPyConnection) -> None:
@@ -275,22 +262,23 @@ def _create_limit_pool(con: duckdb.DuckDBPyConnection) -> None:
                 """
             )
         if has_xdf:
-            # Priority 0 as well: TuShare limit_list_d is exchange-grade too.
-            # Same-priority rows coexist within a day so the two official
-            # sources fill each other's gaps instead of excluding one another;
-            # the QUALIFY dedupe resolves per-stock conflicts by freshness.
-            # board_level is derived at collection time from local kline streaks.
+            # Only the native limit_times field qualifies. Older rows with a
+            # locally derived board_level remain raw evidence, not native facts.
+            native_height = 'TRY_CAST(limit_times AS DOUBLE)' if 'limit_times' in table_columns(con, 'xdf_limit_pool') else 'NULL::DOUBLE'
             sources.append(
                 f"""
                 SELECT CAST(trade_date AS VARCHAR) AS trade_date,
-                       TRY_CAST(board_level AS INTEGER) AS board_level,
+                       TRY_CAST({native_height} AS INTEGER) AS board_level,
                        regexp_replace(CAST(ts_code AS VARCHAR), '[.].*$', '') AS stock_code,
                        max(name) AS stock_name,
                        CAST(NULL AS VARCHAR) AS limit_up_time,
-                       CAST(max(fetched_at) AS TIMESTAMP) AS fetched_at,
+                       max(TRY_CAST(fetched_at AS TIMESTAMP)) AS fetched_at,
                        'xiaodefa' AS source,
                        {xiaodefa_priority} AS source_priority
                 FROM xdf_limit_pool
+                WHERE {native_height} >= 1 AND {native_height} = floor({native_height})
+                  AND isfinite({native_height}) AND TRY_CAST({native_height} AS INTEGER) IS NOT NULL
+                  AND TRY_CAST(fetched_at AS TIMESTAMP) IS NOT NULL
                 GROUP BY 1, 2, 3
                 """
             )
@@ -833,6 +821,9 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
         ("new_high_count", "INTEGER"),
         ("earning_effect_score", "DOUBLE"),
         ("acute_drop_risk_score", "DOUBLE"),
+        ("market_daily_status", "VARCHAR"),
+        ("earning_effect_status", "VARCHAR"),
+        ("acute_drop_risk_status", "VARCHAR"),
         ("source_table", "VARCHAR"),
         ("is_fallback", "BOOLEAN"),
         ("fetched_at", "TIMESTAMP"),
@@ -868,6 +859,9 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
         ["date"],
         [("date", "DATE"), ("count", "INTEGER")],
     )
+    earning_valid = "isfinite(e.success_rate) AND e.success_rate BETWEEN 0 AND 100 AND CAST(m.rise_count AS DOUBLE) + m.fall_count > 0"
+    risk_valid = ("isfinite(r.blown_limit_up_rate) AND r.blown_limit_up_rate BETWEEN 0 AND 100 AND "
+                  + count_valid_sql('r.broken_limit_up_count') + ' AND ' + count_valid_sql('r.blown_limit_up_count'))
     con.execute(
         f"""
         CREATE OR REPLACE VIEW v_market_state_inputs AS
@@ -885,29 +879,30 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
             e.yll,
             e.success_rate,
             n.count AS new_high_count,
-            round(
-                coalesce(e.success_rate, 0) * 0.4
-                + CASE
-                    WHEN coalesce(m.rise_count, 0) + coalesce(m.fall_count, 0) > 0
-                    THEN m.rise_count * 100.0 / (m.rise_count + m.fall_count) * 0.4
-                    ELSE 0
-                  END
-                + least(coalesce(m.limit_up_count, 0), 100) * 0.2,
+            CASE WHEN m.market_daily_status = 'available' AND {earning_valid} THEN round(
+                e.success_rate * 0.4
+                + m.rise_count * 100.0 / (CAST(m.rise_count AS DOUBLE) + m.fall_count) * 0.4
+                + least(m.limit_up_count, 100) * 0.2,
                 2
-            ) AS earning_effect_score,
-            round(
+            ) END AS earning_effect_score,
+            CASE WHEN m.market_daily_status = 'available' AND {risk_valid} THEN round(
                 least(
                     100.0,
                     greatest(
                         0.0,
-                        coalesce(r.blown_limit_up_rate, 0) * 0.35
-                        + least(coalesce(m.limit_down_count, 0), 80) * 0.85
-                        + least(coalesce(r.broken_limit_up_count, 0), 80) * 0.55
-                        + least(coalesce(r.blown_limit_up_count, 0), 100) * 0.35
+                        r.blown_limit_up_rate * 0.35
+                        + least(m.limit_down_count, 80) * 0.85
+                        + least(r.broken_limit_up_count, 80) * 0.55
+                        + least(r.blown_limit_up_count, 100) * 0.35
                     )
                 ),
                 2
-            ) AS acute_drop_risk_score,
+            ) END AS acute_drop_risk_score,
+            m.market_daily_status,
+            CASE WHEN m.market_daily_status <> 'available' THEN m.market_daily_status
+                 WHEN {earning_valid} THEN 'available' ELSE 'partial' END AS earning_effect_status,
+            CASE WHEN m.market_daily_status <> 'available' THEN m.market_daily_status
+                 WHEN {risk_valid} THEN 'available' ELSE 'partial' END AS acute_drop_risk_status,
             m.market_daily_source || '+market_rise_fall+market_emotion_money' AS source_table,
             m.is_fallback,
             m.fetched_at

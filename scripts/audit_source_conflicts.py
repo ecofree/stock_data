@@ -42,10 +42,11 @@ def _duplicate_groups(
     if not set(key_columns) | {"provider"} <= columns:
         return []
     key_sql = ", ".join(_q(column) for column in key_columns)
+    current_filter = 'WHERE coalesce(is_stale, FALSE)=FALSE' if 'is_stale' in columns else ''
     rows = con.execute(
         f"SELECT {key_sql}, count(*) AS row_count, count(DISTINCT provider) AS provider_count, "
         f"string_agg(DISTINCT coalesce(provider, '<null>'), ', ' ORDER BY coalesce(provider, '<null>')) AS providers "
-        f"FROM {_q(table)} WHERE coalesce(is_stale, FALSE)=FALSE "
+        f"FROM {_q(table)} {current_filter} "
         f"GROUP BY {key_sql} HAVING count(DISTINCT provider)>1 ORDER BY row_count DESC LIMIT ?",
         [limit],
     ).fetchall()
@@ -64,11 +65,14 @@ def _provider_counts(con: duckdb.DuckDBPyConnection, table: str) -> list[dict[st
 
 
 def audit(db_path: str | Path, *, limit: int = 1000) -> dict[str, Any]:
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError('audit result limit must be between 1 and 1000')
     con = duckdb.connect(str(db_path), read_only=True)
     try:
+        con.execute('BEGIN TRANSACTION')
         tables = _tables(con)
         domains = {
-            "kline": ("multi_source_kline", ("source_date", "asset_type", "asset_code")),
+            "kline": ("multi_source_kline", ("source_date", "asset_type", "asset_code", "adjustment")),
             "stock_flow": ("multi_source_stock_flow", ("source_date", "stock_code")),
             "sector_flow": ("multi_source_sector_flow", ("source_date", "sector_code")),
         }
@@ -93,6 +97,7 @@ def audit(db_path: str | Path, *, limit: int = 1000) -> dict[str, Any]:
             ths_duplicates[table] = int(con.execute(
                 f"SELECT count(*) FROM (SELECT {key_sql} FROM {_q(table)} GROUP BY {key_sql} HAVING count(*)>1)"
             ).fetchone()[0])
+        from trade_system.snapshot_contract import historical_worklist
         return {
             "db": str(Path(db_path).resolve()),
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -100,6 +105,7 @@ def audit(db_path: str | Path, *, limit: int = 1000) -> dict[str, Any]:
             "provider_counts": counts,
             "ths_duplicate_groups": ths_duplicates,
             "policies": list(SOURCE_POLICIES),
+            "historical_worklist": historical_worklist(con),
         }
     finally:
         con.close()
@@ -134,7 +140,7 @@ def render(result: dict[str, Any]) -> str:
     for domain, rows in result["conflicts"].items():
         policy = SOURCE_POLICIES.get(domain)
         for row in rows:
-            keys = ", ".join(str(row[key]) for key in ("source_date", "asset_type", "asset_code", "stock_code", "sector_code") if key in row)
+            keys = ", ".join(str(row[key]) for key in ("source_date", "asset_type", "asset_code", "adjustment", "stock_code", "sector_code") if key in row)
             primary = ", ".join(policy.primary) if policy else ""
             lines.append(f"| `{domain}` | `{keys}` | {row['row_count']} | `{row['providers']}` | {primary} |")
     lines.extend([
@@ -146,6 +152,11 @@ def render(result: dict[str, Any]) -> str:
     ])
     for table, count in result["ths_duplicate_groups"].items():
         lines.append(f"| `{table}` | {count} |")
+    lines.extend(['', '## Historical disposition worklist', '',
+                  '| Category | Status | Count | Disposition |', '|---|---|---:|---|'])
+    for item in result.get('historical_worklist', {}).get('items', []):
+        count = item['count'] if item['count'] is not None else 'unknown'
+        lines.append(f"| {item['id']} | {item['status']} | {count} | {item['disposition']} |")
     lines.extend([
         "",
         "## Interpretation",

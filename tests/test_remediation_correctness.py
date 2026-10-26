@@ -13,16 +13,16 @@ from trade_system.gate_contract import build_operator_state
 from trade_system.v2.decisions import RiskPolicy
 
 
-def test_execution_permission_requires_every_gate_and_no_blockers():
+def test_current_research_state_never_grants_execution_for_any_legacy_gate_combination():
     for source, pipeline, artifact, data, flow, requested, blocked in product((False, True), repeat=7):
         state = build_operator_state(
             source_ready=source, pipeline_ready=pipeline, artifact_current=artifact,
             data_certified_ready=data, flow_certified_ready=flow,
             execution_ready=requested, blockers=['hard_block'] if blocked else [],
         )
-        expected = all((source, pipeline, artifact, data, flow, requested)) and not blocked
-        assert state['execution_ready'] is expected
-        assert (state['operator_status'] == 'executable') is expected
+        assert state['execution_ready'] is False
+        assert state['operator_status'] != 'executable'
+        assert state['legacy_execution_requested'] is requested
 
 
 @pytest.mark.parametrize('field', ['max_total_fraction', 'max_single_fraction',

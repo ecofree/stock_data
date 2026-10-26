@@ -51,7 +51,7 @@ def test_real_daily_retry_replaces_same_date_fallback(tmp_path):
         store.close()
 
 
-def test_real_rise_fall_retry_replaces_fallback_source_markers(tmp_path):
+def test_real_rise_fall_retry_qualifies_only_its_own_fields(tmp_path):
     store = DuckDBStore(tmp_path / "rise-fall-retry.duckdb")
     try:
         init_schema(store.conn)
@@ -73,7 +73,7 @@ def test_real_rise_fall_retry_replaces_fallback_source_markers(tmp_path):
         assert store.conn.execute(
             "SELECT limit_up_count,source_kind FROM daily_summary "
             "WHERE date='2026-07-27'"
-        ).fetchone() == (10, "real_cross_source")
+        ).fetchone() == (10, "real_partial")
     finally:
         store.close()
 
@@ -96,7 +96,7 @@ def test_previous_session_kpl_row_is_stored_at_source_date_without_relabelling(t
         assert store.conn.execute(
             "SELECT limit_up_count,rise_count,fall_count,source_kind "
             "FROM daily_summary WHERE date='2026-07-24'"
-        ).fetchone() == (14, 763, 4185, "real_cross_source")
+        ).fetchone() == (14, 763, 4185, "real_partial")
         assert store.conn.execute(
             "SELECT source_kind FROM market_rise_fall WHERE date='2026-07-24'"
         ).fetchone()[0] == "real"

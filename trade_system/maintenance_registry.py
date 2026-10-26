@@ -121,6 +121,10 @@ def empty_table_collection_plan(
 
 def script_lifecycle(name: str, *, mentioned_by_runner: bool = False) -> str:
     lower = name.lower()
+    if lower == 'split_cold_storage.py':
+        return 'read_only_inventory_destructive_execution_retired'
+    if lower in ('offsite_backup.ps1','import_operator_trade_outcomes.py'):
+        return 'retired_refusal_only'
     if lower == "run_integrated_daily.py":
         return "migration_only"
     if lower.startswith("audit_") or lower.startswith("check_"):

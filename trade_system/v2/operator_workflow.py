@@ -73,6 +73,9 @@ def configured_account_risk(output, as_of):
     from .accounts import risk_snapshot
     path=Path(output)/'workspace-config.json'
     config=read_json(path)[0] if path.exists() else {}
+    from .acceptance_scope import from_config, account_not_applicable
+    if from_config(config):
+        return account_not_applicable()
     if not config.get('account_database') or not config.get('account_id'):
         return {'status':'account_unknown','execution_ready':False,'positions':[],'open_orders':[]}
     import duckdb
@@ -91,7 +94,10 @@ def evaluate_observation_plan(plan, as_of, *, quote=None, account=None):
         deadline=datetime.fromisoformat(quote['valid_until'])
         if deadline.tzinfo is None:deadline=deadline.replace(tzinfo=ZoneInfo('Asia/Shanghai'))
     blockers=[]
-    if not account or account.get('status')!='account_snapshot_available_not_execution':blockers.append('account_not_verified')
+    from .acceptance_scope import observation_only
+    if observation_only(account):
+        if plan.get('account_id') or plan.get('account_snapshot_id'):blockers.append('account_scope_conflict')
+    elif not account or account.get('status')!='account_snapshot_available_not_execution':blockers.append('account_not_verified')
     if plan.get('account_snapshot_id') and (account or {}).get('snapshot_id')!=plan['account_snapshot_id']:blockers.append('account_version_changed')
     if at<utc(plan['received_at']):state='data_insufficient'
     elif at>=utc(plan['valid_until']):state='expired'

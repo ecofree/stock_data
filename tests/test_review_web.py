@@ -2,6 +2,7 @@ import json
 import re
 
 import duckdb
+import pytest
 from pathlib import Path
 
 from trade_system.daily_review import (
@@ -34,6 +35,54 @@ from trade_system.review_web import (
     _render_tomorrow,
 )
 from trade_system.review_extras import render_first_seal_distribution, render_theme_timeline
+
+
+@pytest.mark.parametrize("outcome_fields", [{}, {"outcomes": None}, {"outcomes": []}],
+                         ids=["missing", "null", "empty"])
+def test_empty_outcomes_page_explains_retirement_without_import_guidance(outcome_fields):
+    from trade_system.review_web import _page_html
+
+    html = _page_html(dict(outcome_fields), "2026-10-12", "", {}, [], [])
+    assert "当前没有可用于复盘的真实成交记录。旧人工计划导入已退役；" in html
+    assert "历史记录仅供查看，真实成交接入待独立账本方案验收。" in html
+    assert "收盘后用 operator_outcomes" not in html
+    assert "导入真实结果、跳过或取消" not in html
+    assert "收盘后导入真实成交" not in html
+    assert any("旧人工计划导入已退役" in item
+               for item in build_review_narrative(outcome_fields)["tomorrow"])
+    assert "<form" not in html and "type=\"file\"" not in html
+
+
+def test_markdown_review_does_not_recommend_retired_import():
+    from trade_system.daily_review import render_daily_review_markdown
+
+    markdown = render_daily_review_markdown({"outcomes": []})
+    assert "旧人工计划导入已退役" in markdown
+    assert "真实成交接入待独立账本方案验收" in markdown
+    assert "收盘后导入真实成交" not in markdown
+
+
+def test_historical_outcomes_page_preserves_results_and_escapes_notes():
+    from trade_system.review_web import _page_html
+
+    marker = '<img src=x onerror="window.__outcome_injection=1">'
+    ctx = {"outcomes": [
+        {"stock_name": "历史成交甲", "execution_status": "executed",
+         "position_pct": 3.0, "net_return_pct": 7.8,
+         "outcome_tag": "历史记录", "review_note": marker},
+        {"stock_name": "历史取消乙", "execution_status": "cancelled",
+         "position_pct": 0, "net_return_pct": None, "review_note": "未成交，不计收益"},
+    ]}
+    html = _page_html(ctx, "2026-10-12", "", {}, [], [])
+    assert "真实成交</strong>" in html
+    assert "历史成交甲" in html and "历史取消乙" in html
+    assert "7.80" in html and "未成交，不计收益" in html
+    assert "&lt;img src=x onerror=&quot;window.__outcome_injection=1&quot;&gt;" in html
+    assert marker not in html
+    assert "当前没有可用于复盘的真实成交记录" not in html
+    assert "收盘后用 operator_outcomes" not in html
+    assert "导入真实结果、跳过或取消" not in html
+    assert "<form" not in html and "type=\"file\"" not in html
 
 
 def test_member_detail_uses_clock_formatter_not_raw_epoch():
@@ -193,7 +242,7 @@ def test_blocked_page_labels_plans_as_research_drafts():
     })
 
     assert "研究计划草案" in html
-    assert "研究草案（门禁未开放）" in html
+    assert "研究草案（执行权限关闭）" in html
     assert "已列入计划" not in html
 
 
@@ -524,7 +573,7 @@ def test_review_narrative_is_blocked_when_close_source_missing():
     html = _render_command_summary(ctx)
     assert "仅可复盘" in html
     assert "共封装光学(CPO)" in html
-    assert "没有导入成交" in _render_loop(ctx)
+    assert "当前没有可用于复盘的真实成交记录" in _render_loop(ctx)
     tomorrow = _render_tomorrow(ctx)
     assert "先补齐 kline, close_source" in tomorrow
 
@@ -622,6 +671,7 @@ def test_review_keeps_full_details_inline_with_bounded_initial_cards():
     }
     inline = _concept_inline_data(ctx)
     assert len(inline[0]["limit_up_stocks"]) == 50
+    assert inline[0]["limit_up_stock_total"] == 60
     assert inline[1]["limit_up_stocks"] == []
 
     from trade_system.review_web import _page_html

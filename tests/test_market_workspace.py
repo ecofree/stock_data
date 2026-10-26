@@ -23,6 +23,27 @@ def con():
 def project(c):return market.project(c,'2026-09-11','2026-09-12T12:00:00+08:00',{'000001'})
 
 
+@pytest.mark.parametrize('status',['partial','estimated','available','legacy'])
+def test_market_totals_keep_qualification_through_workspace(con,status):
+    con.execute('CREATE TABLE v_market_daily(trade_date VARCHAR,limit_up_count INTEGER,limit_down_count INTEGER,consecutive_count INTEGER,market_daily_source VARCHAR,fetched_at TIMESTAMP)')
+    con.execute("INSERT INTO v_market_daily VALUES ('2026-09-11',NULL,2,NULL,'fixture','2026-09-11 16:00:00')")
+    if status!='legacy':
+        con.execute('ALTER TABLE v_market_daily ADD COLUMN market_daily_status VARCHAR')
+        con.execute('UPDATE v_market_daily SET market_daily_status=?',[status])
+    if status in ('available','estimated'):
+        con.execute('ALTER TABLE v_market_daily ADD COLUMN rise_count INTEGER DEFAULT 0')
+        con.execute('ALTER TABLE v_market_daily ADD COLUMN fall_count INTEGER DEFAULT 0')
+        con.execute('UPDATE v_market_daily SET limit_up_count=0,consecutive_count=0')
+    result=project(con)
+    assert result['market_totals']['status']==('unverified_legacy' if status=='legacy' else status)
+    if status=='available':
+        assert result['market_totals']['limit_up']==0
+        assert result['breadth']['limit_down']==2
+    else:
+        assert result['market_totals']['limit_up'] == (0 if status=='estimated' else None)
+        assert result['breadth'].get('limit_down') is None
+
+
 def test_full_members_and_fixed_scope_previous_day(con):
     r=project(con)
     assert r['themes'][0]['member_codes']==['000001','000002']
@@ -235,6 +256,8 @@ def test_market_update_receipt_reads_only_its_published_generation(tmp_path,monk
         first_pointer.append(pointer)
         assert len(history_calls)==1
         newer=dict(snapshot,as_of='2026-09-12T13:00:00+08:00')
+        from trade_system.business_contract import market_consumption
+        newer['product_consumption']=market_consumption(newer)
         newer.pop('snapshot_id');newer['snapshot_id']=identity(newer)
         publish(tmp_path,market=newer)
         return pointer

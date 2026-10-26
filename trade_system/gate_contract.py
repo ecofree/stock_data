@@ -1,9 +1,9 @@
-"""Canonical operator state for the daily trading-data pipeline.
+"""Canonical manual-research qualification for the retained data pipeline.
 
 The project has several useful gates, but they describe different things:
 source freshness, data certification, capital-flow reconciliation, and entry
-execution.  This module gives those dimensions one stable vocabulary while
-keeping the legacy boolean aliases used by existing reports.
+historical candidate flags. Legacy flags remain diagnostic inputs, never
+execution authority. Compatibility aliases describe data/analysis only.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-OPERATOR_STATE_VERSION = "p0.operator_state.v1"
+OPERATOR_STATE_VERSION = "manual_research.operator_state.v2"
 OPERATIONAL_CAPABILITIES_VERSION = "operational_capabilities_v1"
 
 
@@ -107,17 +107,15 @@ def build_operator_state(
     warning_list = sorted({str(item) for item in warnings if str(item)})
     if blocker_list or not source or not pipeline or not artifact:
         operator_status = "blocked"
-    elif bool(execution_ready) and analysis_ready:
-        operator_status = "executable"
     elif analysis_ready:
         operator_status = "analysis_only"
     elif flow_certified is None and data_certified:
         operator_status = "data_only"
     else:
         operator_status = "uncertified"
-    effective_execution_ready = operator_status == "executable"
     return {
         "operator_state_version": OPERATOR_STATE_VERSION,
+        "scope": "manual_research_qualification_not_execution_authority",
         "operator_status": operator_status,
         "run_status": str(run_status),
         "source_ready": source,
@@ -128,7 +126,10 @@ def build_operator_state(
         "analysis_ready": analysis_ready,
         "analysis_assessed": flow_certified is not None,
         "analysis_scope": analysis_scope,
-        "execution_ready": effective_execution_ready,
+        # Retain the old argument for readers of historical candidate flags.
+        # No boolean, old row or data certificate can reopen an execution owner.
+        "legacy_execution_requested": bool(execution_ready),
+        "execution_ready": False,
         "blockers": blocker_list,
         "warnings": warning_list,
         # Compatibility aliases.  New code should use the explicit fields

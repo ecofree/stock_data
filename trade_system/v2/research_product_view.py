@@ -28,11 +28,13 @@ def export_projection(data):
     from copy import deepcopy
     from .domain import identity
     result=deepcopy(data)
-    if result.get('action_queue'):
+    from .acceptance_scope import SCOPE
+    observation_only=result.get('acceptance_scope')==SCOPE
+    if result.get('action_queue') and not observation_only:
         result['action_queue']=[row for row in result['action_queue'] if row.get('kind')=='observation_plan']
         result['action_queue'].insert(0,{'priority':0,'kind':'account_privacy','instrument':None,
             'reason':'静态导出已隐藏账户详情','allowed_action':'在本地工作台核对账户风险；隐藏不代表无持仓'})
-    if result.get('account_periods'):
+    if result.get('account_periods') and not observation_only:
         result['account_periods']={k:{key:v for key,v in value.items() if key in ('period','start','end','through','missing')} | {'status':'account_details_omitted_from_static_export'} for k,value in result['account_periods'].items()}
     if result.get('observation'):
         result['observation'].pop('sampling',None)
@@ -41,7 +43,13 @@ def export_projection(data):
             row.pop('risk_related',None)
             row['roles']=['current_observation']
     if 'plans' in result:
-        result['plans']['account']={'status':'account_details_omitted_from_static_export','execution_ready':False}
+        if observation_only:
+            from .acceptance_scope import account_not_applicable
+            result['plans']['account']=account_not_applicable()
+        else:
+            result['plans']['account']={'status':'account_details_omitted_from_static_export','execution_ready':False}
+        # A scope change does not erase account bindings in historical plans.
+        # Preserve local originals and conflict blockers, but never export IDs.
         for plan in result['plans'].get('rows',[]):
             for key in ('account_id','account_snapshot_id'):plan.pop(key,None)
         result['plans']['scope']='redacted_display_not_authoritative_plan_receipts'
@@ -64,8 +72,18 @@ def candidate_scope(data):
 
 
 def render(data, *, include_account=False):
+    from .acceptance_scope import SCOPE, observation_only
+    if data.get('acceptance_scope')==SCOPE:
+        account=(data.get('plans') or {}).get('account')
+        if account and (not observation_only(account) or account.get('positions') or account.get('open_orders')):
+            raise ValueError('observation page contains conflicting account evidence')
+        if any(p.get('status')!='not_applicable_current_scope' for p in data.get('account_periods',{}).values()):
+            raise ValueError('observation page contains account performance')
     if not include_account:data=export_projection(data)
     payload=json.dumps(data,ensure_ascii=False,allow_nan=False).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+    static_message=('离机只读验收：此包用于历史查看和恢复验收，操作以随包说明为准。这里不能更新或保存；没有恢复运营。'
+                    if data.get('historical_rehearsal') else
+                    '只读导出快照：这里不能更新或保存；填写/导出不代表已记录。请用 Start Research.cmd 打开在线工作台。')
     return '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; form-action 'self'; base-uri 'none'">
 <title>Stock Data · 研究与每日复盘</title>'''+STYLE+'''
@@ -90,6 +108,9 @@ def render(data, *, include_account=False):
 <footer>离线显示数据全部内联。研究样本与真实账户分开；未验证选股优势，真实执行关闭。<!--RUNNING_REFRESH--></footer></main>
 <script type="application/json" id="data">'''+payload+'''</script><script>
 'use strict';const D=JSON.parse(document.getElementById('data').textContent),$=x=>document.getElementById(x),P=D.prediction;
+const observationScope=D.acceptance_scope==='market_research_observation_v1';
+const accountNotice=observationScope?'真实账户对账本阶段不适用；不计算账户收益或可用仓位。':'账户未核对，不给可用仓位。';
+if(observationScope){document.querySelector('.statusbar span:nth-child(2)').textContent='真实账户：本阶段不适用';for(const o of $('review-period').options){if(o.value==='month')o.textContent='月度市场与观察';if(o.value==='quarter')o.textContent='季度市场与观察'}}
 const candidateScope='''+json.dumps(candidate_scope(data),ensure_ascii=True).replace('<','\\u003c')+''';
 const el=(tag,t)=>{const e=document.createElement(tag);e.textContent=t;return e},fmt=x=>x==null?'—':Number(x).toFixed(4);
 const labels={price_auction:'QLib · 价格 + 竞价撮合',price_baseline:'QLib · 价格',price_money:'QLib · 价格 + 资金',price_alpha158:'QLib · 价格 + Alpha158',constant:'常量预测（误差对照）'};
@@ -155,6 +176,8 @@ window.addEventListener('hashchange',switchWorkspace);switchWorkspace();
 if(market){
 $('market-state').textContent='交易日 '+market.trade_date+' / 评估时点 '+market.as_of+' / 市场状态 '+market.regime+'。'+({closed:'今日休市',open_session:'今日为交易日',calendar_unknown:'今日日历尚未核对'}[market.session_state]||'日历状态未核对')+'；展示最近完整交易日，不冒充当前报价。';
 if(market.breadth_scope)$('market-state').append(' 广度仅覆盖可用标准价格记录，不冒充交易所全市场总数。');
+if(market.membership_contract){const m=market.membership_contract;
+ $('market-state').append(' 成员快照日期 '+(m.snapshot_session||'未知')+'；'+(m.same_session_membership?'当日声明范围已核对':m.usable_for_retained_review?'沿用已核对的历史快照，当前成员变化未知':'成员范围未完整核对')+'。快照日期不代表成员加入或退出的生效日期。');}
 if(market.collection_diagnostics){const q=market.collection_diagnostics;
  $('market-state').append(q.status==='gaps_present'?' 当前采集仍有缺口，已展示合格事实不代表整日验收通过。':' 当前事实尚未获得完整市场认证。');
  const detail=el('details','');detail.append(el('summary','采集缺口与分产品覆盖'));
@@ -218,15 +241,15 @@ window.addEventListener('pageshow',()=>{$('save').disabled=!D.market&&!P;$('save
 $('new-note').addEventListener('click',()=>{if(!draftDirty)try{sessionStorage.removeItem(draftKey)}catch(_){}});
 if(D.note_scope&&D.note_scope.total>D.note_scope.shown)$('notes').prepend(el('p','当前仅展示最近 '+D.note_scope.shown+' / '+D.note_scope.total+' 条；历史记录仍保留在本地。'));
 const online=location.protocol==='http:'&&!form.elements.csrf.value.startsWith('__');
-function staticMode(){if(!online){document.querySelectorAll('form button').forEach(b=>b.disabled=true);$('message').textContent='只读导出快照：这里不能更新或保存；填写/导出不代表已记录。请用 Start Research.cmd 打开在线工作台。'}}staticMode();window.addEventListener('pageshow',staticMode);
+function staticMode(){if(!online){document.querySelectorAll('form button').forEach(b=>b.disabled=true);$('message').textContent='''+json.dumps(static_message,ensure_ascii=False)+'''}}staticMode();window.addEventListener('pageshow',staticMode);
 const conditionNames={pending:'仍待观察',triggered:'失效条件已触发',not_triggered:'截至记录时未触发',unclear:'证据不足，无法判断'};
 const quoteStates={no_qualified_current_quote:'无合格当前报价',expired_after_publication:'已过期，不显示旧价格',conflicting_same_priority_quotes:'同优先级报价冲突',capacity_blocked:'本轮采集容量受限，尚未核对',current_observation_not_executable:'时点合格，仅供观察'};
 const obs=D.observation,watched=D.notes.filter(n=>n.is_latest&&n.intent==='observe');
-$('observation-state').textContent='人工关注 '+watched.length+' 条；'+(obs?'当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。':'尚未核对当前报价。')+' 账户未核对，不给可用仓位。';
+$('observation-state').textContent='人工关注 '+watched.length+' 条；'+(obs?'当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。':'尚未核对当前报价。')+' '+accountNotice;
 if(obs?.capture)$('observation-capture').textContent='备用来源：腾讯；留存 '+obs.capture.received_rows+' 条，采集批次失败 '+obs.capture.failures+' 次；本次请求 '+obs.capture.provider_requests_this_run+' 次'+(obs.capture.reused?'（复用封存响应，不延长行情时效）':'')+'。响应完整性编号 '+obs.capture.manifest_id.slice(0,12)+'。取得响应不等于当前价合格。';
 if(obs?.error)$('observation-state').textContent='报价快照校验失败或不可读取，当前报价关闭。日常工作台与判断记录仍可用；请核对来源后重新更新，不改用旧价。';
 $('market').after($('observation'));
-function drawObservation(){if(obs&&!obs.error){for(const q of obs.rows)if(q.price!=null){const deadline=Date.parse(q.valid_until+'+08:00');if(!Number.isFinite(deadline)||Date.now()>deadline){q.price=null;q.state='expired_after_publication'}}obs.qualified=obs.rows.filter(q=>q.price!=null).length;$('observation-state').textContent='人工关注 '+watched.length+' 条；当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。账户未核对，不给可用仓位。'}const items=watched.map(n=>({code:n.instrument,note:n}));for(const r of obs?.live_scope||[])if((r.roles||[]).some(role=>role!=='research_forecast')&&!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});if($('observation-all').checked)for(const r of forecastRows)if(!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});
+function drawObservation(){if(obs&&!obs.error){for(const q of obs.rows)if(q.price!=null){const deadline=Date.parse(q.valid_until+'+08:00');if(!Number.isFinite(deadline)||Date.now()>deadline){q.price=null;q.state='expired_after_publication'}}obs.qualified=obs.rows.filter(q=>q.price!=null).length;$('observation-state').textContent='人工关注 '+watched.length+' 条；当前报价合格 '+obs.qualified+' / '+obs.rows.length+' 只。最近核对 '+obs.as_of+'。'+accountNotice}const items=watched.map(n=>({code:n.instrument,note:n}));for(const r of obs?.live_scope||[])if((r.roles||[]).some(role=>role!=='research_forecast')&&!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});if($('observation-all').checked)for(const r of forecastRows)if(!items.some(x=>x.code===r.instrument))items.push({code:r.instrument});
  table($('observation-rows'),items.map(item=>{const q=obs?.rows.find(r=>r.instrument===item.code),n=item.note,review=n?(D.human_reviews||[]).filter(r=>r.note_id===n.note_id).sort((a,b)=>b.received_at.localeCompare(a.received_at))[0]:null;return [item.code+' / '+(n?(n.prediction_date||'独立关注'):'未人工关注'),n?n.invalidation:'先记录观察理由与失效条件',review?conditionNames[review.conclusion]+' · '+review.received_at:'尚未人工核对',q?.price==null?'—':fmt(q.price),q?(quoteStates[q.state]||q.state)+(q.provider?' / '+q.provider+' / '+q.source_event_time:''):'没有报价快照']}));
  for(const [i,item] of items.entries())if(item.note){const a=el('a','查看原判断与复盘');a.href='#note-'+item.note.note_id;$('observation-rows').rows[i].cells[0].append(el('br',''),a)}
  if(!items.length){const row=el('tr',''),cell=el('td','暂无人工关注。先在候选比较区保存一条“继续观察”，不会自动把模型排序变成关注清单。');cell.colSpan=5;row.append(cell);$('observation-rows').append(row)}
@@ -249,7 +272,8 @@ for(const [i,r] of (D.reviews||[]).entries())$('reviews').children[i].id='review
 
 function drawPeriod(){
  const kind=$('review-period').value,p=D.market?.periods?.[kind],box=$('period-summary');box.replaceChildren();
- if(kind==='month'||kind==='quarter'){
+ if((kind==='month'||kind==='quarter')&&observationScope){box.append(el('p','真实账户对账本阶段不适用；本页仅复盘行情与人工观察。'))}
+ if((kind==='month'||kind==='quarter')&&!observationScope){
   const a=D.account_periods?.[kind];box.append(el('h3',kind==='month'?'自然月账户复盘':'自然季度账户复盘'));
   if(!a){box.append(el('p','没有导入账户绩效资料。收益未知，市场汇总仍可查看。'))}
   else if(a.status==='account_details_omitted_from_static_export'){box.append(el('p','此静态导出已隐藏账户详情；请在本地工作台查看。这不表示账户资料缺失。'))}
@@ -296,9 +320,9 @@ window.addEventListener('pagehide',keepView);
 try{const saved=JSON.parse(sessionStorage.getItem(viewKey)||'null');if(saved){$('review-period').value=saved.period||'day';drawPeriod();$('search').value=saved.search||'';$('sort').value=saved.sort||'code';$('search').dispatchEvent(new Event('input'));for(const c of saved.compare||[])if(rows.some(r=>r.instrument===c))compared.add(c);drawCompare();draw();const selected=rows.find(r=>r.instrument===saved.selected);if(selected)show(selected);if(saved.focus&&$(saved.focus))$(saved.focus).focus({preventScroll:true});requestAnimationFrame(()=>window.scrollTo(0,saved.scroll||0))}}catch(_){}
 
 for(const item of D.attention_followups||[]){const box=el('article','');box.id='review-'+item.note_id;box.append(el('strong','独立关注 '+item.instrument),el('p',item.original_date+' → '+(item.current_date||'等待')+'：'+(item.change_pct==null?'等待后续同口径价格或当前缺失':fmt(item.change_pct)+'%')) ,el('p','状态 '+item.status+'；从记录时所见收盘价计算，不是实际成交收益。原失效条件仍需人工核对。'));$('reviews').append(box)}
-const plansPanel=el('div','');plansPanel.id='plans';plansPanel.append(el('h3','观察计划与账户风险'));
+const plansPanel=el('div','');plansPanel.id='plans';plansPanel.append(el('h3',observationScope?'人工观察计划':'观察计划与账户风险'));
 const account=D.plans?.account||{status:'account_unknown'};
-plansPanel.append(el('p','账户状态：'+account.status+'；无核对账户时，仅保存观察计划，不计算数量或可用仓位。'));
+plansPanel.append(el('p',observationScope?accountNotice:'账户状态：'+account.status+'；无核对账户时，仅保存观察计划，不计算数量或可用仓位。'));
 if(account.snapshot_id){
  plansPanel.append(el('p','账户快照 '+account.as_of+'，有效至 '+account.valid_until+'；现金 '+fmt(account.cash_fen/100)+' 元 / 冻结 '+fmt(account.frozen_fen/100)+' 元。'+(account.blockers||[]).join('；')));
  const holdings=el('table',''),body=el('tbody','');holdings.append(body);table(body,[['持仓','数量','可卖','标记价格'],...(account.positions||[]).map(p=>[p.instrument,p.quantity,p.sellable,p.mark_price])]);plansPanel.append(holdings);

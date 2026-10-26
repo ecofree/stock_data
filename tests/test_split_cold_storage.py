@@ -26,6 +26,7 @@ def db(tmp_path):
         "('2026-02-01','000002',12.0)"
     )
     con.close()
+    assert not (tmp_path / 'cold.duckdb').exists()
     return path
 
 
@@ -39,37 +40,31 @@ def test_dry_run_does_not_move_rows(db, tmp_path, capsys):
     con.close()
 
 
-def test_execute_moves_old_rows_and_keeps_recent(db, tmp_path):
+def test_retired_execute_refuses_before_opening_target(db, tmp_path):
     rc = main_with_args(db, tmp_path, execute=True, before="2026-01-01")
-    assert rc == 0
+    assert rc == 2
     con = duckdb.connect(str(db), read_only=True)
-    cold = duckdb.connect(str(tmp_path / "cold.duckdb"), read_only=True)
-    assert con.execute("SELECT count(*) FROM kline").fetchone()[0] == 2
-    assert cold.execute("SELECT count(*) FROM kline").fetchone()[0] == 1
-    # recent row intact in the hot table
+    assert con.execute("SELECT count(*) FROM kline").fetchone()[0] == 3
+    assert not (tmp_path / 'cold.duckdb').exists()
     assert con.execute("SELECT close FROM kline WHERE date='2026-01-05'").fetchone()[0] == 11.0
     # moved row queryable from cold via the standard attach name
     con.close()
-    cold.close()
 
 
 def test_rerun_is_idempotent(db, tmp_path):
-    assert main_with_args(db, tmp_path, execute=True, before="2026-01-01") == 0
-    # second run finds nothing new and leaves counts unchanged
-    assert main_with_args(db, tmp_path, execute=True, before="2026-01-01") == 0
+    assert main_with_args(db, tmp_path, execute=False, before="2026-01-01") == 0
+    assert main_with_args(db, tmp_path, execute=False, before="2026-01-01") == 0
     con = duckdb.connect(str(db), read_only=True)
-    cold = duckdb.connect(str(tmp_path / "cold.duckdb"), read_only=True)
-    assert con.execute("SELECT count(*) FROM kline").fetchone()[0] == 2
-    assert cold.execute("SELECT count(*) FROM kline").fetchone()[0] == 1
+    assert con.execute("SELECT count(*) FROM kline").fetchone()[0] == 3
+    assert not (tmp_path / 'cold.duckdb').exists()
     con.close()
-    cold.close()
 
 
 def test_attach_readthrough_via_env_name(db, tmp_path):
     """KPL_COLD_DB_PATH attach (base.connect_duckdb) makes cold visible as ``cold``."""
     from trade_system import data_store as base
-    rc = main_with_args(db, tmp_path, execute=True, before="2026-01-01")
-    assert rc == 0
+    with duckdb.connect(str(tmp_path/'cold.duckdb')) as cold:
+        cold.execute('CREATE TABLE kline(date DATE, stock_code VARCHAR, close DOUBLE)')
     monkey = pytest.MonkeyPatch()
     monkey.setenv("KPL_COLD_DB_PATH", str(tmp_path / "cold.duckdb"))
     try:

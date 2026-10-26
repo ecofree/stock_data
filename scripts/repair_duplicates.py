@@ -31,7 +31,7 @@ def main() -> int:
         try:
             for name in (
                 "uq_multi_source_stock_flow", "uq_multi_source_sector_flow",
-                "uq_multi_source_kline", "uq_tushare_daily",
+                "uq_multi_source_kline", "uq_multi_source_kline_product", "uq_tushare_daily",
                 "uq_tushare_daily_basic", "uq_tushare_moneyflow",
                 "ix_multi_source_stock_flow", "ix_multi_source_sector_flow",
                 "ix_multi_source_kline", "ix_tushare_daily",

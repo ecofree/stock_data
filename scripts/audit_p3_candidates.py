@@ -169,8 +169,8 @@ def audit(db: str, trade_date: str, out: str) -> dict:
     lines.extend(f"| {r['code']} | {r['name']} | {r['score']:.2f} |" for r in result["top_industries"])
     lines.extend([
         "", "## 使用边界", "",
-        "候选池只有在阶段窗口、同日数据截止时间、个股证据和风险门槛同时满足时才标记为可执行；历史补采数据晚于交易日的记录保持 blocked，避免回填数据伪装成盘中信号。",
-        "人工结果必须由操作者填写模板后导入，不自动生成成交或收益。",
+        "当前候选仅供人工研究；旧可执行标记只作历史诊断，数据与风险检查不会恢复退役入口。历史补采记录不能冒充原交易时点可得的信号。",
+        "旧人工计划导入已退役；历史记录仅供查看，真实成交接入待独立账本方案验收。不自动生成成交或收益。",
         "", "```json", json.dumps(result, ensure_ascii=False, indent=2, default=str), "```",
     ])
     Path(out).parent.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,9 @@
 
 A股人工研究与复盘助手，保留合格行情、带来源的资金观察和人工记录；不创建真实订单。
 
+当前入口、退役边界及阶段 1/2 数据合同见 [当前业务边界](docs/current_business_contract.md)。
+采集产品与具体消费端见 [产品消费合同](docs/business_product_contract.md)；声明关系与实际发布消费分别记录。
+
 ## 当前运行状态
 
 [状态入口](docs/v2/STATUS.json)只定位稳定运行目录的`state/current.json`。

@@ -290,6 +290,9 @@ def journal_projection(output,data):
         data['plans']=observation_plans(output,now_utc().isoformat(),(data.get('observation') or {}).get('rows',[]))
     except (OSError,ValueError,KeyError) as exc:
         data['plans']={'rows':[],'account':{'status':'risk_unavailable','execution_ready':False},'error':str(exc)[:200]}
+    from .acceptance_scope import for_workspace
+    scope=for_workspace(output)
+    if scope:data['acceptance_scope']=scope
     from .daily_workspace import action_queue
     data['action_queue']=action_queue(data)
     data['report_id']=identity(data)

@@ -19,6 +19,7 @@ import duckdb
 
 from trade_system.ths_quality import canonical_ths_snapshot
 from trade_system.time_utils import as_local_naive
+from trade_system.business_contract import task_contract
 
 
 PHASES = ("auction", "intraday", "close", "supplemental", "history")
@@ -52,10 +53,10 @@ def close_datasets(trade_date: str, now: datetime | str | None = None) -> tuple[
 _TASKS = {
     "build_auction_evidence": ProfileTask("build_auction_evidence", "local auction snapshots", None, "normalize retained auction observations", network=False),
     'collect_market_context': ProfileTask('collect_market_context', 'KPL market/rise-fall', 300, 'native context; final data gate still requires qualified market context', network=True, required=False),
-    'collect_realtime_limit_pool': ProfileTask('collect_realtime_limit_pool', 'KPL L2 realtime/ladder', 180, 'same-day executable limit-up pool', network=True),
+    'collect_realtime_limit_pool': ProfileTask('collect_realtime_limit_pool', 'KPL L2 realtime/ladder', 180, 'same-day dated limit-up observations; no execution authority', network=True),
     'collect_auction_evidence': ProfileTask('collect_auction_evidence', 'KPL scoped /auction/tick + Tencent snapshot', 180, 'bounded candidate auction observations with explicit unit gaps', network=True),
     'collect_intraday_stock_flow_market': ProfileTask('collect_intraday_stock_flow_market', 'Eastmoney push2 clist', 300, 'full-market stock capital flow', network=True),
-    'collect_executable_quotes': ProfileTask('collect_executable_quotes', 'Tencent qt.gtimg.cn spot', 180, 'candidate-only live prices for entry-executable signals when clist is delayed-only', network=True),
+    'collect_executable_quotes': ProfileTask('collect_executable_quotes', 'Tencent qt.gtimg.cn spot', 180, 'bounded observation prices; legacy task name never grants execution authority', network=True),
     'collect_l2_focus': ProfileTask('collect_l2_focus', 'KPL /l2/stock-intraday (candidates)', 300, 'bounded L2 price curves; phase mode never runs full L2', network=True),
     'collect_intraday_sector_flow_full': ProfileTask('collect_intraday_sector_flow_full', 'Eastmoney sector pages + TuShare/THS aggregate', 300, 'full-sector capital flow refreshed after L2', network=True),
     'sync_tushare_close': ProfileTask('sync_tushare_close', 'TuShare relay date batches', 3600, 'same-day daily/basic/adjustment/money-flow facts', network=True),
@@ -91,6 +92,8 @@ def validate_plan(steps):
     names = [name for name, _, _ in steps]
     if len(names) != len(set(names)) or any(name not in _TASKS for name in names):
         raise ValueError("duplicate or unregistered collection task")
+    for name in names:
+        task_contract(name)
     return steps
 
 def command_plan(
@@ -367,7 +370,7 @@ def read_product_counts(text, context):
             'scopes': scopes, 'coverage': 'explicit_projections_only_not_all_process_writes'}
 
 
-def product_usage(manifests=()):
+def product_usage(manifests=(), *, publication_roots=()):
     """Declared products joined to actual stage evidence, without fetching data.
 
     A configured provider is not proof of entitlement or product capability.
@@ -375,10 +378,16 @@ def product_usage(manifests=()):
     """
     from .source_authority import policy_dicts
     runs = list(manifests)
+    roots = list(publication_roots)
     if len(runs) > 100:
         raise ValueError('product audit limited to 100 explicit run receipts')
+    if len(roots) > 20:
+        raise ValueError('product audit limited to 20 explicit publication roots')
+    from .business_contract import read_publication_consumption
+    publications = [read_publication_consumption(root) for root in roots]
     products = []
     for name, task in _TASKS.items():
+        business = task_contract(name)
         observations = []
         for run in runs:
             for step in run.get('steps', []):
@@ -396,14 +405,20 @@ def product_usage(manifests=()):
                         | {'transport_attempts':(step.get('request_metrics') or {}).get('transport_attempts')},
                 })
         products.append({'product_id': name, 'configured_source': task.source,
-            'consumers': ['market_review_and_observation'], 'purpose': task.purpose,
+            'consumers': business['consumers'], 'purpose': task.purpose,
+            'business_contract': business,
+            'publication_consumption': [dict(publication_run_id=p['publication_run_id'],
+                session=p['session'], artifact_sha256=p['artifact_sha256'], **receipt)
+                for p in publications for receipt in p['receipts']
+                if receipt['product_id'] in business['data_product_ids']],
+            'collection_to_publication_join': 'declared_product_only_not_proven_request_or_row_lineage',
             'phases': [phase for phase, tasks in PROFILE_TASKS.items() if any(t.name==name for t in tasks)],
             'cadence_seconds': task.cadence_seconds, 'network': task.network,
             'required': task.required, 'capability_status': 'requires_product_and_entitlement_evidence',
             'observations': observations,
             'disposition': 'inspect_failed_input' if any(o['status'] in ('failed','degraded','blocked') for o in observations)
                 else 'verify_consumption' if observations else 'unmeasured_not_proven_unused'})
-    return {'products': products, 'source_policies': policy_dicts(),
+    return {'products': products, 'source_policies': policy_dicts(), 'publications': publications,
         'diagnostic_limits': {'per_endpoint': 2, 'total': 6,
             'stop_on': ['authentication_failed','permission_denied','rate_limited','cooldown']},
         'source_selection': 'authorized_product_capability_then_hithink_xiaodefa_other',

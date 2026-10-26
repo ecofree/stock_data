@@ -37,9 +37,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", required=True, choices=["start", "success", "failure"])
     parser.add_argument("--message", default="")
+    parser.add_argument('--run-id', default='')
+    parser.add_argument('--trade-date', default='')
     args = parser.parse_args()
 
-    heartbeat.write("daily_close", {"event": args.event})
+    heartbeat.write("daily_close", {"event": args.event, 'run_id':args.run_id, 'trade_date':args.trade_date,
+        'completion_scope':'collection_only', 'acceptance_verified':False})
     statuses: dict[str, str] = {}
 
     # Healthcheck semantics: only completion is pinged.  A start ping would

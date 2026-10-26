@@ -61,12 +61,21 @@ folder, without replacing live facts or orders.
 
 ## Ops & monitoring
 
-- `pipeline_notify.py --event start|success|failure` — heartbeat touch,
+- `pipeline_notify.py --event start|success|failure [--run-id ID --trade-date YYYY-MM-DD]` — records the last attempt separately from last success,
   optional healthcheck ping and push alerts (env: `KPL_NOTIFY_*`,
   `KPL_NOTIFY_HEALTHCHECK_URL`).
-- `check_pipeline_heartbeat.py [--alert-on-stale]` — external liveness gate.
-- `offsite_backup.ps1 -Destination <path|rclone:remote> [-Execute]` —
-  off-site copy of the newest daily/weekly backups (dry-run default).
+- `check_pipeline_heartbeat.py [--alert-on-stale]` — successful-completion gate.
+  Fresh `start`/`failure` events fail this gate. Optional `--runtime-state` reads
+  an explicit JSON `status` (`paused`, `active`, `running`); paused is reported
+  separately and never as success. Paired `--calendar-db`/`--trade-date` read the
+  exchange calendar without refresh: closed sessions are neutral; missing or
+  contradictory dates fail. Open sessions require a success for that date.
+- `offsite_backup.ps1` — permanently retired; all invocations exit 2 before
+  accessing source/destination, including `-Execute` and `-IncludeMainDb`.
+  Off-site delivery is currently unavailable. A replacement must transfer only
+  backups bound to the runtime's qualified receipt and hash, verify the copy,
+  and prove restore; never copy a live main database. No scheduled task changes
+  or backup transfer are authorized by this source change.
 
 ## Research console
 
@@ -77,7 +86,7 @@ folder, without replacing live facts or orders.
 ## Storage lifecycle
 
 `archive_legacy_tables.py` (--dry-run first), `split_cold_storage.py`
-(EXPERIMENTAL, --execute only after fresh backup + scheduler stop),
+(read-only inventory only; `--execute` is permanently rejected before any database open),
 `reclaim_disk_space.py`
 
 ## Collection (focused)

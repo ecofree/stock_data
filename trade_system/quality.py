@@ -60,7 +60,7 @@ DEFAULT_DUPLICATE_KEYS = {
     "ths_concept_stock_history": ["trade_date", "concept_code", "stock_code"],
     "multi_source_stock_flow": ["source_date", "stock_code", "provider"],
     "multi_source_sector_flow": ["source_date", "sector_code", "provider"],
-    "multi_source_kline": ["source_date", "asset_type", "asset_code", "provider"],
+    "multi_source_kline": ["source_date", "asset_type", "asset_code", "provider", "adjustment"],
 }
 
 

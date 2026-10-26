@@ -1,36 +1,39 @@
-# QLib 可选依赖环境
+# QLib 隔离研究环境
 
-2026-09-17：下列手工环境与旧表实验命令仅为历史参考，不是部署基线。
-当前候选环境是独立 Python 3.12.11 研究运行包，绑定 `requirements-research-replay.lock`；
-使用 `python -I -B -m pip check`，不能依赖全局 Anaconda 或未验证的 Scripts 启动器。
-每日任务准备改接 `scripts/run_research_daily.ps1 -RefreshResearch`，尚未切换现网。
+2026-10-22：研究依赖使用独立 Windows CPython 3.12 环境和单一哈希锁。
+新环境为 `D:\accio\stock_data-research-isolated-20261022`，解释器是
+`Scripts\python.exe`。它没有系统 site-packages 继承，未接入生产任务。
+旧 `.venv-qlib` 和 Anaconda 保留原样；旧研究环境依赖冲突没有通过修改父环境掩盖。
 
-QLib 不放入每日采集解释器。核心采集使用 `D:\anaconda\python.exe`，研究/影子模型使用项目内的 `.venv-qlib`，避免 cvxpy、gym、MLflow 等依赖污染核心环境。
+## 重建方式
 
-## 安装
-
-```powershell
-cd D:\accio\stock_data
-D:\anaconda\python.exe -m venv --system-site-packages .venv-qlib
-.\.venv-qlib\Scripts\python.exe -m pip install -r requirements-qlib.txt -i https://pypi.org/simple
-.\.venv-qlib\Scripts\python.exe scripts\check_qlib_env.py
-```
-
-Windows/Python 3.12 下 `gym==0.26.2` 没有 wheel，需要源码构建；全量解析过慢时可按下面顺序执行：
+选择一个不存在的新目录，使用已验证的 CPython 3.12 解释器创建环境：
 
 ```powershell
-.\.venv-qlib\Scripts\python.exe -m pip install --only-binary=:all: --prefer-binary cvxpy==1.7.1 filelock==3.16.1 ruamel.yaml==0.18.10 -i https://pypi.org/simple
-.\.venv-qlib\Scripts\python.exe -m pip install gym==0.26.2 --no-binary gym --no-deps -i https://pypi.org/simple
-.\.venv-qlib\Scripts\python.exe -m pip install mlflow==3.14.0 --no-deps -i https://pypi.org/simple
-.\.venv-qlib\Scripts\python.exe scripts\check_qlib_env.py
+uv venv --python D:\accio\stock_data-dev\.venv\python.exe D:\accio\stock_data-research-new
+uv pip install --require-hashes --python D:\accio\stock_data-research-new\Scripts\python.exe -r D:\accio\stock_data-dev\requirements-research-test.lock
+D:\accio\stock_data-research-new\Scripts\python.exe -I -m ensurepip
+D:\accio\stock_data-research-new\Scripts\python.exe -I -B -m pip check
 ```
 
-检查脚本只做导入和 `LGBModel` 构造 smoke test，不访问网络、不写 DuckDB、不启动 MLflow 服务。QLib 可用于 shadow 训练、预测、研究候选融合和后验评估，但不直接改变交易信号、仓位或订单。
+`requirements-research-test.lock` 包含 `requirements-research-replay.lock`；
+这是一次完整解析后的 200 个研究及测试依赖。ensurepip 仅安装解释器自带的 pip 检查工具，
+不修改锁中的依赖。纯重放环境可只安装 replay 锁。
+不能使用 `--system-site-packages`，不能先装另一套 QLib 锁再用 `--no-deps` 覆盖降级。
+本次冻结契约包括 NumPy 1.26.4、Pandas 2.2.2、LightGBM 4.6.0、QLib 0.9.7、DuckDB 1.5.4。
 
-## 运行
+## 验收边界
 
-```powershell
-.\.venv-qlib\Scripts\python.exe scripts\export_qlib_features.py --db kpl_data.duckdb --start-date 2026-01-01 --end-date 2026-07-14 --out reports\qlib_features_2026.csv --format both
-.\.venv-qlib\Scripts\python.exe scripts\train_qlib_shadow.py --db kpl_data.duckdb --features reports\qlib_features_2026.parquet --model-id qlib_shadow_lgbm_2026_ytd
-.\.venv-qlib\Scripts\python.exe scripts\evaluate_qlib_shadow.py --db kpl_data.duckdb --out reports\qlib_shadow_latest.md
-```
+需要同时核实 pyvenv.cfg、隔离启动的 sys.path、包元数据重复项、实际导入路径、
+锁哈希、全部安装版本和 pip check。只有导入成功不足以验收。
+本次环境证据位于 `D:\accio\stock_data-independent-fixes-20261022\research-environment.json`。
+
+在项目外冻结源码、清空供应商凭据与生产配置、阻止外网和越界写入后运行：
+
+- `tests/test_research_runtime_contract.py`：合成数据的 158 因子、未来扰动隔离、拟合及冻结重载。
+- `tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order`：模型特征顺序和贡献度。
+- 已有历史产物只读核验与重放：原注册、模型、特征及预测文件的哈希必须保持原值；
+  版本或实现不匹配时明确拒绝，不能改登记信息来制造通过。
+
+这里没有授权生产训练、模型发布、任务切换或恢复运营。主动训练/刷新等已退役入口保持拒绝；
+环境建立及合成测试通过不代表研究有效、历史策略有效或可以实盘。

@@ -18,7 +18,8 @@ def action_queue(data):
     """Risk first, then plan changes. Viewing an item never resolves it."""
     plans=data.get('plans') or {};account=plans.get('account') or {}
     rows=[]
-    if account.get('status') != 'account_snapshot_available_not_execution' or account.get('blockers'):
+    from .acceptance_scope import observation_only
+    if not observation_only(account) and (account.get('status') != 'account_snapshot_available_not_execution' or account.get('blockers')):
         rows.append({'priority':0,'kind':'account_verification','instrument':None,
             'reason':account.get('status','account_unknown'),'allowed_action':'核对账户资料；收益与仓位保持未知'})
     for item in account.get('open_orders',[]):

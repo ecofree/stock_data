@@ -1,76 +1,23 @@
-# Operator Outcome Import
+# Historical operator outcomes
 
-This project does not place orders. Operator outcomes are imported after the
-session so the system can review plan quality, execution discipline, and mistake
-patterns.
+The legacy CSV import is permanently retired. Both
+`scripts/import_operator_trade_outcomes.py` and
+`trade_system.operator_outcomes.import_operator_trade_outcomes` reject before
+opening a CSV or database. No environment variable or command flag reopens it.
+It cannot update `trade_plan`, `trade_journal`, or `operator_trade_outcome`.
 
-## CSV Format
+Existing records and read-only historical reports remain available. Their
+recorded returns are historical operator declarations, not verified current
+account facts or evidence of live execution. Proxy K-line samples remain
+diagnostic data, not realized operator performance.
 
-Required columns:
+`create_operator_outcome_template.py` can export a new review file without
+overwriting another file. Filling that file does not authorize import and does
+not close the current research feedback loop.
 
-- `trade_date`
-- `stock_code`
-- `execution_status`
-
-Recommended columns:
-
-- `stock_name`
-- `entry_time`
-- `exit_time`
-- `entry_price`
-- `exit_price`
-- `position_pct`
-- `outcome_tag`
-- `mistake_tag`
-- `review_note`
-
-Allowed `execution_status` values:
-
-- `executed`
-- `skipped`
-- `cancelled`
-- `not_executed`
-- `review_required`
-
-Example:
-
-```csv
-trade_date,stock_code,stock_name,execution_status,entry_time,exit_time,entry_price,exit_price,position_pct,outcome_tag,mistake_tag,review_note
-2026-07-06,000001,Example,executed,09:35,14:50,10.00,10.80,5.0,followed_plan,none,auction confirmed then held to close
-2026-07-06,000002,Example B,skipped,09:25,15:00,,,0,avoided_weak_market,discipline_ok,auction failed confirmation
-```
-
-## Import
-
-The close pipeline creates a dated template after the candidate/plan stage:
-
-```powershell
-D:\anaconda\python.exe scripts\create_operator_outcome_template.py --db kpl_data.duckdb --date YYYY-MM-DD --out reports\operator_outcomes_template_YYYY-MM-DD.csv
-```
-
-Fill every row before importing. An untouched or partially reviewed template
-is rejected; it cannot create fake returns or silently mark a plan complete.
-
-```powershell
-D:\anaconda\python.exe scripts\import_operator_trade_outcomes.py --db kpl_data.duckdb --csv path\to\operator_outcomes.csv
-```
-
-The importer replaces existing rows for the same `trade_date` and `stock_code`.
-It updates the matching `trade_plan.status`, writes one
-`trade_journal.action = operator_outcome` row, and stores normalized returns in
-`operator_trade_outcome`.
-
-## Review
-
-After import:
-
-```powershell
-D:\anaconda\python.exe scripts\run_operator_backtest.py --db kpl_data.duckdb
-D:\anaconda\python.exe scripts\generate_daily_review.py --db kpl_data.duckdb
-D:\anaconda\python.exe scripts\generate_operator_reports.py --db kpl_data.duckdb
-```
-
-`operator_backtest_latest.md` uses real outcomes first. If no imported outcomes
-exist, it falls back to proxy K-line samples and labels them as proxy data.
-Proxy samples are for diagnostics only and must not be reported as live
-operator performance.
+Current account management uses the V2 `account_import` workflow on its explicit
+independent database, with a complete manual declaration or broker export and
+reconciliation. This does not replace outcome import and must not automatically
+infer cash, sellable holdings or pending orders from historical legacy tables.
+A future outcome-ingestion workflow requires its own provenance, validation and
+authorization. No production migration or resumed operation is implied.

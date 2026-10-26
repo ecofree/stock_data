@@ -1,22 +1,13 @@
-﻿"""EXPERIMENTAL cold/hot storage split for the main DuckDB.
+"""Read-only cutoff inventory. Destructive cold-storage split is retired.
 
-Moves rows older than a cutoff date from chosen tables into a separate
-``cold_storage.duckdb``.  The main table keeps the recent rows; consumers
-that need full history must query both databases (attach
-``cold_storage.duckdb`` manually or set ``KPL_COLD_DB_PATH`` so
-``base.connect_duckdb`` attaches it as ``cold``).
-
-Known limitation: there is no automatic read-through view yet — a UNION
-view over ``cold.<table>`` plus the hot table would not accept new inserts,
-and DuckDB has no partitioned tables.  Until that design lands, treat this
-as an archival compaction tool for history you rarely query.
-
-Default is a DRY-RUN report.  This is a downtime operation: take a fresh
-backup, stop the scheduler, then run with --execute.
+The old algorithm erased previously archived history on subsequent moves.
+--execute is always refused. --cold-db is accepted only for old callers and is
+never opened or created. Future migration needs a separate preservation contract.
 """
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import sys
 from pathlib import Path
 
@@ -42,7 +33,7 @@ def _table_exists(con, name: str) -> bool:
 
 
 def _date_column(con, table: str) -> str | None:
-    cols = {r[0] for r in con.execute(f'DESCRIBE "{table}"').fetchall()}
+    cols = {r[0] for r in con.execute(f'DESCRIBE "{table.replace(chr(34), chr(34)*2)}"').fetchall()}
     for candidate in ("date", "trade_date", "source_date"):
         if candidate in cols:
             return candidate
@@ -54,28 +45,23 @@ def main() -> int:
     parser.add_argument("--db", default=str(PROJECT_ROOT / "kpl_data.duckdb"))
     parser.add_argument("--cold-db", default=str(PROJECT_ROOT / "cold_storage.duckdb"))
     parser.add_argument(
-        "--before", required=True,
-        help="Move rows strictly older than this YYYY-MM-DD cutoff.",
+        "--before", required=True, type=date.fromisoformat,
+        help="Inventory rows strictly older than this YYYY-MM-DD cutoff.",
     )
     parser.add_argument("--tables", default=",".join(DEFAULT_CANDIDATES))
-    parser.add_argument("--execute", action="store_true", help="Perform the move.")
+    parser.add_argument("--execute", action="store_true", help="Retired: always refused before accessing either database.")
     args = parser.parse_args()
 
-    if not Path(args.db).exists():
-        print(f"database not found: {args.db}")
-        return 1
-    lock = Path(args.db).parent / (Path(args.db).name + ".pipeline.lock")
-    if lock.exists():
-        print(f"refusing to run while pipeline lock exists: {lock}")
+    if args.execute:
+        print('RETIRED: destructive cold-storage split disabled; use read-only inventory.', file=sys.stderr)
+        return 2
+    if not Path(args.db).is_file():
+        print(f'database not found: {args.db}', file=sys.stderr)
         return 1
 
     from trade_system.db_utils import legacy_connect
-    con = legacy_connect(args.db)
-    failed = False
+    con = legacy_connect(args.db, read_only=True)
     try:
-        cold_lit = args.cold_db.replace("'", "''")
-        con.execute(f"ATTACH '{cold_lit}' AS cold")
-        total_moved = 0
         for table in [t.strip() for t in args.tables.split(",") if t.strip()]:
             if not _table_exists(con, table):
                 print(f"skip {table}: not present")
@@ -84,45 +70,14 @@ def main() -> int:
             if date_col is None:
                 print(f"skip {table}: no date column")
                 continue
+            quoted_table = table.replace(chr(34), chr(34)*2)
             old_rows = con.execute(
-                f'SELECT count(*) FROM "{table}" WHERE {date_col} < ?', [args.before]
+                f'SELECT count(*) FROM "{quoted_table}" WHERE {date_col} < ?', [args.before]
             ).fetchone()[0]
-            total_rows = con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+            total_rows = con.execute(f'SELECT count(*) FROM "{quoted_table}"').fetchone()[0]
             print(f"{table}: {old_rows}/{total_rows} rows older than {args.before}")
-            if not args.execute or old_rows == 0:
-                continue
-
-            # DuckDB cannot write two attached databases inside one
-            # transaction, so the move is a crash-safe ordered pair:
-            # (1) refresh the cold copy for the cutoff range (idempotent on
-            # retry), (2) delete those rows from main.  A crash in between
-            # only means duplicated data that the next run cleans up.
-            con.execute(
-                f'CREATE TABLE IF NOT EXISTS cold."{table}" AS '
-                f'SELECT * FROM "{table}" WHERE false'
-            )
-            con.execute(
-                f'DELETE FROM cold."{table}" WHERE {date_col} < ?',
-                [args.before],
-            )
-            con.execute(
-                f'INSERT INTO cold."{table}" '
-                f'SELECT * FROM "{table}" WHERE {date_col} < ?',
-                [args.before],
-            )
-            moved = con.execute(
-                f'SELECT count(*) FROM cold."{table}" '
-                f'WHERE {date_col} < ?', [args.before]
-            ).fetchone()[0]
-            if moved < old_rows:
-                print(f"  FAILED {table}: moved {moved} < expected {old_rows}")
-                failed = True
-                break
-            con.execute(f'DELETE FROM "{table}" WHERE {date_col} < ?', [args.before])
-            total_moved += old_rows
-            print(f"  moved {old_rows} row(s)")
-        print(f"done; rows moved this run: {total_moved}")
-        return 1 if failed else 0
+        print('read-only inventory complete; no cold database accessed, no rows moved')
+        return 0
     finally:
         con.close()
 

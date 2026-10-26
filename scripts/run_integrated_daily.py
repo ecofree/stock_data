@@ -33,6 +33,28 @@ def _utf8_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _check_collector_dependencies(python, manifest):
+    """Retain preflight failures in this exclusively allocated attempt."""
+    try:
+        check = subprocess.run([python, '-I', '-B', '-m', 'pip', 'check'], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        detail = f'collector dependency preflight failed: {exc}'
+    else:
+        if check.returncode == 0:
+            return
+        detail = f'collector dependency check failed ({check.returncode}); no collection performed'
+        diagnostic = (check.stdout + check.stderr).decode('utf-8', 'backslashreplace')
+        try:
+            (manifest.run_dir / 'dependency-check.log').write_text(diagnostic, encoding='utf-8')
+        except OSError as exc:
+            detail += f'; dependency log unavailable: {exc}; original diagnostic: {diagnostic}'
+    try:
+        manifest.finish('preflight_failed', detail)
+    except OSError as exc:
+        raise ValueError(f'{detail}; receipt unavailable: {exc}') from exc
+    raise ValueError(detail)
+
+
 def _decode_process_bytes(payload: bytes | str | None, stream_name: str) -> tuple[str, bool]:
     if payload is None:
         return "", False
@@ -210,7 +232,11 @@ def main() -> int:
     parser.add_argument("--collection-profile", choices=("priority",), default="priority")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--product-usage", nargs="*", default=None, metavar="RUN_JSON", help="Read-only product usage from at most 100 explicit run receipts; no collection")
+    parser.add_argument('--publication-usage', nargs='*', default=None, metavar='PUBLICATION_ROOT',
+                        help='With --product-usage only: verify explicit current desk bundles, no collection')
     args = parser.parse_args()
+    if args.publication_usage is not None and args.product_usage is None:
+        parser.error('--publication-usage requires the read-only --product-usage mode')
     if args.product_usage is not None:
         from trade_system.collection_profiles import product_usage
         from trade_system.http_transport import request_metrics
@@ -230,7 +256,7 @@ def main() -> int:
                     step['operation_counts'] = read_product_counts(
                         log.read_text(encoding='utf-8'), step.get('request_context'))
             runs.append(run)
-        print(json.dumps(product_usage(runs),ensure_ascii=False))
+        print(json.dumps(product_usage(runs, publication_roots=args.publication_usage or ()),ensure_ascii=False))
         return 0
     if bool(args.collector_contract) != bool(args.collector_contract_sha256):
         parser.error("collector contract and approved hash must be supplied together")
@@ -290,14 +316,6 @@ def main() -> int:
         for name, command, _ in plan:
             print(f"RUN {name}: {' '.join(command)}")
         return 0
-    # A dedicated collector interpreter must be healthy before acquiring any
-    # database lock. No fallback to the current shell/global interpreter.
-    if args.collector_contract:
-        check = subprocess.run([python, "-I", "-B", "-m", "pip", "check"], capture_output=True, timeout=60)
-        if check.returncode:
-            dependency_log=artifact_dir/'dependency-check.log'
-            dependency_log.write_text((check.stdout+check.stderr).decode('utf-8','backslashreplace'),encoding='utf-8')
-            raise ValueError(f"collector dependency check failed ({check.returncode}); details: {dependency_log}; no collection performed")
     from trade_system.pipeline_runtime import PipelineLock, PipelineAlreadyRunning, RunManifest
     from trade_system.trading_calendar import trading_session_status, ensure_trading_session_status
     manifest = RunManifest(args.reports_dir, run_id, args.trade_date, selected_phase)
@@ -307,6 +325,8 @@ def main() -> int:
         manifest.data['scope'] = 'pre_session_reference_preparation_only'
     elif args.collector_contract:
         manifest.bind_observation_contract(args.collector_contract, args.collector_contract_sha256)
+    if args.collector_contract:
+        _check_collector_dependencies(python, manifest)
     from trade_system.http_transport import ssl_context_note
     import urllib.request
     from urllib.parse import urlsplit
@@ -394,9 +414,14 @@ def main() -> int:
                 process = None
                 try:
                     import hashlib
-                    demand={'product_id':name,'semantic_version':'phase-product-v1',
+                    from trade_system.business_contract import task_contract, contract_hash
+                    business = task_contract(name)
+                    demand={'product_id':name,'semantic_version':'phase-product-v2',
+                            'data_product_ids':business['data_product_ids'],
+                            'business_contract_sha256':contract_hash(),
                             'phase':selected_phase,'session':args.trade_date,'scope':'profile_declared_scope'}
-                    context={**demand, 'demand_id':hashlib.sha256(json.dumps(demand,sort_keys=True).encode()).hexdigest(), 'consumer':'market_review_and_observation',
+                    context={**demand, 'demand_id':hashlib.sha256(json.dumps(demand,sort_keys=True).encode()).hexdigest(),
+                        'consumer':'collection_task:'+name, 'declared_consumers':business['consumers'],
                         'phase':selected_phase,'session':args.trade_date,
                         'refresh_reason':'supplemental_retry' if selected_phase=='supplemental' else 'profile_due',
                         'coverage_before':reason}

@@ -239,7 +239,9 @@ def _checkpoint_state(store, account_id, seq):
         if hashlib.sha256(body.encode()).hexdigest()!=raw or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=raw:
             raise ValueError('paper checkpoint archive/checksum mismatch')
         obj = json.loads(body)
-        if obj.get('format') == 'state_delta_v2':
+        if obj.get('format') in ('state_delta_v2','state_delta_fifo_v3'):
+            if obj['format']=='state_delta_fifo_v3' and not isinstance(obj.get('order_sequence'),list):
+                raise ValueError('FIFO checkpoint submission sequence missing')
             if obj['parent_seq']!=previous:
                 raise ValueError('paper checkpoint parent missing')
             state = state or {}
@@ -394,6 +396,17 @@ def load_paper(store, account_id, *, full_replay=False, writer_session=False):
         restored=_checkpoint_state(store,account_id,start_seq)
         if identity(restored)!=state_hash:
             raise ValueError('paper checkpoint state checksum mismatch')
+        # Matching priority is durable journal submission order, not JSON object
+        # key order. Recover old checkpoints from the already verified prefix.
+        order_ids = [r[0] for r in store.con.execute("""SELECT json_extract_string(payload,'$.payload.order_id')
+            FROM paper_ledger_event WHERE account_id=? AND seq<=?
+              AND json_extract_string(payload,'$.kind')='submit' ORDER BY seq""",[account_id,start_seq]).fetchall()]
+        if len(order_ids)!=len(set(order_ids)) or set(order_ids)!=set(restored['orders']):
+            raise ValueError('paper checkpoint order identities disagree with journal')
+        declared = json.loads(body).get('order_sequence')
+        if declared is not None and declared!=order_ids:
+            raise ValueError('paper checkpoint submission order disagrees with journal')
+        restored['orders'] = {key:restored['orders'][key] for key in order_ids}
         book.state=restored
         book.seen=_JournalSeen(store,account_id,start_seq)
     book.checkpoint_state=deepcopy(book.state) if checkpoint else {}
@@ -433,7 +446,8 @@ def _append(store, book, event, *, transferred_reservation=None, transferred_exi
             store.con.execute("UPDATE exit_reservation SET status='paper_order' WHERE reservation_id=? AND status='held'",[transferred_exit_reservation])
         _projection(store,book)
         if (head[0]+1)%CHECKPOINT_INTERVAL==0:
-            body=canonical({'format':'state_delta_v2','parent_seq':book.checkpoint_seq,
+            body=canonical({'format':'state_delta_fifo_v3','parent_seq':book.checkpoint_seq,
+                            'order_sequence':list(book.state['orders']),
                             'delta':_state_delta(book.checkpoint_state,book.state)})
             raw=store.archive(body.encode())
             store.con.execute('INSERT INTO paper_checkpoint VALUES (?,?,?,?,?,?,?)',
@@ -499,6 +513,25 @@ def apply_paper_event(store, account_id, event):
     return _append(store,book,body)
 
 
+def current_buy_valuation_deadline(store, account, at, *, book=None):
+    """Recheck the current projection and every held mark at the use clock."""
+    book = book or load_paper(store, account['payload']['account_id'])
+    if (account['payload'].get('source')!='paper_ledger_projection'
+            or account['payload'].get('ledger_hash')!=identity(book.state)
+            or not book.complete_valuation(at)):
+        raise ValueError('current complete holding valuation and ledger projection required')
+    deadlines = [account['valid_until']]
+    for lot in book.state['lots']:
+        if lot['quantity']:
+            mark = utc(book.state['marks'][lot['instrument']]['at'])
+            deadlines.append(mark+timedelta(seconds=book.config['mark_ttl_seconds']))
+            # A previous-session mark cannot remain valid across the session date.
+            from zoneinfo import ZoneInfo
+            local = mark.astimezone(ZoneInfo('Asia/Shanghai'))
+            deadlines.append(utc((local+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)))
+    return min(deadlines)
+
+
 def submit_confirmed_buy(store, account_id, confirmation_request_id, order_id):
     book = load_paper(store,account_id,writer_session=True)
     request = store.con.execute('SELECT payload,account_id FROM operator_action WHERE action_id=?',[confirmation_request_id]).fetchone()
@@ -522,6 +555,7 @@ def submit_confirmed_buy(store, account_id, confirmation_request_id, order_id):
     if (latest['payload'].get('ledger_hash')!=identity(book.state) or latest['payload'].get('source')!='paper_ledger_projection'
         or latest['mode']!='paper' or not latest['reconciled']):
         raise ValueError('confirmation must bind the current reconciled paper ledger projection')
+    current_buy_valuation_deadline(store, latest, at, book=book)
     if store.con.execute('SELECT count(*) FROM account_event WHERE account_id=? AND happened_at>=?',
                          [account_id,latest['imported_at']]).fetchone()[0]:
         raise ValueError('account event requires reconciliation before paper submission')

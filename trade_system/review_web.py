@@ -35,7 +35,6 @@ from trade_system.i18n_labels import (
     SELECTION_STATUS_CN,
     SEVERITY_CN,
     SETUP_TYPE_CN,
-    PLAN_STATUS_CN,
     EXECUTION_STATUS_CN,
     WATCHLIST_STATUS_CN,
     cn,
@@ -53,6 +52,13 @@ from trade_system.i18n_labels import (
 # ---------------------------------------------------------------------------
 # HTML building helpers
 # ---------------------------------------------------------------------------
+
+def _script_json(value: Any, **kwargs: Any) -> str:
+    """JSON inside HTML script text must not contain an HTML closing delimiter."""
+    return (json.dumps(value, **kwargs).replace("&", "\\u0026")
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
 
 def _e(v: Any) -> str:
     return html.escape(str(v), quote=True)
@@ -374,11 +380,19 @@ def _render_kpis(ctx: dict[str, Any]) -> str:
         effective_position = suggested
     consecutive = ctx.get("consecutive")
 
+    daily = market.get('market_daily') or {}
+    qualification = daily.get('market_daily_status', 'unverified')
+    qualification_note = {'available': '五项计数完整', 'partial': '数据不完整，不能视为市场全貌',
+                          'estimated': '估算数据，未获完整市场资格', 'source_missing': '市场统计缺失'}.get(qualification, '市场统计资格未验证')
+    if daily:
+        limit_up, limit_down = daily.get('limit_up_count'), daily.get('limit_down_count')
+        rise, fall = daily.get('rise_count'), daily.get('fall_count')
+
     cards = [
         ("涨停 / 跌停", f"{_e(limit_up) if limit_up is not None else '—'} / {_e(limit_down) if limit_down is not None else '—'}",
-         "涨跌停家数", "hot" if (limit_up or 0) > (limit_down or 0) * 4 else ""),
+         qualification_note, "hot" if qualification == 'available' and (limit_up or 0) > (limit_down or 0) * 4 else ""),
         ("上涨 / 下跌家数", f"{_num(rise)} / {_num(fall)}",
-         f"涨跌比 {_ratio(rise, fall)}", "hot" if (rise or 0) > (fall or 0) else "cold"),
+         f"涨跌比 {_ratio(rise, fall)} · {qualification_note}", ("hot" if (rise or 0) > (fall or 0) else "cold") if qualification == 'available' else ""),
         ("炸板率", _pct(blown_rate), "炸板 / 涨停", "warn" if (blown_rate or 0) >= 25 else ""),
         ("情绪温度", _fmt(emotion), "赚钱效应 CGL", "hot" if (emotion or 0) >= 50 else "cold"),
         ("市场状态", _e(regime_name), f"有效仓位 {_pct(effective_position)} · 理论 {_pct(suggested)}", "bad" if execution_control.get("override") == "BLOCK" else ""),
@@ -499,8 +513,6 @@ def _render_loop(ctx: dict[str, Any]) -> str:
     journal = ctx.get("journal") or []
     watchlist = ctx.get("watchlist") or []
     picks = (ctx.get("capital_flow") or {}).get("candidate_picks") or []
-    execution_ready = bool((ctx.get("execution_control") or {}).get("execution_ready"))
-    plans_blocked = not execution_ready
     parts: list[str] = []
 
     if outcomes:
@@ -522,18 +534,14 @@ def _render_loop(ctx: dict[str, Any]) -> str:
         )
     else:
         parts.append(
-            "<div class='empty'>今日没有导入成交。没有成交，就不能用候选分数写胜率。"
-            "收盘后用 operator_outcomes 导入真实结果、跳过或取消。</div>"
+            "<div class='empty'>当前没有可用于复盘的真实成交记录。旧人工计划导入已退役；"
+            "历史记录仅供查看，真实成交接入待独立账本方案验收。</div>"
         )
 
     if plans:
         rows = []
         for plan in plans[:12]:
-            plan_status = (
-                "研究草案（门禁未开放）"
-                if plans_blocked
-                else zh_text(cn(PLAN_STATUS_CN, plan.get("status")))
-            )
+            plan_status = "研究草案（执行权限关闭）"
             rows.append(
                 f"<tr><td class='mono'>{_slk(plan.get('stock_code'))}</td><td>{_e(plan.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, plan.get('setup_type')))}</td><td class='num'>{_pct(plan.get('max_position_pct'))}</td>"
@@ -541,8 +549,8 @@ def _render_loop(ctx: dict[str, Any]) -> str:
                 f"<td class='dim'>{_e(zh_text(plan.get('entry_condition')) or '—')}</td>"
                 f"<td class='dim'>{_e(zh_text(plan.get('stop_condition')) or '—')}</td></tr>"
             )
-        plan_title = "今日执行计划" if execution_ready else "研究计划草案"
-        plan_note = "已通过当前执行门禁" if execution_ready else "门禁开放后才可能进入执行计划"
+        plan_title = "研究计划草案"
+        plan_note = "当前仅供人工研究；旧执行入口已退役，历史标记不授予执行权限"
         parts.append(
             f"<div class='sec-title'><strong>{plan_title}</strong>"
             f"<span class='dim'>{plan_note}</span></div>"
@@ -694,7 +702,7 @@ def _render_sector_trail(ctx: dict[str, Any]) -> str:
             }
         )
         daily_details[str(sector.get("id"))] = {"daily": daily_detail}
-    daily_payload = json.dumps(
+    daily_payload = _script_json(
         {
             "dates": dates,
             "sectors": summary_sectors,
@@ -728,8 +736,8 @@ def _render_sector_trail(ctx: dict[str, Any]) -> str:
             "periods": pack.get("periods") or [],
             "sectors": summary_period_sectors,
         }
-    period_payload = json.dumps(period_summary, ensure_ascii=False).replace("</", "<\\/")
-    detail_payload = json.dumps(
+    period_payload = _script_json(period_summary, ensure_ascii=False).replace("</", "<\\/")
+    detail_payload = _script_json(
         {
             "daily": daily_details,
             "periods": period_details,
@@ -1090,7 +1098,7 @@ def _render_stages(ctx: dict[str, Any]) -> str:
             f"<div class='n'>{total}</div>"
             f"<div style='height:2px;background:var(--line);margin-top:8px;overflow:hidden'>"
             f"<i style='display:block;height:100%;width:{pct}%;background:var(--rule)'></i></div>"
-            f"<div class='l'>可行动 {st.get('actionable') or 0} · 风控过 {st.get('approved') or 0} · 可执行 {st.get('executable') or 0}</div></div>"
+            f"<div class='l'>旧候选 {st.get('actionable') or 0} · 旧风控标记 {st.get('approved') or 0} · 历史执行标记 {st.get('executable') or 0}（不授予执行权限）</div></div>"
         )
     return "<div class='flowline'>" + " <div class='arrow'>→</div> ".join(nodes) + "</div>"
 
@@ -1117,7 +1125,6 @@ def _render_plans(ctx: dict[str, Any]) -> str:
     plans = ctx.get("plans", [])
     journal = ctx.get("journal", [])
     risk = ctx.get("risk", {})
-    execution_ready = bool((ctx.get("execution_control") or {}).get("execution_ready"))
     parts: list[str] = []
     parts.append(
         "<div class='detail-grid'>"
@@ -1130,11 +1137,7 @@ def _render_plans(ctx: dict[str, Any]) -> str:
     if plans:
         rows = []
         for p in plans[:15]:
-            plan_status = (
-                "研究草案（门禁未开放）"
-                if not execution_ready
-                else zh_text(cn(PLAN_STATUS_CN, p.get("status")))
-            )
+            plan_status = "研究草案（执行权限关闭）"
             rows.append(
                 f"<tr><td class='mono'>{_slk(p.get('stock_code'))}</td><td>{_e(p.get('stock_name'))}</td>"
                 f"<td>{_e(cn(SETUP_TYPE_CN, p.get('setup_type')))}</td><td class='num'>{_pct(p.get('max_position_pct'))}</td>"
@@ -1142,8 +1145,8 @@ def _render_plans(ctx: dict[str, Any]) -> str:
                 f"<td class='dim'>{_e(zh_text(p.get('entry_condition')) or '—')}</td>"
                 f"<td class='dim'>{_e(zh_text(p.get('stop_condition')) or '—')}</td></tr>"
             )
-        plan_title = "今日执行计划" if execution_ready else "研究计划草案"
-        plan_note = "已通过当前执行门禁" if execution_ready else "execution_ready=false 时不是订单"
+        plan_title = "研究计划草案"
+        plan_note = "当前仅供人工研究；旧执行入口已退役，历史标记不授予执行权限"
         parts.append(
             f"<div class='sec-title'><strong>{plan_title}</strong>"
             f"<span class='dim'>{plan_note}</span></div>"
@@ -1180,8 +1183,10 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
     data_certified = readiness.get("data_certified_ready")
     flow_certified = readiness.get("flow_certified_ready")
     analytics = readiness.get("analysis_ready", readiness.get("certified_ready", readiness.get("analytics_ready")))
-    execution = readiness.get("execution_ready")
+    execution = False  # Historical payloads cannot reopen a retired capability.
     operator_status = readiness.get("operator_status", "uncertified")
+    if operator_status == "executable":
+        operator_status = "analysis_only" if analytics is True else "uncertified"
     missing = readiness.get("missing_groups") or []
     parts.append(
         "<div class='detail-grid'>"
@@ -1191,7 +1196,7 @@ def _render_data_gates(ctx: dict[str, Any]) -> str:
         f"<div class='detail-item'><div class='d-label'>分析就绪</div><div class='d-value'>{_status_pill(str(analytics))}</div></div>"
         f"<div class='detail-item'><div class='d-label'>执行就绪</div><div class='d-value'>{_status_pill(str(execution))}</div></div>"
         f"<div class='detail-item'><div class='d-label'>缺失分组</div><div class='d-value'>{_e(', '.join(missing) if missing else 'none')}</div></div>"
-        f"<div class='detail-item'><div class='d-label'>候选池</div><div class='d-value mono'>{readiness.get('actionable_candidates', 0)} 可行动 / {readiness.get('executable_candidates', 0)} 可执行</div></div>"
+        f"<div class='detail-item'><div class='d-label'>历史候选诊断</div><div class='d-value mono'>{readiness.get('actionable_candidates', 0)} 条旧候选标记 / 当前执行权限关闭</div></div>"
         "</div>"
     )
     checkpoints = data_sources.get("provider_checkpoints") or data_sources.get("checkpoints") or data_sources.get('tushare') or []
@@ -1305,6 +1310,7 @@ def _concept_inline_data(ctx: dict[str, Any], stock_limit: int = 50) -> list[dic
         # Other concepts retain metadata and read full details from inert inline
         # JSON on click, without building every stock card on initial load.
         item["limit_up_stocks"] = stocks[:stock_limit] if index == 0 else []
+        item["limit_up_stock_total"] = len(stocks)
         inline.append(item)
     return inline
 
@@ -1317,8 +1323,8 @@ def _chart_js(ctx: dict[str, Any], trend: dict[str, Any], ladder: list[dict[str,
          "seal_rate": t.get("seal_rate")}
         for t in ctx.get("theme_mainline", [])[:10]
     ]
-    d = json.dumps
-    concept_data_json = json.dumps(
+    d = _script_json
+    concept_data_json = _script_json(
         concept_data if concept_data is not None else (concept_limit_up or {}).get("groups", []),
         ensure_ascii=False,
         default=str,
@@ -1415,11 +1421,11 @@ window.addEventListener('DOMContentLoaded', () => {{
   const grid = document.getElementById('concept-stock-grid');
   const escHtml = value => String(value == null ? '' : value)
     .replace(/[&<>\"']/g, char => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[char]));
-  const conceptTab = (item, index) => `<button type="button" class="concept-tab" data-concept-index="${{index}}">`
-    + `<span class="concept-rank">${{String(index + 1).padStart(2, '0')}}</span>`
+  const conceptTab = (item, index) => `<button type="button" class="concept-tab" data-concept-index="${{escHtml(index)}}">`
+    + `<span class="concept-rank">${{escHtml(String(index + 1).padStart(2, '0'))}}</span>`
     + `<span class="concept-name">${{escHtml(item.concept_name || '—')}}</span>`
-    + `<span class="concept-lu">${{item.limit_up_count || 0}}</span>`
-    + `<span class="concept-meta">最高 ${{item.max_board == null ? '—' : item.max_board}}板 · 成分 ${{item.member_count || 0}}</span></button>`;
+    + `<span class="concept-lu">${{escHtml(item.limit_up_count || 0)}}</span>`
+    + `<span class="concept-meta">最高 ${{escHtml(item.max_board == null ? '—' : item.max_board)}}板 · 成分 ${{escHtml(item.member_count || 0)}}</span></button>`;
   let fullConceptData = null;
   const loadFullConceptData = () => {{
     if (fullConceptData) return fullConceptData;
@@ -1456,14 +1462,14 @@ window.addEventListener('DOMContentLoaded', () => {{
     const shown = expand ? allStocks : allStocks.slice(0, 50);
     const cards = shown.length ? shown.map(stock => `
       <div class="concept-stock-card">
-        <span class="stock-name">${{stock.stock_name || '—'}}</span>
-        <span class="stock-board">${{stock.board_level == null ? '—' : stock.board_level + '板'}}</span>
-        <span class="stock-code">${{stock.stock_code || '—'}}</span>
-        <span class="stock-time">${{fmtTime(stock.limit_up_time)}}</span>
+        <span class="stock-name">${{escHtml(stock.stock_name || '—')}}</span>
+        <span class="stock-board">${{escHtml(stock.board_level == null ? '—' : stock.board_level + '板')}}</span>
+        <span class="stock-code">${{escHtml(stock.stock_code || '—')}}</span>
+        <span class="stock-time">${{escHtml(fmtTime(stock.limit_up_time))}}</span>
        </div>`).join('') : '<div class="empty">该概念暂无同日涨停个股</div>';
-    const hiddenCount = allStocks.length - shown.length;
+    const hiddenCount = Math.max(allStocks.length, Number(item.limit_up_stock_total) || 0) - shown.length;
     const more = hiddenCount > 0
-      ? `<button type="button" class="trail-more" id="concept-stock-more">加载全部个股（剩余 ${{hiddenCount}} 只）</button>`
+      ? `<button type="button" class="trail-more" id="concept-stock-more">加载全部个股（剩余 ${{escHtml(hiddenCount)}} 只）</button>`
       : '';
     grid.innerHTML = cards + more;
     const moreButton = document.getElementById('concept-stock-more');
@@ -1605,13 +1611,13 @@ window.addEventListener('DOMContentLoaded', () => {{
     const hidden = index > TOPN && !forceVisible ? ' hidden data-hidden-row' : '';
     const coverage = cell.coverage_pct == null ? '' : ` · 覆盖 ${{fmtRateJs(cell.coverage_pct)}}`;
     const extra = wide
-      ? `<span class="num ${{signCls(cell.main_net)}}">${{fmtFlowJs(cell.main_net)}}</span>`
-      : `<span class="num ${{signCls(cell.strength)}}">${{fmtPctJs(cell.strength)}}</span>`;
+      ? `<span class="num ${{escHtml(signCls(cell.main_net))}}">${{escHtml(fmtFlowJs(cell.main_net))}}</span>`
+      : `<span class="num ${{escHtml(signCls(cell.strength))}}">${{escHtml(fmtPctJs(cell.strength))}}</span>`;
     const tail = wide
-      ? `<span class="num up">${{cell.limit_up ?? '—'}}</span><span class="num ${{signCls(cell.pct_chg)}}">${{fmtPctJs(cell.pct_chg)}}</span>${{extra}}`
-      : `${{extra}}<span class="num up">${{cell.limit_up ?? '—'}}</span><span class="num ${{signCls(cell.pct_chg)}}">${{fmtPctJs(cell.pct_chg)}}</span>`;
-    return `<button type="button" class="day-row cols5" data-trail-id="${{sector.id}}"${{hidden}}>`
-      + `<span class="dim">${{index}}</span><span class="n">${{sector.name || sector.id}}<small class="dim">${{coverage}}</small></span>`
+      ? `<span class="num up">${{escHtml(cell.limit_up ?? '—')}}</span><span class="num ${{escHtml(signCls(cell.pct_chg))}}">${{escHtml(fmtPctJs(cell.pct_chg))}}</span>${{extra}}`
+      : `${{extra}}<span class="num up">${{escHtml(cell.limit_up ?? '—')}}</span><span class="num ${{escHtml(signCls(cell.pct_chg))}}">${{escHtml(fmtPctJs(cell.pct_chg))}}</span>`;
+    return `<button type="button" class="day-row cols5" data-trail-id="${{escHtml(sector.id)}}"${{hidden}}>`
+      + `<span class="dim">${{escHtml(index)}}</span><span class="n">${{escHtml(sector.name || sector.id)}}<small class="dim">${{coverage}}</small></span>`
       + tail + `</button>`;
   }};
   const renderTrailBoard = () => {{
@@ -1626,9 +1632,9 @@ window.addEventListener('DOMContentLoaded', () => {{
           , day);
         const rows = ranked.slice(0, TOPN).map((item, i) => conceptRow(item.sector, item.cell, i + 1, false)).join('');
         const more = ranked.length > TOPN
-          ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{ranked.length - TOPN}} 个）</button>` : '';
-        return `<div class="day-card" data-trail-day="${{day}}"><div class="day-title">${{day}}</div>`
-          + `<div class="day-head cols5"><span>#</span><span>概念</span><span class="num">强度</span><span class="num">涨停</span><span class="num sort-head" data-trail-sort="${{day}}">${{sortTitle(day)}}</span></div>`
+          ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{escHtml(ranked.length - TOPN)}} 个）</button>` : '';
+        return `<div class="day-card" data-trail-day="${{escHtml(day)}}"><div class="day-title">${{escHtml(day)}}</div>`
+          + `<div class="day-head cols5"><span>#</span><span>概念</span><span class="num">强度</span><span class="num">涨停</span><span class="num sort-head" data-trail-sort="${{escHtml(day)}}">${{escHtml(sortTitle(day))}}</span></div>`
           + `<div class="day-rows">${{rows}}${{more}}</div></div>`;
       }}).join('') + (!trailHistoryExpanded && (trailData.dates || []).length > 1
         ? '<button type="button" class="trail-more" id="trail-history-more">加载历史交易日</button>' : '');
@@ -1642,10 +1648,10 @@ window.addEventListener('DOMContentLoaded', () => {{
           , frame.label);
         const rows = ranked.slice(0, TOPN).map((item, i) => conceptRow(item.sector, item.cell, i + 1, true)).join('');
         const more = ranked.length > TOPN
-          ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{ranked.length - TOPN}} 个）</button>` : '';
-        return `<div class="day-card wide"><div class="day-title">${{frame.label}}`
-          + `<small>${{frame.start || ''}} ~ ${{frame.end || ''}} · ${{frame.trading_days || 0}}个交易日</small></div>`
-          + `<div class="day-head cols5"><span>#</span><span>概念</span><span class="num">涨停</span><span class="num sort-head" data-trail-sort="${{frame.label}}">${{sortTitle(frame.label)}}</span><span class="num">净流入</span></div>`
+          ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{escHtml(ranked.length - TOPN)}} 个）</button>` : '';
+        return `<div class="day-card wide"><div class="day-title">${{escHtml(frame.label)}}`
+          + `<small>${{escHtml(frame.start || '')}} ~ ${{escHtml(frame.end || '')}} · ${{escHtml(frame.trading_days || 0)}}个交易日</small></div>`
+          + `<div class="day-head cols5"><span>#</span><span>概念</span><span class="num">涨停</span><span class="num sort-head" data-trail-sort="${{escHtml(frame.label)}}">${{escHtml(sortTitle(frame.label))}}</span><span class="num">净流入</span></div>`
           + `<div class="day-rows">${{rows}}${{more}}</div></div>`;
       }}).join('') || '<div class="empty">暂无期间数据</div>';
     }}
@@ -1679,20 +1685,24 @@ window.addEventListener('DOMContentLoaded', () => {{
         const lu = luByDateCode[`${{day}}|${{stock.code}}`] || null;
         const board = lu && lu.board != null ? lu.board + '板' : '—';
         const time = lu && lu.time ? fmtTime(lu.time) : '—';
-        return `<div class="day-row cols5 stock-detail-row" style="cursor:default"><span class="dim">${{index + 1}}</span>`
-          + `<span class="n">${{stock.name || stock.code || '—'}} <span class="dim">${{stock.code || ''}}</span></span>`
-          + `<span class="num ${{signCls(stock.pct)}}">${{fmtPctJs(stock.pct)}}</span>`
-          + `<span class="num">${{board}}</span>`
-          + `<span class="num">${{time}}</span></div>`;
+        return `<div class="day-row cols5 stock-detail-row" style="cursor:default"><span class="dim">${{escHtml(index + 1)}}</span>`
+          + `<span class="n">${{escHtml(stock.name || stock.code || '—')}} <span class="dim">${{escHtml(stock.code || '')}}</span></span>`
+          + `<span class="num ${{escHtml(signCls(stock.pct))}}">${{escHtml(fmtPctJs(stock.pct))}}</span>`
+          + `<span class="num">${{escHtml(board)}}</span>`
+          + `<span class="num">${{escHtml(time)}}</span></div>`;
       }}).join('') || '<div class="empty">当日无成分数据</div>';
       const memberPanel = panel ? {{
         codes: panel.codes || [],
         pct: trailData.stock_pct || {{}},
       }} : null;
       const namesMap = trailData.stock_names || {{}};
+      const memberQuoteCount = day => memberPanel ? memberPanel.codes.filter(code => {{
+        const value = (memberPanel.pct[day] || {{}})[code];
+        return typeof value === 'number' && Number.isFinite(value);
+      }}).length : 0;
+      const hasMemberDay = day => memberQuoteCount(day) > 0;
       const dayStocks = day => {{
-        if (!memberPanel) return ((sector.daily || {{}})[day] || {{}}).stocks || [];
-        if (!Object.prototype.hasOwnProperty.call(memberPanel.pct, day)) {{
+        if (!hasMemberDay(day)) {{
           return (((sector.daily || {{}})[day] || {{}}).stocks || []).map(stock => ({{
             code: stock.stock_code,
             name: stock.stock_name || stock.stock_code,
@@ -1703,7 +1713,7 @@ window.addEventListener('DOMContentLoaded', () => {{
         return memberPanel.codes.map(code => ({{
           code,
           name: namesMap[code] || code,
-          pct: col[code] == null ? null : col[code] / 100,
+          pct: typeof col[code] === 'number' && Number.isFinite(col[code]) ? col[code] / 100 : null,
         }})).sort((a, b) => (b.pct == null ? -9999 : b.pct) - (a.pct == null ? -9999 : a.pct));
       }};
       const cards = (trailData.dates || []).map(day => {{
@@ -1712,21 +1722,24 @@ window.addEventListener('DOMContentLoaded', () => {{
         const limitUpCount = cell.limit_up == null ? ((cell.stocks || []).length) : cell.limit_up;
         const rows = renderDetailRows(day, stocks.slice(0, TOPN));
         const more = stocks.length > TOPN
-          ? `<button type="button" class="trail-more" data-day-more="${{day}}">加载全部（剩余 ${{stocks.length - TOPN}} 个）</button>` : '';
-        return `<div class="day-card"><div class="day-title">${{day}} · 全部成分 ${{stocks.length}}只 · 涨停 ${{limitUpCount}}只</div>`
+          ? `<button type="button" class="trail-more" data-day-more="${{escHtml(day)}}">加载全部（剩余 ${{escHtml(stocks.length - TOPN)}} 个）</button>` : '';
+        const scope = hasMemberDay(day)
+          ? `快照成分（有效行情 ${{memberQuoteCount(day)}}/${{memberPanel.codes.length}}）`
+          : '涨停样本（成员快照或当日行情缺失）';
+        return `<div class="day-card"><div class="day-title">${{escHtml(day)}} · ${{scope}} ${{escHtml(stocks.length)}}只 · 涨停 ${{escHtml(limitUpCount)}}只</div>`
           + `<div class="day-head cols5 stock-detail-head"><span>#</span><span>个股</span><span class="num">涨幅</span><span class="num">连板</span><span class="num">封板时间</span></div>`
-          + `<div class="day-rows" data-day-rows="${{day}}">${{rows}}${{more}}</div></div>`;
+          + `<div class="day-rows" data-day-rows="${{escHtml(day)}}">${{rows}}${{more}}</div></div>`;
       }}).join('');
       const latestCell = (sector.daily || {{}})[(trailData.dates || [])[0]] || {{}};
       const coverage = latestCell.coverage_pct == null ? '' : ` · 成分 K 线覆盖 ${{fmtRateJs(latestCell.coverage_pct)}}`;
-      const snapNote = memberPanel ? ` · 成分快照 ${{panel.snapshot_date || '—'}}` : '';
-      trailDetail.innerHTML = `<div class="sec-title"><strong>${{sector.name || id}}</strong>`
+      const snapNote = memberPanel ? ` · 成分快照 ${{escHtml(panel.snapshot_date || '—')}}` : ' · 成员快照缺失，仅展示已知涨停样本';
+      trailDetail.innerHTML = `<div class="sec-title"><strong>${{escHtml(sector.name || id)}}</strong>`
         + `<span class="dim">成分按涨幅排序，涨停股标注连板与封板时间 · 一只票可以同时属于多个概念${{coverage}}${{snapNote}}</span></div>`
         + `<div class="trail-scroll">${{cards}}</div>`;
       document.querySelectorAll('#trail-detail [data-day-more]').forEach(button => button.addEventListener('click', () => {{
         const day = button.dataset.dayMore;
         const stocks = dayStocks(day);
-        const rows = document.querySelector(`#trail-detail [data-day-rows="${{day}}"]`);
+        const rows = document.querySelector(`#trail-detail [data-day-rows="${{CSS.escape(day)}}"]`);
         if (rows) rows.innerHTML = renderDetailRows(day, stocks);
         button.remove();
       }}));
@@ -1735,7 +1748,7 @@ window.addEventListener('DOMContentLoaded', () => {{
     const pack = trailPeriods[trailMode] || {{}};
     const sector = (pack.sectors || []).find(item => item.id === id);
     if (!sector) {{
-      trailDetail.innerHTML = `<div class="empty">该概念在${{trailMode === 'week' ? '周' : trailMode === 'month' ? '月' : '季'}}度没有进入前排</div>`;
+      trailDetail.innerHTML = `<div class="empty">该概念在${{escHtml(trailMode === 'week' ? '周' : trailMode === 'month' ? '月' : '季')}}度没有进入前排</div>`;
       return;
     }}
     hydratePeriodSector(trailMode, sector);
@@ -1744,20 +1757,20 @@ window.addEventListener('DOMContentLoaded', () => {{
       const stocks = [...(cell.stocks || [])];
       const rows = stocks.length ? stocks.map((stock, index) => {{
         const hidden = index >= TOPN ? ' hidden data-hidden-row' : '';
-        return `<div class="day-row cols5 stock-detail-row" style="cursor:default"${{hidden}}><span class="dim">${{index + 1}}</span>`
-          + `<span class="n">${{stock.stock_name || stock.stock_code || '—'}} <span class="dim">${{stock.stock_code || ''}}</span></span>`
-          + `<span class="num">${{stock.limit_up ?? '—'}}</span>`
-          + `<span class="num ${{signCls(stock.pct_chg)}}">${{fmtPctJs(stock.pct_chg)}}</span>`
-          + `<span class="num">${{stock.board_level == null ? '—' : stock.board_level + '板'}}</span></div>`;
+        return `<div class="day-row cols5 stock-detail-row" style="cursor:default"${{hidden}}><span class="dim">${{escHtml(index + 1)}}</span>`
+          + `<span class="n">${{escHtml(stock.stock_name || stock.stock_code || '—')}} <span class="dim">${{escHtml(stock.stock_code || '')}}</span></span>`
+          + `<span class="num">${{escHtml(stock.limit_up ?? '—')}}</span>`
+          + `<span class="num ${{escHtml(signCls(stock.pct_chg))}}">${{escHtml(fmtPctJs(stock.pct_chg))}}</span>`
+          + `<span class="num">${{escHtml(stock.board_level == null ? '—' : stock.board_level + '板')}}</span></div>`;
       }}).join('') : '<div class="empty">该期无涨停</div>';
       const more = stocks.length > TOPN
-        ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{stocks.length - TOPN}} 个）</button>` : '';
-      return `<div class="day-card wide"><div class="day-title">${{frame.label}} · ${{cell.limit_up || 0}}次`
-        + `<small>区间涨幅 ${{fmtPctJs(cell.pct_chg)}} · 净流入 ${{fmtFlowJs(cell.main_net)}}</small></div>`
+        ? `<button type="button" class="trail-more" data-expand-col="1">加载全部（剩余 ${{escHtml(stocks.length - TOPN)}} 个）</button>` : '';
+      return `<div class="day-card wide"><div class="day-title">${{escHtml(frame.label)}} · ${{escHtml(cell.limit_up || 0)}}次`
+        + `<small>区间涨幅 ${{escHtml(fmtPctJs(cell.pct_chg))}} · 净流入 ${{escHtml(fmtFlowJs(cell.main_net))}}</small></div>`
         + `<div class="day-head cols5 stock-detail-head"><span>#</span><span>个股</span><span class="num">涨停次数</span><span class="num">区间收益</span><span class="num">最高板</span></div>`
         + `<div class="day-rows">${{rows}}${{more}}</div></div>`;
     }}).join('');
-    trailDetail.innerHTML = `<div class="sec-title"><strong>${{sector.name || id}}</strong>`
+    trailDetail.innerHTML = `<div class="sec-title"><strong>${{escHtml(sector.name || id)}}</strong>`
       + `<span class="dim">期间内涨停个股 · 涨停=该窗口内涨停次数，区间收益=窗口首收至末收</span></div>`
       + `<div class="trail-scroll">${{cards}}</div>`;
     document.querySelectorAll('#trail-detail [data-expand-col]').forEach(btn => {{
@@ -2025,7 +2038,7 @@ def _page_html(ctx: dict[str, Any], trade_date: str, echarts_src: str,
     # complete concept payload remains inert and is parsed only after the user
     # switches concepts, so metadata is not duplicated in executable JS.
     concept_data = _concept_inline_data(ctx, stock_limit=50)[:1]
-    concept_payload_json = json.dumps(
+    concept_payload_json = _script_json(
         concept_limit_up.get("groups") or [],
         ensure_ascii=False,
         separators=(",", ":"),

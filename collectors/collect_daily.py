@@ -1,21 +1,37 @@
 """Daily data collectors (4 endpoints)."""
 import json
+from datetime import datetime
 from trade_system.data_store import KPLClient, DuckDBStore, logger
+from trade_system.market_contract import MARKET_COUNT_FIELDS, count_evidence, market_count, require_observed_counts, validate_requested_day
 
 
 def collect_daily(client: KPLClient, store: DuckDBStore, date: str) -> int:
     data = client.get("/daily", {"date": date})
-    if not data:
+    if data is None:
         return 0
     try:
+        if not isinstance(data, dict):
+            raise ValueError('daily summary must be an object')
+        validate_requested_day(data, date)
+        require_observed_counts(data)
+        aliases = ('涨停数', '跌停数', '上涨家数', '下跌家数', '连板数')
+        counts = []
+        for field, alias in zip(MARKET_COUNT_FIELDS, aliases):
+            # Missing fields are failures, including when another field is nonzero.
+            values = [market_count(data[key]) for key in (field, alias) if key in data]
+            if not values or len(set(values)) != 1:
+                raise ValueError('missing or conflicting daily count: ' + field)
+            counts.append(values[0])
+        received = datetime.now()
+        provenance = {field: count_evidence(value, source='kpl_daily', source_kind='real',
+            source_date=date, fetched_at=received, received_at=received)
+            for field, value in zip(MARKET_COUNT_FIELDS, counts)}
         row = (
             date,
-            data.get("limit_up_count", data.get("涨停数", 0)),
-            data.get("limit_down_count", data.get("跌停数", 0)),
-            data.get("rise_count", data.get("上涨家数", 0)),
-            data.get("fall_count", data.get("下跌家数", 0)),
-            data.get("consecutive_count", data.get("连板数", 0)),
+            *counts,
             json.dumps(data, ensure_ascii=False),
+            received,
+            json.dumps(provenance, ensure_ascii=False),
         )
         # A derived fallback may already occupy the date primary key.  A real
         # KPL retry must replace it, not fail with a duplicate-key error.
@@ -23,8 +39,8 @@ def collect_daily(client: KPLClient, store: DuckDBStore, date: str) -> int:
             """
             INSERT INTO daily_summary
             (date,limit_up_count,limit_down_count,rise_count,fall_count,
-             consecutive_count,raw_json,fetched_at,source_kind)
-            VALUES (?,?,?,?,?,?,?,current_timestamp,'real')
+             consecutive_count,raw_json,fetched_at,count_provenance_json,source_kind)
+            VALUES (?,?,?,?,?,?,?,?,?,'real')
             ON CONFLICT(date) DO UPDATE SET
                 limit_up_count=excluded.limit_up_count,
                 limit_down_count=excluded.limit_down_count,
@@ -33,6 +49,7 @@ def collect_daily(client: KPLClient, store: DuckDBStore, date: str) -> int:
                 consecutive_count=excluded.consecutive_count,
                 raw_json=excluded.raw_json,
                 fetched_at=excluded.fetched_at,
+                count_provenance_json=excluded.count_provenance_json,
                 source_kind='real'
             """,
             list(row),
@@ -43,6 +60,7 @@ def collect_daily(client: KPLClient, store: DuckDBStore, date: str) -> int:
     except Exception as e:
         logger.error(f"daily error: {e}")
         store.insert_raw("/daily", data)
+        store.log_collect("daily_summary", "/daily", 0, f"error: {e}")
         return 0
 
 

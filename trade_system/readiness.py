@@ -21,6 +21,7 @@ import duckdb
 from trade_system.quality import table_columns, table_exists
 from trade_system.time_utils import as_local_naive
 from trade_system.gate_contract import build_operator_state, build_operational_capabilities
+from trade_system.market_contract import MARKET_STATE_RELATIONS, market_daily_status_sql
 
 
 def _normalize_trade_date(value: str) -> str:
@@ -618,6 +619,23 @@ def relation_freshness(
         }:
             real_rows = 0
             status = "fallback_only"
+    market_status = None
+    if rows and relation in MARKET_STATE_RELATIONS:
+        # Qualify the latest as-of snapshot, never rescue a partial replacement
+        # using an older complete row or a differently named raw relation.
+        qualification = market_daily_status_sql(columns)
+        order = timestamp_value_expr if timestamp_column else f'"{date_column}"'
+        qualifications = con.execute(
+            f'SELECT {qualification} FROM "{relation}" '
+            f'WHERE CAST("{date_column}" AS VARCHAR)=?{as_of_filter} '
+            f'QUALIFY dense_rank() OVER (ORDER BY {order} DESC NULLS LAST)=1', base_params,
+        ).fetchall()
+        states = {row[0] for row in qualifications}
+        market_status = next(iter(states)) if len(states) == 1 else 'source_conflict'
+        if market_status != 'available':
+            real_rows = 0
+            if status in ('ready', 'fallback_only'):
+                status = 'fallback_only' if market_status == 'estimated' else 'partial'
     data_status = status
     kind = (
         "stock" if relation in GROUPS["stock_capital_flow"].relations
@@ -650,6 +668,7 @@ def relation_freshness(
         "coverage": coverage,
         "coverage_reason": coverage.get("reason") if coverage else None,
         "data_status": data_status,
+        "market_daily_status": market_status,
         "status": status,
     }
 
@@ -1194,11 +1213,11 @@ def assess_trade_date_readiness(
 
 def render_readiness_markdown(result: dict) -> str:
     analytics_ready = result.get("analytics_ready", result["ready"])
-    execution_ready = result.get("execution_ready", False)
+    execution_ready = False  # Historical state dictionaries cannot grant execution.
     actionable_candidates = result.get("actionable_candidates", 0)
     tradable_candidates = result.get("tradable_candidates", 0)
     risk_approved_candidates = result.get("risk_approved_candidates", 0)
-    executable_candidates = result.get("executable_candidates", 0)
+    executable_candidates = 0
     lines = [
         "# Trade Date Readiness",
         "",
@@ -1216,13 +1235,12 @@ def render_readiness_markdown(result: dict) -> str:
         f"- Tradable candidates: `{tradable_candidates}`",
         f"- Risk-approved candidates: `{risk_approved_candidates}`",
         f"- Executable candidates: `{executable_candidates}`",
+        "- Scope: manual research qualification; legacy candidate flags are historical diagnostics only.",
         f"- Missing groups: `{', '.join(result['missing_groups']) or 'none'}`",
     ]
     if analytics_ready and not execution_ready:
         lines.append(
-            "- WARNING: data is present but no candidate is entry-executable "
-            "(e.g. delayed providers or close signal_close review-only); "
-            "treat as analysis-only, NOT entry-ready."
+            "- Analysis-only: qualified data does not grant execution authority. Retired entries remain closed."
         )
     lines.extend([
         "",

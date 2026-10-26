@@ -109,7 +109,11 @@ def theme_facts(con,day,current,research_codes,limits):
                 'max_board':max((boards.get(c,0) for c in actual),default=0) if limits['status']=='available' else None,
                 'limit_status':limits['status']})
         membership_status='complete' if catalog and len(themes)==len(catalog) and set(groups)==seen else 'partial'
+    from trade_system.snapshot_contract import membership_contract
+    membership = membership_contract(day, str(snap) if snap else None, membership_status,
+        {t['concept_code']: t['member_codes'] for t in themes}, max_age_days=THS_MEMBERSHIP_MAX_AGE_DAYS)
     return {'themes':themes,'stocks':stocks,'membership_status':membership_status,
+        'membership_contract':membership,
         'membership_date':str(snap) if snap else None,'membership_age_days':membership_age,
         'source_groups':len(catalog),'excluded_broad_or_unknown_members':len(excluded),'excluded_membership':excluded}
 
@@ -287,13 +291,17 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
         row['next_change_pct']=current.get(row['stock_code'],{}).get('pct')
     tables={r[0] for r in con.execute('SHOW TABLES').fetchall()}
     if 'v_market_daily' in tables:
-        rows=con.execute('SELECT limit_up_count,limit_down_count,consecutive_count,market_daily_source,fetched_at FROM v_market_daily WHERE trade_date=? AND fetched_at<=?',[day,clock]).fetchall()
-        result['market_totals']={'status':'available' if len(rows)==1 else 'source_conflict' if rows else 'source_missing'}
+        total_columns={r[0] for r in con.execute('DESCRIBE v_market_daily').fetchall()}
+        from trade_system.market_contract import market_daily_status_sql
+        status_expr=market_daily_status_sql(total_columns) if 'market_daily_status' in total_columns else "'unverified_legacy'"
+        rows=con.execute(f'SELECT limit_up_count,limit_down_count,consecutive_count,market_daily_source,fetched_at,{status_expr} FROM v_market_daily WHERE trade_date=? AND fetched_at<=?',[day,clock]).fetchall()
+        result['market_totals']={'status':'source_conflict' if rows else 'source_missing'}
         if len(rows)==1:
-            up,down,consecutive,source,received=rows[0]
-            result['market_totals'].update(limit_up=up,limit_down=down,consecutive=consecutive,source=source,fetched_at=received.isoformat())
-            # Totals and the identified pool are distinct products, never silently interchangeable.
-            result['breadth']['limit_down']=down
+            up,down,consecutive,source,received,status=rows[0]
+            result['market_totals'].update(status=status,limit_up=up,limit_down=down,consecutive=consecutive,
+                source=source,fetched_at=received.isoformat())
+            # Derived/partial totals remain observations, never certified breadth.
+            if status=='available':result['breadth']['limit_down']=down
     columns={r[0] for r in con.execute('DESCRIBE v_kline_daily').fetchall()}
     if 'turnover' in columns:
         sums=con.execute('SELECT amount_unit,sum(turnover),count(*) FROM v_kline_daily WHERE trade_date=? AND fetched_at<=? AND turnover>=0 GROUP BY amount_unit',[day,clock]).fetchall()
@@ -306,6 +314,8 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
             'product':'v_kline_daily.normalized_turnover_cny','source_unit_labels':[u for u,_,_ in sums],
             'legacy_unit_label_mismatch':any(u not in ('yuan','CNY') for u,_,_ in sums),
             'samples':sum(n for _,_,n in sums),'scope':'available_canonical_rows_not_exchange_total'}
+    from trade_system.business_contract import market_consumption
+    result['product_consumption'] = market_consumption(result)
     return dict(result,snapshot_id=identity(result))
 
 

@@ -22,7 +22,8 @@ def service_identity(root, output):
                                      'output':str(Path(output).resolve()).casefold()}),
             'surface_sha256':identity({**{name:file_hash(folder/name) for name in files},
                 'source_authority.py':file_hash(folder.parent/'source_authority.py'),
-                'quote_transport.py':file_hash(folder.parent/'quote_transport.py')})}
+                'quote_transport.py':file_hash(folder.parent/'quote_transport.py'),
+                'acceptance_scope.py':file_hash(folder/'acceptance_scope.py')})}
 
 
 def handler(root, output, port, *, shutdown=None):

@@ -285,7 +285,7 @@ def build_review_narrative(context: dict) -> dict[str, Any]:
     else:
         tomorrow.append("竞价前重新确认主线，避免把过宽概念当成方向。")
     if not outcomes:
-        tomorrow.append("收盘后导入真实成交/跳过/取消，否则次日复盘仍是候选清单。")
+        tomorrow.append("旧人工计划导入已退役；历史记录仅供查看，真实成交接入待独立账本方案验收。")
 
     return {
         "trade_date": trade_date,
@@ -676,7 +676,7 @@ def _render_flow_review_sections(flow: dict[str, Any]) -> list[str]:
             "",
             "### Potential Stocks (Research Only)",
             "",
-            "These are review candidates, not executable orders. Promote only after K-line, sector, auction, readiness, and manual-risk gates pass.",
+            "These are retained review candidates. Data or risk checks never reopen retired execution entries.",
             "",
             "| Code | Name | Score | Main Net | Flow Rank | Selection Status |",
             "|---|---|---:|---:|---:|---|",
@@ -879,11 +879,12 @@ def render_daily_review_markdown(context: dict) -> str:
         "## P0 Data And Execution Gate",
         "",
         f"- Source ready: `{str(readiness.get('source_ready', readiness.get('analytics_ready', False))).lower()}`; pipeline ready: `{str(readiness.get('pipeline_ready', False)).lower()}`; artifact current: `{str(readiness.get('artifact_current', False)).lower()}`.",
-        f"- Data certified: `{str(readiness.get('data_certified_ready', False)).lower()}`; flow certified: `{str(readiness.get('flow_certified_ready', 'not_assessed')).lower()}`; analysis ready: `{str(readiness.get('analysis_ready', readiness.get('certified_ready', False))).lower()}`; operator status: `{readiness.get('operator_status', 'uncertified')}`.",
-        f"- Control: `{control.get('override', 'BLOCK')}`; effective position cap: `{control.get('effective_position_pct', 0)}%`.",
-        f"- Actionable / tradable / risk-approved / executable: `{readiness.get('actionable_candidates', 0)} / {readiness.get('tradable_candidates', 0)} / {readiness.get('risk_approved_candidates', 0)} / {readiness.get('executable_candidates', 0)}`.",
+        f"- Data certified: `{str(readiness.get('data_certified_ready', False)).lower()}`; flow certified: `{str(readiness.get('flow_certified_ready', 'not_assessed')).lower()}`; analysis ready: `{str(readiness.get('analysis_ready', readiness.get('certified_ready', False))).lower()}`; recorded operator status (historical diagnostic): `{readiness.get('operator_status', 'uncertified')}`.",
+        f"- Recorded control (historical diagnostic): `{control.get('override', 'BLOCK')}`; recorded position cap: `{control.get('effective_position_pct', 0)}%`.",
+        f"- Historical candidate flags (actionable / tradable / risk-approved / executable): `{readiness.get('actionable_candidates', 0)} / {readiness.get('tradable_candidates', 0)} / {readiness.get('risk_approved_candidates', 0)} / {readiness.get('candidate_pool_executable_candidates', readiness.get('executable_candidates', 0))}`.",
+        "- Current execution ready: `false`; current executable candidates: `0`. Retired entries remain closed.",
         f"- Missing groups: `{', '.join(readiness.get('missing_groups', [])) or 'none'}`.",
-        "- Review basis: same-date postmarket snapshot; use the live freshness gate before any executable decision.",
+        "- Review basis: same-date postmarket snapshot for manual research; execution authority remains closed.",
         ]
     )
     lines.extend(

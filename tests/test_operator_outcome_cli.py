@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ def test_import_operator_trade_outcomes_cli(tmp_path):
         encoding="utf-8",
     )
 
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
     result = subprocess.run(
         [sys.executable, "scripts/import_operator_trade_outcomes.py", "--db", str(db_path), "--csv", str(csv_path)],
         cwd=ROOT,
@@ -47,12 +49,9 @@ def test_import_operator_trade_outcomes_cli(tmp_path):
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "rows_imported=1" in result.stdout
-    con = duckdb.connect(str(db_path), read_only=True)
-    try:
-        row = con.execute("SELECT execution_status, outcome_tag FROM operator_trade_outcome").fetchone()
-    finally:
-        con.close()
-    assert row == ("skipped", "avoided_weak_market")
-
+    assert result.returncode == 2, result.stderr
+    assert 'RETIRED' in result.stderr
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest()==before
+    with duckdb.connect(str(db_path),read_only=True) as con:
+        assert con.execute('SELECT count(*) FROM operator_trade_outcome').fetchone()[0]==0
+        assert con.execute('SELECT status FROM trade_plan').fetchone()[0]=='planned'

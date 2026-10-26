@@ -71,6 +71,12 @@ class DecisionService:
                                  [account_id, account['imported_at']]).fetchone()[0]:
                 blockers.append('account_event_requires_reconciliation')
             expires = min(expires, account['valid_until'])
+            if account['payload'].get('source') == 'paper_ledger_projection':
+                from .paper_storage import current_buy_valuation_deadline
+                try:
+                    expires = min(expires, current_buy_valuation_deadline(store, account, at))
+                except ValueError:
+                    blockers.append('holding_valuation_stale_or_incomplete')
         context = store.con.execute('SELECT asof_time,mode FROM input_manifest WHERE manifest_id=?', [quote_manifest]).fetchone()
         if context is None or context[1] != 'system_replay' or context[0] > at:
             blockers.append('invalid_quote_context')

@@ -1,11 +1,14 @@
 """Market sentiment and emotion data collectors."""
 import json
+import math
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from trade_system.data_store import KPLClient, DuckDBStore, logger
+from trade_system.market_contract import count_evidence, inherited_count_evidence, market_count, require_observed_counts, validate_requested_day
 
 # After this many consecutive runs where KPL answers but returns no row for the
 # requested trading date, escalate to an explicit alert (WP5).  At a 5-minute
@@ -73,7 +76,7 @@ def _require_daily_summary_schema(store) -> None:
         str(row[1])
         for row in store.conn.execute("PRAGMA table_info('daily_summary')").fetchall()
     }
-    required = {"date", "raw_json", "source_kind"}
+    required = {"date", "raw_json", "source_kind", "count_provenance_json"}
     missing = sorted(required - columns)
     if missing:
         raise RuntimeError(
@@ -87,10 +90,12 @@ def collect_market_mood(client: KPLClient, store: DuckDBStore, date: str) -> int
     if not data:
         return 0
     try:
+        validate_requested_day(data, date)
+        require_observed_counts(data)
         row = (
             date,
-            data.get("上涨家数"),
-            data.get("下跌家数"),
+            market_count(data.get("上涨家数")),
+            market_count(data.get("下跌家数")),
             data.get("涨停家数"),
             data.get("跌停家数"),
             data.get("全市场流通量"),
@@ -139,99 +144,105 @@ def collect_market_rise_fall(client: KPLClient, store: DuckDBStore, date: str) -
         # Each item in raw_data: [limit_up, limit_down, broken, real_limit_up, broken_rate, real_limit_down, date]
         rows = []
         current_found = False
+        seen = set()
         for item in raw_data:
-            if isinstance(item, list) and len(item) >= 7:
-                row_date = item[6]
-                if str(row_date)[:10] == str(date)[:10]:
-                    current_found = True
-                rows.append((
-                    row_date,
-                    item[0],  # limit_up_count
-                    item[1],  # limit_down_count
-                    item[2],  # broken_count
-                    item[3],  # real_limit_up_count
-                    item[4],  # broken_rate
-                    item[5],  # real_limit_down_count
-                    json.dumps(item, ensure_ascii=False)
-                ))
-        
+            if not isinstance(item, list) or len(item) < 7:
+                raise ValueError('incomplete market rise/fall row')
+            row_date = datetime.strptime(str(item[6])[:10], '%Y-%m-%d').date().isoformat()
+            if row_date in seen:
+                raise ValueError('duplicate market rise/fall source date')
+            seen.add(row_date)
+            counts = []
+            for index in (0, 1, 2, 3, 5):
+                number = Decimal(str(item[index]))
+                if not number.is_finite() or number != number.to_integral_value() or number < 0:
+                    raise ValueError('market counts must be finite nonnegative integers')
+                counts.append(int(number))
+            rate = float(item[4])
+            if not math.isfinite(rate):
+                raise ValueError('market rate must be finite')
+            current_found = current_found or row_date == str(date)[:10]
+            rows.append((row_date, *counts[:4], rate, counts[4], json.dumps(item, ensure_ascii=False)))
+
         if rows:
             historical_dates = sorted({str(row[0])[:10] for row in rows})
             placeholders = ",".join("?" for _ in historical_dates)
-            store.conn.execute(
-                f"DELETE FROM market_rise_fall WHERE CAST(date AS VARCHAR) IN ({placeholders})",
-                historical_dates,
-            )
-            store.conn.executemany("""
-                INSERT INTO market_rise_fall 
-                (date, limit_up_count, limit_down_count, broken_limit_up_count, 
-                 blown_limit_up_count, blown_limit_up_rate, raw_field_5, raw_json, source_kind)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'real')
-            """, rows)
-            # Persist every response at its own source date.  Before the open,
-            # KPL legitimately returns the previous completed session; losing
-            # that real row left auction readiness with only a derived
-            # fallback.  It still must not be relabelled as the requested day.
-            try:
+            with store.transaction():
+                store.conn.execute(
+                    f"DELETE FROM market_rise_fall WHERE CAST(date AS VARCHAR) IN ({placeholders})",
+                    historical_dates,
+                )
+                store.conn.executemany("""
+                    INSERT INTO market_rise_fall
+                    (date, limit_up_count, limit_down_count, broken_limit_up_count,
+                     blown_limit_up_count, blown_limit_up_rate, raw_field_5, raw_json, source_kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'real')
+                """, rows)
+                # Persist every response at its own source date.  Before the open,
+                # KPL legitimately returns the previous completed session; losing
+                # that real row left auction readiness with only a derived
+                # fallback.  It still must not be relabelled as the requested day.
                 for row in rows:
                     source_date = str(row[0])[:10]
                     # Select only scalar columns: DuckDB is columnar, so NOT
                     # selecting raw_json guarantees the (once multi-gigabyte) audit
                     # blob is never materialized -- this is what prevents the OOM.
+                    received = datetime.now()
                     existing = store.conn.execute(
-                        "SELECT rise_count,fall_count,consecutive_count "
+                        "SELECT rise_count,fall_count,consecutive_count,source_kind,fetched_at,count_provenance_json "
                         "FROM daily_summary WHERE CAST(date AS VARCHAR)=?",
                         [source_date],
                     ).fetchone()
                     mood = store.conn.execute(
-                        "SELECT rise_count,fall_count FROM market_mood "
+                        "SELECT rise_count,fall_count,source_kind,fetched_at FROM market_mood "
                         "WHERE CAST(date AS VARCHAR)=? ORDER BY fetched_at DESC LIMIT 1",
                         [source_date],
                     ).fetchone()
-                    rise_count = mood[0] if mood else existing[0] if existing else None
-                    fall_count = mood[1] if mood else existing[1] if existing else None
-                    consecutive_count = existing[2] if existing else None
-                    source_kind = (
-                        "real"
-                        if source_date == str(date)[:10] and mood
-                        else "real_cross_source"
-                        if existing or mood
-                        else "real_partial"
-                    )
-                    # Preserve only the prior scalar snapshot (bounded).  Never read
-                    # or re-embed the previous raw_json blob (the old nesting bomb).
-                    preserved = (
-                        {
-                            "rise_count": existing[0],
-                            "fall_count": existing[1],
-                            "consecutive_count": existing[2],
-                        }
-                        if existing
-                        else None
-                    )
+                    evidence = {}
+                    for field, value in zip(('limit_up_count', 'limit_down_count'), row[1:3]):
+                        evidence[field] = count_evidence(value, source='kpl_market_rise_fall',
+                            source_kind='real', source_date=source_date,
+                            fetched_at=received, received_at=received)
+                    for index, field in enumerate(('rise_count','fall_count','consecutive_count')):
+                        # The latest mood response is authoritative for breadth even
+                        # when partial/fallback. Never borrow an earlier good row
+                        # to disguise an explicit bad observation as a success.
+                        use_mood = index < 2 and mood is not None
+                        if use_mood:
+                            evidence[field] = count_evidence(mood[index], source='market_mood',
+                                source_kind=mood[2], source_date=source_date,
+                                fetched_at=mood[3], received_at=received)
+                        else:
+                            evidence[field] = inherited_count_evidence(existing[index] if existing else None,
+                                field, provenance=existing[5] if existing else None,
+                                source_kind=existing[3] if existing else None, source_date=source_date,
+                                fetched_at=existing[4] if existing else None, received_at=received)
+                    qualified = all(item['qualified'] for item in evidence.values())
+                    source_kind = 'real' if qualified else 'real_partial'
+                    # Every required constituent must be within a reader's TTL.
+                    # min(receipt clocks) is equivalent to checking them all; a
+                    # future/unknown clock already made the aggregate partial.
+                    clocks = [datetime.fromisoformat(item['fetched_at']) for item in evidence.values()
+                              if item['fetched_at'] is not None]
+                    freshness_at = min(clocks) if clocks else None
                     audit_payload = {
-                        "source": "kpl_market_rise_fall",
-                        "requested_date": str(date)[:10],
-                        "source_date": source_date,
-                        "kpl_raw": json.loads(row[7]),
-                        "preserved_daily_summary": preserved,
+                        'source': 'kpl_market_rise_fall', 'requested_date': str(date)[:10],
+                        'source_date': source_date, 'kpl_raw': json.loads(row[7]),
+                        'received_at': received.isoformat(timespec='microseconds'),
+                        'count_evidence': evidence,
                     }
                     store.conn.execute(
-                        "INSERT INTO daily_summary(date,limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,raw_json,fetched_at,source_kind) "
-                        "VALUES (?,?,?,?,?,?,?,current_timestamp,?) "
+                        "INSERT INTO daily_summary(date,limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,raw_json,fetched_at,source_kind,count_provenance_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?) "
                         "ON CONFLICT(date) DO UPDATE SET limit_up_count=excluded.limit_up_count,limit_down_count=excluded.limit_down_count,"
-                        "rise_count=coalesce(excluded.rise_count,daily_summary.rise_count),fall_count=coalesce(excluded.fall_count,daily_summary.fall_count),"
-                        "consecutive_count=coalesce(excluded.consecutive_count,daily_summary.consecutive_count),"
-                        "raw_json=excluded.raw_json,fetched_at=excluded.fetched_at,source_kind=excluded.source_kind",
-                        [
-                            source_date, row[1], row[2], rise_count, fall_count,
-                            consecutive_count,
-                            json.dumps(audit_payload, ensure_ascii=False),
-                            source_kind,
-                        ],
+                        "rise_count=excluded.rise_count,fall_count=excluded.fall_count,"
+                        "consecutive_count=excluded.consecutive_count,"
+                        "raw_json=excluded.raw_json,fetched_at=excluded.fetched_at,source_kind=excluded.source_kind,"
+                        "count_provenance_json=excluded.count_provenance_json",
+                        [source_date, *[item['value'] for item in evidence.values()],
+                         json.dumps(audit_payload, ensure_ascii=False), freshness_at, source_kind,
+                         json.dumps(evidence, ensure_ascii=False)],
                     )
-            except Exception as exc:
-                logger.warning(f"daily_summary fallback from market/rise-fall failed: {exc}")
             stale_count = _track_kpl_stale(store, str(date)[:10], current_found)
             if not current_found:
                 logger.warning(

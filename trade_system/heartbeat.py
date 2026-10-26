@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import os
 import socket
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from trade_system.logging_setup import get_logger
+from trade_system.file_lock import FileLock
 
 logger = get_logger(__name__)
 
@@ -29,19 +31,37 @@ def _path(name: str) -> Path:
 
 
 def write(name: str, extra: dict[str, Any] | None = None) -> Path:
-    """Record a fresh heartbeat. Returns the file path."""
+    """Record an attempt; only an explicit success advances last_success."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    attempt: dict[str, Any] = dict(extra or {})
+    attempt.update({
         "name": name,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "epoch": int(datetime.now().timestamp()),
         "host": socket.gethostname(),
         "pid": os.getpid(),
-    }
-    if extra:
-        payload.update(extra)
+    })
+    attempt.pop('last_success', None)
+    attempt.pop('last_attempt', None)
+    attempt['event'] = str(attempt.get('event', 'attempt'))
     path = _path(name)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    with FileLock(path.with_suffix('.guard')):
+        prior = read(name) or {}
+        success = prior.get('last_success')
+        if not success and prior.get('event')=='success' and 'epoch' in prior:
+            success = {k:v for k,v in prior.items() if k not in ('last_attempt','last_success')}
+        if attempt['event']=='success':
+            success = attempt
+        payload = {**attempt, 'last_attempt':attempt, 'last_success':success}
+        temporary = path.with_name(path.name+'.'+uuid.uuid4().hex+'.partial')
+        try:
+            with temporary.open('x',encoding='utf-8') as stream:
+                json.dump(payload,stream,ensure_ascii=False,indent=1)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary,path)
+        finally:
+            temporary.unlink(missing_ok=True)
     return path
 
 
@@ -50,17 +70,45 @@ def read(name: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data,dict) else None
     except (OSError, ValueError):
         logger.warning("unreadable heartbeat file: %s", path)
         return None
 
 
 def age_seconds(name: str) -> float | None:
+    """Age of the latest attempt; this alone is not a completion gate."""
     payload = read(name)
     if not payload or "epoch" not in payload:
         return None
     return max(0.0, datetime.now().timestamp() - float(payload["epoch"]))
+
+
+def completion_status(name: str, max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS) -> str:
+    payload = read(name)
+    if not payload:
+        return 'MISSING'
+    attempt = payload.get('last_attempt',payload)
+    if not isinstance(attempt,dict):
+        return 'INVALID'
+    event = attempt.get('event')
+    if event=='failure':
+        return 'FAILED'
+    if event=='start':
+        return 'IN_PROGRESS'
+    if event!='success':
+        return 'INCOMPLETE'
+    success = payload.get('last_success',attempt)
+    try:
+        import math
+        epoch = float(success['epoch'])
+        age = datetime.now().timestamp()-epoch
+        if not math.isfinite(age) or age < -60 or success.get('event')!='success':
+            return 'INVALID'
+        return 'SUCCESS' if age<=max_age_seconds else 'STALE_SUCCESS'
+    except (KeyError,TypeError,ValueError):
+        return 'INVALID'
 
 
 def is_stale(name: str, max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS) -> bool:

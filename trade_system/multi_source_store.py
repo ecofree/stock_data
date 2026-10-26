@@ -44,7 +44,11 @@ class MultiSourceStore:
         from trade_system.db_utils import legacy_connect
         self.con = legacy_connect(self.db_path)
         self.fetcher = fetcher or resilient_sources.get
-        self._ensure_tables()
+        try:
+            self._ensure_tables()
+        except BaseException:
+            self.con.close()
+            raise
 
     def close(self) -> None:
         self.con.close()
@@ -97,6 +101,10 @@ class MultiSourceStore:
         self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS volume_unit VARCHAR")
         self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS amount_unit VARCHAR")
         self.con.execute("ALTER TABLE multi_source_kline ADD COLUMN IF NOT EXISTS adjustment VARCHAR")
+        index = self.con.execute("SELECT expressions FROM duckdb_indexes() WHERE index_name='uq_multi_source_kline'").fetchone()
+        if index and 'adjustment' not in index[0]:
+            raise ValueError('multi_source_kline product key requires explicit migration 0016 before collection')
+        self.con.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_multi_source_kline_product ON multi_source_kline(source_date,asset_type,asset_code,provider,adjustment)')
         ensure_stock_flow_contract(self.con)
         self.con.execute("""
             CREATE TABLE IF NOT EXISTS multi_source_quote(
@@ -212,8 +220,8 @@ class MultiSourceStore:
                             continue
                         materialized = self.con.execute(
                             "SELECT 1 FROM multi_source_kline WHERE source_date=? AND asset_type=? "
-                            "AND asset_code=? AND provider=? AND raw_json=? AND is_stale=false LIMIT 1",
-                            [_date(row.get("date")), kind, code, provider, _json(row)]).fetchone()
+                            "AND asset_code=? AND provider=? AND adjustment=? AND raw_json=? AND is_stale=false LIMIT 1",
+                            [_date(row.get("date")), kind, code, provider, row.get('adjustment') or 'unknown', _json(row)]).fetchone()
                         if not materialized:
                             exists = False
                             break

@@ -226,6 +226,9 @@ def configured_performance(output, day):
     from trade_system.review_metrics import period_bounds
     path=Path(output)/'workspace-config.json';config=read_json(path)[0] if path.exists() else {}
     periods=('month','quarter')
+    from .acceptance_scope import from_config
+    if from_config(config):
+        return {p:{'period':p,'status':'not_applicable_current_scope','execution_ready':False} for p in periods}
     if not config.get('account_database') or not config.get('account_id'):
         return {p:{'period':p,'start':period_bounds(day,p)[0],'end':period_bounds(day,p)[1],'through':day,
             'status':'insufficient_account_evidence','net_pnl_fen':None,'time_weighted_return':None,'observed_drawdown':None,

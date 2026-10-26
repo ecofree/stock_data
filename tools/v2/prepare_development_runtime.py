@@ -11,37 +11,20 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
-import re
+from pathlib import Path
 import subprocess
+import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from tools.v2.offline_contract import LOCKS, locked_blocks as locked_blocks, runtime_blocks, base_entries
+from tools.v2.offline_process import run_stage
 
 
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
-def locked_blocks(path):
-    result = {}
-    name, lines = None, []
-    for line in Path(path).read_text('utf-8').splitlines():
-        match = re.match(r'^([A-Za-z0-9_.-]+)==([^\s\\]+)', line)
-        if match:
-            if name:
-                result[name] = '\n'.join(lines) + '\n'
-            name = re.sub(r'[-_.]+', '-', match[1]).lower()
-            lines = [line]
-        elif name and (line.startswith(' ') or not line.strip()):
-            lines.append(line)
-        elif name:
-            result[name] = '\n'.join(lines) + '\n'
-            name, lines = None, []
-    if name:
-        result[name] = '\n'.join(lines) + '\n'
-    return result
 
 
 def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, output):
@@ -54,16 +37,10 @@ def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, ou
         raise ValueError('new development runtime and evidence paths required; inspect rather than overwrite')
     if digest(base_archive) != base_sha or digest(jsonpath_wheel) != jsonpath_sha:
         raise ValueError('exact retained archive/wheel SHA required')
-    locks = ('requirements-dev.lock', 'requirements-data.lock', 'requirements-build.lock')
-    blocks = {}
-    for name in locks:
-        blocks.update(locked_blocks(ROOT / name))
-    if not {'pytest', 'ruff', 'duckdb', 'pyarrow', 'pypdf', 'setuptools', 'jsonpath'} <= blocks.keys():
-        raise ValueError('incomplete development lock closure')
-    original_jsonpath = blocks['jsonpath']
+    locks = LOCKS
+    blocks, original_jsonpath = runtime_blocks(ROOT, jsonpath_sha)
     # This wheel was built offline from the original pinned sdist; the caller
     # supplies its independently retained build digest, never a guessed wheel.
-    blocks['jsonpath'] = 'jsonpath==0.82.2 --hash=sha256:' + jsonpath_sha + '\n'
     output.mkdir(parents=True, exist_ok=False)
     lock = output / 'development-runtime.lock'
     lock.write_text('# Derived only from the reviewed repository locks and pinned local jsonpath build.\n' +
@@ -74,33 +51,13 @@ def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, ou
                        PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', UV_OFFLINE='1')
 
     def run(name, command):
-        result = subprocess.run(list(map(str, command)), env=environment, cwd=ROOT,
-                                capture_output=True, text=True, encoding='utf-8',
-                                errors='replace', timeout=300)
-        (output / (name + '.log')).write_text(result.stdout + '\n' + result.stderr, encoding='utf-8')
-        if result.returncode:
-            raise RuntimeError(name + ' failed; retain the attempt and do not overwrite')
-        return result.stdout
+        return run_stage(name, command, directory=output, env=environment, cwd=ROOT,
+                         timeout=300, runner=subprocess.run)
 
     target.mkdir(exist_ok=False)
     base_members = {}
     with zipfile.ZipFile(base_archive) as archive:
-        for member in archive.infolist():
-            parts = PurePosixPath(member.filename.replace('\\', '/')).parts
-            if not parts or parts[0] != 'python-collector' or '..' in parts:
-                raise ValueError('unexpected base archive namespace')
-            if member.is_dir() or len(parts) < 2:
-                continue
-            relative = PurePosixPath(*parts[1:])
-            if (relative.is_absolute() or ':' in str(relative) or
-                    (member.external_attr >> 16) & 0o170000 == 0o120000):
-                raise ValueError('linked/unsafe original member')
-            name = relative.as_posix()
-            if (name.startswith(('Lib/site-packages/', 'Scripts/')) or '__pycache__' in relative.parts
-                    or relative.suffix in ('.pyc', '.pyo')
-                    or name in ('pyvenv.cfg', 'runtime-manifest.json', 'Lib/EXTERNALLY-MANAGED')):
-                continue
-            data = archive.read(member)
+        for name, data in base_entries(archive):
             path = target / name
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open('xb') as stream:

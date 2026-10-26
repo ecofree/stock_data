@@ -25,6 +25,7 @@ class SourcePolicy:
     write_owner: str
     compatibility_only: tuple[str, ...] = ()
     notes: str = ""
+    lifecycle: str = "retained_data_product"
 
     @property
     def provider_order(self) -> tuple[str, ...]:
@@ -75,18 +76,24 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
         "Derived THS rows retain their taxonomy and are not silently merged as raw EM rows.",
     ),
     "limit_pool": SourcePolicy(
-        "limit_pool", "v_limit_pool", ("hithink", "kpl"),
-        ("xiaodefa", "eastmoney", "derived"),
+        "limit_pool", "v_limit_pool", ("hithink", "xiaodefa"),
+        ("kpl", "eastmoney", "derived"),
         "collect_realtime_limit_pool.py",
         (),
-        "Limit-up/ladder data is not a substitute for capital-flow data.",
+        "Qualify native dated board heights before ranking: HiThink > xiaodefa > other. Derived local streaks are not interchangeable native board facts.",
     ),
     "auction": SourcePolicy(
         "auction", "auction_tick", ("kpl_auction_market",),
         ("tencent_qt", "auction_quote_snapshot", "kpl_legacy"),
         "collect_auction_market_daily.py",
         (),
-        "Default market sequence/final snapshot, explicit scoped ticks and global anomalies are distinct products. Tencent is an order-book snapshot, never trade ticks. Anomalies are not synthesized from final matches.",
+        "KPL observations and scoped ticks only. Tencent is an order-book snapshot, never trade ticks. TuShare matched results use auction_match; official final snapshots and anomalies are distinct products.",
+    ),
+    "auction_match": SourcePolicy(
+        "auction_match", "v_auction_evidence", ("xiaodefa",), (),
+        "collect_auction_market_daily.py --product match",
+        (),
+        "Retained TuShare stk_auction matched-result product. No interchangeable official product is configured here; official final snapshots, opening bars and pre-open ticks remain distinct. Source priority never substitutes a different product.",
     ),
     "index": SourcePolicy(
         "index", "index_kline", ("kpl_index_kline",),
@@ -119,16 +126,18 @@ SOURCE_POLICIES: dict[str, SourcePolicy] = {
     "qlib": SourcePolicy(
         "qlib", "qlib_candidate_pool", ("qlib_shadow",),
         ("external_qlib_file",),
-        "trade_system/v2/research_product.py (frozen research artifacts; legacy candidate table is historical)",
+        "none (historical artifacts are read-only)",
         (),
-        "Scheduled research consumes a frozen model through the research product; legacy candidate tables are historical, not its output. No automatic training, promotion or execution signals.",
+        "Historical research evidence only. Active training, prediction refresh and promotion are retired. Environment validation does not grant research or execution readiness.",
+        lifecycle="historical_read_only",
     ),
     "operator_outcome": SourcePolicy(
         "operator_outcome", "operator_trade_outcome", ("operator_input",),
         (),
-        "trade_system/operator_outcomes.py",
+        "none (legacy import permanently retired)",
         (),
-        "Only reviewed human outcomes can close the QLib feedback loop; untouched templates are not data.",
+        "Historical records only. Legacy outcome import is permanently retired; no current write authority.",
+        lifecycle="historical_read_only",
     ),
 }
 
@@ -158,7 +167,7 @@ PHASE_REQUIRED_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
         "quality": ("derive_market_context", "reconcile_independent_stock_flow",
                     "check_capital_flow_health", "check_data_readiness"),
         "lhb": ("collect_lhb_daily",),
-        "auction": ("collect_auction_market_daily",),
+        "auction_match": ("collect_auction_market_daily",),
         "index": ("collect_index_kline_daily",),
         "chips_margin": ("collect_xiaodefa_critical",),
     },
@@ -258,28 +267,29 @@ def policy_dicts() -> list[dict[str, Any]]:
 
 def render_policy_markdown() -> str:
     lines = [
-        "# Source Authority Matrix",
+        "# 数据源权威矩阵",
         "",
-        "This is the production selection contract. Fallback providers remain available for recovery and reconciliation, but a newer `fetched_at` alone does not promote them over the declared primary source.",
+        "由 `trade_system.source_authority.render_policy_markdown` 生成。描述当前开发合同，不证明生产部署或供应商授权。资格先于来源排序；更新的抓取时间不能提升不合格备用数据。",
+        "同一合格产品按 HiThink 官方 > xiaodefa TuShare 中继 > 其他选择；不同产品不可互换。AKShare 仅末级不稳定兜底。",
         "",
-        "| Dataset | Canonical relation | Primary | Fallback | Write owner | Compatibility only |",
-        "|---|---|---|---|---|---|",
+        "| 数据域 | 核心关系 | 主源 | 备用/核对源 | 写入责任 | 生命周期 | 说明 |",
+        "|---|---|---|---|---|---|---|",
     ]
     for item in SOURCE_POLICIES.values():
         lines.append(
             f"| `{item.dataset}` | `{item.canonical_relation}` | "
             f"{', '.join(item.primary)} | {', '.join(item.fallback)} | "
-            f"`{item.write_owner}` | {', '.join(item.compatibility_only) or '-'} |"
+            f"`{item.write_owner}` | {item.lifecycle} | {item.notes} |"
         )
     lines.extend([
         "",
-        "## Rules",
+        "## 规则与消费关系",
         "",
-        "1. Raw/provider rows stay source-separated.",
-        "2. Only the write owner promotes a row into a canonical core relation.",
-        "3. A fallback row must carry `is_fallback` or an equivalent provider marker.",
-        "4. Independent sources are used for certification/reconciliation, not summed together.",
-        "5. Compatibility scripts may be run for recovery, but must not be scheduled as a second production writer.",
+        "1. 原始来源分开保留，规范视图不复制第二份事实；来源、复权、单位和时间必须保留。",
+        "2. 主源缺失不授权恢复退役入口；历史兼容读取不授予当前写入权。",
+        "3. 单产品观察与独立确认分开；共用原始来源或中继不能算独立证据。",
+        "4. [产品消费合同](business_product_contract.md)记录具体消费端及未证实消费的保留理由。",
+        "5. [当前业务边界](current_business_contract.md)是入口导航；实际运行仍须独立取证。",
         "",
     ])
     return "\n".join(lines)

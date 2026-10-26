@@ -19,6 +19,7 @@ from trade_system.quality import table_columns, table_exists
 from trade_system.source_authority import provider_rank_sql
 from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
 from trade_system.units import normalization_sql
+from trade_system.market_contract import market_daily_status_sql
 
 logger = get_logger(__name__)
 
@@ -692,6 +693,18 @@ def _market_context_review(con: duckdb.DuckDBPyConnection, trade_date: str) -> d
         "breadth": [], "limit_summary": [], "auction": [],
         "limit_ladder": [], "lhb_summary": {},
     }
+    context['market_daily'] = {'market_daily_status': 'source_missing'}
+    for relation, day_column in (('v_market_daily', 'trade_date'), ('daily_summary', 'date')):
+        if table_exists(con, relation):
+            columns = set(table_columns(con, relation))
+            order = 'fetched_at DESC NULLS LAST' if 'fetched_at' in columns else day_column
+            projection = '* EXCLUDE (market_daily_status)' if 'market_daily_status' in columns else '*'
+            qualified = _rows(con, relation,
+                f'SELECT {projection}, {market_daily_status_sql(columns)} AS market_daily_status '
+                f'FROM {relation} WHERE CAST({day_column} AS VARCHAR)=? ORDER BY {order} LIMIT 1', [trade_date])
+            if qualified:
+                context['market_daily'] = qualified[0]
+                break
     if table_exists(con, "market_rise_fall"):
         context["breadth"] = _rows(
             con, "market_rise_fall",

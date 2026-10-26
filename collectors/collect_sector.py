@@ -1,38 +1,94 @@
 """Sector data collectors (19 endpoints)."""
 import json
 from datetime import datetime
+from contextlib import contextmanager
+from trade_system.sector_contract import envelope, members, number, strength
 from trade_system.data_store import KPLClient, DuckDBStore, logger
 
 
-def collect_sector_plates(client: KPLClient, store: DuckDBStore, date: str) -> list:
-    """Fetch all sector plates and return list of (code, name) for downstream use."""
-    data = client.get("/sector/plates")
-    if not data:
+@contextmanager
+def _publication(store):
+    """Nested collector scopes share only this explicit sector publication."""
+    if getattr(store, '_sector_publication', False):
+        yield
+    else:
+        with store.transaction():
+            store._sector_publication = True
+            try:
+                yield
+            finally:
+                store._sector_publication = False
+
+
+def _ranking_rows(data, date):
+    envelope(data, date)
+    if not isinstance(data, dict) or not isinstance(data.get('sectors'), list):
+        raise ValueError('sector ranking: sectors list required')
+    sectors = data['sectors']
+    identities = _validated_plate_rows({'plates': [
+        {'code': s.get('sector_code', s.get('code')), 'name': s.get('sector_name', s.get('name', ''))}
+        if isinstance(s, dict) else s for s in sectors]})
+    rows, stock_rows = [], []
+    for item, (code, name, _) in zip(sectors, identities):
+        if not isinstance(item, dict):
+            raise ValueError('sector ranking: object row required')
+        envelope(item, date, code)
+        rows.append((date, code, name, number(item.get('stock_count'), count=True)))
+        parsed = members({'stocks': item.get('stocks', [])}, date, code)
+        # Also validate explicit dates/identities on the nested member objects.
+        stock_rows.extend(row[:4] for row in parsed)
+    return rows, stock_rows
+
+
+def _validated_plate_rows(data):
+    """Parse once for both catalogue and ranking fallback, before any writes."""
+    if data is None:
         return []
-    plates = data.get("plates", data.get("data", []))
+    if not isinstance(data, dict) or not any(key in data for key in ("plates", "data")):
+        raise ValueError("sector plates: catalogue response required; original catalogue retained")
+    plates = data.get("plates", data.get("data"))
+    if not isinstance(plates, list):
+        raise ValueError("sector plates: list required; original catalogue retained")
     rows = []
-    result = []
+    seen = set()
     for p in plates:
         if isinstance(p, dict):
-            code = str(p.get("code", p.get("plate_code", "")))
+            code = p.get("code", p.get("plate_code"))
             name = p.get("name", p.get("plate_name", ""))
             ptype = p.get("type", p.get("sector_type", ""))
-            if code:
-                rows.append((code, name, str(ptype)))
-                result.append((code, name))
         elif isinstance(p, (list, tuple)) and len(p) >= 2:
-            code = str(p[0])
-            name = str(p[1])
-            ptype = str(p[2]) if len(p) > 2 else ""
-            rows.append((code, name, ptype))
-            result.append((code, name))
+            code, name = p[:2]
+            ptype = p[2] if len(p) > 2 else ""
+        else:
+            raise ValueError("sector plates: invalid row; original catalogue retained")
+        if (isinstance(code, bool) or not isinstance(code, (str, int))
+                or not str(code).strip() or not isinstance(name, str)
+                or isinstance(ptype, bool) or not isinstance(ptype, (str, int))):
+            raise ValueError("sector plates: invalid identity or metadata; original catalogue retained")
+        code = str(code).strip()
+        if code in seen:
+            raise ValueError("sector plates: duplicate identity; original catalogue retained")
+        seen.add(code)
+        rows.append((code, name, str(ptype)))
+    return rows
+
+
+def collect_sector_plates(client: KPLClient, store: DuckDBStore, date: str) -> list:
+    """Merge a validated catalogue; absence is not evidence of sector retirement.
+
+    This endpoint provides no qualified full-snapshot receipt. Even a nonempty
+    response can be partial, so it cannot authorize deletion of old identifiers.
+    Downstream collectors receive the retained catalogue, not just this batch.
+    """
+    rows = _validated_plate_rows(client.get("/sector/plates"))
     if rows:
-        # Use REPLACE for upsert on sector_plates
-        store.execute("DELETE FROM sector_plates")
-        store.insert_rows("sector_plates", rows, ["sector_code", "sector_name", "sector_type"],
-            replace_on=["sector_code"])
-        store.log_collect("sector_plates", "/sector/plates", len(rows), "ok")
-    return result
+        received = datetime.now()
+        with _publication(store):
+            store.insert_rows("sector_plates", [(*row, received) for row in rows],
+                ["sector_code", "sector_name", "sector_type", "fetched_at"],
+                replace_on=["sector_code"])
+        store.log_collect("sector_plates", "/sector/plates", len(rows), "merged_unverified_completeness")
+    return store.fetchall("SELECT sector_code,sector_name FROM sector_plates ORDER BY sector_code")
 
 
 def collect_sector_ranking(client: KPLClient, store: DuckDBStore, date: str) -> int:
@@ -44,55 +100,29 @@ def collect_sector_ranking(client: KPLClient, store: DuckDBStore, date: str) -> 
     data = client.get("/sector/ranking", {"date": date}, critical=True)
     if not data:
         return 0
-    sectors = data.get("sectors", [])
-
-    # Rate-limit fallback: if ranking is empty, try building from individual sector/strength calls
-    if not sectors:
-        logger.warning("  sector/ranking returned empty — attempting fallback via per-sector strength...")
+    rows, all_stock_rows = _ranking_rows(data, date)
+    if not data['sectors']:
         return _collect_sector_ranking_fallback(client, store, date)
-    rows = []
-    all_stock_rows = []
-    for s in sectors:
-        if not isinstance(s, dict):
-            continue
-        scode = str(s.get("sector_code", s.get("code", "")))
-        sname = s.get("sector_name", s.get("name", ""))
-        scount = s.get("stock_count", 0)
-        if not scode:
-            continue
-
-        # Store sector-level metadata
-        rows.append((date, scode, sname, scount))
-
-        # Also extract constituent stocks if available
-        stocks = s.get("stocks", [])
-        if isinstance(stocks, list):
-            for st in stocks:
-                if isinstance(st, dict):
-                    all_stock_rows.append((
-                        date, scode,
-                        str(st.get("股票代码", st.get("stock_code", ""))),
-                        st.get("股票名称", st.get("stock_name", "")),
-                    ))
 
     total = 0
-    if rows:
-        # DELETE+INSERT replaces old data for this date; the transaction keeps
-        # the pair all-or-nothing so a crash cannot drop the day's ranking.
-        with store.transaction():
-            store.execute("DELETE FROM sector_ranking WHERE date = ?", [date])
-            n = store.insert_rows("sector_ranking", rows,
-                ["date", "sector_code", "sector_name", "stock_count"])
-        store.log_collect("sector_ranking", "/sector/ranking", n, "ok")
-        total += n
+    received = datetime.now()
+    # No qualified completeness receipt: absent sectors/stocks are retained.
+    # Ranking and its inline stock projection are one publication transaction.
+    with _publication(store):
+        if rows:
+            n = store.insert_rows("sector_ranking", [(*row, received) for row in rows],
+                ["date", "sector_code", "sector_name", "stock_count", "fetched_at"], replace_on=['date','sector_code'])
+            store.log_collect("sector_ranking", "/sector/ranking", n, "merged_unverified_completeness")
+            total += n
 
-    if all_stock_rows:
-        with store.transaction():
-            store.execute("DELETE FROM sector_stocks WHERE date = ?", [date])
-            n2 = store.insert_rows("sector_stocks", all_stock_rows,
-                ["date", "sector_code", "stock_code", "stock_name"])
-        store.log_collect("sector_stocks", "/sector/ranking(stocks)", n2, "ok")
-        total += n2
+        if all_stock_rows:
+            # Inline membership does not refresh old quote fields. Clear only
+            # those fields on returned keys, while absent keys retain old clocks.
+            n2 = store.insert_rows("sector_stocks", [(*row, None, None, None, None, received) for row in all_stock_rows],
+                ["date", "sector_code", "stock_code", "stock_name", "change_pct", "turnover", "market_cap", "raw_json", "fetched_at"],
+                replace_on=['date','sector_code','stock_code'])
+            store.log_collect("sector_stocks", "/sector/ranking(stocks)", n2, "merged_unverified_completeness")
+            total += n2
 
     # Also log the summary if present
     summary = data.get("summary", {})
@@ -103,66 +133,35 @@ def collect_sector_ranking(client: KPLClient, store: DuckDBStore, date: str) -> 
 
 
 def collect_sector_strength(client: KPLClient, store: DuckDBStore, date: str, sector_codes: list) -> int:
-    """API returns {sector_code, date, strength, zhangting, fengban, dieting, up_count, down_count}."""
-    total = 0
+    rows = []
+    received = datetime.now()
     for code in sector_codes:
-        data = client.get("/sector/strength", {"code": code, "date": date})
-        if not data:
-            continue
-        if isinstance(data, dict):
-            row = (
-                data.get("date", date), code,
-                data.get("strength", data.get("强度", 0)),
-                data.get("zhangting", data.get("涨停", 0)),
-                data.get("fengban", data.get("封板率", 0)),
-                data.get("dieting", data.get("跌停", 0)),
-                data.get("up_count", data.get("上涨家数", 0)),
-                data.get("down_count", data.get("下跌家数", 0)),
-            )
-            n = store.insert_rows("sector_strength", [row],
-                ["date", "sector_code", "strength_value", "zhangting", "fengban_rate",
-                 "dieting", "up_count", "down_count"])
-            total += n
-    if total:
-        store.log_collect("sector_strength", "/sector/strength", total, "ok")
+        data = client.get('/sector/strength', {'code': code, 'date': date})
+        parsed = strength(data, date, code)
+        if parsed is not None:
+            rows.append((*parsed, json.dumps(data, ensure_ascii=False), received))
+    with _publication(store):
+        total = store.insert_rows('sector_strength', rows,
+            ['date','sector_code','strength_value','zhangting','fengban_rate',
+             'dieting','up_count','down_count','raw_json','fetched_at'], replace_on=['date','sector_code']) if rows else 0
+        if total:
+            store.log_collect('sector_strength', '/sector/strength', total, 'merged_unverified_completeness')
     return total
 
 
 def collect_sector_stocks(client: KPLClient, store: DuckDBStore, date: str, sector_codes: list) -> int:
-    total = 0
+    rows = []
+    received = datetime.now()
     for code in sector_codes:
-        data = client.get("/sector/stocks", {"code": code, "date": date})
-        if not data:
-            continue
-        stocks = data.get("stocks", data.get("data", []))
-        if isinstance(data, list):
-            stocks = data
-        rows = []
-        for s in stocks:
-            if isinstance(s, dict):
-                rows.append((
-                    date, code,
-                    str(s.get("stock_code", s.get("code", s.get("股票代码", "")))),
-                    s.get("stock_name", s.get("name", s.get("股票名称", ""))),
-                    s.get("change_pct", s.get("涨跌幅", 0)),
-                    s.get("turnover", s.get("成交额", 0)),
-                    s.get("market_cap", s.get("流通市值", 0)),
-                ))
-            elif isinstance(s, (list, tuple)) and len(s) >= 3:
-                rows.append((
-                    date, code,
-                    str(s[0]), str(s[1]),
-                    s[2] if len(s) > 2 else 0,
-                    s[3] if len(s) > 3 else 0,
-                    s[4] if len(s) > 4 else 0,
-                ))
-        if rows:
-            n = store.insert_rows("sector_stocks", rows,
-                ["date", "sector_code", "stock_code", "stock_name",
-                 "change_pct", "turnover", "market_cap"])
-            total += n
-    if total:
-        store.log_collect("sector_stocks", "/sector/stocks", total, "ok")
+        data = client.get('/sector/stocks', {'code': code, 'date': date})
+        rows.extend((*row, None, received) for row in members(data, date, code))
+    # Validate the whole multi-sector response before changing any member key.
+    with _publication(store):
+        total = store.insert_rows('sector_stocks', rows,
+            ['date','sector_code','stock_code','stock_name','change_pct','turnover',
+             'market_cap','raw_json','fetched_at'], replace_on=['date','sector_code','stock_code']) if rows else 0
+        if total:
+            store.log_collect('sector_stocks', '/sector/stocks', total, 'merged_unverified_completeness')
     return total
 
 
@@ -462,106 +461,90 @@ def _collect_sector_ranking_fallback(client, store, date):
         logger.warning("  Fallback failed: /sector/plates also returned empty")
         return 0
 
-    plates = plates_data.get("plates", [])
-    codes = [(str(p.get("code", "")), p.get("name", "")) for p in plates if isinstance(p, dict)]
-    codes = [(c, n) for c, n in codes if c]
+    plate_rows = _validated_plate_rows(plates_data)
+    codes = dict(store.fetchall('SELECT sector_code,sector_name FROM sector_plates ORDER BY sector_code'))
+    codes.update((code, name) for code, name, _ in plate_rows)
 
     ranking_rows = []
     stock_rows = []
     strength_rows = []
 
-    for code, name in codes:
-        # Get strength for ranking data
-        strength_data = client.get("/sector/strength", {"code": code, "date": date})
-        if strength_data and isinstance(strength_data, dict):
-            # Add to ranking (simulate what /sector/ranking would give)
-            zhangting = strength_data.get("zhangting", 0)
-            if name == "" and strength_data.get("sector_code"):
-                name = f"Sector_{code}"
-
-            ranking_rows.append((date, code, name or f"Sector_{code}", zhangting or 0))
-
-            # Store full strength
-            strength_rows.append((
-                strength_data.get("date", date), code,
-                strength_data.get("strength", 0),
-                strength_data.get("zhangting", 0),
-                strength_data.get("fengban", 0),
-                strength_data.get("dieting", 0),
-                strength_data.get("up_count", 0),
-                strength_data.get("down_count", 0),
-            ))
-
-        # Get constituent stocks
-        stocks_data = client.get("/sector/stocks", {"code": code, "date": date})
-        if stocks_data:
-            stock_list = stocks_data if isinstance(stocks_data, list) else stocks_data.get("stocks", stocks_data.get("data", []))
-            if isinstance(stock_list, list):
-                for s in stock_list:
-                    if isinstance(s, dict):
-                        stock_rows.append((
-                            date, code,
-                            str(s.get("stock_code", s.get("code", s.get("股票代码", "")))),
-                            s.get("stock_name", s.get("name", s.get("股票名称", ""))),
-                        ))
-                    elif isinstance(s, (list, tuple)) and len(s) >= 2:
-                        stock_rows.append((date, code, str(s[0]), str(s[1])))
+    received = datetime.now()
+    for code, name in codes.items():
+        strength_data = client.get('/sector/strength', {'code': code, 'date': date})
+        parsed = strength(strength_data, date, code)
+        stocks_data = client.get('/sector/stocks', {'code': code, 'date': date})
+        parsed_members = members(stocks_data, date, code)
+        if parsed is not None:
+            # Neither limit-up counts nor a possibly partial member list prove
+            # the provider's stock_count. Keep it unknown unless explicitly supplied.
+            ranking_rows.append((date, code, name or f'Sector_{code}', number(strength_data.get('stock_count'), count=True)))
+            strength_rows.append((*parsed, json.dumps(strength_data, ensure_ascii=False), received))
+        stock_rows.extend(row[:4] for row in parsed_members)
 
     total = 0
-    if ranking_rows:
-        store.execute("DELETE FROM sector_ranking WHERE date = ?", [date])
-        n = store.insert_rows("sector_ranking", ranking_rows,
-            ["date", "sector_code", "sector_name", "stock_count"])
-        store.log_collect("sector_ranking", "/sector/ranking(fallback)", n, "ok")
-        total += n
-        logger.info(f"  Fallback: {n} sector ranking rows from per-sector strength")
+    received = datetime.now()
+    with _publication(store):
+        if ranking_rows:
+            n = store.insert_rows("sector_ranking", [(*row, received) for row in ranking_rows],
+                ["date", "sector_code", "sector_name", "stock_count", "fetched_at"], replace_on=['date','sector_code'])
+            store.log_collect("sector_ranking", "/sector/ranking(fallback)", n, "merged_unverified_completeness")
+            total += n
+            logger.info(f"  Fallback: {n} sector ranking rows from per-sector strength")
 
-    if strength_rows:
-        # Don't delete existing — may have come from other sources
-        n2 = store.insert_rows("sector_strength", strength_rows,
-            ["date", "sector_code", "strength_value", "zhangting", "fengban_rate",
-             "dieting", "up_count", "down_count"])
-        store.log_collect("sector_strength", "/sector/strength(fallback)", n2, "ok")
-        total += n2
+        if strength_rows:
+            # Don't delete existing — may have come from other sources
+            n2 = store.insert_rows("sector_strength", strength_rows,
+                ["date", "sector_code", "strength_value", "zhangting", "fengban_rate",
+                 "dieting", "up_count", "down_count", "raw_json", "fetched_at"], replace_on=['date','sector_code'])
+            store.log_collect("sector_strength", "/sector/strength(fallback)", n2, "ok")
+            total += n2
 
-    if stock_rows:
-        store.execute("DELETE FROM sector_stocks WHERE date = ?", [date])
-        n3 = store.insert_rows("sector_stocks", stock_rows,
-            ["date", "sector_code", "stock_code", "stock_name"])
-        store.log_collect("sector_stocks", "/sector/stocks(fallback)", n3, "ok")
-        total += n3
-        logger.info(f"  Fallback: {n3} stock-code rows from per-sector stocks")
+        if stock_rows:
+            n3 = store.insert_rows("sector_stocks", [(*row, None, None, None, None, received) for row in stock_rows],
+                ["date", "sector_code", "stock_code", "stock_name", "change_pct", "turnover", "market_cap", "raw_json", "fetched_at"],
+                replace_on=['date','sector_code','stock_code'])
+            store.log_collect("sector_stocks", "/sector/stocks(fallback)", n3, "merged_unverified_completeness")
+            total += n3
+            logger.info(f"  Fallback: {n3} stock-code rows from per-sector stocks")
 
     return total
 
 
 def collect_all_sector(client: KPLClient, store: DuckDBStore, date: str) -> dict:
     results = {}
-    results["sector_plates"] = 0
-    # sector_ranking now also populates sector_stocks (either directly or via fallback)
-    results["sector_ranking"] = collect_sector_ranking(client, store, date)
+    class PreparedClient:
+        def __init__(self):
+            self.cache = {}
+        def get(self, endpoint, params=None, **kwargs):
+            key = (endpoint, tuple(sorted((params or {}).items())))
+            if key not in self.cache:
+                self.cache[key] = client.get(endpoint, params, **kwargs) if params is not None else client.get(endpoint, **kwargs)
+            return self.cache[key]
+    prepared = PreparedClient()
+    plates_data = prepared.get('/sector/plates')
+    incoming = _validated_plate_rows(plates_data)
+    codes = dict(store.fetchall('SELECT sector_code,sector_name FROM sector_plates ORDER BY sector_code'))
+    codes.update((code, name) for code, name, _ in incoming)
+    ranking = prepared.get('/sector/ranking', {'date': date}, critical=True)
+    if ranking is not None:
+        ranked, _ = _ranking_rows(ranking, date)
+        codes.update((row[1],row[2]) for row in ranked)
+    if not codes:
+        codes.update(store.fetchall('SELECT DISTINCT sector_code,sector_name FROM sector_ranking WHERE date=?', [date]))
+    sector_codes = sorted(codes)
+    for code in sector_codes:
+        strength(prepared.get('/sector/strength', {'code':code,'date':date}), date, code)
+        members(prepared.get('/sector/stocks', {'code':code,'date':date}), date, code)
+    # These reads are now cached; no network is held inside this transaction.
+    with _publication(store):
+        plates = collect_sector_plates(prepared, store, date)
+        results['sector_plates'] = len(plates)
+        results['sector_ranking'] = collect_sector_ranking(prepared, store, date)
+        results['sector_stocks_full'] = collect_sector_stocks(prepared, store, date, sector_codes)
+        results['sector_strength'] = collect_sector_strength(prepared, store, date, sector_codes)
+    results['sector_all_stocks'] = collect_sector_all_stocks(client, store, date, sector_codes)
 
-    # Get all plate codes from the API directly (sector_plates)
-    plates = collect_sector_plates(client, store, date)
-    results["sector_plates"] = len(plates)
-    sector_codes = [p[0] for p in plates]
-
-    # Fallback: if sector_plates returned empty, extract codes from sector_ranking's saved data
-    if not sector_codes:
-        try:
-            sector_codes = [row[0] for row in store.fetchall(
-                "SELECT DISTINCT sector_code FROM sector_ranking WHERE date = ?", [date]
-            )]
-        except Exception:
-            pass
-
-    logger.info(f"  Found {len(sector_codes)} sectors, collecting per-sector data...")
-
-    # Also collect full per-sector stocks (more comprehensive than ranking-inline stocks)
-    results["sector_stocks_full"] = collect_sector_stocks(client, store, date, sector_codes)
-    results["sector_all_stocks"] = collect_sector_all_stocks(client, store, date, sector_codes)
-
-    results["sector_strength"] = collect_sector_strength(client, store, date, sector_codes)
     results["sector_capital"] = collect_sector_capital(client, store, date, sector_codes)
     results["sector_boom_reason"] = collect_sector_boom_reason(client, store, date, sector_codes)
     results["sector_son_plates"] = collect_sector_son_plates(client, store, date, sector_codes)

@@ -86,6 +86,13 @@ def publish(root, run_id, artifacts, *, generation):
                         'themes': len(data['market'].get('themes', [])),
                         'artifacts': len(artifacts),
                         'visibility': 'only_when_referenced_by_verified_current_or_history_pointer'}
+                    # The immutable desk hash binds the same inline measurement.
+                    # Missing historical instrumentation remains missing.
+                    if 'product_consumption' in data['market']:
+                        from trade_system.business_contract import market_consumption
+                        if data['market']['product_consumption'] != market_consumption(data['market']):
+                            raise ValueError('publication consumption differs from projected values')
+                        manifest['product_consumption'] = data['market']['product_consumption']
                     # The new atomic pointer attests these previously current bundles.
                     # A staged directory is never admitted by scanning runs/.
                     manifest['published_days'] = {day: history[day] for day in sorted(history)[-64:]}

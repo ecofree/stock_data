@@ -10,6 +10,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -847,8 +848,11 @@ class RunManifest:
         trade_date: str,
         phase: str | None = None,
     ) -> None:
+        if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', run_id):
+            raise ValueError('run_id must be a single bounded attempt identifier')
         self.run_dir = Path(reports_dir).resolve() / "runs" / run_id
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # A retry is a new attempt, including after a partial directory creation.
+        self.run_dir.mkdir(parents=True, exist_ok=False)
         self.path = self.run_dir / "run.json"
         self.data = {
             "run_id": run_id,
@@ -906,6 +910,4 @@ class RunManifest:
         self.write()
 
     def write(self) -> None:
-        temp = self.path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(self.path)
+        _runtime_json(self.path, self.data)

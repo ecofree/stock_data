@@ -20,7 +20,7 @@ def _ensure_business_indexes(db: duckdb.DuckDBPyConnection) -> None:
     indexes = (
         ("uq_multi_source_stock_flow", "multi_source_stock_flow", "source_date, stock_code, provider"),
         ("uq_multi_source_sector_flow", "multi_source_sector_flow", "source_date, sector_code, provider"),
-        ("uq_multi_source_kline", "multi_source_kline", "source_date, asset_type, asset_code, provider"),
+        ("uq_multi_source_kline_product", "multi_source_kline", "source_date, asset_type, asset_code, provider, adjustment"),
         ("uq_tushare_daily", "tushare_daily", "date, ts_code"),
         ("uq_tushare_daily_basic", "tushare_daily_basic", "date, ts_code"),
         ("uq_tushare_moneyflow", "tushare_moneyflow", "date, ts_code"),
@@ -679,6 +679,7 @@ def init_schema(db: duckdb.DuckDBPyConnection):
         )
     """)
     db.execute("ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS source_kind VARCHAR")
+    db.execute("ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS count_provenance_json VARCHAR")
     
     db.execute("""
         CREATE TABLE IF NOT EXISTS daily_new_high (

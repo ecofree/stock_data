@@ -36,7 +36,10 @@ $LogDir = Join-Path $ReportsDirectory "scheduled-logs"
 $IntegratedRunner = Join-Path $Root "scripts\run_integrated_daily.py"
 $NotifyHelper = Join-Path $Root "scripts\pipeline_notify.py"
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
-$backupRunId='close_'+$stamp+'_'+[Guid]::NewGuid().ToString('N')
+$collectionRunId='close_'+$stamp+'_'+[Guid]::NewGuid().ToString('N')
+# A linked but distinct receipt: backup success does not certify collection.
+$backupRunId=$collectionRunId+'_backup'
+if (-not $TradeDate) {$TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')}
 $Log = Join-Path $LogDir ("scheduled_close_{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 $processState=Join-Path $LogDir ('close_'+$backupRunId+'_process.json')
 $backupStatus='not_attempted'; $backupReceipt=$null; $compressed=''; $code=1
@@ -58,7 +61,7 @@ function Write-CloseLog {
 function Invoke-CloseNotification([string]$Event,[string]$Message='') {
     if (Test-Path -LiteralPath $NotifyHelper -PathType Leaf) {
         try {
-            $notice=Invoke-StockDataProcess -Executable $Python -Arguments @($NotifyHelper,'--event',$Event,'--message',$Message) -WorkingDirectory $Root -TimeoutSeconds 15 -ProgressPath $processState
+            $notice=Invoke-StockDataProcess -Executable $Python -Arguments @($NotifyHelper,'--event',$Event,'--message',$Message,'--run-id',$collectionRunId,'--trade-date',$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 15 -ProgressPath $processState
             ($notice.Stdout+$notice.Stderr) | Write-CloseLog
             if ($notice.ExitCode -ne 0) {throw 'Notification process did not complete within its cooperative budget'}
         } catch {"NOTIFICATION_DEFERRED event=$Event error=$($_.Exception.Message)" | Write-CloseLog}
@@ -66,7 +69,7 @@ function Invoke-CloseNotification([string]$Event,[string]$Message='') {
 }
 # The startup failure path must have durable evidence before DB/lock/runtime checks.
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-"DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath" | Write-CloseLog
+"DAILY_RUN_START time=$(Get-Date -Format o) phase=$Phase db=$DbPath run_id=$collectionRunId trade_date=$TradeDate backup_run_id=$backupRunId" | Write-CloseLog
 try {
     if ($EnvironmentFile) {
         if (-not [IO.Path]::IsPathRooted($EnvironmentFile) -or -not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {throw 'Explicit existing absolute provider environment file required'}
@@ -79,11 +82,10 @@ try {
     $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
     . (Join-Path $PSScriptRoot 'native_process.ps1')
     if ($RuntimeRoot) { Set-StockDataRuntimeRoot $RuntimeRoot }
-    if (-not $TradeDate) {$TradeDate=[TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow,'China Standard Time').ToString('yyyy-MM-dd')}
     # Contract verification is read-only. Backup and collection use its same
     # original close deadline; preflight/copy may never renew the phase budget.
     $valuationArgs=if ($ValuationWorkspace) {@('--valuation-workspace',$ValuationWorkspace)} else {@()}
-    $preflight=Invoke-StockDataProcess -Executable $Python -Arguments (@($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') + $valuationArgs) -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
+    $preflight=Invoke-StockDataProcess -Executable $Python -Arguments (@($IntegratedRunner,'--db',$DbPath,'--reports-dir',$ReportDir,'--phase','close','--trade-date',$TradeDate,'--run-id',$collectionRunId,'--collector-contract',$CollectorContract,'--collector-contract-sha256',$CollectorContractSha256,'--dry-run') + $valuationArgs) -WorkingDirectory $Root -TimeoutSeconds 60 -ProgressPath $processState
     if ($preflight.ExitCode -ne 0) {throw ('Collection contract rejected before backup: '+$preflight.Stderr)}
     $calendarCode="import json,sys; from trade_system.trading_calendar import trading_session_status; s=trading_session_status(sys.argv[1],sys.argv[2]); print(json.dumps({'state':s.state,'reason':s.reason}))"
     $calendarResult=Invoke-StockDataProcess -Executable $Python -Arguments @('-B','-c',$calendarCode,$DbPath,$TradeDate) -WorkingDirectory $Root -TimeoutSeconds 30 -ProgressPath $processState
@@ -126,7 +128,7 @@ try {
     }
     $args = @($IntegratedRunner,"--db",$DbPath,"--reports-dir",$ReportDir,
         "--collector-contract",$CollectorContract,"--collector-contract-sha256",$CollectorContractSha256,
-        "--collection-profile",$CollectionProfile,"--phase",$Phase,"--trade-date",$TradeDate)
+        "--collection-profile",$CollectionProfile,"--phase",$Phase,"--trade-date",$TradeDate,"--run-id",$collectionRunId)
     $args += $valuationArgs
     if ($SkipCollection) {$args+='--skip-collect'}
     Push-Location $Root

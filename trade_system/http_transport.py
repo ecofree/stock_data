@@ -160,10 +160,17 @@ def request_receipt(request):
     import re
     try:context=json.loads(os.environ.get('STOCKDATA_REQUEST_CONTEXT','{}'))
     except ValueError:context={}
-    allowed=('demand_id','consumer','refresh_reason','phase','session','revision_of','coverage_before',
+    allowed=('demand_id','consumer','data_product_ids','business_contract_sha256','declared_consumers',
+             'refresh_reason','phase','session','revision_of','coverage_before',
              'product_id','semantic_version','scope')
     value['attribution']={key:item for key,item in context.items() if key in allowed
         and isinstance(item,str) and re.fullmatch(r'[A-Za-z0-9_.:/ -]{1,160}',item)} if isinstance(context,dict) else {}
+    if isinstance(context, dict):
+        for key in ('data_product_ids', 'declared_consumers'):
+            items = context.get(key)
+            if (isinstance(items, list) and len(items) <= 32 and all(isinstance(v, str)
+                    and re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', v) for v in items)):
+                value['attribution'][key] = items
     logger=get_logger('http_transport')
     logger.info('request_receipt %s',json.dumps(dict(value,event='started'),sort_keys=True))
     try:yield value

@@ -561,7 +561,11 @@ function Start-ScheduledTask {
     closed=_ps(scripts/'run_stock_data_daily.ps1',*args)
     assert closed.returncode==0,closed.stdout+closed.stderr
     assert 'BACKUP_COMPLETE' in closed.stdout and 'DAILY_RUN_COMPLETE' in closed.stdout
-    original=(tmp_path/'reports/runs/fixture_close/run.json').read_bytes()
+    close_receipts=list((tmp_path/'reports/runs').glob('close_*/run.json'))
+    assert len(close_receipts)==1
+    close_receipt=close_receipts[0]
+    original=close_receipt.read_bytes()
+    assert json.loads(original)['run_id']==close_receipt.parent.name
     supplement=_ps(scripts/'run_phase_once.ps1',*args,'-Phase','supplemental','-PublicationTask','StockData-ResearchDaily')
     assert supplement.returncode==0,supplement.stdout+supplement.stderr
     assert 'PUBLICATION_REQUESTED' in supplement.stdout and 'DAILY_WORKSPACE_COMPLETE' in supplement.stdout
@@ -569,7 +573,7 @@ function Start-ScheduledTask {
     assert json.loads(supplemental_receipt)['legacy_evidence']=={'source_fingerprints':{'':'unknown'},'label':'合成回执'}
     assert 'receipt_sha256='+hashlib.sha256(supplemental_receipt).hexdigest() in supplement.stdout
     assert (tmp_path/'requests').read_text().splitlines()==['synthetic-request']
-    assert (tmp_path/'reports/runs/fixture_close/run.json').read_bytes()==original
+    assert close_receipt.read_bytes()==original
     with duckdb.connect(str(db),read_only=True) as c:
         assert c.execute('SELECT phase FROM fixture_commits ORDER BY rowid').fetchall()==[('close',),('supplemental',)]
     manifest,files=read_current(workspace/'publication')

@@ -27,6 +27,11 @@ def test_candidate_audit_uses_qualified_prior_membership_and_fails_on_missing_sn
     with duckdb.connect(str(db)) as con:
         con.execute("DROP TABLE v_default_concept_stock_history")
     assert audit(str(db), "2026-09-16", str(tmp_path / "missing.md"))["status"] == "fail"
+    for name in ("available", "stale", "missing"):
+        report = (tmp_path / f"{name}.md").read_text(encoding="utf-8")
+        assert "旧人工计划导入已退役" in report
+        assert "真实成交接入待独立账本方案验收" in report
+        assert "填写模板后导入" not in report
 
 
 def test_phase_auto_resolves_market_windows():

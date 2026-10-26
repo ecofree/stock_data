@@ -18,7 +18,6 @@ def collect_stock_company_info(client: KPLClient, store: DuckDBStore, date: str,
             json.dumps(data, ensure_ascii=False),
         )
         try:
-            store.execute("DELETE FROM stock_company_info WHERE stock_code = ?", [code])
             n = store.insert_rows("stock_company_info", [row],
                 ["stock_code", "company_name", "industry", "market_cap", "description", "raw_json"],
                 replace_on=["stock_code"])
