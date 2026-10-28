@@ -4,13 +4,71 @@ Historical rows are evaluated as received now, not certified point-in-time data.
 No raw fallback, source rewriting, portfolio advice or model ranking is allowed.
 """
 from datetime import date, datetime
+from collections import Counter
 from pathlib import Path
 import math
 
 import duckdb
 from trade_system.ths_quality import qualified_membership_snapshot, THS_MEMBERSHIP_MAX_AGE_DAYS
+from trade_system.source_authority import policy, provider_rank, provider_rank_sql
+from trade_system.units import ADJUSTMENT_NONE, ADJUSTMENT_QFQ, ADJUSTMENT_HFQ, UNIT_FACTORS
 
 from .domain import identity
+
+
+def price_observation_reason_sql():
+    """One read-side contract for comparable prices and observed breadth.
+
+    Canonical values retain their declared product labels. Known legacy unit
+    labels are admitted without converting normalized values a second time.
+    This does not certify a full exchange universe or point-in-time arrival.
+    """
+    def values(items):
+        return ','.join("'" + item.replace("'", "''") + "'" for item in sorted(items))
+    def known(column, items):
+        return f"lower(trim(coalesce({column},''))) IN ({values(items)})"
+    return ("CASE "
+        f"WHEN {provider_rank_sql('kline')} >= {len(policy('kline').provider_order)} THEN 'unknown_provider' "
+        f"WHEN NOT ({known('adjustment', (ADJUSTMENT_NONE, ADJUSTMENT_QFQ, ADJUSTMENT_HFQ))}) THEN 'unknown_adjustment' "
+        f"WHEN NOT ({known('volume_unit', UNIT_FACTORS['volume'])}) THEN 'unknown_volume_unit' "
+        f"WHEN NOT ({known('amount_unit', UNIT_FACTORS['amount'])}) THEN 'unknown_amount_unit' "
+        "WHEN fetched_at IS NULL OR TRY_CAST(trade_date AS TIMESTAMP) IS NULL "
+        "OR fetched_at < TRY_CAST(trade_date AS TIMESTAMP) THEN 'invalid_source_clock' "
+        "WHEN NOT coalesce(isfinite(close) AND close>0 AND isfinite(change_pct),false) THEN 'invalid_price' "
+        "ELSE NULL END")
+
+
+def price_qualification(rows):
+    """Count retained rows, not all-market or calendar-certified coverage."""
+    reasons=Counter(r['price_reason'] for r in rows if r['price_reason'])
+    total=len(rows)
+    return {'observed_rows':total,'qualified_rows':total-sum(reasons.values()),
+        'excluded_rows':sum(reasons.values()),'excluded_reasons':dict(sorted(reasons.items())),
+        'scope':'retained_price_rows_not_exchange_or_calendar_certification'}
+
+
+def price_snapshot_qualified(stock):
+    """Require explicit snapshot qualification and the same declared vocabulary.
+
+    Old evidence without these fields stays unqualified; this read-side check
+    cannot reconstruct its missing source clocks or upgrade historical proof.
+    """
+    if not isinstance(stock,dict) or stock.get('price_status')!='available':return False
+    if 'price_reason' not in stock or stock['price_reason'] is not None:return False
+    contract=stock.get('price_contract')
+    if not isinstance(contract,(list,tuple)) or len(contract)!=4:return False
+    if not all(isinstance(value,str) for value in contract):return False
+    provider,adjustment,volume,amount=(value.strip().lower() for value in contract)
+    if provider_rank('kline',provider)>=len(policy('kline').provider_order):return False
+    if adjustment not in {ADJUSTMENT_NONE,ADJUSTMENT_QFQ,ADJUSTMENT_HFQ}:return False
+    if volume not in UNIT_FACTORS['volume'] or amount not in UNIT_FACTORS['amount']:return False
+    values=[stock.get(key) for key in ('close','change_pct')]
+    if any(isinstance(value,bool) or not isinstance(value,(int,float)) for value in values):return False
+    try:
+        if not all(math.isfinite(value) for value in values):return False
+    except OverflowError:
+        return False
+    return values[0]>0
 
 
 def latest_snapshot(source, as_of, research_codes=(), *, research_workspace=None):
@@ -48,7 +106,6 @@ def limit_facts(con, day, clock):
         valid[code]={'stock_code':code,'stock_name':name,'board_level':int(board),
                      'source':source,'fetched_at':received.isoformat()}
     for code in conflicts:valid.pop(code,None)
-    from collections import Counter
     counts=Counter(r['board_level'] for r in valid.values())
     complete_empty=False
     if not rows and 'history_fetch_checkpoint' in tables:
@@ -80,7 +137,9 @@ def theme_facts(con,day,current,research_codes,limits):
     boards={r['stock_code']:r['board_level'] for r in limits['rows']}
     snap, membership_age=qualified_membership_snapshot(con,day)
     themes=[];stocks={c:{'stock_code':c,'stock_name':'','research_covered':c in research_codes,
-        'change_pct':r['pct'],'close':r['close'],'price_contract':r['contract']} for c,r in current.items()}
+        'change_pct':r['pct'],'close':r['close'],'price_contract':r['contract'],
+        'price_status':'unqualified' if r['price_reason'] else 'available',
+        'price_reason':r['price_reason']} for c,r in current.items()}
     excluded=[];membership_status='stale' if snap is not None else 'missing';catalog=[]
     if snap is not None and membership_age<=THS_MEMBERSHIP_MAX_AGE_DAYS:
         catalog=con.execute('SELECT concept_code,concept_name,stock_count FROM v_default_concept_daily WHERE trade_date=? ORDER BY concept_code LIMIT 10001',[snap]).fetchall()
@@ -94,7 +153,9 @@ def theme_facts(con,day,current,research_codes,limits):
             group.append(code)
             stocks[code]={'stock_code':code,'stock_name':name,'research_covered':code in research_codes,
                 'change_pct':current.get(code,{}).get('pct'),'close':current.get(code,{}).get('close'),
-                'price_contract':current.get(code,{}).get('contract')}
+                'price_contract':current.get(code,{}).get('contract'),
+                'price_status':('unqualified' if current[code]['price_reason'] else 'available') if code in current else 'source_missing',
+                'price_reason':current[code]['price_reason'] if code in current else 'source_missing'}
         seen=set()
         for code,name,count in catalog:
             if code in seen:raise ValueError('duplicate theme identity')
@@ -168,32 +229,45 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
     week_start,week_end=period_bounds(day,'week')
     quarter_start,_=period_bounds(day,'quarter')
     price_start=min(week_start,prior or day)
-    prices=con.execute("""SELECT trade_date,stock_code,change_pct,provider,adjustment,volume_unit,amount_unit,close
-        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? AND close>0
+    price_reason=price_observation_reason_sql()
+    prices=con.execute(f"""SELECT trade_date,stock_code,change_pct,provider,adjustment,volume_unit,amount_unit,close,{price_reason}
+        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=?
         ORDER BY trade_date,stock_code LIMIT 80001""",[price_start,day,clock]).fetchall()
     if len(prices)>80000:raise ValueError('market price budget exceeded')
     keyed={}
-    for d,code,pct,provider,adjustment,vol,amount,close in prices:
+    for d,code,pct,provider,adjustment,vol,amount,close,reason in prices:
         d=str(d)[:10];code=str(code)
         if (d,code) in keyed:raise ValueError('duplicate canonical market identity')
-        keyed[d,code]={'pct':pct,'close':close,'contract':[provider,adjustment,vol,amount]}
-    current={c:r for (d,c),r in keyed.items() if d==day and r['pct'] is not None and math.isfinite(r['pct'])}
+        keyed[d,code]={'pct':pct,'close':close,'contract':[provider,adjustment,vol,amount],'price_reason':reason}
+    current_rows={c:r for (d,c),r in keyed.items() if d==day}
+    current={c:r for c,r in current_rows.items() if r['pct'] is not None and math.isfinite(r['pct'])
+             and r['close'] is not None and math.isfinite(r['close']) and r['close']>0}
     if not current:raise ValueError('no current canonical market prices; keep last publication')
-    common=[c for c,r in current.items() if (prior,c) in keyed and keyed[prior,c]['pct'] is not None
-            and math.isfinite(keyed[prior,c]['pct']) and r['contract']==keyed[prior,c]['contract']
-            and all(r['contract'])]
+    common=[];comparison_exclusions=[]
+    for code,row in current_rows.items():
+        previous=keyed.get((prior,code))
+        reason=('current_'+row['price_reason'] if row['price_reason'] else
+                'previous_price_missing' if previous is None else
+                'previous_'+previous['price_reason'] if previous['price_reason'] else
+                'price_contract_changed' if row['contract']!=previous['contract'] else None)
+        if reason:comparison_exclusions.append({'stock_code':code,'reason':reason})
+        else:common.append(code)
     def breadth(items):
         values=list(items)
         return {'rise':sum(v>0 for v in values),'fall':sum(v<0 for v in values),'flat':sum(v==0 for v in values),'samples':len(values)}
+    comparison_reasons=Counter(row['reason'] for row in comparison_exclusions)
     matched={'status':'matched' if common else 'unavailable','previous_date':prior,'samples':len(common),
         'scope':'same_stock_provider_adjustment_units_retrospective_not_PIT',
         'current':breadth(current[c]['pct'] for c in common),
-        'previous':breadth(keyed[prior,c]['pct'] for c in common)}
+        'previous':breadth(keyed[prior,c]['pct'] for c in common),
+        'observed_rows':len(current_rows),'excluded_rows':len(comparison_exclusions),
+        'excluded_reasons':dict(sorted(comparison_reasons.items()))}
     theme=theme_facts(con,day,current,research_codes,limits)
     themes=theme['themes']
     result={'schema':2,'scope':'read_only_market_review_not_execution','trade_date':day,'as_of':as_of,
-        'breadth':breadth(r['pct'] for r in current.values()),'regime':'未评级（价格广度不替代情绪模型）',
-        'breadth_scope':'available_canonical_price_rows_not_exchange_total','matched_previous':matched,
+        'breadth':breadth(r['pct'] for r in current.values() if not r['price_reason']),'regime':'未评级（价格广度不替代情绪模型）',
+        'breadth_scope':'qualified_price_observations_not_exchange_total','matched_previous':matched,
+        'price_qualification':price_qualification(list(current_rows.values())),
         'collection_diagnostics':collection_diagnostics(con,day,clock),
         **theme,'theme_scope':'all_quality_gated_declared_members_not_all_market_coverage',
         'membership_max_age_days':THS_MEMBERSHIP_MAX_AGE_DAYS,
@@ -228,26 +302,40 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
         calendar.setdefault(str(d)[:10],[]).append((exchange,opened))
     daily={}
     for (d,code),r in keyed.items():
-        if d<week_start or r['pct'] is None or not math.isfinite(r['pct']) or not all(r['contract']):continue
+        if d<week_start or r['price_reason']:continue
         counts=daily.setdefault(d,{'rise':0,'fall':0,'flat':0,'samples':0})
         counts['samples']+=1;counts['rise' if r['pct']>0 else 'fall' if r['pct']<0 else 'flat']+=1
     result['periods']={period:market_period_summary(day,period,daily,calendar) for period in ('day','week')}
     # Period breadth is a bounded SQL aggregation, not an expanded full-market
     # Python row history or a substitute for returns/account performance.
-    period_daily={}
-    for d,total,distinct,rise,fall,flat in con.execute("""SELECT trade_date,count(*),count(DISTINCT stock_code),
+    period_daily={};period_qualification={}
+    period_start=min(quarter_start,week_start)
+    for d,reason,total,distinct,rise,fall,flat in con.execute(f"""SELECT trade_date,{price_reason} AS price_reason,count(*),count(DISTINCT stock_code),
         count(*) FILTER (WHERE change_pct>0),count(*) FILTER (WHERE change_pct<0),count(*) FILTER (WHERE change_pct=0)
-        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? AND close>0
-        AND isfinite(change_pct) AND coalesce(provider,'')<>'' AND coalesce(adjustment,'')<>''
-        AND coalesce(volume_unit,'')<>'' AND coalesce(amount_unit,'')<>''
-        GROUP BY trade_date ORDER BY trade_date LIMIT 94""",[quarter_start,day,clock]).fetchall():
+        FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=?
+        GROUP BY trade_date,price_reason ORDER BY trade_date,price_reason LIMIT 752""",[period_start,day,clock]).fetchall():
         if total!=distinct:raise ValueError('duplicate canonical period identity')
-        period_daily[str(d)[:10]]={'samples':total,'rise':rise,'fall':fall,'flat':flat}
+        session=str(d)[:10]
+        period_qualification.setdefault(session,{})[reason]=total
+        if reason is None:period_daily[session]={'samples':total,'rise':rise,'fall':fall,'flat':flat}
+    # Grouping qualification reasons must not hide a duplicated canonical key
+    # split between a usable and an unusable product.
+    if con.execute('SELECT 1 FROM v_kline_daily WHERE trade_date BETWEEN ? AND ? AND fetched_at<=? '
+                   'GROUP BY trade_date,stock_code HAVING count(*)>1 LIMIT 1',[period_start,day,clock]).fetchone():
+        raise ValueError('duplicate canonical period identity')
     result['periods'].update({period:market_period_summary(day,period,period_daily,calendar)
         for period in ('month','quarter')})
+    for period in result['periods'].values():
+        totals=Counter()
+        for session,counts in period_qualification.items():
+            if period['start']<=session<=day:totals.update(counts)
+        period['price_qualification']={'observed_rows':sum(totals.values()),'qualified_rows':totals.get(None,0),
+            'excluded_rows':sum(n for reason,n in totals.items() if reason is not None),
+            'excluded_reasons':dict(sorted((reason,n) for reason,n in totals.items() if reason is not None)),
+            'scope':'retained_price_rows_not_exchange_or_calendar_certification'}
     weekly=[]
     for session in result['periods']['week']['expected_sessions']:
-        values={c:r for (d,c),r in keyed.items() if d==session and r['pct'] is not None and math.isfinite(r['pct'])}
+        values={c:r for (d,c),r in keyed.items() if d==session}
         pool=limits if session==day else limit_facts(con,session,clock)
         item=theme if session==day else theme_facts(con,session,values,research_codes,pool)
         flows={}
@@ -256,10 +344,13 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
             flows={r['sector_code']:r for r in qualified_concept_review(con,session,now=min(clock,datetime.fromisoformat(session+'T18:00:00')))['rows']}
         rows=[]
         for row in item['themes']:
-            members=row['member_codes'];valid=[values[c]['pct'] for c in members if c in values and all(values[c]['contract'])]
+            members=row['member_codes'];valid=[values[c]['pct'] for c in members if c in values and not values[c]['price_reason']]
+            excluded=Counter(values[c]['price_reason'] if c in values else 'source_missing' for c in members
+                             if c not in values or values[c]['price_reason'])
             rows.append({k:row[k] for k in ('concept_code','concept_name','member_count','limit_up_count','max_board')} |
                 {'member_version':identity([item['membership_date'],members]),'member_set_id':identity(sorted(members)),
-                 'priced_members':len(valid),
+                 'priced_members':len(valid),'excluded_price_members':sum(excluded.values()),
+                 'price_exclusion_reasons':dict(sorted(excluded.items())),
                  'mean_change_pct':sum(valid)/len(valid) if valid else None,
                  'main_flow_cny':flows.get(row['concept_code'],{}).get('main_net'),
                  'flow_status':'qualified' if row['concept_code'] in flows else 'source_missing',
@@ -288,12 +379,14 @@ def project(con, day, as_of, research_codes, *, research_workspace=None):
     result['previous_limit_queue']=limit_facts(con,prior,clock) if prior else {'status':'source_missing','rows':[],'ladder':[]}
     result['previous_limit_queue']['evaluation_scope']='retained_previous_session_pool_not_predeclared_selection'
     for row in result['previous_limit_queue']['rows']:
-        row['next_change_pct']=current.get(row['stock_code'],{}).get('pct')
+        price=current.get(row['stock_code'])
+        row['next_change_pct']=price['pct'] if price and not price['price_reason'] else None
+        row['next_price_reason']=price['price_reason'] if price else 'source_missing'
     tables={r[0] for r in con.execute('SHOW TABLES').fetchall()}
     if 'v_market_daily' in tables:
         total_columns={r[0] for r in con.execute('DESCRIBE v_market_daily').fetchall()}
         from trade_system.market_contract import market_daily_status_sql
-        status_expr=market_daily_status_sql(total_columns) if 'market_daily_status' in total_columns else "'unverified_legacy'"
+        status_expr=market_daily_status_sql(total_columns,as_of=clock) if 'market_daily_status' in total_columns else "'unverified_legacy'"
         rows=con.execute(f'SELECT limit_up_count,limit_down_count,consecutive_count,market_daily_source,fetched_at,{status_expr} FROM v_market_daily WHERE trade_date=? AND fetched_at<=?',[day,clock]).fetchall()
         result['market_totals']={'status':'source_conflict' if rows else 'source_missing'}
         if len(rows)==1:

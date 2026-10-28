@@ -234,6 +234,8 @@ def annotate(notes):
 
 def attention_followups(output, notes, market):
     """Compare original seen closes, not fills or strategy returns. No database writes."""
+    import math
+    from .market_workspace import price_snapshot_qualified
     results=[]
     for note in notes:
         if note.get('schema')!=2:continue
@@ -241,17 +243,26 @@ def attention_followups(output, notes, market):
         if identity(original)!=note['evidence_file_id']:raise ValueError('original attention evidence changed')
         base=original.get('stocks',{}).get(note['instrument'],{})
         current=(market or {}).get('stocks',{}).get(note['instrument'],{})
-        status='pending_next_session';change=None
+        status='pending_next_session';change=None;qualification_reasons={}
         if market and market['trade_date']>original['trade_date']:
             if not base.get('close') or not current.get('close'):status='source_missing'
-            elif base.get('price_contract')!=current.get('price_contract'):status='source_conflict'
             else:
-                status='observed_close_change_not_execution_return'
-                change=(current['close']/base['close']-1)*100
+                for side,stock in (('original',base),('current',current)):
+                    if not price_snapshot_qualified(stock):
+                        qualification_reasons[side]='price_qualification_unverified'
+                if qualification_reasons:status='price_unqualified'
+                elif base['price_contract']!=current['price_contract']:status='source_conflict'
+                else:
+                    change=(current['close']/base['close']-1)*100
+                    if math.isfinite(change):status='observed_close_change_not_execution_return'
+                    else:
+                        change=None;status='price_unqualified'
+                        qualification_reasons['comparison']='nonfinite_price_change'
         results.append({'note_id':note['note_id'],'instrument':note['instrument'],
             'original_date':original['trade_date'],'current_date':market['trade_date'] if market else None,
             'original_close':base.get('close'),'current_close':current.get('close'),
-            'status':status,'change_pct':change,'condition_result':'human_review_required',
+            'status':status,'change_pct':change,'price_qualification_reasons':qualification_reasons,
+            'condition_result':'human_review_required',
             'scope':'change_from_original_seen_close_not_entry_fill_or_portfolio_return'})
     return results
 

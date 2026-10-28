@@ -11,7 +11,7 @@ def con():
     c.execute('CREATE TABLE tushare_trade_cal(exchange VARCHAR,is_open INTEGER,cal_date DATE)')
     c.execute("INSERT INTO tushare_trade_cal VALUES ('SSE',1,'2026-09-10'),('SSE',1,'2026-09-11')")
     c.execute('CREATE TABLE v_kline_daily(trade_date VARCHAR,stock_code VARCHAR,change_pct DOUBLE,provider VARCHAR,adjustment VARCHAR,volume_unit VARCHAR,amount_unit VARCHAR,fetched_at TIMESTAMP,close DOUBLE)')
-    c.execute("INSERT INTO v_kline_daily VALUES ('2026-09-10','000001',-1,'native','raw','shares','yuan','2026-09-10 16:00',10),('2026-09-11','000001',2,'native','raw','shares','yuan','2026-09-11 16:00',10)")
+    c.execute("INSERT INTO v_kline_daily VALUES ('2026-09-10','000001',-1,'xiaodefa','none','shares','yuan','2026-09-10 16:00',10),('2026-09-11','000001',2,'xiaodefa','none','shares','yuan','2026-09-11 16:00',10)")
     c.execute('CREATE TABLE v_default_concept_daily(trade_date DATE,concept_code VARCHAR,concept_name VARCHAR,stock_count INTEGER)')
     c.execute("INSERT INTO v_default_concept_daily VALUES ('2026-09-11','T','题材',2)")
     c.execute('CREATE TABLE v_default_concept_stock_history(trade_date DATE,concept_code VARCHAR,stock_code VARCHAR,stock_name VARCHAR)')
@@ -34,6 +34,17 @@ def test_market_totals_keep_qualification_through_workspace(con,status):
         con.execute('ALTER TABLE v_market_daily ADD COLUMN rise_count INTEGER DEFAULT 0')
         con.execute('ALTER TABLE v_market_daily ADD COLUMN fall_count INTEGER DEFAULT 0')
         con.execute('UPDATE v_market_daily SET limit_up_count=0,consecutive_count=0')
+    if status == 'available':
+        import json
+        from datetime import datetime
+        from trade_system.market_contract import MARKET_COUNT_FIELDS, count_evidence
+        received = datetime(2026, 9, 11, 16)
+        proof = {name: count_evidence(value, source='kpl_daily', source_kind='real', source_date='2026-09-11',
+                                     fetched_at=received, received_at=received)
+                 for name, value in zip(MARKET_COUNT_FIELDS, (0, 2, 0, 0, 0))}
+        con.execute("ALTER TABLE v_market_daily ADD COLUMN source_kind VARCHAR DEFAULT 'real'")
+        con.execute('ALTER TABLE v_market_daily ADD COLUMN count_provenance_json VARCHAR')
+        con.execute('UPDATE v_market_daily SET count_provenance_json=?', [json.dumps(proof)])
     result=project(con)
     assert result['market_totals']['status']==('unverified_legacy' if status=='legacy' else status)
     if status=='available':

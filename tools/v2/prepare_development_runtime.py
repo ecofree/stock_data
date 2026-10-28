@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import zipfile
@@ -28,10 +29,19 @@ def digest(path):
 
 
 def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, output):
+    # Preserve lexical input paths until link checks finish; resolve() would
+    # hide an input junction. lstat works on both supported Python versions.
+    base_archive, wheelhouse, jsonpath_wheel, output = (
+        Path(p).absolute() for p in (base_archive, wheelhouse, jsonpath_wheel, output))
     target = ROOT / '.venv'
     for path in (target, output, base_archive, wheelhouse, jsonpath_wheel):
         for member in (path, *path.parents):
-            if member.is_symlink() or member.is_junction():
+            try:
+                info = member.lstat()
+            except FileNotFoundError:
+                continue  # New outputs are allowed; their parents are checked.
+            if stat.S_ISLNK(info.st_mode) or (getattr(info, 'st_file_attributes', 0)
+                    & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)):
                 raise ValueError('linked input/output rejected')
     if target.exists() or output.exists():
         raise ValueError('new development runtime and evidence paths required; inspect rather than overwrite')
@@ -103,5 +113,5 @@ if __name__ == '__main__':
     parser.add_argument('--jsonpath-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    prepare(args.base_archive.resolve(), args.base_sha256, args.wheelhouse.resolve(),
-            args.jsonpath_wheel.resolve(), args.jsonpath_sha256, args.output.resolve())
+    prepare(args.base_archive, args.base_sha256, args.wheelhouse,
+            args.jsonpath_wheel, args.jsonpath_sha256, args.output)

@@ -12,29 +12,33 @@ env:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m venv tmp/data-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install --require-hashes -r requirements-data.lock
+          & tmp/data-runtime/Scripts/python.exe -I -m pip install --require-hashes -r requirements-data.lock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip check
+          & tmp/data-runtime/Scripts/python.exe -I -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Installed package entry points (offline build)
         run: |
-          python -m pip install --require-hashes -r requirements-build.lock
+          & tmp/data-runtime/Scripts/python.exe -I -m pip install --require-hashes -r requirements-build.lock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip wheel --no-index --no-deps --no-build-isolation . --wheel-dir tmp/wheels
+          & tmp/data-runtime/Scripts/python.exe -I -m pip wheel --no-index --no-deps --no-build-isolation . --wheel-dir tmp/wheels
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $taskWheel = Get-ChildItem tmp/wheels/stock_data_trading_assistant-*.whl
           if ($taskWheel.Count -ne 1) { throw 'Expected exactly one project wheel' }
-          python -m venv tmp/core-runtime
+          & tmp/data-runtime/Scripts/python.exe -I -m venv tmp/core-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & tmp/core-runtime/Scripts/python.exe -m pip install --require-hashes -r requirements-core.lock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -42,13 +46,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # The delivery verifier owns lint, migrations, installed dependency checks,
           # the installed entrypoint probe and the single full test run.
-          python tools/v2/verify_delivery.py --output tmp/delivery --installed-python tmp/core-runtime/Scripts/python.exe --wheel $taskWheel.FullName --minimal-runtime --data-lane
+          & tmp/data-runtime/Scripts/python.exe -I tools/v2/verify_delivery.py --output tmp/delivery --installed-python tmp/core-runtime/Scripts/python.exe --wheel $taskWheel.FullName --minimal-runtime --data-lane
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve test evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: core-evidence-${{ github.sha }}
+          name: core-evidence-${{ matrix.python-version }}-${{ github.sha }}
           path: tmp/delivery/
   research:
     runs-on: windows-latest
@@ -61,12 +65,17 @@ jobs:
           cache-dependency-path: requirements-research-test.lock
       - name: Install frozen research and test runtime
         run: |
-          python -m pip install --require-hashes -r requirements-research-test.lock
+          New-Item -ItemType Directory -Path tmp/research -Force | Out-Null
+          python -m venv tmp/research-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip check
+          & tmp/research-runtime/Scripts/python.exe -I -c "import sys,site,json; assert sys.prefix != sys.base_prefix and not site.ENABLE_USER_SITE; print(json.dumps({'python':sys.version,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'user_site_enabled':site.ENABLE_USER_SITE}))" | Tee-Object -FilePath tmp/research/environment.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & tmp/research-runtime/Scripts/python.exe -I -m pip install --require-hashes -r requirements-research-test.lock 2>&1 | Tee-Object -FilePath tmp/research/install.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & tmp/research-runtime/Scripts/python.exe -I -m pip check 2>&1 | Tee-Object -FilePath tmp/research/pip-check.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Mandatory QLib Alpha158 fit and frozen inference
-        run: python -m pytest -o addopts= -q tests/test_research_runtime_contract.py tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order --junitxml=tmp/research/tests.xml
+        run: '& tmp/research-runtime/Scripts/python.exe -I -m pytest -o addopts= -q tests/test_research_runtime_contract.py tests/test_research_delivery.py::test_prediction_and_contributions_use_frozen_feature_order --junitxml=tmp/research/tests.xml'
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -11,7 +11,7 @@ from collectors.collect_daily import collect_daily
 from collectors import collect_market
 from trade_system.data_store import DuckDBStore
 from trade_system.schema import init_schema
-from trade_system.market_contract import MARKET_COUNT_FIELDS
+from trade_system.market_contract import MARKET_COUNT_FIELDS, count_evidence
 from trade_system.normalize import _create_market_daily, _create_market_state_inputs
 from trade_system.readiness import relation_freshness
 
@@ -27,6 +27,10 @@ def market_template(tmp_path_factory):
         init_schema(db.conn)
         db.conn.execute('INSERT INTO daily_summary(date,limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,source_kind,fetched_at) VALUES (?,?,?,?,?,?,?,?)',
                         [DAY,*COUNTS.values(),'real',NOW-timedelta(seconds=30)])
+        proof = {field: count_evidence(value, source='kpl_daily', source_kind='real', source_date=DAY,
+                                     fetched_at=NOW-timedelta(seconds=30), received_at=NOW)
+                 for field, value in COUNTS.items()}
+        db.conn.execute('UPDATE daily_summary SET count_provenance_json=?', [json.dumps(proof)])
     return path
 
 
@@ -107,6 +111,38 @@ def test_explicit_corrupt_lineage_cannot_borrow_row_real_marker(store,receipt):
     store.conn.execute('UPDATE daily_summary SET count_provenance_json=?',[receipt])
     tick(store)
     assert relation_freshness(store.conn,'v_market_daily',DAY,now=NOW)['status']!='ready'
+
+
+@pytest.mark.parametrize('damage', ['missing', 'unknown_row_kind', 'denied_constituent', 'missing_basis', 'duplicate_keys'])
+def test_read_merge_read_does_not_launder_unqualified_stored_evidence(store, damage):
+    if damage == 'missing':
+        store.conn.execute('UPDATE daily_summary SET count_provenance_json=NULL')
+    elif damage == 'unknown_row_kind':
+        store.conn.execute("UPDATE daily_summary SET source_kind='unknown'")
+    elif damage == 'duplicate_keys':
+        proof = store.fetchall('SELECT count_provenance_json FROM daily_summary')[0][0]
+        # Last-key-wins JSON would erase the explicit denial during merge.
+        proof = proof.replace('"qualified": true', '"qualified": false, "qualified": true')
+        store.conn.execute('UPDATE daily_summary SET count_provenance_json=?', [proof])
+    else:
+        proof = json.loads(store.fetchall('SELECT count_provenance_json FROM daily_summary')[0][0])
+        if damage == 'denied_constituent':
+            proof['consecutive_count']['qualified'] = False
+        else:
+            del proof['consecutive_count']['freshness_basis']
+        store.conn.execute('UPDATE daily_summary SET count_provenance_json=?', [json.dumps(proof)])
+    _create_market_daily(store.conn)
+    assert relation_freshness(store.conn, 'v_market_daily', DAY, now=NOW)['status'] != 'ready'
+    for _ in range(2):
+        tick(store)
+        for relation in ('daily_summary', 'v_market_daily', 'v_market_state_inputs'):
+            assert relation_freshness(store.conn, relation, DAY, now=NOW)['status'] != 'ready'
+    assert store.fetchall('SELECT consecutive_count FROM daily_summary') == [(COUNTS['consecutive_count'],)]
+    # New, explicitly observed source facts can replace the unverified version;
+    # this does not resurrect or relabel the old source evidence.
+    assert collect_daily(SimpleNamespace(get=lambda *a: COUNTS), store, DAY) == 1
+    _create_market_daily(store.conn)
+    assert store.fetchall('SELECT market_daily_status FROM v_market_daily') == [('available',)]
 
 
 def test_partial_new_source_preserves_unknown_instead_of_zero_and_explains_page(store):

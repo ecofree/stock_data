@@ -84,7 +84,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
             'worktree_is_dirty':bool(subprocess.check_output(['git','status','--porcelain','--untracked-files=no'],cwd=ROOT,text=True).strip()),
             'source_files':before,'source_sha256':hashlib.sha256(json.dumps(before,sort_keys=True).encode()).hexdigest(),
             'execution_ready':False,'production_cutover':False,'business_acceptance':'not_performed',
-            'real_account_acceptance':'pending_user_has_no_export','checks':{}}
+            'real_account_acceptance':'not_assessed_by_code_verification','checks':{}}
     validate_wheel_content(wheel, before)
     temporary,owner=reserve_test_run(owned_test_root(),'release' if data_lane else 'all',report['source_sha256'])
     report['temporary_artifacts_owner']=str(temporary/'owner.json')

@@ -126,16 +126,20 @@ def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
     cols = [('trade_date','VARCHAR'), ('limit_up_count','INTEGER'), ('limit_down_count','INTEGER'),
             ('rise_count','INTEGER'), ('fall_count','INTEGER'), ('consecutive_count','INTEGER'),
             ('fetched_at','TIMESTAMP'), ('market_daily_source','VARCHAR'), ('is_fallback','BOOLEAN'),
-            ('market_daily_status','VARCHAR')]
+            ('market_daily_status','VARCHAR'), ('source_kind','VARCHAR'), ('count_provenance_json','VARCHAR')]
     sources = []
     if table_exists(con, 'daily_summary'):
         order = _timestamp_column(con, 'daily_summary')
-        fallback = "lower(coalesce(source_kind,'')) IN ('fallback','derived','derived_current')" if 'source_kind' in table_columns(con,'daily_summary') else 'false'
-        status = market_daily_status_sql(table_columns(con, 'daily_summary'))
+        summary_columns = set(table_columns(con, 'daily_summary'))
+        fallback = "lower(coalesce(source_kind,'')) IN ('fallback','derived','derived_current')" if 'source_kind' in summary_columns else 'false'
+        status = market_daily_status_sql(summary_columns)
+        source_kind = 'source_kind' if 'source_kind' in summary_columns else 'NULL::VARCHAR'
+        provenance = 'count_provenance_json' if 'count_provenance_json' in summary_columns else 'NULL::VARCHAR'
         sources.append(f"""SELECT CAST(date AS VARCHAR) AS trade_date,
             limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,
             {order} AS fetched_at, 'daily_summary' AS market_daily_source, {fallback} AS is_fallback,
-            {status} AS market_daily_status, 1 AS source_priority
+            {status} AS market_daily_status, {source_kind} AS source_kind,
+            {provenance} AS count_provenance_json, 1 AS source_priority
             FROM ({_latest_cte('daily_summary',['date'],order)})""")
     if table_exists(con, 'tushare_daily'):
         has_basic = table_exists(con, 'tushare_stock_basic')
@@ -152,6 +156,7 @@ def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
                  ELSE 'tushare_daily+qualified_hithink_limit_pool' END AS market_daily_source,
             true AS is_fallback,
             CASE WHEN p.up_count IS NULL THEN 'partial' ELSE 'estimated' END AS market_daily_status,
+            'fallback' AS source_kind, NULL::VARCHAR AS count_provenance_json,
             2 AS source_priority
             FROM tushare_daily d {basic_join}
             LEFT JOIN ({_qualified_limit_totals_sql(con)}) p ON p.trade_date=d.date
@@ -160,7 +165,7 @@ def _create_market_daily(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(_empty_view_sql('v_market_daily',cols));return
     con.execute(f"""CREATE OR REPLACE VIEW v_market_daily AS
         SELECT trade_date,limit_up_count,limit_down_count,rise_count,fall_count,consecutive_count,
-               fetched_at,market_daily_source,is_fallback,market_daily_status
+               fetched_at,market_daily_source,is_fallback,market_daily_status,source_kind,count_provenance_json
         FROM ({' UNION ALL '.join(sources)})
         QUALIFY row_number() OVER (PARTITION BY trade_date ORDER BY source_priority,fetched_at DESC NULLS LAST)=1""")
 
@@ -822,6 +827,8 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
         ("earning_effect_score", "DOUBLE"),
         ("acute_drop_risk_score", "DOUBLE"),
         ("market_daily_status", "VARCHAR"),
+        ("source_kind", "VARCHAR"),
+        ("count_provenance_json", "VARCHAR"),
         ("earning_effect_status", "VARCHAR"),
         ("acute_drop_risk_status", "VARCHAR"),
         ("source_table", "VARCHAR"),
@@ -862,6 +869,10 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
     earning_valid = "isfinite(e.success_rate) AND e.success_rate BETWEEN 0 AND 100 AND CAST(m.rise_count AS DOUBLE) + m.fall_count > 0"
     risk_valid = ("isfinite(r.blown_limit_up_rate) AND r.blown_limit_up_rate BETWEEN 0 AND 100 AND "
                   + count_valid_sql('r.broken_limit_up_count') + ' AND ' + count_valid_sql('r.blown_limit_up_count'))
+    market_columns = set(table_columns(con, 'v_market_daily'))
+    source_kind = 'm.source_kind' if 'source_kind' in market_columns else 'NULL::VARCHAR'
+    provenance = 'm.count_provenance_json' if 'count_provenance_json' in market_columns else 'NULL::VARCHAR'
+    qualification = market_daily_status_sql(market_columns)
     con.execute(
         f"""
         CREATE OR REPLACE VIEW v_market_state_inputs AS
@@ -899,6 +910,8 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
                 2
             ) END AS acute_drop_risk_score,
             m.market_daily_status,
+            {source_kind} AS source_kind,
+            {provenance} AS count_provenance_json,
             CASE WHEN m.market_daily_status <> 'available' THEN m.market_daily_status
                  WHEN {earning_valid} THEN 'available' ELSE 'partial' END AS earning_effect_status,
             CASE WHEN m.market_daily_status <> 'available' THEN m.market_daily_status
@@ -906,7 +919,7 @@ def _create_market_state_inputs(con: duckdb.DuckDBPyConnection) -> None:
             m.market_daily_source || '+market_rise_fall+market_emotion_money' AS source_table,
             m.is_fallback,
             m.fetched_at
-        FROM v_market_daily m
+        FROM (SELECT * EXCLUDE(market_daily_status), {qualification} AS market_daily_status FROM v_market_daily) m
         LEFT JOIN ({rise_fall}) r ON m.trade_date = CAST(r.date AS VARCHAR)
         LEFT JOIN ({emotion}) e ON m.trade_date = CAST(e.date AS VARCHAR)
         LEFT JOIN ({new_high}) n ON m.trade_date = CAST(n.date AS VARCHAR)

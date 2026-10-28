@@ -12,7 +12,8 @@ import os
 import platform
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import stat
 import subprocess
 import sys
 import time as clock
@@ -34,33 +35,99 @@ def _file_fingerprint(paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def _sealed_source_identity(root):
+    """Verify a source manifest's actual members; this grants no write authority."""
+    marker = root / 'source-distribution.json'
+
+    def unlinked(path):
+        for member in (path, *path.parents):
+            info = member.lstat()
+            if stat.S_ISLNK(info.st_mode) or (getattr(info, 'st_file_attributes', 0)
+                    & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)):
+                raise ValueError('linked source identity')
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('duplicate source identity key')
+            value[key] = item
+        return value
+
+    unlinked(marker)
+    if marker.stat().st_size > 2_000_000:
+        raise ValueError('source identity budget exceeded')
+    raw = marker.read_bytes()
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    if (not isinstance(value, dict) or value.get('schema') != 'source_distribution_v1'
+            or value.get('scope') != 'source_identity_only_not_deployment_authority'
+            or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', str(value.get('source_commit', '')))):
+        raise ValueError('invalid source identity contract')
+    files = value.get('files')
+    if not isinstance(files, dict) or not 1 <= len(files) <= 10000:
+        raise ValueError('invalid source identity members')
+    seen, total = set(), 0
+    for name, expected in files.items():
+        if (not isinstance(name, str) or not name or '\\' in name or ':' in name
+                or PurePosixPath(name).is_absolute() or name == marker.name
+                or any(p in ('', '.', '..') or p.endswith((' ', '.')) or Path(p).is_reserved()
+                       for p in name.split('/')) or name.casefold() in seen
+                or not isinstance(expected, str) or not re.fullmatch('[0-9a-f]{64}', expected)):
+            raise ValueError('unsafe source identity member')
+        seen.add(name.casefold())
+        path = root / name
+        unlinked(path)
+        info = path.stat()
+        total += info.st_size
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16_000_000 or total > 256_000_000:
+            raise ValueError('source identity member budget exceeded')
+        with path.open('rb') as stream:
+            actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if actual != expected:
+            raise ValueError('source identity member changed')
+    if marker.read_bytes() != raw:
+        raise ValueError('source identity changed during verification')
+    return {'identity_kind': 'source_distribution', 'source_commit': value['source_commit'],
+            'source_distribution_sha256': hashlib.sha256(raw).hexdigest(),
+            'source_distribution_file_count': len(files),
+            'identity_scope': 'verified_manifest_members_and_collection_inputs_not_deployment_authority'}, files
+
+
 def runtime_fingerprint() -> dict[str, object]:
     """Bind the actual collection dependency closure and declared configuration, never .env values.
 
-    Git failure is unknown, not clean. An explicit work-tree works with the
-    retained bare-config repository without changing its shared Git settings.
+    Git and sealed-source identity are distinct. Neither grants deployment or
+    execution permission. A Git failure is never converted into a clean tree.
     """
     errors = []
     git_commit, worktree_dirty = "unknown", None
+    identity, distribution_files = {'identity_kind': 'unknown', 'source_commit': 'unknown'}, None
     git = ["git", "-c", "core.bare=false", "--work-tree=" + str(PROJECT_ROOT)]
-    try:
-        revision = subprocess.run(git + ["rev-parse", "HEAD"], cwd=PROJECT_ROOT,
-                                  capture_output=True, text=True, check=False)
-        status = subprocess.run(git + ["status", "--porcelain", "--untracked-files=normal"],
-                                cwd=PROJECT_ROOT, capture_output=True, text=True, check=False)
-        if revision.returncode == 0 and len(revision.stdout.strip()) in (40, 64):
-            git_commit = revision.stdout.strip()
-        else:
-            errors.append("git_revision_unavailable")
-        if status.returncode == 0:
-            worktree_dirty = bool(status.stdout.strip())
-        else:
-            errors.append("git_worktree_state_unavailable")
-    except OSError:
-        errors.append("git_unavailable")
+    if os.path.lexists(PROJECT_ROOT / 'source-distribution.json') and not os.path.lexists(PROJECT_ROOT / '.git'):
+        try:
+            identity, distribution_files = _sealed_source_identity(PROJECT_ROOT)
+        except (OSError, ValueError, TypeError):
+            errors.append('source_distribution_unverified')
+    else:
+        try:
+            revision = subprocess.run(git + ["rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+                                      capture_output=True, text=True, check=False)
+            status = subprocess.run(git + ["status", "--porcelain", "--untracked-files=normal"],
+                                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False)
+            if revision.returncode == 0 and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', revision.stdout.strip()):
+                git_commit = revision.stdout.strip()
+                identity = {'identity_kind': 'git_worktree', 'source_commit': git_commit}
+            else:
+                errors.append("git_revision_unavailable")
+            if status.returncode == 0:
+                worktree_dirty = bool(status.stdout.strip())
+            else:
+                errors.append("git_worktree_state_unavailable")
+        except OSError:
+            errors.append("git_unavailable")
     from trade_system.migration_boundary import collection_source_files
     try:
-        source_paths = [p for p in collection_source_files(PROJECT_ROOT) if p.suffix == '.py']
+        source_paths = [p for p in collection_source_files(PROJECT_ROOT, strict_local_imports=True) if p.suffix == '.py']
     except (OSError, ValueError, SyntaxError):
         source_paths = []
         errors.append('collector_dependency_closure_unavailable')
@@ -69,6 +136,17 @@ def runtime_fingerprint() -> dict[str, object]:
                     if p.is_file() and p.suffix in (".json", ".toml", ".yaml", ".yml")]
     config_paths += list(PROJECT_ROOT.glob("requirements*.lock"))
     schema_paths = [PROJECT_ROOT / "trade_system/schema.py", *sorted((PROJECT_ROOT / "migrations").glob("*.sql"))]
+    if distribution_files is not None:
+        # A manifest cannot omit an active consumer/configuration and still
+        # provide a complete runtime identity, even if its listed files match.
+        for path in set(source_paths + config_paths + schema_paths):
+            try:
+                expected = distribution_files[path.relative_to(PROJECT_ROOT).as_posix()]
+                if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    raise ValueError('active input differs')
+            except (OSError, ValueError, KeyError):
+                errors.append('collection_input_not_bound_to_distribution')
+                break
     hashes = {}
     for kind, paths in (("source", source_paths), ("config", config_paths), ("schema", schema_paths)):
         try:
@@ -85,6 +163,7 @@ def runtime_fingerprint() -> dict[str, object]:
         duckdb_version = "unknown"
     return {
         "git_commit": git_commit, "worktree_dirty": worktree_dirty,
+        **identity,
         **hashes, "fingerprint_complete": not errors, "fingerprint_errors": errors,
         "source_file_count": len(source_paths), "config_file_count": len(config_paths),
         "python_version": platform.python_version(), "python_executable": sys.executable,

@@ -9,7 +9,7 @@ import pytest
 
 from trade_system.normalize import _create_market_daily, _create_market_state_inputs, _create_limit_pool
 from trade_system.readiness import relation_freshness, assess_trade_date_readiness
-from trade_system.market_contract import MARKET_COUNT_FIELDS
+from trade_system.market_contract import MARKET_COUNT_FIELDS, count_evidence
 
 DAY = '2026-10-12'
 NOW = datetime(2026, 10, 12, 18)
@@ -17,8 +17,12 @@ NOW = datetime(2026, 10, 12, 18)
 
 def summary(con, kind='real', counts=(10, 2, 3000, 1000, 3)):
     con.execute('CREATE TABLE daily_summary(date DATE,limit_up_count DOUBLE,limit_down_count DOUBLE,'
-                'rise_count DOUBLE,fall_count DOUBLE,consecutive_count DOUBLE,source_kind VARCHAR,fetched_at TIMESTAMP)')
-    con.execute("INSERT INTO daily_summary VALUES (?,?,?,?,?,?,?,'2026-10-12 16:00:00')", [DAY, *counts, kind])
+                'rise_count DOUBLE,fall_count DOUBLE,consecutive_count DOUBLE,source_kind VARCHAR,fetched_at TIMESTAMP,count_provenance_json VARCHAR)')
+    received = datetime(2026,10,12,16)
+    proof = {name: count_evidence(value, source='kpl_daily', source_kind='real', source_date=DAY,
+                                 fetched_at=received, received_at=received)
+             for name, value in zip(MARKET_COUNT_FIELDS, counts)}
+    con.execute("INSERT INTO daily_summary VALUES (?,?,?,?,?,?,?,'2026-10-12 16:00:00',?)", [DAY, *counts, kind, json.dumps(proof)])
     con.execute('CREATE TABLE market_emotion_money(date DATE,cgl DOUBLE,yll DOUBLE,success_rate DOUBLE,fetched_at TIMESTAMP)')
     con.execute("INSERT INTO market_emotion_money VALUES (?,50,50,60,'2026-10-12 16:00:00')", [DAY])
     con.execute('CREATE TABLE market_rise_fall(date DATE,limit_up_count INTEGER,limit_down_count INTEGER,'

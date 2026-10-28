@@ -114,6 +114,37 @@ def evaluate_observation_plan(plan, as_of, *, quote=None, account=None):
             'condition_scope':'observation_only_not_fill_or_order_permission'}
 
 
+def observation_plan_risk(evaluation):
+    """One display contract for evaluated risks; no account identifiers or authority."""
+    evaluation=evaluation or {}
+    states={'pending_human_condition':'待人工核对观察条件','pending':'观察条件尚未触发',
+        'triggered':'观察条件已触发（不代表可执行）','expired':'计划已过期',
+        'invalid':'计划已失效','data_insufficient':'缺少有效报价或时点资料',
+        'account_conflict':'账户范围冲突','unknown':'状态未知，需核对原始回执'}
+    state=evaluation.get('state','unknown')
+    if state not in states:state='unknown'
+    reasons={'account_scope_conflict':'历史账户绑定不适用于当前观察范围，本阶段不接入真实账户',
+        'account_version_changed':'历史账户版本与当前资料不匹配，不能沿用原绑定',
+        'account_not_verified':'账户资料未核对，不计算数量或可用仓位'}
+    blockers=[]
+    for code in evaluation.get('account_blockers') or []:
+        item={'code':code if code in reasons else 'unknown_account_blocker',
+              'message':reasons.get(code,'存在未识别的账户阻断，需核对原始回执')}
+        if item not in blockers:blockers.append(item)
+    invalidations={'plan_superseded':'计划已被新版本替代，旧版本不能继续使用',
+        'judgement_revised_requires_new_plan':'原判断已修订，需要另建观察计划',
+        'human_reported_invalidation':'人工已记录失效条件触发，需要另建观察计划'}
+    actual=evaluation.get('invalidation')
+    invalidation=None
+    if actual or state=='invalid':
+        invalidation={'code':actual if actual in invalidations else 'unknown_invalidation',
+            'message':invalidations.get(actual,'计划已失效，具体原因需核对原始回执')}
+    priority=1 if blockers or invalidation or state in ('expired','triggered','account_conflict','unknown') else 2
+    return {'state':state,'state_label':states[state],
+        'summary_label':('存在风险阻断 · ' if blockers else '')+states[state],'blockers':blockers,
+        'invalidation':invalidation,'priority':priority,'execution_ready':False}
+
+
 def observation_plans(output, as_of, quotes=()):
     from .journal_index import recent
     paths,_=recent(output,'plan')

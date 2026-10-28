@@ -6,8 +6,20 @@ from datetime import datetime
 
 from trade_system.readiness import assess_trade_date_readiness, capital_flow_coverage, relation_freshness
 
-# Positive readiness fixtures supply all five market counts, including known
-# zeroes. A dated row alone is tested as unqualified in test_followup_market_qualification.
+# Positive readiness fixtures supply all five observed counts with their dated
+# receipts. A row label alone is tested as unqualified in test_current_market_provenance.
+
+
+def _observed_market_receipts(con, day, observed):
+    from trade_system.market_contract import MARKET_COUNT_FIELDS, count_evidence
+    values = con.execute('SELECT ' + ','.join(MARKET_COUNT_FIELDS) + ' FROM daily_summary WHERE date=?', [day]).fetchone()
+    proof = {field: count_evidence(value, source='kpl_daily', source_kind='real', source_date=day,
+                                 fetched_at=observed, received_at=observed)
+             for field, value in zip(MARKET_COUNT_FIELDS, values)}
+    con.execute('ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS count_provenance_json VARCHAR')
+    con.execute('ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS source_kind VARCHAR')
+    con.execute('ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMP')
+    con.execute("UPDATE daily_summary SET source_kind='real',fetched_at=?,count_provenance_json=? WHERE date=?", [observed, json.dumps(proof), day])
 
 
 def _qualified_prices(con, day):
@@ -183,6 +195,7 @@ def _frozen_operation(tmp_path, monkeypatch, phase, *, price_view=False):
         if phase == 'auction':
             con.execute('CREATE TABLE daily_summary(date DATE,fetched_at TIMESTAMP,source_kind VARCHAR,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)')
             con.execute("INSERT INTO daily_summary(date,fetched_at,source_kind) VALUES (?,?,'native')", [day, observed])
+            _observed_market_receipts(con, day, observed)
             con.execute('CREATE VIEW v_market_state_inputs AS SELECT date trade_date,* EXCLUDE (date) FROM daily_summary')
             con.execute('CREATE TABLE v_limit_pool(trade_date DATE,fetched_at TIMESTAMP)')
             con.execute('INSERT INTO v_limit_pool VALUES (?,?)', [day, observed])
@@ -431,6 +444,7 @@ def test_readiness_aware_as_of_is_comparable_to_naive_db_time(tmp_path):
     con.execute(
         "INSERT INTO daily_summary(date,limit_up_count,fetched_at,source_kind) VALUES ('2026-07-31', 10, '2026-07-31 17:45:00', 'real')"
     )
+    _observed_market_receipts(con, '2026-07-31', datetime(2026, 7, 31, 17, 45))
     con.close()
     result = assess_trade_date_readiness(
         db_path,
@@ -467,6 +481,7 @@ def test_close_readiness_requires_same_date_capital_flows(tmp_path):
     con = duckdb.connect(str(db_path))
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-09')")
+    _observed_market_receipts(con, '2026-07-09', datetime(2026, 7, 9, 10))
     con.execute("CREATE TABLE kline(date DATE, stock_code VARCHAR)")
     con.execute("INSERT INTO kline VALUES ('2026-07-09','000001')")
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-09' trade_date")
@@ -496,6 +511,7 @@ def test_intraday_readiness_passes_when_both_capital_flows_are_current(tmp_path)
     con = duckdb.connect(str(db_path))
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-09')")
+    _observed_market_receipts(con, '2026-07-09', datetime(2026, 7, 9, 10))
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-09' trade_date")
     con.execute("CREATE TABLE sector_capital(date DATE, sector_code VARCHAR)")
     con.execute("INSERT INTO sector_capital VALUES ('2026-07-09','801001')")
@@ -516,6 +532,7 @@ def test_intraday_readiness_uses_same_date_market_stock_flow(tmp_path):
     con = duckdb.connect(str(db_path))
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-09')")
+    _observed_market_receipts(con, '2026-07-09', datetime(2026, 7, 9, 10))
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-09' trade_date")
     con.execute("CREATE TABLE sector_capital(date DATE, sector_code VARCHAR)")
     con.execute("INSERT INTO sector_capital VALUES ('2026-07-09','801001')")
@@ -535,6 +552,7 @@ def test_partial_market_batch_cannot_be_replaced_by_bounded_flow(tmp_path):
     con = duckdb.connect(str(db_path))
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-09')")
+    _observed_market_receipts(con, '2026-07-09', datetime(2026, 7, 9, 10))
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-09' trade_date")
     con.execute("CREATE TABLE realtime_candidate_pool_snapshot(trade_date DATE, status VARCHAR, stock_count INTEGER)")
     con.execute("INSERT INTO realtime_candidate_pool_snapshot VALUES ('2026-07-09','success',2)")
@@ -809,6 +827,7 @@ def test_auction_accepts_calendar_proven_previous_session_market_context(tmp_pat
     )
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-23')")
+    _observed_market_receipts(con, '2026-07-23', datetime(2026, 7, 23, 15))
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-24' trade_date")
     con.execute("CREATE TABLE auction_tick(trade_date DATE, stock_code VARCHAR)")
     con.execute("INSERT INTO auction_tick VALUES ('2026-07-24', '000001')")
@@ -832,6 +851,7 @@ def test_auction_rejects_arbitrary_old_market_row(tmp_path):
     )
     con.execute("CREATE TABLE daily_summary(date DATE,limit_up_count INTEGER DEFAULT 0,limit_down_count INTEGER DEFAULT 0,rise_count INTEGER DEFAULT 0,fall_count INTEGER DEFAULT 0,consecutive_count INTEGER DEFAULT 0)")
     con.execute("INSERT INTO daily_summary(date) VALUES ('2026-07-15')")
+    _observed_market_receipts(con, '2026-07-15', datetime(2026, 7, 15, 15))
     con.execute("CREATE VIEW v_limit_pool AS SELECT '2026-07-24' trade_date")
     con.execute("CREATE TABLE auction_tick(trade_date DATE, stock_code VARCHAR)")
     con.execute("INSERT INTO auction_tick VALUES ('2026-07-24', '000001')")

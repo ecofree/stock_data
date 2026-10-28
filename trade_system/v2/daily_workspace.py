@@ -31,9 +31,10 @@ def action_queue(data):
                 'reason':'已有持仓需核对原计划和数据时效','allowed_action':'查看持仓及原判断'})
     for plan in plans.get('rows',[]):
         if not plan.get('is_latest'):continue
-        state=plan.get('evaluation',{}).get('state','unknown')
-        rows.append({'priority':1 if state in ('expired','invalidated','triggered','account_conflict') else 2,
-            'kind':'observation_plan','instrument':plan['instrument'],'reason':state,
+        from .operator_workflow import observation_plan_risk
+        risk=observation_plan_risk(plan.get('evaluation'))
+        rows.append({'priority':risk['priority'],
+            'kind':'observation_plan','instrument':plan['instrument'],'reason':risk['state'],'risk':risk,
             'plan_id':plan['plan_id'],'valid_until':plan.get('valid_until'),
             'allowed_action':'核对条件并追加判断；查看不解除风险'})
     return sorted(rows,key=lambda r:(r['priority'],r.get('instrument') or '',r.get('plan_id','')))

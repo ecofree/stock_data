@@ -623,7 +623,7 @@ def relation_freshness(
     if rows and relation in MARKET_STATE_RELATIONS:
         # Qualify the latest as-of snapshot, never rescue a partial replacement
         # using an older complete row or a differently named raw relation.
-        qualification = market_daily_status_sql(columns)
+        qualification = market_daily_status_sql(columns, as_of=now)
         order = timestamp_value_expr if timestamp_column else f'"{date_column}"'
         qualifications = con.execute(
             f'SELECT {qualification} FROM "{relation}" '
