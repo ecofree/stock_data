@@ -1,9 +1,13 @@
+import json
+
 import duckdb
+import pytest
 
 from trade_system.normalize import build_normalized_views
 
 
-def test_build_normalized_views_exposes_fallback_sources_for_professional_data_chains(tmp_path):
+@pytest.mark.parametrize('with_provenance', [True, False])
+def test_build_normalized_views_exposes_fallback_sources_for_professional_data_chains(tmp_path, with_provenance):
     db_path = tmp_path / "sample.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -50,11 +54,20 @@ def test_build_normalized_views_exposes_fallback_sources_for_professional_data_c
     con.execute(
         "CREATE TABLE daily_summary("
         "date DATE, limit_up_count INTEGER, limit_down_count INTEGER, rise_count INTEGER, "
-        "fall_count INTEGER, consecutive_count INTEGER, raw_json VARCHAR, fetched_at TIMESTAMP)"
+        "fall_count INTEGER, consecutive_count INTEGER, raw_json VARCHAR, fetched_at TIMESTAMP, "
+        "source_kind VARCHAR, count_provenance_json VARCHAR)"
     )
+    # This positive fixture explicitly models observed synthetic counts; an
+    # otherwise identical historical row without proof must not produce scores.
+    proof = json.dumps({field: {'value': value, 'source': 'daily_summary', 'source_kind': 'real',
+        'source_date': '2026-07-06', 'fetched_at': '2026-07-06T15:00:00', 'qualified': True,
+        'freshness_basis': 'source_relation_receipt_lower_bound'} for field, value in zip(
+            ('limit_up_count', 'limit_down_count', 'rise_count', 'fall_count', 'consecutive_count'),
+            (55, 5, 3200, 900, 6))})
     con.execute(
         "INSERT INTO daily_summary VALUES "
-        "('2026-07-06', 55, 5, 3200, 900, 6, '{}', '2026-07-06 15:00:00')"
+        "('2026-07-06', 55, 5, 3200, 900, 6, '{}', '2026-07-06 15:00:00', 'real', ?)",
+        [proof if with_provenance else None],
     )
     con.execute(
         "CREATE TABLE market_rise_fall("
@@ -93,6 +106,10 @@ def test_build_normalized_views_exposes_fallback_sources_for_professional_data_c
         "SELECT earning_effect_score, acute_drop_risk_score, source_table, is_fallback "
         "FROM v_market_state_inputs"
     ).fetchone()
+    market_status = con.execute(
+        "SELECT market_daily_status, earning_effect_status, acute_drop_risk_status "
+        "FROM v_market_state_inputs"
+    ).fetchone()
     index_state = con.execute(
         "SELECT source_table, is_fallback, index_code FROM v_index_state"
     ).fetchone()
@@ -101,8 +118,13 @@ def test_build_normalized_views_exposes_fallback_sources_for_professional_data_c
     assert auction == ("advanced_morning_bidding_summary", True, 11.2)
     assert sector == ("sector_strength", True, "test sector", 82.0)
     assert kline == ("advanced_gujia_kline", True, 9.8)
-    assert market[0] > 0
-    assert market[1] > 0
+    if with_provenance:
+        assert market[0] > 0
+        assert market[1] > 0
+        assert market_status == ('available', 'available', 'available')
+    else:
+        assert market[:2] == (None, None)
+        assert market_status == ('unverified', 'unverified', 'unverified')
     assert market[2:] == ("daily_summary+market_rise_fall+market_emotion_money", False)
     assert index_state == ("market_state_fallback", True, "MARKET_PROXY")
 

@@ -463,7 +463,8 @@ function Write-WatchEvent([string]$Message) {{Write-Output $Message}}
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows 5.1 isolated engineering chain')
-def test_ps51_close_commit_supplemental_handoff_and_real_local_publication(tmp_path, monkeypatch):
+@pytest.mark.parametrize('price_provider,qualified_samples',[('xiaodefa',1),('fixture',0)])
+def test_ps51_close_commit_supplemental_handoff_and_real_local_publication(tmp_path, monkeypatch,price_provider,qualified_samples):
     """Synthetic clocks/data/task request; real PS5, owners, DuckDB and publisher."""
     import duckdb
     from trade_system.pipeline_runtime import default_observation_policy
@@ -502,6 +503,9 @@ def test_ps51_close_commit_supplemental_handoff_and_real_local_publication(tmp_p
     digest=hashlib.sha256(contract.read_bytes()).hexdigest()
     # The response fixture commits under the actual PipelineLock. All database
     # targets are explicitly confined to this fixture; there is no provider API.
+    # The normal handoff case declares a known contract on synthetic values.
+    # Unknown identity remains a counterexample: retained facts may publish,
+    # but they must not become qualified breadth or same-contract comparisons.
     (scripts/'run_integrated_daily.py').write_text(r"""import sys,json
 from pathlib import Path
 import duckdb
@@ -522,7 +526,7 @@ with PipelineLock(db,run):
  with duckdb.connect(str(db)) as con:
   con.execute('INSERT INTO fixture_commits VALUES (?,?)',[phase,run])
   if phase=='close':
-   con.execute("INSERT INTO v_kline_daily VALUES ('2026-10-08','000001',1,'fixture','none','shares','yuan','2026-10-08 16:00',10),('2026-10-09','000001',2,'fixture','none','shares','yuan','2026-10-09 17:31',10.2)")
+   con.execute("INSERT INTO v_kline_daily VALUES ('2026-10-08','000001',1,'__PRICE_PROVIDER__','none','shares','yuan','2026-10-08 16:00',10),('2026-10-09','000001',2,'__PRICE_PROVIDER__','none','shares','yuan','2026-10-09 17:31',10.2)")
   else: con.execute("UPDATE v_kline_daily SET change_pct=3,close=10.3 WHERE trade_date='2026-10-09'")
   count=con.execute('SELECT count(*) FROM v_kline_daily WHERE trade_date=?',[day]).fetchone()[0]
 receipt={'run_id':run,'phase':phase,'trade_date':day,'scope':'transitional_market_collection_only',
@@ -533,7 +537,7 @@ receipt={'run_id':run,'phase':phase,'trade_date':day,'scope':'transitional_marke
 path=Path(value('--reports-dir'))/'runs'/run/'run.json';path.parent.mkdir(parents=True,exist_ok=True)
 path.write_text(json.dumps(receipt,ensure_ascii=False),encoding='utf-8')
 print(json.dumps({'committed_rows':count,'run_id':run,'fixture':True}))
-""",encoding='utf-8')
+""".replace('__PRICE_PROVIDER__',price_provider),encoding='utf-8')
     workspace=tmp_path/'workspace';workspace.mkdir()
     (workspace/'workspace-config.json').write_text(json.dumps({'market_database':str(db),'read_only':True}))
     release=tmp_path/'fixture-release';release.mkdir()
@@ -587,8 +591,20 @@ function Start-ScheduledTask {
     assert publication_receipt['publication']['generation']==manifest['generation']
     assert publication_receipt['snapshot_id']==desk['market']['snapshot_id']
     assert publication_receipt['report_id']==desk['report_id']
-    assert desk['market']['trade_date']=='2026-10-09' and desk['market']['breadth']['samples']==1
+    assert desk['market']['trade_date']=='2026-10-09' and desk['market']['breadth']['samples']==qualified_samples
     assert desk['market']['stocks']['000001']['change_pct']==3
+    stock=desk['market']['stocks']['000001']
+    assert stock['close']==10.3 and stock['price_contract']==[price_provider,'none','shares','yuan']
+    assert stock['price_status']==('available' if qualified_samples else 'unqualified')
+    assert stock['price_reason']==(None if qualified_samples else 'unknown_provider')
+    qualification=desk['market']['price_qualification']
+    assert qualification['observed_rows']==1
+    assert qualification['qualified_rows']==qualified_samples and qualification['excluded_rows']==1-qualified_samples
+    assert qualification['excluded_reasons']==({} if qualified_samples else {'unknown_provider':1})
+    matched=desk['market']['matched_previous']
+    assert matched['current']['samples']==matched['previous']['samples']==qualified_samples
+    assert matched['excluded_rows']==1-qualified_samples
+    assert matched['excluded_reasons']==({} if qualified_samples else {'current_unknown_provider':1})
     assert not desk['execution_ready']
     research_log=next((workspace/'scheduled-logs').glob('*.log')).read_bytes()
     assert b'\x00' not in research_log
