@@ -1995,7 +1995,8 @@ def _create_data_coverage(con: duckdb.DuckDBPyConnection) -> None:
         row[0]
         for row in con.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'main' AND table_name NOT LIKE 'v_%' ORDER BY table_name"
+            "WHERE table_catalog = current_database() AND table_schema = 'main' "
+            "AND table_name NOT LIKE 'v_%' ORDER BY table_name"
         ).fetchall()
     ]
     if not table_names:

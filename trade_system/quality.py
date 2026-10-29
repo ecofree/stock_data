@@ -76,7 +76,7 @@ NORMALIZED_DUPLICATE_SQL = {
 def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     row = con.execute(
         "SELECT count(*) FROM information_schema.tables "
-        "WHERE table_schema = 'main' AND table_name = ?",
+        "WHERE table_catalog = current_database() AND table_schema = 'main' AND table_name = ?",
         [table_name],
     ).fetchone()
     return bool(row and row[0])

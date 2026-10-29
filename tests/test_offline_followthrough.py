@@ -16,6 +16,65 @@ from trade_system.v2.domain import identity, file_hash
 from trade_system.v2.isolated_workspace import write_json, read_json
 
 
+def complete_observation_fixture(output, source):
+    """Test-only schema-1 fixture using real journal/publisher/render owners."""
+    from datetime import timedelta
+    from trade_system.v2 import research_product as product, research_journal as journal
+    from trade_system.v2 import operator_workflow as workflow
+    from trade_system.v2.domain import now_utc
+    from trade_system.v2.publisher import read_current
+    from trade_system.v2.research_product_view import receipt_page, plan_receipt_page, review_receipt_page, journal_page
+    workspace, pages = output/'workspace', output/'pages'
+    workspace.mkdir(parents=True); pages.mkdir()
+    write_json(workspace/'workspace-config.json',{'acceptance_scope':SCOPE,'read_only':True,
+        'fixture_only':True,'provider_requests_allowed':False})
+    snapshots = []
+    for day, close in [('2026-10-12',10),('2026-10-13',11),('2026-10-14',12)]:
+        row = {'stock_code':'000001','stock_name':'SYNTHETIC','close':close,'change_pct':1,
+            'price_status':'available','price_reason':None,'price_contract':['xiaodefa','none','shares','yuan']}
+        market = {'trade_date':day,'as_of':day+'T18:00:00+08:00','stocks':{'000001':row},
+            'themes':[],'breadth':{'rise':1,'fall':0},'regime':'SYNTHETIC','session_state':'calendar_unknown',
+            'scope':'synthetic_fixture_not_real_market','execution_ready':False}
+        snapshots.append(dict(market,snapshot_id=identity(market)))
+    def retain(label):
+        _, artifacts = read_current(workspace/'publication')
+        for name in ('desk.json','index.html'):
+            (pages/(label+'-'+name)).write_bytes(artifacts[name])
+    product.publish_desk(workspace,market=snapshots[0])
+    command = dict(instrument='000001',operator='SYNTHETIC ONLY',intent='observe',hypothesis='D0',
+        invalidation='Synthetic condition',evidence_id=snapshots[0]['snapshot_id'],request_id='1'*32)
+    note = product.save_note(workspace,command)
+    revision = product.save_note(workspace,dict(command,supersedes=note,request_id='2'*32,hypothesis='D0 revision'))
+    plan = workflow.save_observation_plan(workspace,dict(note_id=revision,operator='SYNTHETIC ONLY',condition='manual',
+        threshold='',valid_until=(now_utc()+timedelta(days=7)).isoformat(),request_id='3'*32))
+    product.publish_desk(workspace,market=snapshots[0]); retain('D0')
+    product.publish_desk(workspace,market=snapshots[1])
+    review = journal.save_review(workspace,dict(note_id=revision,plan_id=plan,request_id='4'*32,reviewer='SYNTHETIC ONLY',
+        conclusion='not_triggered',evidence='D1 synthetic',seen_market_snapshot_id=snapshots[1]['snapshot_id'],
+        seen_market_evidence_file_id=identity(snapshots[1])))
+    product.publish_desk(workspace,market=snapshots[1]); retain('D1')
+    original = {p.relative_to(workspace).as_posix():file_hash(p) for p in (workspace/'notes').rglob('*.json')}
+    product.publish_desk(workspace,market=snapshots[2]); retain('D2')
+    bound = journal.review_projection(workspace,journal.read_review(workspace,review))
+    documents = {'note-receipt.html':receipt_page(journal.read_note(workspace,note)),
+        'revision-receipt.html':receipt_page(journal.read_note(workspace,revision)),
+        'plan-receipt.html':plan_receipt_page(workflow.read_observation_plan(workspace,plan)),
+        'review-receipt.html':review_receipt_page(bound),
+        'selected-chain.html':journal_page(product.journal_navigation(workspace,kind='review',selected=review))}
+    for name, body in documents.items():
+        (pages/name).write_text(body,encoding='utf-8')
+    receipt = {'schema':1,'fixture_only':True,'label':'SYNTHETIC D0 -> revision -> plan -> D1 -> D2',
+        'workspace':str(workspace),'pages':str(pages),'note_id':note,'revision_id':revision,'plan_id':plan,'review_id':review,
+        **{f'D{i}_snapshot_id':market['snapshot_id'] for i,market in enumerate(snapshots)},
+        'fixed_seen_comparison':bound['seen_comparison'],'original_event_hashes_preserved':original,
+        'provider_requests':0,'market_database_reads':0,'execution_ready':False,'production_cutover':False,
+        'acceptance_scope':SCOPE,'source_files':{p.relative_to(source).as_posix():file_hash(p)
+            for p in (source/'trade_system/v2').glob('*.py')},
+        'artifacts':{p.relative_to(output).as_posix():file_hash(p) for p in pages.iterdir()}}
+    write_json(output/'fixture-receipt.json',receipt)
+    return receipt
+
+
 @pytest.fixture
 def bound_lab(tmp_path):
     root = tmp_path/'lab'
@@ -31,16 +90,6 @@ def bound_lab(tmp_path):
     shutil.copyfile(tmp_path/'migration/migrated-market.duckdb', dbs/'migrated.duckdb')
     facts = root/'inputs/raw_facts'
     shutil.copyfile(tmp_path/'migration/migration-receipt.json', facts/'migration.json')
-    write_json(root/'inputs/workspace/workspace-config.json', {'acceptance_scope':SCOPE})
-    from trade_system.v2.publisher import publish, read_current
-    from trade_system.v2.domain import canonical
-    from trade_system.v2.research_product_view import render
-    current, artifacts = read_current(root/'inputs/workspace/publication')
-    data = json.loads(artifacts['desk.json'])
-    data.update(acceptance_scope=SCOPE,historical_rehearsal=True)
-    publish(root/'inputs/workspace/publication','synthetic-scope',
-            {'desk.json':canonical(data).encode(),'index.html':render(data).encode()},
-            generation=current['generation']+1)
     # Export exactly the source contract the real migration receipt binds.
     code = root/'inputs/code'
     actual = Path(__file__).resolve().parents[1]
@@ -49,9 +98,10 @@ def bound_lab(tmp_path):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(actual/name, dest)
     from trade_system.v2.recovery_bundle import inventory
-    fixture = {'fixture_only':True, 'label':'SYNTHETIC', 'execution_ready':False,
-               'provider_requests':0, 'market_database_reads':0,
-               'acceptance_scope':SCOPE, 'source_files':{}, 'artifacts':{}}
+    fixture = complete_observation_fixture(tmp_path/'complete-fixture',actual)
+    (root/'inputs/workspace').rename(facts/'prepared-workspace')
+    shutil.copytree(tmp_path/'complete-fixture/workspace',root/'inputs/workspace')
+    shutil.copytree(tmp_path/'complete-fixture/pages',facts/'pages')
     write_json(facts/'fixture.json', fixture)
     binding = {'schema':'offline_database_bindings_v1',
         'raw_archive_database':{'path':'databases/raw.duckdb', 'sha256':file_hash(dbs/'raw.duckdb')},
@@ -165,6 +215,173 @@ def test_receipt_cannot_expand_normalized_view_allowlist(bound_lab):
         verify_bindings(folder,binding)
 
 
+def test_approved_view_definition_cannot_change_close_ten_to_990(bound_lab):
+    from trade_system.v2.offline_binding import verify_bindings, migration
+    root, binding = bound_lab
+    folder = root/'restores/first'; market = folder/'databases/migrated.duckdb'
+    before_raw = file_hash(folder/'databases/raw.duckdb')
+    # Retain the independently reproduced false-value SQL without introducing
+    # an extra unapproved view that would mask the definition loophole.
+    with duckdb.connect(str(market)) as con:
+        con.execute("CREATE OR REPLACE VIEW v_kline_daily AS SELECT CAST(source_date AS VARCHAR) trade_date,asset_code stock_code,open,high,low,close*99 AS close,CAST(volume AS BIGINT) volume,CAST(amount AS BIGINT) turnover,change_pct,'D' ktype,'multi_source_kline' source_table,false is_fallback,fetched_at,'shares' volume_unit,'yuan' amount_unit,coalesce(adjustment,'unknown') adjustment,provider FROM multi_source_kline")
+    with duckdb.connect(str(market),read_only=True) as con:
+        snapshot = migration._snapshot(con)
+        assert con.execute('SELECT close FROM multi_source_kline').fetchone()[0] == 10
+        assert con.execute('SELECT close FROM v_kline_daily').fetchone()[0] == 990
+    receipt = read_json(folder/'raw_facts/migration.json')
+    receipt['candidate'].update(sha256=file_hash(market),bytes=market.stat().st_size)
+    receipt['preservation']['candidate_schema'] = snapshot
+    (folder/'raw_facts/migration.json').write_text(json.dumps(receipt))
+    binding['migrated_market_database']['sha256'] = file_hash(market)
+    binding['migration_receipt']['sha256'] = file_hash(folder/'raw_facts/migration.json')
+    before_market = file_hash(market)
+    with pytest.raises(ValueError,match='normalized view'):
+        verify_bindings(folder,binding)
+    assert file_hash(market) == before_market and file_hash(folder/'databases/raw.duckdb') == before_raw
+
+
+@pytest.mark.parametrize('damage',['empty-source','partial-source','duplicate-source','empty-artifacts','partial-artifacts',
+    'artifact-hash','fake-id','fake-parent','empty-events','partial-events','comparison','schema'])
+def test_complete_fixture_contract_rejects_partial_or_inconsistent_receipts(bound_lab,damage):
+    from trade_system.v2.offline_binding import verify_bindings
+    root, binding = bound_lab; folder = root/'restores/first'; path = folder/'raw_facts/fixture.json'
+    fixture = read_json(path)
+    if damage == 'empty-source': fixture['source_files'] = {}
+    elif damage == 'partial-source': fixture['source_files'].pop(next(iter(fixture['source_files'])))
+    elif damage == 'duplicate-source':
+        name = next(iter(fixture['source_files'])); fixture['source_files'][name.replace('/','\\')] = fixture['source_files'][name]
+    elif damage == 'empty-artifacts': fixture['artifacts'] = {}
+    elif damage == 'partial-artifacts': fixture['artifacts'].pop('pages/D1-desk.json')
+    elif damage == 'artifact-hash': (folder/'raw_facts/pages/D1-index.html').write_text('changed')
+    elif damage == 'fake-id': fixture['review_id'] = 'f'*64
+    elif damage == 'fake-parent': fixture['revision_id'] = fixture['note_id']
+    elif damage == 'empty-events': fixture['original_event_hashes_preserved'] = {}
+    elif damage == 'partial-events': fixture['original_event_hashes_preserved'].pop(next(iter(fixture['original_event_hashes_preserved'])))
+    elif damage == 'schema': fixture['schema'] = True
+    else: fixture['fixed_seen_comparison']['current_close'] = 990
+    path.write_text(json.dumps(fixture)); binding['synthetic_observation_receipt']['sha256'] = file_hash(path)
+    with pytest.raises((ValueError,FileNotFoundError)):
+        verify_bindings(folder,binding)
+
+
+def test_complete_fixture_windows_members_are_portable_and_read_only(bound_lab):
+    from trade_system.v2.offline_binding import verify_bindings
+    root, binding = bound_lab; folder = root/'restores/first'; path = folder/'raw_facts/fixture.json'
+    fixture = read_json(path)
+    for key in ('source_files','artifacts','original_event_hashes_preserved'):
+        fixture[key] = {name.replace('/','\\'):sha for name,sha in fixture[key].items()}
+    path.write_text(json.dumps(fixture)); binding['synthetic_observation_receipt']['sha256'] = file_hash(path)
+    before = recovery_bundle.inventory(folder)
+    proof = verify_bindings(folder,binding)
+    assert proof['observation_fixture']['page_artifacts'] == 11
+    assert proof['observation_fixture']['chain_verified']
+    assert proof['normalized_derivation']['fact_tables_copied'] == 0
+    assert proof['normalized_derivation']['metadata_database_bytes'] <= 16*1024**2
+    assert recovery_bundle.inventory(folder) == before
+
+
+def test_approved_view_cannot_be_missing_from_resealed_candidate(bound_lab):
+    from trade_system.v2.offline_binding import verify_bindings, migration
+    root, binding = bound_lab; folder = root/'restores/first'; market = folder/'databases/migrated.duckdb'
+    with duckdb.connect(str(market)) as con: con.execute('DROP VIEW v_data_coverage')
+    with duckdb.connect(str(market),read_only=True) as con: snapshot = migration._snapshot(con)
+    receipt = read_json(folder/'raw_facts/migration.json')
+    receipt['candidate'].update(sha256=file_hash(market),bytes=market.stat().st_size)
+    receipt['preservation']['candidate_schema'] = snapshot
+    (folder/'raw_facts/migration.json').write_text(json.dumps(receipt))
+    binding['migrated_market_database']['sha256'] = file_hash(market)
+    binding['migration_receipt']['sha256'] = file_hash(folder/'raw_facts/migration.json')
+    with pytest.raises(ValueError,match='normalized view'):
+        verify_bindings(folder,binding)
+
+
+def test_attached_catalog_cannot_supply_current_table_or_coverage(tmp_path):
+    from trade_system.quality import table_exists, table_columns
+    from trade_system.normalize import build_normalized_views_on_connection
+    with duckdb.connect(':memory:') as con:
+        con.execute('CREATE TABLE local_facts(local_value INTEGER)')
+        con.execute("ATTACH ':memory:' AS foreign_catalog")
+        con.execute('CREATE TABLE foreign_catalog.only_foreign(secret VARCHAR)')
+        con.execute('CREATE TABLE foreign_catalog.local_facts(foreign_value VARCHAR)')
+        assert not table_exists(con,'only_foreign')
+        assert table_columns(con,'only_foreign') == []
+        assert table_columns(con,'local_facts') == ['local_value']
+        build_normalized_views_on_connection(con)
+        assert con.execute('SELECT table_name FROM v_data_coverage ORDER BY table_name').fetchall() == [('local_facts',)]
+
+
+def test_attached_table_names_do_not_duplicate_current_coverage():
+    from trade_system.normalize import build_normalized_views_on_connection
+    with duckdb.connect(':memory:') as con:
+        con.execute('CREATE TABLE facts(value INTEGER)'); con.execute('INSERT INTO facts VALUES (1),(2)')
+        build_normalized_views_on_connection(con)
+        assert con.execute('SELECT * FROM v_data_coverage').fetchall() == [('facts',2)]
+        con.execute("ATTACH ':memory:' AS foreign_catalog")
+        con.execute('CREATE TABLE foreign_catalog.facts(foreign_value VARCHAR)')
+        con.execute("INSERT INTO foreign_catalog.facts VALUES ('other')")
+        build_normalized_views_on_connection(con)
+        assert con.execute('SELECT * FROM v_data_coverage').fetchall() == [('facts',2)]
+
+
+def test_workspace_staging_uses_authority_inventory_without_weakening_stale_reader(tmp_path):
+    from tools.v2 import build_offline_candidate as builder
+    from trade_system.v2 import journal_index as index
+    actual = Path(__file__).resolve().parents[1]
+    complete_observation_fixture(tmp_path/'fixture',actual)
+    source = tmp_path/'fixture/workspace'
+    assert index.cache_path(source).is_file() and index.recent(source,'note')[1] == 2
+    before = {p.relative_to(source).as_posix():file_hash(p) for p in source.rglob('*') if p.is_file()}
+    expected = recovery_bundle.inventory(source)
+    builder.stage_workspace(source,tmp_path/'stage')
+    assert recovery_bundle.inventory(tmp_path/'stage') == expected
+    assert not index.cache_path(tmp_path/'stage').exists()
+    assert not list((tmp_path/'stage').rglob('*.guard'))
+    assert index.recent(tmp_path/'stage','note')[1] == 2
+    assert before == {p.relative_to(source).as_posix():file_hash(p) for p in source.rglob('*') if p.is_file()}
+    shutil.copytree(source,tmp_path/'stale-cache-copy')
+    with pytest.raises(RuntimeError,match='stale'):
+        index.recent(tmp_path/'stale-cache-copy','note')
+
+
+def test_definition_scratch_preserves_legacy_rowid_tie_and_copies_no_facts(tmp_path):
+    from trade_system.v2.offline_binding import verify_normalized_definitions
+    from trade_system.normalize import build_normalized_views_on_connection
+    source = source_db(tmp_path)
+    with duckdb.connect(str(source)) as con:
+        con.execute('DELETE FROM multi_source_kline')
+        con.execute('CREATE TABLE kline(date DATE,stock_code VARCHAR,close DOUBLE,ktype VARCHAR)')
+        con.execute("INSERT INTO kline VALUES ('2026-09-04','000001',10,'D'),('2026-09-04','000001',20,'D')")
+        build_normalized_views_on_connection(con)
+    # This legacy rowid test exercises the normalize owner only. Its dynamic
+    # current_timestamp fallback is deliberately not a migration qualification.
+    market = source; before = file_hash(market)
+    config = {'threads':1,'memory_limit':'1GB','max_temp_directory_size':'268435456B',
+              'autoinstall_known_extensions':False,'autoload_known_extensions':False}
+    result = verify_normalized_definitions(market,tmp_path/'metadata',config=config)
+    assert result['fact_tables_copied'] == 0 and result['metadata_database_bytes'] <= 16*1024**2
+    with duckdb.connect(str(tmp_path/'metadata/definitions.duckdb'),read_only=True) as con:
+        con.execute("ATTACH '"+str(market).replace("'","''")+"' AS retained (READ_ONLY)")
+        assert con.execute('SELECT close FROM v_kline_daily').fetchall() == [(20.0,)]
+        assert con.execute('SELECT count(*) FROM duckdb_tables() WHERE database_name=current_database() AND NOT internal').fetchone()[0] == 0
+    assert file_hash(market) == before
+
+
+def test_full_schema_all_nineteen_owner_views_survive_readonly_derivation(tmp_path):
+    from trade_system.schema import init_schema
+    from trade_system.normalize import build_normalized_views_on_connection
+    from trade_system.v2.offline_binding import verify_normalized_definitions
+    market = tmp_path/'full-empty-schema.duckdb'
+    with duckdb.connect(str(market)) as con:
+        init_schema(con)
+        assert len(build_normalized_views_on_connection(con)) == 19
+    before = file_hash(market)
+    result = verify_normalized_definitions(market,tmp_path/'full-schema-proof',config={
+        'threads':1,'memory_limit':'1GB','max_temp_directory_size':'268435456B',
+        'autoinstall_known_extensions':False,'autoload_known_extensions':False})
+    assert result['normalized_view_count'] == 19 and result['fact_tables_copied'] == 0
+    assert file_hash(market) == before
+
+
 def test_verifier_exports_separate_historical_and_synthetic_pages(bound_lab, tmp_path):
     from tools.v2.verify_offline_recovery import verify
     root, _ = bound_lab
@@ -257,7 +474,7 @@ def technical_receipt(tmp_path):
             'real_accounts':'not_applicable_current_scope',
             'recovery':{'files':{'databases/raw.duckdb':{'sha256':'d'*64}},'offsite_accepted':False},
             'capacity':{'complete_multiset_verified':True,'rows':1,'batches':1},
-            'database_roles':{'preservation_verified':True,'qualification_verified':True},
+            'database_roles':{'preservation_verified':True,'qualification_verified':True,'normalized_views_verified':True},
             'rebound_readonly_configuration':{'read_only':True,'activation_allowed':False}},
         'evidence/historical-market.json':{'historical_rehearsal':True,
             'market':{'trade_date':'2026-09-04','snapshot_id':'c'*64}},
@@ -386,9 +603,13 @@ def test_small_candidate_build_preserves_legacy_and_emits_pinned_private_transfe
     subprocess.run(['git','-C',str(source),'-c','user.name=SYNTHETIC','-c','user.email=synthetic@example.invalid',
                     'commit','-qm','Synthetic source fixture'],check=True,capture_output=True)
     write_json(tmp_path/'source-manifest.json',{'schema':'offline_source_export_v1','files':files})
-    pages = tmp_path/'fixture-pages'; pages.mkdir()
+    pages = tmp_path/'pages'
+    shutil.copytree(root/'inputs/raw_facts/pages',pages)
     fixture = read_json(root/'inputs/raw_facts/fixture.json')
-    fixture.update(workspace=str(root/'inputs/workspace'),pages=str(pages))
+    fresh_workspace = Path(fixture['workspace'])
+    source_workspace_before = {p.relative_to(fresh_workspace).as_posix():file_hash(p)
+                              for p in fresh_workspace.rglob('*') if p.is_file()}
+    fixture.update(pages=str(pages))
     write_json(tmp_path/'fixture-receipt.json',fixture)
     write_json(tmp_path/'targets.json',targets())
     plan = {'schema':'offline_candidate_build_plan_v1','source_root':str(source),
@@ -397,7 +618,7 @@ def test_small_candidate_build_preserves_legacy_and_emits_pinned_private_transfe
         'raw_database_member':'rehearsal/bundles/initial/databases/market.duckdb',
         'migration_receipt':{'path':str(root/'inputs/raw_facts/migration.json'),'sha256':file_hash(root/'inputs/raw_facts/migration.json')},
         'migrated_database':{'path':str(root/'inputs/databases/migrated.duckdb'),'sha256':file_hash(root/'inputs/databases/migrated.duckdb')},
-        'observation':{'workspace':str(root/'inputs/workspace'),'pages':str(pages),
+        'observation':{'workspace':str(fresh_workspace),'pages':str(pages),
             'receipt':{'path':str(tmp_path/'fixture-receipt.json'),'sha256':file_hash(tmp_path/'fixture-receipt.json')}},
         'targets':{'path':str(tmp_path/'targets.json'),'sha256':file_hash(tmp_path/'targets.json')},
         'projection':{'day':'2026-09-04','as_of':'2026-10-29T18:00:00+08:00'},'output':str(tmp_path/'candidate')}
@@ -409,6 +630,8 @@ def test_small_candidate_build_preserves_legacy_and_emits_pinned_private_transfe
     assert (kit/'RUN-HOME.ps1').is_file() and (kit/'COLLECT-ACCEPTANCE.ps1').is_file()
     assert read_json(tmp_path/'candidate/business-evidence/historical-market.json')['market']['stocks']['000001']['close'] == 10
     assert recovery_bundle.inventory(old) == old_before
+    assert source_workspace_before == {p.relative_to(fresh_workspace).as_posix():file_hash(p)
+                                     for p in fresh_workspace.rglob('*') if p.is_file()}
     # Even re-sealing the outer membership cannot admit a missing new tool.
     (kit/'code/tools/v2/offline_home.py').unlink()
     manifest = read_json(kit/'package.json'); manifest['files'] = offline_package.inventory(kit)

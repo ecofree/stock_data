@@ -20,7 +20,7 @@ from tools.v2.offline_home import read, validate_targets
 from trade_system.v2 import recovery_bundle as recovery, capacity_acceptance as capacity
 from trade_system.v2.domain import identity
 from trade_system.v2.isolated_workspace import initialize, write_json
-from trade_system.v2.offline_binding import verify_bindings
+from trade_system.v2.offline_binding import verify_bindings, verify_observation_fixture
 from tools.v2.verify_offline_recovery import verify as verify_business
 
 
@@ -48,6 +48,24 @@ def pinned(record):
     if digest(path)!=record['sha256']:
         raise ValueError('explicit input pin differs')
     return path
+
+
+def stage_workspace(source, destination):
+    """Copy exactly the recovery owner's authority set, never portable caches."""
+    source, destination = safe(source), safe(destination)
+    if destination.exists() or destination.is_relative_to(source) or source.is_relative_to(destination):
+        raise ValueError('new separate workspace staging required')
+    files = recovery.inventory(source)
+    if not files:
+        raise ValueError('nonempty authority workspace required')
+    destination.mkdir(parents=True)
+    for name in files:
+        target = member(destination,name)
+        target.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(member(source,name),target)
+    if recovery.inventory(destination)!=files or recovery.inventory(source)!=files:
+        raise ValueError('workspace authority bytes changed during staging')
+    return files
 
 
 def home_scripts(package):
@@ -156,6 +174,7 @@ def build(plan_path, plan_sha256):
     if (safe(fixture['workspace'])!=workspace or safe(fixture['pages'])!=pages
             or fixture.get('fixture_only') is not True):
         raise ValueError('explicit synthetic fixture paths required')
+    verify_observation_fixture(source,workspace,fixture_path)
     targets = pinned(plan['targets'])
     validate_targets(read(targets))
     retained = sum(v['bytes'] for n,v in old_manifest['files'].items()
@@ -175,7 +194,7 @@ def build(plan_path, plan_sha256):
     shutil.copytree(old_bundle/'databases',inputs/'databases')
     migrated_name = 'databases/migrated-market.duckdb'
     shutil.copyfile(market,inputs/migrated_name)
-    shutil.copytree(workspace,inputs/'workspace')
+    stage_workspace(workspace,inputs/'workspace')
     shutil.copytree(old_bundle/'raw_facts',inputs/'raw_facts/original-facts')
     shutil.copytree(old_bundle/'workspace',inputs/'raw_facts/original-workspace')
     facts = inputs/'raw_facts'

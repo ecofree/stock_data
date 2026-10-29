@@ -170,6 +170,7 @@ def business_summary(target, receipt):
             or business.get('real_accounts') != 'not_applicable_current_scope'
             or capacity.get('complete_multiset_verified') is not True
             or roles.get('preservation_verified') is not True or roles.get('qualification_verified') is not True
+            or roles.get('normalized_views_verified') is not True
             or rebound.get('read_only') is not True or rebound.get('activation_allowed') is not False
             or recovery.get('offsite_accepted') is not False or not isinstance(recovery.get('files'),dict)
             or not recovery['files'] or historical.get('historical_rehearsal') is not True):
@@ -193,6 +194,7 @@ def business_summary(target, receipt):
         raise ValueError('typed pinned platform and technical timing evidence required')
     return {'recovered_files':len(recovery['files']),'archive_rows':capacity['rows'],'archive_batches':capacity['batches'],
             'complete_multiset_verified':True,'migration_preservation_verified':True,'qualification_verified':True,
+            'normalized_view_definitions_verified':True,
             'historical_market_date':day,'historical_snapshot_id':historical['market']['snapshot_id'],
             'environment_rebuilt_verified':True,'synthetic_observation_is_separate':True}
 

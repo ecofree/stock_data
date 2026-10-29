@@ -116,3 +116,22 @@ RTO为14400秒，从取回/复制开始，至技术核验通过且操作者确�
 
 本候选范围是历史行情、原始人工记录、冻结研究材料与只读页面；不包含实时采集、退役训练/预测、
 完整独立QLib研究环境或真实账户，不给予恢复运营授权。
+
+第3版独立内容核验还要求批准视图的**定义**符合当前冻结normalize owner；名称在19view清单内不代表定义合格。
+验证在独立新scratch中只读attach迁移库，基础表使用保留物理rowid的read-through视图；
+现有normalize builder生成期望定义，不复制任何事实基表，也不重写原库/恢复库。
+scratch先落盘再只读重开，消除DuckDB存储时CAST引号/UNION树序列化差异，随后精确比较批准定义集合及SQL；
+缺失view、同名view把close改成close×99、伪造receipt扩张声明都不能通过。
+quality.table_exists与normalize.data_coverage的元数据判断限定current_database()，attached外库不提供当前库的缺失表或重复覆盖项。
+该scratch最多3000个输入元数据对象，仍用1线程/1GB与原spill上限；元数据DB的16MiB为**关闭落盘后准入检查**，
+不是文件写入时的硬配额。超限保留现场并拒收，未把此上限当作所有数据库的容量认证。
+
+观察fixture准入复用既有外部helper的schema 1，无须改helper合同：完整direct `trade_system/v2/*.py`来源集合、
+全部11个`pages/*`JSON/HTML成员与hash、notes下全部原事件/证据JSON保存hash、note/revision/plan/review与D0/D1/D2身份均必需。
+Windows反斜线相对成员在校验时规范化并拒绝重复别名，原receipt不重写。
+已有journal/readers核对真实父子链与固定seen comparison，publisher核对三阶段保留页与原不可变发布物，
+已有renderer核对五张回执/整链页；空/缺一项source或artifact、伪ID、空原件map或改写固定比较均拒收。
+构建器在开始复制数据前先运行同一fixture准入，恢复目标再次核对；没有第二套journal、标准化SQL或qualification服务。
+活动workspace staging按既有`recovery_bundle.inventory`精确成员逐项复制；可重建`.index`缓存和原`.guard`不属于搬运成员。
+上游cache/guard原件字节不改，capture只在新staging创建自己的guard。恢复后的无缓存读取仍用既有owner的只读内存兼容路径；
+普通GET对确实存在的stale cache仍拒绝，不增加新回退开关、ContextVar或journal接口。
