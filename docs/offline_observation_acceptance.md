@@ -135,3 +135,12 @@ Windows反斜线相对成员在校验时规范化并拒绝重复别名，原rece
 活动workspace staging按既有`recovery_bundle.inventory`精确成员逐项复制；可重建`.index`缓存和原`.guard`不属于搬运成员。
 上游cache/guard原件字节不改，capture只在新staging创建自己的guard。恢复后的无缓存读取仍用既有owner的只读内存兼容路径；
 普通GET对确实存在的stale cache仍拒绝，不增加新回退开关、ContextVar或journal接口。
+
+离线产物的两个直接数据库写点由`tools/v2/closure_readiness.py`逐调用分类：
+`rehearse`只能写新迁移副本，`verify_normalized_definitions`只能写新的元数据scratch。
+原全局allowed清单不增加条目。分类固定审查于b6e37fe的函数AST、模块声明/绑定与关键防护helper契约，
+包括新目标、无链接路径、原件只读/独立复制、源ATTACH READ_ONLY和scratch只读重开等条件。
+保留原FunctionDef后再赋值/替换duckdb或guard alias不能沿用分类；新增writer也不继承同模块资格。
+AST忽略位置/格式和3.12新增的空type_params，已在真实3.11/3.12解释器核对；未知契约退回未分类。
+维护取舍是这些函数/安全依赖/模块声明改变时必须重新审查并更新固定契约，不能在运行时从当前源码自举expected，
+也不能通过挪到动态调用隐藏写点。这仍是受限静态直接调用门禁，不是全程序或OS权限证明，不能据此恢复运营。

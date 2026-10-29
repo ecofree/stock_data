@@ -172,7 +172,8 @@ def test_recovery_rejects_broken_human_references(lab, missing):
             path = workspace / 'notes/evidence' / (note['evidence_file_id'] + '.json')
     elif missing == 'review-parent':
         rid = research_journal.save_review(workspace, {'note_id': note['note_id'], 'request_id': 'c' * 32,
-             'conclusion': 'pending', 'reviewer': 'synthetic-reviewer', 'evidence': 'synthetic observation'})
+             'conclusion': 'pending', 'reviewer': 'synthetic-reviewer', 'evidence': 'synthetic observation',
+             'seen_market_snapshot_id':'unbound','seen_market_evidence_file_id':''})
         assert research_journal.read_review(workspace, rid)['note_id'] == note['note_id']
     else:
         newer = dict(note, supersedes=note['note_id'], request_id='d' * 32)
@@ -191,13 +192,41 @@ def test_restored_human_records_are_readable_without_index_rebuild(lab):
     note = read_json(next((workspace / 'notes').glob('*.json')))
     pid = human_plan(workspace, note)
     rid = research_journal.save_review(workspace, {'note_id': note['note_id'], 'request_id': 'c' * 32,
-         'conclusion': 'pending', 'reviewer': 'synthetic-reviewer', 'evidence': 'synthetic observation'})
+         'conclusion': 'pending', 'reviewer': 'synthetic-reviewer', 'evidence': 'synthetic observation',
+         'seen_market_snapshot_id':'unbound','seen_market_evidence_file_id':''})
     captured(lab)
     restored = root / 'restores/first/workspace'
     assert not (restored / 'notes/.index').exists()
     assert operator_workflow.read_observation_plan(restored, pid) == operator_workflow.read_observation_plan(workspace, pid)
     assert research_journal.read_review(restored, rid) == research_journal.read_review(workspace, rid)
     assert not (restored / 'notes/.index').exists()
+
+
+def test_pre_binding_immutable_review_survives_restore_without_index_or_reclassification(lab,monkeypatch):
+    from trade_system.v2 import journal_index
+    root, _ = lab; workspace = root/'inputs/workspace'
+    note = read_json(next((workspace/'notes').glob('*.json')))
+    # Exact pre-binding command/record vocabulary. Existing immutable history
+    # is not submitted as a new command and acquires no fabricated seen facts.
+    command = {'note_id':note['note_id'],'conclusion':'pending','reviewer':'synthetic-reviewer',
+               'evidence':'synthetic historical observation'}
+    old = dict(command,request_id='e'*32,command_id=identity(command),prediction_id=note['prediction_id'],
+        instrument=note['instrument'],received_at=now_utc().isoformat(),
+        identity_scope='caller_declared_not_authenticated',
+        scope='human_condition_observation_not_price_label_or_account_acceptance',execution_ready=False)
+    old['review_id'] = identity(old)
+    path = workspace/'notes/attention/reviews'/(old['review_id']+'.json')
+    write_json(path,old); original = path.read_bytes()
+    monkeypatch.setattr(journal_index,'rebuild',lambda *a:pytest.fail('recovery rebuilt a historical cache'))
+    captured(lab)
+    restored = root/'restores/first/workspace'
+    restored_path = restored/'notes/attention/reviews'/path.name
+    assert path.read_bytes() == restored_path.read_bytes() == original
+    record = research_journal.read_review(restored,old['review_id'])
+    assert record == old and 'seen_market_snapshot_id' not in record
+    projection = research_journal.review_projection(restored,record)
+    assert projection['market_binding']=='historical_unbound' and projection['seen_comparison'] is None
+    assert not (restored/'notes/.index').exists()
 
 
 def test_recovery_checks_feedback_semantics_not_only_sqlite_structure(lab):

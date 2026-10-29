@@ -142,6 +142,127 @@ def test_snapshot_writer_classification_does_not_follow_function_to_another_file
         writer_gate(tmp_path)
 
 
+def _isolated_writer_fixture(tmp_path, change=None):
+    from pathlib import Path
+    import subprocess
+    root=Path(__file__).resolve().parents[1]
+    files=('trade_system/v2/market_migration_rehearsal.py','trade_system/v2/offline_binding.py',
+           'trade_system/v2/isolated_workspace.py','trade_system/db_utils.py')
+    subprocess.run(['git','init',str(tmp_path)],check=True,capture_output=True)
+    for name in files:
+        target=tmp_path/name;target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes((root/name).read_bytes())
+    if change:
+        name,old,new=change;target=tmp_path/name;source=target.read_text('utf-8-sig')
+        assert old in source
+        target.write_text(source.replace(old,new),encoding='utf-8')
+
+
+def test_writer_gate_classifies_exact_isolated_artifact_calls_and_keeps_allowed(tmp_path):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    result=writer_gate(tmp_path)
+    assert result['direct_writer_gate_passed']
+    assert result['non_test_sites']=={'trade_system/db_utils.py':1}
+    sites=result['classified_writer_sites']
+    assert {(s['file'],s['function'],s['kind']) for s in sites}=={
+        ('trade_system/v2/market_migration_rehearsal.py','rehearse','isolated_historical_migration_writer'),
+        ('trade_system/v2/offline_binding.py','verify_normalized_definitions','isolated_normalization_metadata_writer')}
+    assert all(s['contract_id'] and len(s['contract_sha256'])==64 for s in sites)
+
+
+@pytest.mark.parametrize('change',[
+ ('trade_system/v2/market_migration_rehearsal.py',"con = duckdb.connect(str(candidate), config=config)","con = duckdb.connect(str(source), config=config)"),
+ ('trade_system/v2/market_migration_rehearsal.py',"source.open('rb')","source.open('wb')"),
+ ('trade_system/v2/market_migration_rehearsal.py',"candidate.open('xb')","candidate.open('wb')"),
+ ('trade_system/v2/market_migration_rehearsal.py',"if output.exists():","if False:"),
+ ('trade_system/v2/market_migration_rehearsal.py',"source, output = _validate_paths(source, output, source_sha256)","source, output = Path(source), Path(output)"),
+ ('trade_system/v2/market_migration_rehearsal.py',"with _source_read_guard(source):","with source.open('rb'):"),
+ ('trade_system/v2/market_migration_rehearsal.py',"0x80000000, 1, None, 3, 0x80","0x80000000, 7, None, 3, 0x80"),
+ ('trade_system/v2/market_migration_rehearsal.py',"if source.samefile(candidate) or _sha256(candidate) != expected:","if False:"),
+ ('trade_system/v2/offline_binding.py',"database = scratch/'definitions.duckdb'","database = source"),
+ ('trade_system/v2/offline_binding.py',"scratch = safe_path(scratch)","scratch = Path(scratch)"),
+ ('trade_system/v2/offline_binding.py',"scratch.mkdir(exist_ok=False)","scratch.mkdir(exist_ok=True)"),
+ ('trade_system/v2/offline_binding.py',"AS retained (READ_ONLY)","AS retained"),
+ ('trade_system/v2/offline_binding.py',"read_only=True,config=configuration","read_only=False,config=configuration"),
+ ('trade_system/v2/offline_binding.py',"database = scratch/'definitions.duckdb'","database = scratch/'definitions.duckdb'\n    database = source"),
+ ('trade_system/v2/offline_binding.py',"with duckdb.connect(str(database),config=configuration) as con:","with duckdb.connect(str(database),config=configuration) as con:\n        extra = duckdb.connect(str(source))"),
+ ('trade_system/v2/isolated_workspace.py',"return path.resolve()","return path"),
+ ('trade_system/db_utils.py',"def primary_checkout():","def renamed_primary_checkout():"),
+ ('trade_system/db_utils.py',"root = Path(__file__).resolve().parents[1]","root = Path('C:/wrong-root')"),
+ ('trade_system/v2/offline_binding.py',"name = record['path']","global safe_path\n    safe_path = lambda value: value\n    name = record['path']"),
+ ('trade_system/v2/offline_binding.py',"name = record['path']","duckdb.connect = lambda *a,**k: None\n    name = record['path']"),
+])
+def test_writer_gate_rejects_isolated_path_source_guard_or_extra_writer_mutations(tmp_path,change):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path,change)
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
+@pytest.mark.parametrize('suffix',[
+ '\nduckdb = object()\n', '\nduckdb.connect = lambda *a,**k: None\n',
+ '\nsafe_path = lambda value: value\n','\nfrom pathlib import Path as safe_path\n',
+ '\nmigration = object()\n','\nPath = object()\n','\nstr = lambda value: value\n',
+ '\nverify_normalized_definitions = lambda *a,**k: None\n',
+ '\ndef verify_normalized_definitions(source,scratch,*,config):\n    return None\n',
+ '\ndef extra_writer(source):\n    return duckdb.connect(source)\n',
+ '\ndef rebind_guard():\n    global safe_path\n    safe_path = lambda value: value\n',
+ '\ndef change_duckdb():\n    duckdb.connect = lambda *a,**k: None\n',
+])
+def test_writer_gate_rejects_module_alias_shadowing_even_with_original_definition(tmp_path,suffix):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    target=tmp_path/'trade_system/v2/offline_binding.py'
+    target.write_text(target.read_text('utf-8-sig')+suffix,encoding='utf-8')
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
+def test_writer_gate_contract_ast_is_stable_for_empty_python312_metadata():
+    import ast
+    from tools.v2.closure_readiness import _contract_digest
+    node=ast.parse('def fixture(value):\n    return value\n').body[0]
+    node._fields=tuple(name for name in node._fields if name!='type_params')
+    before=_contract_digest(node)
+    node._fields=(*node._fields,'type_params');node.type_params=[]
+    assert _contract_digest(node)==before
+    node.body[0].value=ast.Constant(7)
+    assert _contract_digest(node)!=before
+
+
+@pytest.mark.parametrize('name,suffix',[
+ ('trade_system/v2/market_migration_rehearsal.py','\n_validate_paths = lambda source,output,expected: (source,output)\n'),
+ ('trade_system/v2/market_migration_rehearsal.py',"\n_source_read_guard = lambda value: value.open('rb')\n"),
+ ('trade_system/db_utils.py','\nprimary_checkout = lambda: None\n'),
+ ('trade_system/v2/isolated_workspace.py','\nsafe_path = lambda value: value\n'),
+])
+def test_writer_gate_guard_helper_rebinding_does_not_leave_original_def_approved(tmp_path,name,suffix):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    target=tmp_path/name;target.write_text(target.read_text('utf-8-sig')+suffix,encoding='utf-8')
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
+def test_writer_gate_unknown_ast_value_remains_unclassified(tmp_path):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    target=tmp_path/'trade_system/v2/offline_binding.py'
+    target.write_text(target.read_text('utf-8-sig')+'\nUNKNOWN_REVIEWED_VALUE = 1j\n',encoding='utf-8')
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
+def test_writer_gate_isolated_classification_does_not_follow_code_to_other_module(tmp_path):
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    source=tmp_path/'trade_system/v2/offline_binding.py'
+    (source.parent/'other_offline_binding.py').write_bytes(source.read_bytes())
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
 def test_delivery_timeout_preserves_real_child_output_and_failure(tmp_path):
     from tools.v2.verify_delivery import _run_check, digest
 
