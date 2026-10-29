@@ -87,7 +87,37 @@ def apply_pending(
     ``schema_migration`` bookkeeping row, so a failed migration leaves no
     partial state behind.
     """
+    return _apply_pending(con, directory, dry_run=dry_run, own_transaction=True)
+
+
+def apply_pending_in_transaction(
+    con: duckdb.DuckDBPyConnection,
+    directory: str | Path = _DEFAULT_MIGRATIONS_DIR,
+    *,
+    versions: tuple[int, ...] | None = None,
+) -> list[int]:
+    """Apply selected migrations within the caller's active transaction.
+
+    The caller must BEGIN first and COMMIT or ROLLBACK the entire operation.
+    Neither this function nor its error path commits, rolls back or closes.
+    Missing historical versions/checksums are never retroactively certified.
+    """
+    return _apply_pending(con, directory, dry_run=False, own_transaction=False, versions=versions)
+
+
+def _apply_pending(
+    con: duckdb.DuckDBPyConnection,
+    directory: str | Path,
+    *,
+    dry_run: bool,
+    own_transaction: bool,
+    versions: tuple[int, ...] | None = None,
+) -> list[int]:
     discovered = discover_migrations(directory)
+    if versions is not None:
+        missing = set(versions) - {version for version, _ in discovered}
+        if missing:
+            raise ValueError(f"required migrations missing: {sorted(missing)}")
     done = applied_versions(con)
     has_checksums = con.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name='schema_migration_checksum'"
@@ -103,7 +133,7 @@ def apply_pending(
     pending = [
         (version, path)
         for version, path in discovered
-        if version not in done
+        if version not in done and (versions is None or version in versions)
     ]
     if not dry_run:
         ensure_migration_table(con)
@@ -120,7 +150,8 @@ def apply_pending(
             applied.append(version)
             continue
         logger.info("applying migration %s (%s)", version, description)
-        con.execute("BEGIN TRANSACTION")
+        if own_transaction:
+            con.execute("BEGIN TRANSACTION")
         try:
             con.execute(script)
             con.execute(
@@ -129,9 +160,11 @@ def apply_pending(
             )
             con.execute('INSERT INTO schema_migration_checksum VALUES (?, ?)',
                         [version, hashlib.sha256(script_bytes).hexdigest()])
-            con.execute("COMMIT")
+            if own_transaction:
+                con.execute("COMMIT")
         except Exception as exc:
-            con.execute("ROLLBACK")
+            if own_transaction:
+                con.execute("ROLLBACK")
             raise RuntimeError(f"migration {version} ({path.name}) failed: {exc}") from exc
         applied.append(version)
         logger.info("applied migration %s", version)

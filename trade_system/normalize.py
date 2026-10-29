@@ -2008,47 +2008,60 @@ def _create_data_coverage(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("CREATE OR REPLACE VIEW v_data_coverage AS " + " UNION ALL ".join(parts))
 
 
+def build_normalized_views_on_connection(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Rebuild views without closing, committing or taking ownership of ``con``."""
+    _refresh_default_concept_views(con)
+    _create_market_daily(con)
+    _create_sector_daily(con)
+    _create_limit_pool(con)
+    _create_limit_pool_rich(con)
+    _create_lhb_daily(con)
+    _create_stock_pool(con)
+    _create_auction_status(con)
+    _create_sector_capital(con)
+    _create_kline_daily(con)
+    _create_market_state_inputs(con)
+    _create_index_state(con)
+    _create_intraday_capital_flow_evidence(con)
+    _create_intraday_strength_evidence(con)
+    _create_theme_mainline_evidence(con)
+    _create_research_event_evidence(con)
+    _create_lhb_review_evidence(con)
+    _create_data_coverage(con)
+    return [
+        "v_default_concept_daily",
+        "v_default_concept_stock_history",
+        "v_market_daily",
+        "v_sector_daily",
+        "v_limit_pool",
+        "v_limit_pool_rich",
+        "v_lhb_daily",
+        "v_stock_pool",
+        "v_auction_status",
+        "v_sector_capital",
+        "v_kline_daily",
+        "v_market_state_inputs",
+        "v_index_state",
+        "v_intraday_capital_flow_evidence",
+        "v_intraday_strength_evidence",
+        "v_theme_mainline_evidence",
+        "v_research_event_evidence",
+        "v_lhb_review_evidence",
+        "v_data_coverage",
+    ]
+
+
 def build_normalized_views(db_path: str | Path) -> list[str]:
     from trade_system.db_utils import legacy_connect
     con = legacy_connect(str(db_path))
     try:
-        _refresh_default_concept_views(con)
-        _create_market_daily(con)
-        _create_sector_daily(con)
-        _create_limit_pool(con)
-        _create_limit_pool_rich(con)
-        _create_lhb_daily(con)
-        _create_stock_pool(con)
-        _create_auction_status(con)
-        _create_sector_capital(con)
-        _create_kline_daily(con)
-        _create_market_state_inputs(con)
-        _create_index_state(con)
-        _create_intraday_capital_flow_evidence(con)
-        _create_intraday_strength_evidence(con)
-        _create_theme_mainline_evidence(con)
-        _create_research_event_evidence(con)
-        _create_lhb_review_evidence(con)
-        _create_data_coverage(con)
-        return [
-            "v_default_concept_daily",
-            "v_default_concept_stock_history",
-            "v_market_daily",
-            "v_sector_daily",
-            "v_limit_pool",
-            "v_lhb_daily",
-            "v_stock_pool",
-            "v_auction_status",
-            "v_sector_capital",
-            "v_kline_daily",
-            "v_market_state_inputs",
-            "v_index_state",
-            "v_intraday_capital_flow_evidence",
-            "v_intraday_strength_evidence",
-            "v_theme_mainline_evidence",
-            "v_research_event_evidence",
-            "v_lhb_review_evidence",
-            "v_data_coverage",
-        ]
+        con.execute("BEGIN TRANSACTION")
+        try:
+            result = build_normalized_views_on_connection(con)
+            con.execute("COMMIT")
+            return result
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
     finally:
         con.close()
