@@ -2028,7 +2028,12 @@ def build_normalized_views_on_connection(con: duckdb.DuckDBPyConnection) -> list
     _create_research_event_evidence(con)
     _create_lhb_review_evidence(con)
     _create_data_coverage(con)
-    return [
+    return list(normalized_view_names())
+
+
+def normalized_view_names() -> tuple[str, ...]:
+    """Fixed owner allowlist shared by creation and read-only preservation."""
+    return (
         "v_default_concept_daily",
         "v_default_concept_stock_history",
         "v_market_daily",
@@ -2048,7 +2053,7 @@ def build_normalized_views_on_connection(con: duckdb.DuckDBPyConnection) -> list
         "v_research_event_evidence",
         "v_lhb_review_evidence",
         "v_data_coverage",
-    ]
+    )
 
 
 def build_normalized_views(db_path: str | Path) -> list[str]:

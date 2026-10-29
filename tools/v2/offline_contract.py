@@ -69,9 +69,9 @@ def base_entries(archive):
         yield name, archive.read(item)
 
 
-def code_closure(code):
+def code_closure(code, extra=()):
     """Follow local imports without executing package code or optional services."""
-    pending = list(ENTRYPOINTS) + ['trade_system/__init__.py', 'trade_system/v2/__init__.py']
+    pending = list(ENTRYPOINTS) + list(extra) + ['trade_system/__init__.py', 'trade_system/v2/__init__.py']
     visited = set()
 
     def require(module):
@@ -144,7 +144,7 @@ def wheel_identity(path):
     return name, version, compatible
 
 
-def validate_closure(root, files, *, base_sha, jsonpath_name, jsonpath_sha, catalog, member):
+def validate_closure(root, files, *, base_sha, jsonpath_name, jsonpath_sha, catalog, member, candidate=False):
     required = ('RUN-RESTORE.ps1', 'README-离机验收.txt', 'environment/base.zip',
                 'environment/wheels/' + jsonpath_name, 'rehearsal/rehearsal.json',
                 'rehearsal/bundles/initial/completed.json', 'rehearsal/' + catalog + '/completed.json',
@@ -159,7 +159,8 @@ def validate_closure(root, files, *, base_sha, jsonpath_name, jsonpath_sha, cata
         raise ValueError('incomplete standalone Python base')
     if {n.removeprefix('bootstrap/'):v for n,v in files.items() if n.startswith('bootstrap/')} != expected:
         raise ValueError('bootstrap differs from complete pinned base')
-    code = code_closure(root/'code')
+    extra = ('tools/v2/offline_home.py', 'tools/v2/build_offline_candidate.py') if candidate else ()
+    code = code_closure(root/'code', extra)
     if any('code/'+n not in files for n in code): raise ValueError('recovery code is not in manifest')
     blocks, _ = runtime_blocks(root/'code',jsonpath_sha)
     candidates = {}

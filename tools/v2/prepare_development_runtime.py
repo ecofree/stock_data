@@ -58,6 +58,7 @@ def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, ou
     environment = {k: v for k, v in os.environ.items() if not k.startswith(
         ('GIT_', 'KPL_', 'TUSHARE_', 'HITHINK_', 'XIAODEFA_', 'DEEPSEEK_', 'STOCKDATA_'))}
     environment.update(PIP_NO_INDEX='1', PIP_DISABLE_PIP_VERSION_CHECK='1',
+                       PIP_CONFIG_FILE=os.devnull, PIP_NO_CACHE_DIR='1',
                        PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', UV_OFFLINE='1')
 
     def run(name, command):
@@ -81,7 +82,7 @@ def prepare(base_archive, base_sha, wheelhouse, jsonpath_wheel, jsonpath_sha, ou
               "assert all(Path(p).resolve().is_relative_to(r) for p in sys.path);print('INDEPENDENT_PREFIX_PASS')")
     run('prefix-before', [python, '-I', '-B', '-X', 'utf8', '-c', prefix, target])
     run('ensurepip', [python, '-I', '-B', '-X', 'utf8', '-m', 'ensurepip', '--default-pip'])
-    run('offline-install', [python, '-I', '-B', '-X', 'utf8', '-m', 'pip', 'install', '--no-index',
+    run('offline-install', [python, '-I', '-B', '-X', 'utf8', '-m', 'pip', '--isolated', 'install', '--no-index', '--no-cache-dir',
                            '--no-compile', '--only-binary=:all:', '--require-hashes', '--find-links',
                            wheelhouse, '--find-links', jsonpath_wheel.parent, '-r', lock])
     run('pip-check', [python, '-I', '-B', '-m', 'pip', 'check'])
