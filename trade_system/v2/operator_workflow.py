@@ -46,6 +46,10 @@ def save_observation_plan(output, values):
             if old['command_id']!=identity(command):raise ValueError('plan request reused with different content')
             return old['plan_id']
         note=read_note(output,command['note_id'])
+        if note['intent']!='observe' or lookup(output,'note','parent',note['note_id']):
+            raise ValueError('new plan requires current observable judgement')
+        if plan_invalidation(output,{'note_id':note['note_id'],'plan_id':''}):
+            raise ValueError('judgement invalidated; append a revision before creating a new plan')
         if command['operator']!=note['operator']:raise ValueError('plan must preserve declared judgement author')
         if command['condition'] not in ('manual','price_above','price_below'):raise ValueError('explicit supported condition required')
         if command['condition']!='manual' and number(command['threshold'])<=0:raise ValueError('positive unadjusted CNY threshold required')
@@ -146,10 +150,12 @@ def observation_plan_risk(evaluation):
 
 
 def observation_plans(output, as_of, quotes=()):
-    from .journal_index import recent
+    from .journal_index import recent, effective
     paths,_=recent(output,'plan')
-    plans=[read_observation_plan(output,p.stem) for p in paths]
-    superseded={p.get('supersedes') for p in plans};by_code={q['instrument']:q for q in quotes}
+    leaves=effective(output,'plan');leaf_ids={p['plan_id'] for p in leaves}
+    ids=dict.fromkeys([*(p['plan_id'] for p in leaves),*(p.stem for p in paths)])
+    plans=[read_observation_plan(output,key) for key in ids]
+    by_code={q['instrument']:q for q in quotes}
     account=configured_account_risk(output,as_of)
     invalidations=plan_invalidation_context(output,plans)
     rows=[]
@@ -157,7 +163,7 @@ def observation_plans(output, as_of, quotes=()):
         evaluation=evaluate_observation_plan(plan,as_of,quote=by_code.get(plan['instrument']),account=account)
         invalidation=plan_invalidation(output,plan,context=invalidations)
         if invalidation:evaluation.update(state='invalid',invalidation=invalidation)
-        rows.append(dict(plan,is_latest=plan['plan_id'] not in superseded,evaluation=evaluation))
+        rows.append(dict(plan,is_latest=plan['plan_id'] in leaf_ids,evaluation=evaluation))
     return {'account':account,'rows':rows}
 
 

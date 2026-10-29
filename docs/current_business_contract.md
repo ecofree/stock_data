@@ -12,6 +12,8 @@
 | 当前市场发布 | v2.daily_workspace.update_market → v2.publisher | 只读行情库 → 不可变 desk.json/index.html 和 current 指针 | 同日快照、哈希与渲染合同一致；发布失败保留上一成功版本 |
 | 当前本地工作台 | v2.research_product_server | 已绑定工作区 → 本地页面、显式人工保存 | 已有本地 HTTP 界面；不授予券商下单或任务恢复权限 |
 | 人工判断与条件 | v2.research_product.save_note / v2.operator_workflow.save_observation_plan | 原始证据、人工判断与失效条件 → 追加记录、观察计划 | 幂等、保留历史；观察触发不是成交 |
+| 人工所见行情复盘 | v2.research_journal.save_review / review_projection | 明确所见快照身份与完整内容哈希、人工文字 → 原复盘存储中的追加回执 | 新关注复盘绑定盘后快照；页面所见已变则拒绝；成功旧请求先幂等恢复。缺价/口径/时点不合格可记文字，但不计算变化；报价未绑定为复盘事实 |
+| 判断、计划与复盘历史 | 本地 GET /journal?kind=note、plan、review；可加 id、before、limit | 原事件与原索引 → 有界历史页与指定原件整链 | GET 无写入；当前判断及风险按全部有效叶子，超过10000明确失败。静态导出只含全部当前叶子及最近100条历史，更早记录须本地服务读取 |
 | 历史复盘预览 | scripts/generate_daily_review_web.py → review_web | 显式只读数据、日期 → 显式外部预览目录 | 项目 reports/daily_review_latest.html 旧 latest 写入已退役；现存页是历史产物。预览仍自包含、交互内联 |
 | 冻结研究证据 | v2.research_product 历史读取 | 原登记与哈希绑定产物 → 历史研究展示 | build/update/price-study 活动入口退役；依赖通过不授予训练、预测刷新或晋级 |
 | 旧真实结果读取 | operator_outcomes | 历史 operator_trade_outcome → 历史复盘 | CSV/API 写入永久退役；新增真实反馈等待 C3 |
@@ -26,6 +28,7 @@
 - execution_ready 在当前研究链始终 false。legacy_execution_requested 和 candidate_pool_executable_candidates 只记录历史输入标记。
 - 运行成功、数据可用、页面发布、研究有效和真实账户对账各自保留证据。
 - 旧兼容函数参数保留以便读取历史记录，不能成为重新启用入口的开关。
+- 旧人工复盘没有所见行情绑定时明确显示未知，不追补证据；新复盘只在没有已发布行情时允许明确 unbound。绑定是接收时封存事实，不认证供应商原始发布时间。原判断修订或人工失效阻止新计划；旧成功请求、原文与回执保留，重新打开和后续价格好转均不复活旧计划。
 
 ## 产品与完整性
 

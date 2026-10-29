@@ -99,7 +99,7 @@ def render(data, *, include_account=False):
 <details id="theme-workspace"><summary>题材与同日涨停证券</summary><label>搜索题材 <input id="theme-search" maxlength="40"></label><p id="theme-count" class="small"></p><div class="scroll" style="max-height:320px"><table><thead><tr><th>题材</th><th>涨停 / 成员</th><th>最高连板</th></tr></thead><tbody id="theme-rows"></tbody></table></div><div id="theme-detail"></div></details></section><section id="today"><div class="toolbar"><h2>候选比较</h2><p class="small">预测更新与自动晋级已退役；历史研究只读，当前仅比较合格市场事实。</p></div>
 <p id="session-date" class="small"></p><details class="small"><summary>数据与模型时点</summary><p id="freshness"></p></details><details class="warning"><summary>研究边界：价格目标不是收益或交易资格</summary><p>模型评分是下一交易日开盘至T+2收盘的价格变化估计，不是成交承诺或收益保证。当前历史对照未证明选股优势，以下是研究观察清单，不是买入推荐。缺失记录保留；当前模型预先指定为价格基线，不按测试赢家自动切换。</p></details>
 <div class="toolbar"><label>筛选证券 <input id="search" placeholder="输入代码或名称，点击行查看依据" maxlength="30"></label><label>排序依据 <select id="sort"><option value="code">证券代码（默认，不代表推荐顺序）</option></select></label></div>
-<div class="scroll"><table id="current"><thead><tr><th>证券</th><th>模型估计 %</th><th>20日动量 %</th><th>数据状态</th></tr></thead><tbody></tbody></table></div><p id="empty"></p>
+<div class="scroll"><table id="current"><thead><tr><th>证券</th><th>事实日期</th><th>来源</th><th>复权</th><th>价格资格</th><th>收盘 / 元</th><th>涨跌 %</th></tr></thead><tbody></tbody></table></div><p id="empty"></p>
 <p class="small">选两只证券加入对比；模型正向贡献只是数值解释，不是利好事实。</p><div id="compare-panel" aria-live="polite"></div><details id="details"><summary>选中候选的依据与风险</summary><div id="evidence"></div></details></section>
 <section id="experiment"><section class="metrics" id="stats"></section><h2 id="research-heading">历史研究：共同样本对照</h2><p id="scope" class="small"></p><div class="scroll"><table><thead><tr><th>模型组</th><th>样本 / 日期</th><th>MSE</th><th>日均Rank IC</th><th>Top5价格目标均值 %</th></tr></thead><tbody id="models"></tbody></table></div>
 <p class="small" id="research-contract">同一组样本、同一目标和预处理规则。资金与Alpha158的对照结果允许为负；Top5统计不是资金曲线。尾段不评分、不调参。历史可用性选择存在偏差，不能外推全市场。</p><div id="comparison"></div></section>
@@ -107,7 +107,7 @@ def render(data, *, include_account=False):
 <section id="journal"><h2>记录你的判断</h2><p class="small">署名为你自行声明；保存时记录本机接收时间，不生成委托。原记录不可改写。</p>
 <p id="note-context" class="small"></p><form method="post" action="/note" id="note-form"><input type="hidden" name="csrf" value="__CSRF__"><input type="hidden" name="request_id" id="request-id"><input type="hidden" name="prediction_id" id="prediction-id"><input type="hidden" name="supersedes" id="supersedes"><input type="hidden" name="evidence_id" id="evidence-id">
 <div class="layout"><div><label>证券 <input name="instrument" id="instrument" list="security-options" pattern="[0-9]{6}" maxlength="6" required><datalist id="security-options"></datalist></label><label>署名 <input name="operator" required maxlength="200"></label><label>意向 <select name="intent"><option value="observe">继续观察</option><option value="reject">不采用</option><option value="paper_hypothesis">研究假设（不下单）</option></select></label></div><div><label>判断依据 <textarea name="hypothesis" required maxlength="4000"></textarea></label><label>失效条件 <textarea name="invalidation" required maxlength="4000"></textarea></label></div></div><button id="save">保存判断到本地</button> <button type="button" id="new-note">退出修订，记录当前判断</button></form><div id="notes"></div></section>
-<section id="followup"><h2>冻结预测与后续结果</h2><p>只评价先冻结、后实际收到的价格。尚未成熟和精确会话缺价分别保留；不补零、不把新训练结果回填旧预测。</p><div id="reviews"></div></section>
+<section id="followup"><h2>原判断后续事实与历史研究</h2><h3>历史冻结预测</h3><p>只评价先冻结、后实际收到的价格。尚未成熟和精确会话缺价分别保留；不补零、不把新训练结果回填旧预测。</p><div id="reviews"></div></section>
 <footer>离线显示数据全部内联。研究样本与真实账户分开；未验证选股优势，真实执行关闭。<!--RUNNING_REFRESH--></footer></main>
 <script type="application/json" id="data">'''+payload+'''</script><script>
 'use strict';const D=JSON.parse(document.getElementById('data').textContent),$=x=>document.getElementById(x),P=D.prediction;
@@ -136,7 +136,7 @@ const t=el('table','');const body=el('tbody','');t.append(body);table(body,Objec
 Object.entries(r.contributions||{}).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).forEach(([k,v])=>evidence.append(el('p',(featureNames[k]||k)+'：'+(v>=0?'+':'')+fmt(v)+'个百分点')));
 evidence.append(el('p','贡献项之和等于评分，不是因果解释。风险：模型老化、样本选择偏差、跳空及无法成交，价格目标不是组合收益。请自行填写失效条件，系统不会替你作出判断。'));
 const d=el('details','');d.append(el('summary','来源回执'),el('p','同花顺原生价格；中继日线交叉核对、复权与资金。'),el('pre',JSON.stringify(r.receipt_files,null,2)));evidence.append(d);if(!$('supersedes').value&&!draftDirty)$('instrument').value=r.instrument}
-function draw(){const key=$('sort').value==='code'?'instrument':$('sort').value==='rule'?'baseline_momentum_20d':'prediction';const filtered=rows.filter(r=>(r.instrument+' '+(r.name||'')).includes($('search').value.trim())).slice().sort((a,b)=>key==='instrument'?a.instrument.localeCompare(b.instrument):(a[key]==null)-(b[key]==null)||(b[key]||0)-(a[key]||0)||a.instrument.localeCompare(b.instrument));table($('current').tBodies[0],filtered.slice(0,100).map(r=>[r.instrument+' '+(r.name||''),fmt(r.prediction),fmt(r.baseline_momentum_20d),r.market_only?stockPriceStatus(D.market?.stocks?.[r.instrument])+' · 无模型判断':r.prediction==null?'特征不足':'研究预测']));[...$('current').tBodies[0].rows].forEach((tr,i)=>{tr.tabIndex=0;tr.setAttribute('aria-selected',compared.has(filtered[i].instrument));const b=el('button',compared.has(filtered[i].instrument)?'移出对比':'加入对比');b.type='button';b.setAttribute('aria-label',b.textContent+' '+filtered[i].instrument);b.onclick=e=>{e.stopPropagation();const code=filtered[i].instrument;if(compared.has(code))compared.delete(code);else if(compared.size<2)compared.add(code);else{$('message').textContent='最多同时比较两只，请先移出一个。';return}drawCompare();draw()};tr.cells[0].append(el('br',''),b);tr.onclick=()=>show(filtered[i]);tr.onkeydown=e=>{if(e.key==='Enter')tr.click()}});$('empty').textContent=filtered.length?'':'当前无可展示候选'}draw();$('search').oninput=draw;$('sort').onchange=draw;
+function draw(){const key=$('sort').value==='code'?'instrument':$('sort').value==='rule'?'baseline_momentum_20d':'prediction';const filtered=rows.filter(r=>(r.instrument+' '+(r.name||'')).includes($('search').value.trim())).slice().sort((a,b)=>key==='instrument'?a.instrument.localeCompare(b.instrument):(a[key]==null)-(b[key]==null)||(b[key]||0)-(a[key]||0)||a.instrument.localeCompare(b.instrument));table($('current').tBodies[0],filtered.slice(0,100).map(r=>[r.instrument+' '+(r.name||''),D.market?.trade_date||'未知',D.market?.stocks?.[r.instrument]?.price_contract?.[0]||'未知',D.market?.stocks?.[r.instrument]?.price_contract?.[1]||'未知',stockPriceStatus(D.market?.stocks?.[r.instrument]),fmt(D.market?.stocks?.[r.instrument]?.close),fmt(D.market?.stocks?.[r.instrument]?.change_pct)]));[...$('current').tBodies[0].rows].forEach((tr,i)=>{tr.tabIndex=0;tr.setAttribute('aria-selected',compared.has(filtered[i].instrument));const b=el('button',compared.has(filtered[i].instrument)?'移出对比':'加入对比');b.type='button';b.setAttribute('aria-label',b.textContent+' '+filtered[i].instrument);b.onclick=e=>{e.stopPropagation();const code=filtered[i].instrument;if(compared.has(code))compared.delete(code);else if(compared.size<2)compared.add(code);else{$('message').textContent='最多同时比较两只，请先移出一个。';return}drawCompare();draw()};tr.cells[0].append(el('br',''),b);tr.onclick=()=>show(filtered[i]);tr.onkeydown=e=>{if(e.key==='Enter')tr.click()}});$('empty').textContent=filtered.length?'':'当前无可展示候选'}draw();$('search').oninput=draw;$('sort').onchange=draw;
 table($('models'),Object.entries(D.research.aggregate).map(([k,v])=>[labels[k]||k,v.samples+' / '+v.days,fmt(v.mse),fmt(v.mean_daily_rank_ic),fmt(v.top_k_mean_label_pct)]));
 if(D.rule_baselines){const b=D.rule_baselines.summary;[['动量规则（无训练）',b.mean_daily_rank_ic,b.momentum_top5_target_pct],['共同证券等权观察',null,b.equal_weight_target_pct]].forEach(([name,ic,value])=>{const tr=el('tr','');[name,b.samples+' / '+b.days,'不适用',fmt(ic),fmt(value)].forEach(v=>tr.append(el('td',v)));$('models').append(tr)});$('comparison').append(el('p','规则对照复用每折完全相同的样本身份；动量分数不冒充收益预测，因此不计算其MSE。等权行使用同一合格日期的全部共同证券，不是Top5；候选不足的日期另保留，不混入选择效果汇总。规则为事后明确的固定规则，不宣称未见样本。'))}
 Object.entries(D.research.paired_comparisons).forEach(([k,v])=>$('comparison').append(el('p',(labels[k]||k)+' 相对价格基线日MSE差 '+fmt(v.mean_daily_mse_difference)+'；描述性区间 '+(v.moving_block_bootstrap_95pct||[]).map(fmt).join(' ～ ')+'（负值较好）')));
@@ -150,7 +150,7 @@ rows.forEach(r=>{const o=el('option',r.instrument);o.value=r.instrument;$('secur
 const timingNames={before_entry:'事前判断',after_entry:'事后补记',timing_unverified:'时间资格待核对'};
 function newRequest(){return [...crypto.getRandomValues(new Uint8Array(16))].map(x=>x.toString(16).padStart(2,'0')).join('')}
 function resetNote(){draftDirty=false;$('note-form').reset();$('request-id').value=newRequest();$('prediction-id').value=D.market?'':P?P.prediction_id:'';$('evidence-id').value=D.market?.snapshot_id||'';$('supersedes').value='';$('note-context').textContent='绑定证据 '+(D.market?.snapshot_id||P?.prediction_id||'未配置市场').slice(0,12)+'；以保存时刻区分事前与事后，不可回填时间。'}resetNote();$('new-note').onclick=()=>{if(!draftDirty||confirm('放弃尚未保存的草稿？'))resetNote()};
-D.notes.forEach(n=>{const e=el('div','');e.className='note';e.append(el('strong',n.instrument+' · '+n.operator+' · '+n.received_at),el('p',(timingNames[n.timing]||'旧记录，时间待核对')+' / '+(n.is_latest?'当前记录':'历史版本')+' / '+(n.prediction_id||n.evidence_id||'').slice(0,12)),el('p',n.hypothesis),el('p','失效：'+n.invalidation));if(n.is_latest){const b=el('button','追加修订，保留原文');b.type='button';b.onclick=()=>{const form=$('note-form');for(const k of ['operator','hypothesis','invalidation','intent'])form.elements[k].value=n[k];$('instrument').value=n.instrument;$('prediction-id').value=n.prediction_id||'';$('evidence-id').value=n.evidence_id||'';$('supersedes').value=n.note_id;$('note-context').textContent='修订 '+n.note_id.slice(0,12)+'，仍绑定原预测；事后修订不替代事前判断。';$('journal').scrollIntoView()};e.append(b)}$('notes').append(e)});
+D.notes.forEach(n=>{const e=el('div','');e.className='note';e.append(el('strong',n.instrument+' · '+n.operator+' · '+n.received_at),el('p',(timingNames[n.timing]||'旧记录，时间待核对')+' / '+(n.is_latest?'当前记录':'历史版本')+' / '+(n.prediction_id||n.evidence_id||'').slice(0,12)),el('p',n.hypothesis),el('p','失效：'+n.invalidation));if(n.is_latest){const b=el('button','追加修订，保留原文');b.type='button';b.onclick=()=>{const form=$('note-form');for(const k of ['operator','hypothesis','invalidation','intent'])form.elements[k].value=n[k];$('instrument').value=n.instrument;$('prediction-id').value=n.prediction_id||'';$('evidence-id').value=n.evidence_id||'';$('supersedes').value=n.note_id;$('note-context').textContent='修订 '+n.note_id.slice(0,12)+'，仍绑定原市场证据；修订保留原文与时间。';$('journal').scrollIntoView()};e.append(b)}$('notes').append(e)});
 const states={awaiting_review_refresh:'原判断已关联，等待数据更新评估；不是零收益',pending_exact_future_sessions:'等待后续交易日',mature:'价格目标已成熟',partial_missing_prices:'部分精确价格缺失',outside_current_receipt_window:'超出本次更新窗口',not_prospective:'非事前冻结，不计成绩'};
 (D.reviews||[]).forEach(r=>{const e=el('details','');e.append(el('summary',r.prediction_date+' / '+r.prediction_id.slice(0,10)+' / '+(states[r.status]||r.status)+' / 配对 '+r.paired),el('p',r.count_in_summary?'同日同模型首个冻结批次，计入该组统计':'附加判断关联批次，不重复计入统计'));if(r.comparison)e.append(el('p','共同成熟证券 '+r.common_rule_model_samples+' 只；QLib Top5目标均值 '+fmt(r.comparison.model_top5_target_pct)+'%，动量Top5 '+fmt(r.comparison.momentum_top5_target_pct)+'%，等权 '+fmt(r.comparison.equal_weight_target_pct)+'%。不是投资组合收益。'));r.rows.forEach(row=>{const box=el('div','');box.className='note';box.append(el('strong',row.instrument+' / '+(row.entry_date||'等待实际交易日')+' → '+(row.exit_date||'未成熟')),el('p','冻结估计 '+fmt(row.prediction)+'%；实际价格目标 '+fmt(row.target_pct)+'%；误差 '+fmt(row.error_pct)+'个百分点'));(row.judgements||[]).forEach(n=>box.append(el('p',(timingNames[n.verified_timing]||'时间待核对')+' · '+n.operator+'：'+n.hypothesis+'；失效条件：'+n.invalidation)));if(!row.judgements?.length)box.append(el('p','未判断：原队列保留，不删除或补填。'));if(row.judgements?.length)box.append(el('p','失效条件是否触发须人工核对，不能仅凭收益正负自动判定。'));e.append(box)});$('reviews').append(e)});if(!(D.reviews||[]).length)$('reviews').textContent='没有成熟的前瞻结果；等待冻结预测之后的实际交易日。';
 const market=D.market;
@@ -179,7 +179,7 @@ if(market?.valuation_capabilities?.rows){
  capabilityBox.append(detail);
 }
 const groups={market:['market','today','journal','followup'],observation:['observation','journal'],experiment:['experiment','price-study'],operations:['operations']};
-function switchWorkspace(){const hash=location.hash.slice(1),key=groups[hash]?hash:hash.startsWith('note-')?'observation':hash.startsWith('review-')?'market':'market';for(const id of new Set(Object.values(groups).flat()))$(id).hidden=!groups[key].includes(id)||(id==='price-study'&&!D.price_study);document.querySelectorAll('nav.tabs a').forEach(a=>a.setAttribute('aria-current',a.hash==='#'+key?'page':'false'))}
+function switchWorkspace(){const hash=location.hash.slice(1),key=groups[hash]?hash:hash.startsWith('note-')?'observation':hash.startsWith('plan-')?'observation':hash.startsWith('review-')?'market':'market';for(const id of new Set(Object.values(groups).flat()))$(id).hidden=!groups[key].includes(id)||(id==='price-study'&&!D.price_study);document.querySelectorAll('nav.tabs a').forEach(a=>a.setAttribute('aria-current',a.hash==='#'+key?'page':'false'))}
 window.addEventListener('hashchange',switchWorkspace);switchWorkspace();
 
 if(market){
@@ -226,6 +226,7 @@ $('market').append(ecology);
 function appendMarketEvidence(box,r){
  const stock=D.market?.stocks?.[r.instrument];
  if(!stock){box.append(el('p','市场证据缺失；不能按模型分数补齐。'));return}
+ box.append(el('p','事实日期 '+D.market.trade_date+' / 来源 '+(stock.price_contract?.[0]||'未知')+' / 复权 '+(stock.price_contract?.[1]||'未知')+' / 单位 '+(stock.price_contract?.slice(2).join(' / ')||'未知')));
  box.append(el('p',(stock.price_status==='available'?'同日价格事实：':'未认证留存价格：')+'收盘 '+fmt(stock.close)+' 元 / 涨跌 '+fmt(stock.change_pct)+'%'),el('p',stockPriceStatus(stock)));
  const themes=(D.market.themes||[]).filter(t=>!t.broad_classification&&(t.member_codes||[]).includes(r.instrument)).slice(0,3);
  for(const t of themes)box.append(el('p',t.concept_name+'：涨停 '+(t.limit_up_count??'缺失')+' / 成员 '+t.member_count+'，最高 '+(t.max_board??'缺失')+' 板；主力净额 '+(t.main_flow_cny==null?'未通过成员资金核对':fmt(t.main_flow_cny/1e8)+'亿元')));
@@ -234,7 +235,7 @@ function appendMarketEvidence(box,r){
 function drawCompare(){
 $('operations').before($('priorities'));$('operations').before($('observation'));
 $('compare-panel').replaceChildren();$('today').querySelector('.scroll').before($('compare-panel'));
-for(const code of compared){const r=rows.find(x=>x.instrument===code),box=el('article','');box.append(el('strong',r.instrument+' '+(r.name||'')),el('p','模型估计 '+fmt(r.prediction)+'% / 动量 '+fmt(r.baseline_momentum_20d)+'%'));
+for(const code of compared){const r=rows.find(x=>x.instrument===code),box=el('article','');box.append(el('strong',r.instrument+' '+(r.name||'')));
 appendMarketEvidence(box,r);if(r.market_only){box.append(el('p','本次比较不依赖模型。模型窗口与贡献未核对，不把缺失显示为零缺口。'));$('compare-panel').append(box);continue}const contributions=Object.entries(r.contributions||{}).filter(([k])=>k!=='base_value');
 const positive=contributions.filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1])[0],negative=contributions.filter(([,v])=>v<0).sort((a,b)=>a[1]-b[1])[0];
 box.append(el('p','最大正向模型贡献：'+(positive?(featureNames[positive[0]]||positive[0])+' +'+fmt(positive[1])+'个百分点':'无可用正向项')),el('p','最大反向模型贡献：'+(negative?(featureNames[negative[0]]||negative[0])+' '+fmt(negative[1])+'个百分点':'无可用反向项')),el('p','近21日已记录缺口：'+gaps(r.active_window_gap_counts)+'；不是风险评级'),el('p','下一步：核对来源与失效条件，再保存观察或拒绝理由；不形成交易资格。'));
@@ -250,9 +251,10 @@ window.addEventListener('beforeunload',e=>{if(draftDirty){e.preventDefault();e.r
 form.addEventListener('submit',()=>{persistDraft();draftDirty=false;$('save').disabled=true;$('save').textContent='提交中，等待独立保存回执…'});
 window.addEventListener('pageshow',()=>{$('save').disabled=!D.market&&!P;$('save').textContent='保存判断到本地';if(form.elements.hypothesis.value)draftDirty=true});
 $('new-note').addEventListener('click',()=>{if(!draftDirty)try{sessionStorage.removeItem(draftKey)}catch(_){}});
-if(D.note_scope&&D.note_scope.total>D.note_scope.shown)$('notes').prepend(el('p','当前仅展示最近 '+D.note_scope.shown+' / '+D.note_scope.total+' 条；历史记录仍保留在本地。'));
+if(D.note_scope&&D.note_scope.total>D.note_scope.shown)$('notes').prepend(el('p','当前展示全部有效判断与最近历史，共 '+D.note_scope.shown+' / '+D.note_scope.total+' 条；历史记录仍保留在本地。'));
 const online=location.protocol==='http:'&&!form.elements.csrf.value.startsWith('__');
 function staticMode(){if(!online){document.querySelectorAll('form button').forEach(b=>b.disabled=true);$('message').textContent='''+json.dumps(static_message,ensure_ascii=False)+'''}}staticMode();window.addEventListener('pageshow',staticMode);
+const historyNav=el('p',online?'历史判断、复盘与计划可按普通链接分页读取。':'只读导出范围：全部当前判断与计划叶子，加最近100条历史判断、计划和人工复盘；更早历史未内联，须在本地服务读取。');if(online)for(const [kind,label] of [['note','判断历史'],['plan','计划历史'],['review','复盘历史']]){const a=el('a',label+' ');a.href='/journal?kind='+kind;historyNav.append(a)}$('notes').before(historyNav);
 const conditionNames={pending:'仍待观察',triggered:'失效条件已触发',not_triggered:'截至记录时未触发',unclear:'证据不足，无法判断'};
 const quoteStates={no_qualified_current_quote:'无合格当前报价',expired_after_publication:'已过期，不显示旧价格',conflicting_same_priority_quotes:'同优先级报价冲突',capacity_blocked:'本轮采集容量受限，尚未核对',current_observation_not_executable:'时点合格，仅供观察'};
 const obs=D.observation,watched=D.notes.filter(n=>n.is_latest&&n.intent==='observe');
@@ -267,14 +269,15 @@ function drawObservation(){if(obs&&!obs.error){for(const q of obs.rows)if(q.pric
 }drawObservation();$('observation-all').onchange=drawObservation;setInterval(drawObservation,15000);window.addEventListener('pageshow',drawObservation);
 for(const [i,n] of D.notes.entries()){const box=$('notes').querySelectorAll('.note')[i];if(!box)continue;box.id='note-'+n.note_id;const link=el('a','返回原判断后续复盘');link.href='#review-'+(n.prediction_id||n.note_id);box.append(link);if(online){const receipt=el('a','查看保存回执');receipt.href='/receipt/'+n.note_id;box.append(el('br',''),receipt)}const revise=box.querySelector('button');if(revise)revise.addEventListener('click',editDraft);
  const reviewBox=el('details','');reviewBox.append(el('summary','记录这条判断的后续核对'));
- for(const r of (D.human_reviews||[]).filter(r=>r.note_id===n.note_id))reviewBox.append(el('p',r.received_at+' · '+r.reviewer+' · '+conditionNames[r.conclusion]+'：'+r.evidence));
+ for(const r of (D.human_reviews||[]).filter(r=>r.note_id===n.note_id)){const fact=r.seen_comparison;reviewBox.append(el('p',r.received_at+' · '+r.reviewer+' · '+conditionNames[r.conclusion]+'：'+r.evidence),el('p',fact?'固定所见 '+fact.original_date+' → '+fact.current_date+' / 原价 '+fmt(fact.original_close)+' / 所见价 '+fmt(fact.current_close)+' / 来源与复权 '+JSON.stringify(fact.current_price_contract)+' / 资格 '+fact.status+' / 变化 '+fmt(fact.change_pct)+'%':r.market_binding==='explicit_unbound_no_published_market'?'本次明确未绑定行情：当时没有已发布市场快照；仅保存人工文字。':'历史人工记录，所见行情版本未绑定；不认证当时所见事实。'));}
  if(online){const f=document.createElement('form');f.method='post';f.action='/review';f.className='review-form';
-  for(const [name,value] of Object.entries({csrf:form.elements.csrf.value,note_id:n.note_id,request_id:newRequest()})){const input=document.createElement('input');input.type='hidden';input.name=name;input.value=value;f.append(input)}
+  for(const [name,value] of Object.entries({csrf:form.elements.csrf.value,note_id:n.note_id,request_id:newRequest(),...(n.schema===2?{seen_market_snapshot_id:D.market?.snapshot_id||'unbound',seen_market_evidence_file_id:D.seen_market_evidence_file_id||''}:{})})){const input=document.createElement('input');input.type='hidden';input.name=name;input.value=value;f.append(input)}
   const label=el('label','失效条件核对（人工声明，不代替未来价格）'),select=document.createElement('select');select.name='conclusion';for(const [k,v] of Object.entries(conditionNames))select.append(new Option(v,k));label.append(select);f.append(label);
   for(const [key,name] of [['reviewer','复盘署名'],['evidence','观察证据与时间范围']]){const label=el('label',name),input=document.createElement(key==='evidence'?'textarea':'input');input.name=key;input.required=true;input.maxLength=4000;label.append(input);f.append(label)}
   const submit=el('button','保存复盘记录');f.append(submit);const key='stock-data-review-draft:'+n.note_id;
   const keep=()=>{const value=Object.fromEntries(new FormData(f));delete value.csrf;try{sessionStorage.setItem(key,JSON.stringify(value))}catch(_){}};
   try{const saved=JSON.parse(sessionStorage.getItem(key)||'null');if(saved){for(const [k,v] of Object.entries(saved))if(f.elements[k])f.elements[k].value=v;draftDirty=true}}catch(_){}
+  if(n.schema===2&&f.elements.seen_market_snapshot_id.value!==(D.market?.snapshot_id||'unbound')){const warning=el('p','草稿绑定旧行情。请核对当前市场事实后，明确采用当前所见版本再保存。'),ack=el('button','已重新核对，采用当前所见行情');ack.type='button';ack.onclick=()=>{f.elements.seen_market_snapshot_id.value=D.market?.snapshot_id||'unbound';f.elements.seen_market_evidence_file_id.value=D.seen_market_evidence_file_id||'';f.elements.request_id.value=newRequest();keep();warning.textContent='已明确采用当前所见盘后快照；原草稿文字保留。';ack.disabled=true};f.append(warning,ack)}
   f.addEventListener('input',()=>{f.elements.request_id.value=newRequest();keep();draftDirty=true});f.addEventListener('change',()=>{f.elements.request_id.value=newRequest();keep();draftDirty=true});f.addEventListener('submit',()=>{keep();draftDirty=false;submit.disabled=true;submit.textContent='提交中…'});reviewBox.append(f);
  }else reviewBox.append(el('p','只读快照：不能在此保存复盘。'));
  box.append(reviewBox);
@@ -327,7 +330,7 @@ function appendPlanRisk(item,risk){
  for(const reason of risk.blockers||[])item.append(el('p','风险阻断：'+reason.message));
  if(risk.invalidation)item.append(el('p','实际失效原因：'+risk.invalidation.message));
 }
-for(const row of D.action_queue||[]){const item=el('article',''),risk=planRisks[row.plan_id]||row.risk;item.className='note';item.append(el('strong',(row.instrument||'账户')+' · '+(risk?.summary_label||row.reason)),el('p',row.allowed_action));appendPlanRisk(item,risk);$('action-queue').append(item)}
+for(const row of D.action_queue||[]){const item=el('article',''),risk=planRisks[row.plan_id]||row.risk;item.className='note';item.append(el('strong',(row.instrument||'账户')+' · '+(risk?.summary_label||row.reason)),el('p',row.allowed_action));appendPlanRisk(item,risk);if(row.plan_id){const a=el('a','查看原计划');a.href='#plan-'+row.plan_id;item.append(a)}$('action-queue').append(item)}
 if(!(D.action_queue||[]).length)$('action-queue').append(el('p','没有可核验的风险队列；这不表示无持仓或无风险。'));
 for(const [name,value] of Object.entries(D.research?.value_decisions||{}))$('comparison').append(el('p',(labels[name]||name)+'：'+({independent_review_required:'有描述性改善，待独立经济与风险评价',retain_baseline_no_positive_increment:'未证明正增量，保留基线',inconclusive_keep_baseline:'证据不足，保留基线',test_backend_not_value_evidence:'测试后端，不构成价值证据'}[value.decision]||value.decision)+'；不自动推广。'));
 // Keep local reading context across explicit refreshes; no network or business writes.
@@ -337,6 +340,7 @@ window.addEventListener('pagehide',keepView);
 try{const saved=JSON.parse(sessionStorage.getItem(viewKey)||'null');if(saved){$('review-period').value=saved.period||'day';drawPeriod();$('search').value=saved.search||'';$('sort').value=saved.sort||'code';$('search').dispatchEvent(new Event('input'));for(const c of saved.compare||[])if(rows.some(r=>r.instrument===c))compared.add(c);drawCompare();draw();const selected=rows.find(r=>r.instrument===saved.selected);if(selected)show(selected);if(saved.focus&&$(saved.focus))$(saved.focus).focus({preventScroll:true});requestAnimationFrame(()=>window.scrollTo(0,saved.scroll||0))}}catch(_){}
 
 const followupLabels={price_unqualified:'原始或当前价格资格未通过，不能计算后续变化',source_conflict:'原始与当前价格口径冲突，不能计算后续变化',source_missing:'缺少原始或当前价格，不能计算后续变化',pending_next_session:'等待后续交易日同口径价格',observed_close_change_not_execution_return:'已观察到同口径收盘变化'};
+$('reviews').append(el('h3','市场判断：原始到当前事实（随新发布变化）'));
 for(const item of D.attention_followups||[]){const box=el('article','');box.id='review-'+item.note_id;
  const qualifiedChange=item.status==='observed_close_change_not_execution_return'&&typeof item.change_pct==='number'&&Number.isFinite(item.change_pct);
  box.append(el('strong','独立关注 '+item.instrument),el('p',item.original_date+' → '+(item.current_date||'等待')+'：'+(qualifiedChange?fmt(item.change_pct)+'%':followupLabels[item.status]||'价格资格未知，不能计算后续变化')),el('p','状态 '+(followupLabels[item.status]||'未核对')+'；从记录时所见收盘价计算，不是实际成交收益。原失效条件仍需人工核对。'));
@@ -351,9 +355,10 @@ if(account.snapshot_id){
  const holdings=el('table',''),body=el('tbody','');holdings.append(body);table(body,[['持仓','数量','可卖','标记价格'],...(account.positions||[]).map(p=>[p.instrument,p.quantity,p.sellable,p.mark_price])]);plansPanel.append(holdings);
  for(const order of account.open_orders||[])plansPanel.append(el('p','未完成委托 '+order.order_id+' / '+order.instrument+' / 剩余 '+order.remaining_quantity+' / 冻结 '+order.frozen_cash+' 元；须对账，不自动解除。'));
 }
-for(const p of D.plans?.rows||[]){const item=el('article',''),risk=planRisks[p.plan_id];item.className='note';item.append(el('strong',p.instrument+' · '+(p.is_latest?'当前计划':'历史版本')),el('p','条件 '+p.condition+' '+(p.threshold||'人工核对')+'；有效期 '+p.valid_until),el('p','评估状态：'+(risk?.state_label||'状态未知，需核对原始回执')),el('p','预设失效条件：'+p.invalidation));appendPlanRisk(item,risk);if(online){const a=el('a','查看计划回执');a.href='/plan-receipt/'+p.plan_id;item.append(a)}plansPanel.append(item)}
+for(const p of D.plans?.rows||[]){const item=el('article',''),risk=planRisks[p.plan_id];item.className='note';item.id='plan-'+p.plan_id;const parentLink=el('a','查看原判断');parentLink.href=online?'/journal?kind=note&id='+p.note_id:'#note-'+p.note_id;item.append(parentLink);item.append(el('strong',p.instrument+' · '+(p.is_latest?'当前计划':'历史版本')),el('p','条件 '+p.condition+' '+(p.threshold||'人工核对')+'；有效期 '+p.valid_until),el('p','评估状态：'+(risk?.state_label||'状态未知，需核对原始回执')),el('p','预设失效条件：'+p.invalidation));appendPlanRisk(item,risk);if(online){const a=el('a','查看计划回执');a.href='/plan-receipt/'+p.plan_id;item.append(a)}plansPanel.append(item)}
 $('observation').append(plansPanel);
-if(online)for(const n of D.notes.filter(n=>n.is_latest&&n.intent==='observe')){
+for(const n of D.notes.filter(n=>n.is_latest&&n.intent==='observe'&&!n.plan_creation_allowed))plansPanel.append(el('p',n.instrument+'：原判断已人工失效，请追加修订判断后另建计划；查看、后续好转或重新打开不能复活旧计划。'));
+if(online)for(const n of D.notes.filter(n=>n.plan_creation_allowed)){
  const details=el('details','');details.append(el('summary','为 '+n.instrument+' 保存观察计划'));
  const f=document.createElement('form');f.method='post';f.action='/plan';
  for(const [k,v] of Object.entries({csrf:form.elements.csrf.value,note_id:n.note_id,operator:n.operator,request_id:newRequest(),supersedes:(D.plans?.rows||[]).find(p=>p.note_id===n.note_id&&p.is_latest)?.plan_id||''})){const input=document.createElement('input');input.type='hidden';input.name=k;input.value=v;f.append(input)}
@@ -370,6 +375,62 @@ window.addEventListener('pageshow',()=>{if(online)document.querySelectorAll('.re
 </script></html>'''
 
 
+def journal_page(page):
+    """Plain GET links, all selected facts inline; no scripts or external reads."""
+    from urllib.parse import urlencode
+    e=lambda value:escape(str(value),quote=True)
+    shown=set()
+    states={'pending':'仍待观察','triggered':'失效条件已触发','not_triggered':'截至记录时未触发',
+        'unclear':'证据不足，无法判断','observed_close_change_not_execution_return':'同口径价格变化，仅供观察',
+        'pending_next_session':'同日或等待后续日，不计算变化','price_unqualified':'价格资格未通过，不计算变化',
+        'source_conflict':'价格口径不同，不计算变化','source_missing':'价格缺失，不计算变化',
+        'future_evidence':'事实或快照时点晚于人工接收，不计算变化',
+        'evidence_clock_unverified':'时点资料不合格，不计算变化'}
+    def link(kind,key,label):
+        return '<a href="/journal?'+e(urlencode({'kind':kind,'id':key}))+'">'+e(label)+'</a>'
+    def event(value,kind):
+        key=value[kind+'_id']
+        if (kind,key) in shown:return ''
+        shown.add((kind,key))
+        text='<article id="'+e(kind+'-'+key)+'"><h2>'+link(kind,key,value.get('instrument','')+' / '+key[:12])+'</h2>'
+        fields=[('接收时间',value.get('received_at'))]
+        if kind=='note':fields.extend([('判断版本','当前判断' if value.get('is_latest') else '历史版本，原件保留'),
+            ('署名',value['operator']),('人工判断',value['hypothesis']),('失效条件',value['invalidation'])])
+        elif kind=='plan':fields.extend([('计划版本','当前版本' if value.get('is_latest') else '已被替代的历史版本'),
+            ('署名',value['operator']),('条件',value['condition']),('价格阈值',value.get('threshold')),
+            ('有效期',value['valid_until']),('失效条件',value.get('invalidation')),
+            ('永久失效原因',value.get('invalidation_reason') or '无已记录的永久失效；当前到期与报价状态见工作台')])
+        else:
+            fields.extend([('复盘署名',value['reviewer']),('人工核对',states.get(value['conclusion'],'待核对')),
+                ('人工证据',value['evidence'])])
+            comparison=value.get('seen_comparison')
+            if comparison:
+                fields.extend([('固定所见行情',str(comparison['original_date'])+' → '+str(comparison['current_date'])),
+                    ('原始价格',comparison['original_close']),('所见价格',comparison['current_close']),
+                    ('原始来源 / 复权 / 单位',comparison.get('original_price_contract')),
+                    ('所见来源 / 复权 / 单位',comparison.get('current_price_contract')),
+                    ('比较资格',states.get(comparison['status'],'未核对，不计算变化')),
+                    ('同口径变化 %（不是成交收益）',comparison['change_pct'])])
+            else:fields.append(('所见行情','本次明确未绑定：当时无已发布行情' if value.get('market_binding')=='explicit_unbound_no_published_market' else '历史人工记录，所见行情版本未绑定'))
+        text+='<dl>'+''.join('<dt>'+e(label)+'</dt><dd style="white-space:pre-wrap">'+e('未知' if field is None else field)+'</dd>' for label,field in fields)+'</dl>'
+        text+='<details><summary>原件身份与完整字段</summary><pre>'+e(json.dumps(value,ensure_ascii=False,indent=2))+'</pre></details>'
+        if value.get('note_id') and kind!='note':text+=link('note',value['note_id'],'返回原判断')
+        if value.get('supersedes'):text+=link(kind,value['supersedes'],'查看前一版本')
+        return text+'</article>'
+    body='<p>只读历史页：本页最多 '+e(page['limit'])+' 条历史；指定记录及其关联资料完整内联，超出容量明确拒绝。当前资格由全局索引核验。</p>'
+    if page.get('selected'):
+        body+=event(page['selected'],page['kind'])
+        if page.get('parent_note') and page['kind']!='note':body+=event(page['parent_note'],'note')
+        if page.get('successor_note_id'):body+=link('note',page['successor_note_id'],'查看后继修订')
+        for kind,values in page['related'].items():
+            body+='<h2 id="related-'+('reviews' if kind=='review' else 'plans')+'">'+('固定人工复盘' if kind=='review' else '关联观察计划')+'</h2>'
+            for value in values:body+=event(value,kind)
+    body+='<h2>历史列表</h2>'+''.join(event(v,page['kind']) for v in page['events'])
+    if page.get('next_before'):
+        body+='<a href="/journal?'+e(urlencode({'kind':page['kind'],'before':page['next_before'],'limit':page['limit']}))+'">下一页</a>'
+    return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'"><title>判断与计划历史</title>'+STYLE+'<main><h1>判断与计划历史</h1><nav><a href="/">返回市场工作台</a> · <a href="/journal?kind=note">判断历史</a> · <a href="/journal?kind=plan">计划历史</a> · <a href="/journal?kind=review">人工复盘历史</a></nav>'+body+'</main></html>'
+
+
 def receipt_page(note):
     """A durable acknowledgement does not depend on a healthy market renderer."""
     fields=[('回执编号',note['note_id']),('证券',note['instrument']),('声明署名',note['operator']),
@@ -382,8 +443,8 @@ def receipt_page(note):
             '<title>判断已保存 · Stock Data</title>'+STYLE+'<main><header><h1>判断已保存</h1>'
             '<p role="status">已可靠保存到本地。刷新此回执不会重复提交；不产生委托。</p></header><section><dl>'+body+'</dl>'
             '<p>署名由提交者自行声明，未经过账户身份认证。后续结果未成熟时继续等待，不补填结果。</p>'
-            '<a href="/#note-'+escape(note['note_id'],quote=True)+'">返回这条判断</a> · '
-            '<a href="/#review-'+escape(note.get('prediction_id') or note['note_id'],quote=True)+'">查看原判断后续复盘</a></section></main>'
+            '<a href="/journal?kind=note&amp;id='+escape(note['note_id'],quote=True)+'#note-'+escape(note['note_id'],quote=True)+'">返回这条判断</a> · '
+            '<a href="/journal?kind=note&amp;id='+escape(note['note_id'],quote=True)+'#related-reviews">查看原判断后续复盘</a></section></main>'
             '<script>try{const key="stock-data-draft:/:active",raw=sessionStorage.getItem(key);'
             'if(raw&&JSON.parse(raw).request_id==='+request+')sessionStorage.removeItem(key)}catch(_){}</script></html>')
 
@@ -392,13 +453,15 @@ def review_receipt_page(review):
     labels={'pending':'仍待观察','triggered':'失效条件已触发','not_triggered':'截至记录时未触发','unclear':'证据不足，无法判断'}
     text='<dl>'+''.join('<dt>'+escape(k)+'</dt><dd style="overflow-wrap:anywhere;white-space:pre-wrap">'+escape(str(v))+'</dd>' for k,v in [
         ('复盘回执',review['review_id']),('原判断',review['note_id']),('署名',review['reviewer']),
-        ('记录时间',review['received_at']),('人工核对',labels[review['conclusion']]),('证据',review['evidence'])])+'</dl>'
+        ('记录时间',review['received_at']),('人工核对',labels[review['conclusion']]),('证据',review['evidence']),
+        ('所见行情绑定',review.get('market_binding','historical_unbound')),
+        ('原始到所见事实',json.dumps(review.get('seen_comparison'),ensure_ascii=False))])+'</dl>'
     key=json.dumps('stock-data-review-draft:'+review['note_id'])
     request=json.dumps(review['request_id'])
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'">'
         '<title>复盘已保存 · Stock Data</title>'+STYLE+'<main><header><h1>复盘已保存</h1></header><section>'+text+
-        '<p>这是人工条件观察，不修改原判断、价格标签或账户状态，不代表模型优势验收。</p><a href="/#note-'+escape(review['note_id'])+'">返回原判断</a></section></main>'
+        '<p>这是人工条件观察，不修改原判断、价格标签或账户状态，不代表模型优势验收。历史未绑定记录不认证当时所见行情。</p><a href="/journal?kind=review&amp;id='+escape(review['review_id'])+'">查看固定复盘与整链</a><a href="/journal?kind=note&amp;id='+escape(review['note_id'])+'">返回原判断</a></section></main>'
         '<script>try{const key='+key+',raw=sessionStorage.getItem(key);if(raw&&JSON.parse(raw).request_id==='+request+')sessionStorage.removeItem(key)}catch(_){}</script></html>')
 
 
@@ -408,7 +471,7 @@ def plan_receipt_page(plan):
         ''.join('<dt>'+escape(k)+'</dt><dd>'+escape(str(v))+'</dd>' for k,v in [
             ('回执',plan['plan_id']),('证券',plan['instrument']),('原判断',plan['note_id']),
             ('条件',plan['condition']),('阈值',plan['threshold']),('有效期',plan['valid_until']),('账户状态',plan['account_status'])])+
-        '</dl><a href="/#observation">返回观察与计划</a></main></html>')
+        '</dl><a href="/journal?kind=plan&amp;id='+escape(plan['plan_id'])+'">返回这条计划及原判断</a></main></html>')
 
 
 def server_page(html, token, message='', running=False):

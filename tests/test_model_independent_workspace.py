@@ -25,6 +25,11 @@ def command():
         'request_id':'1'*32,'evidence_id':market()['snapshot_id']}
 
 
+def review_binding(output):
+    value=product.saved_projection(output)['market']
+    return {'seen_market_snapshot_id':value['snapshot_id'],'seen_market_evidence_file_id':identity(value)}
+
+
 def test_candidate_header_separates_current_market_from_historical_predictions():
     from trade_system.v2.research_product_view import candidate_scope,render
     from trade_system.v2.daily_workspace import empty_projection
@@ -52,7 +57,7 @@ def test_no_model_publish_judgement_retry_review_and_revision(tmp_path):
     revision=product.save_note(tmp_path,dict(command(),request_id='2'*32,supersedes=note_id,hypothesis='revised'))
     assert revision!=note_id and (tmp_path/'notes/attention'/(note_id+'.json')).read_bytes()==before
     review=journal.save_review(tmp_path,dict(note_id=revision,request_id='3'*32,
-        reviewer='SYNTHETIC TEST ONLY',evidence='synthetic subsequent check',conclusion='pending'))
+        reviewer='SYNTHETIC TEST ONLY',evidence='synthetic subsequent check',conclusion='pending',**review_binding(tmp_path)))
     assert journal.read_review(tmp_path,review)['prediction_id'] is None
     assert len(product.saved_projection(tmp_path)['notes'])==2
     assert list((tmp_path/'notes').glob('*.json'))==[]
@@ -191,4 +196,4 @@ def test_independent_receipt_links_to_its_own_followup(tmp_path):
     note_id=product.save_note(tmp_path,command())
     page=receipt_page(journal.read_note(tmp_path,note_id))
     assert '市场证据' in page and '原预测批次' not in page
-    assert '/#review-'+note_id in page
+    assert '/journal?kind=note&amp;id='+note_id in page

@@ -2,7 +2,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
 import threading
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from . import research_product as product
 from .publisher import read_current
@@ -68,12 +68,26 @@ def handler(root, output, port, *, shutdown=None):
                 return self.reply(200,json.dumps(dict(startup_identity,
                     source_matches=service_identity(root,output)==startup_identity,
                     update_running=state['running'],execution_ready=False)), 'application/json')
+            if urlsplit(self.path).path=='/journal':
+                try:
+                    fields=parse_qs(urlsplit(self.path).query,strict_parsing=True,keep_blank_values=True,max_num_fields=4)
+                    if set(fields)-{'kind','before','limit','id'} or any(len(v)!=1 for v in fields.values()):
+                        raise ValueError('invalid history query')
+                    query={k:v[0] for k,v in fields.items()}
+                    page=product.journal_navigation(output,kind=query.get('kind','note'),before=query.get('before'),
+                        limit=int(query.get('limit','100')),selected=query.get('id'))
+                    from .research_product_view import journal_page
+                    return self.reply(200,journal_page(page),'text/html; charset=utf-8')
+                except (ValueError,KeyError):return self.reply(400,'历史查询参数或完整性校验失败。')
+                except FileNotFoundError:return self.reply(404,'历史记录不存在。')
+                except RuntimeError:return self.reply(409,'历史索引需要核验；GET 未修改记录。')
             if self.path.startswith('/review-receipt/'):
                 try:
                     from .research_journal import read_review
                     from .research_product_view import review_receipt_page
                     value=read_review(output,self.path.removeprefix('/review-receipt/'))
-                    return self.reply(200,review_receipt_page(value),'text/html; charset=utf-8')
+                    from .research_journal import review_projection
+                    return self.reply(200,review_receipt_page(review_projection(output,value)),'text/html; charset=utf-8')
                 except (ValueError,FileNotFoundError,KeyError):
                     return self.reply(404,'复盘回执不存在或完整性校验失败。')
             if self.path.startswith('/receipt/'):

@@ -180,6 +180,17 @@ def history(output, kind='note', before=None, limit=100):
             'next_before':rows[limit-1][1] if len(rows)>limit else None,'limit':limit}
 
 
+def related(output, kind, note_id, limit=10000):
+    """Complete bounded parent detail; history pagination never clips risk scope."""
+    if kind not in ('review','plan') or not 1<=limit<=10000:
+        raise ValueError('bounded related journal query required')
+    with reader(output) as con:
+        rows=con.execute('SELECT path FROM events WHERE kind=? AND note=? ORDER BY received,id LIMIT ?',
+                         (kind,note_id,limit+1)).fetchall()
+    if len(rows)>limit:raise ValueError('related journal scope exceeds capacity')
+    return [event(Path(output)/r[0],kind) for r in rows]
+
+
 def between(output, kind, start, stop, limit=10000):
     """Complete half-open receipt-time interval; overflow is never silently clipped."""
     if kind not in FOLDERS or not 1 <= limit <= 10000 or utc(start)>=utc(stop):

@@ -7,7 +7,7 @@ from trade_system.v2 import operator_workflow as workflow, research_product as p
 from trade_system.v2.domain import now_utc
 from trade_system.v2.storage import Store
 from trade_system.v2.paper_storage import submit_confirmed_buy,apply_paper_event
-from tests.test_model_independent_workspace import market,command
+from tests.test_model_independent_workspace import market,command,review_binding
 from tests.test_v2_operator_workflow import seed
 from tools.v2.run_event_replay import Clock,CODE,market as paper_market
 
@@ -42,9 +42,9 @@ def test_human_invalidation_cannot_be_cleared_by_price_or_later_note(tmp_path):
     from trade_system.v2.research_journal import save_review
     p=make_plan(tmp_path)
     save_review(tmp_path,{'note_id':p['note_id'],'request_id':'b'*32,'reviewer':'SYNTHETIC TEST ONLY',
-        'evidence':'synthetic invalidation observed','conclusion':'triggered'})
+        'evidence':'synthetic invalidation observed','conclusion':'triggered',**review_binding(tmp_path)})
     save_review(tmp_path,{'note_id':p['note_id'],'request_id':'c'*32,'reviewer':'SYNTHETIC TEST ONLY',
-        'evidence':'later synthetic observation','conclusion':'not_triggered'})
+        'evidence':'later synthetic observation','conclusion':'not_triggered',**review_binding(tmp_path)})
     assert workflow.observation_plans(tmp_path,now_utc().isoformat())['rows'][0]['evaluation']['state']=='invalid'
 
 

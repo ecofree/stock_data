@@ -137,9 +137,10 @@ def read_note(output, note_id):
 def save_review(output, values):
     """An explicit human observation, separate from computed future-price labels."""
     from trade_system.file_lock import FileLock
+    from contextlib import ExitStack
     from .domain import now_utc
     output=Path(output)
-    with FileLock(output/'judgement.guard'):
+    with FileLock(output/'judgement.guard'), ExitStack() as bindings:
         note=read_note(output,values.get('note_id'))
         request_id=values.get('request_id')
         if not isinstance(request_id,str) or not re.fullmatch('[a-f0-9]{32}',request_id):
@@ -150,6 +151,11 @@ def save_review(output, values):
             if not isinstance(values.get(key),str) or not 1<=len(values[key].strip())<=4000:
                 raise ValueError('explicit bounded human review required')
         command={key:values[key] for key in ('note_id','conclusion','reviewer','evidence')}
+        binding=('seen_market_snapshot_id','seen_market_evidence_file_id','plan_id')
+        # Keep the original command identity on old successful retries. New
+        # commands must explicitly acknowledge the facts displayed to the human.
+        for key in binding:
+            if key in values:command[key]=values[key]
         folder=output/('notes/attention' if note.get('schema')==2 else 'notes')/'reviews'
         folder.mkdir(parents=True,exist_ok=True)
         from .journal_index import ensure, lookup, appended
@@ -159,6 +165,28 @@ def save_review(output, values):
             read_review(output,old['review_id'])
             if old['command_id']!=identity(command):raise ValueError('review request reused with different content')
             return old['review_id']
+        if note.get('schema')!=2 and any(key in values for key in binding):
+            raise ValueError('market binding is only supported for attention reviews')
+        if note.get('schema')==2:
+            # Publication cannot replace current between the optimistic identity
+            # check and the durable append. Successful retries above need no
+            # current publication lock or current market.
+            bindings.enter_context(FileLock(output/'publication.guard'))
+            from .research_product import saved_projection
+            from .daily_workspace import seal_evidence
+            market=saved_projection(output).get('market') if (output/'publication/current.json').exists() else None
+            if not market:
+                if values.get('seen_market_snapshot_id')!='unbound' or values.get('seen_market_evidence_file_id'):
+                    raise ValueError('explicit unbound review required without published market')
+            else:
+                if (values.get('seen_market_snapshot_id')!=market['snapshot_id'] or
+                    values.get('seen_market_evidence_file_id')!=identity(market)):
+                    raise ValueError('seen market evidence changed; refresh and review before submitting')
+                seal_evidence(output,market)
+            if values.get('plan_id'):
+                from .operator_workflow import read_observation_plan
+                if read_observation_plan(output,values['plan_id'])['note_id']!=note['note_id']:
+                    raise ValueError('review plan parent differs')
         review=dict(command,request_id=request_id,command_id=identity(command),
             prediction_id=note['prediction_id'],instrument=note['instrument'],
             received_at=now_utc().isoformat(),identity_scope='caller_declared_not_authenticated',
@@ -187,7 +215,46 @@ def read_review(output,review_id):
     note=read_note(output,review['note_id'])
     if any(note[k]!=review[k] for k in ('prediction_id','instrument')):
         raise ValueError('human review parent differs')
+    if review.get('seen_market_snapshot_id') not in (None,'unbound'):
+        evidence_id=review.get('seen_market_evidence_file_id')
+        if not isinstance(evidence_id,str) or not re.fullmatch('[a-f0-9]{64}',evidence_id):
+            raise ValueError('human review evidence changed')
+        market=read_json(Path(output)/'notes/evidence'/(evidence_id+'.json'))[0]
+        if identity(market)!=evidence_id or market.get('snapshot_id')!=review['seen_market_snapshot_id'] or market['snapshot_id']!=identity({k:v for k,v in market.items() if k!='snapshot_id'}):
+            raise ValueError('human review evidence changed')
+    if review.get('plan_id'):
+        from .operator_workflow import read_observation_plan
+        if read_observation_plan(output,review['plan_id'])['note_id']!=note['note_id']:
+            raise ValueError('review plan parent differs')
     return review
+
+
+def review_projection(output, review):
+    """Derived original-to-seen facts; never mutate or backfill old reviews."""
+    from .domain import utc
+    result=dict(review)
+    snapshot_id=review.get('seen_market_snapshot_id')
+    result['market_binding']='historical_unbound' if snapshot_id is None else 'explicit_unbound_no_published_market'
+    result['seen_comparison']=None
+    if snapshot_id not in (None,'unbound'):
+        market=read_json(Path(output)/'notes/evidence'/(review['seen_market_evidence_file_id']+'.json'))[0]
+        note=read_note(output,review['note_id'])
+        comparison=attention_followups(output,[note],market)[0]
+        try:
+            receipt=utc(review['received_at']);seen_at=utc(market['as_of'])
+            from zoneinfo import ZoneInfo
+            future=seen_at>receipt or market['trade_date']>receipt.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            original=read_json(Path(output)/'notes/evidence'/(note['evidence_file_id']+'.json'))[0]
+            future=future or utc(original['as_of'])>receipt or original['trade_date']>receipt.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            if any(utc(value['as_of'])<utc(value['trade_date']+'T00:00:00+08:00') for value in (original,market)):
+                comparison.update(change_pct=None,status='evidence_clock_unverified')
+            if future:comparison.update(change_pct=None,status='future_evidence')
+        except (ValueError,KeyError,TypeError):
+            comparison.update(change_pct=None,status='evidence_clock_unverified')
+        result.update(market_binding='bound_daily_market_snapshot',seen_comparison=comparison,
+            seen_market_as_of=market.get('as_of'),seen_market_trade_date=market.get('trade_date'),
+            availability_scope='sealed_at_human_receipt_not_provider_publication_certification')
+    return result
 
 
 def verify_note(note):
@@ -259,6 +326,8 @@ def attention_followups(output, notes, market):
                         change=None;status='price_unqualified'
                         qualification_reasons['comparison']='nonfinite_price_change'
         results.append({'note_id':note['note_id'],'instrument':note['instrument'],
+            'original_price_contract':base.get('price_contract'),'current_price_contract':current.get('price_contract'),
+            'original_price_status':base.get('price_status'),'current_price_status':current.get('price_status'),
             'original_date':original['trade_date'],'current_date':market['trade_date'] if market else None,
             'original_close':base.get('close'),'current_close':current.get('close'),
             'status':status,'change_pct':change,'price_qualification_reasons':qualification_reasons,

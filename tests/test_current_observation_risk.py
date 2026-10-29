@@ -118,7 +118,7 @@ def test_unknown_risk_display_is_generic_without_rewriting_original_evaluation()
 ])
 def test_journal_revisions_keep_original_and_display_the_actual_cause(tmp_path,event,expected):
     from tests.test_observation_plans import make_plan
-    from tests.test_model_independent_workspace import command
+    from tests.test_model_independent_workspace import command,review_binding
     from trade_system.v2 import research_product as product, research_journal as journal
     from trade_system.v2.domain import now_utc
     (tmp_path/'workspace-config.json').write_text(json.dumps({'acceptance_scope':acceptance_scope.SCOPE}))
@@ -130,7 +130,7 @@ def test_journal_revisions_keep_original_and_display_the_actual_cause(tmp_path,e
             supersedes=original['note_id'],hypothesis='追加修订，原计划必须失效'))
     elif event=='human':
         journal.save_review(tmp_path,{'note_id':original['note_id'],'request_id':'b'*32,
-            'reviewer':'SYNTHETIC TEST ONLY','evidence':'人工核对原条件已经触发','conclusion':'triggered'})
+            'reviewer':'SYNTHETIC TEST ONLY','evidence':'人工核对原条件已经触发','conclusion':'triggered',**review_binding(tmp_path)})
     else:
         workflow.save_observation_plan(tmp_path,{'note_id':original['note_id'],'operator':original['operator'],
             'request_id':'b'*32,'condition':'manual','valid_until':original['valid_until'],'supersedes':original['plan_id']})

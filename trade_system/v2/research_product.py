@@ -218,15 +218,21 @@ def journal_projection(output,data):
     """Read-only projection; no model loading, fetching, fitting or business writes."""
     from . import research_journal
     from copy import deepcopy
-    from .journal_index import recent
+    from .journal_index import recent, effective, invalidations
     data=deepcopy(data);data.pop('report_id',None)
     note_paths,note_total=recent(output,'note')
-    notes=sorted([research_journal.read_note(output,p.stem) for p in note_paths],key=lambda n:n['received_at'])
-    data['notes']=research_journal.annotate(notes)
+    leaves=effective(output,'note');leaf_ids={n['note_id'] for n in leaves}
+    ids=dict.fromkeys([*(n['note_id'] for n in leaves),*(p.stem for p in note_paths)])
+    notes=sorted([research_journal.read_note(output,key) for key in ids],key=lambda n:n['received_at'])
+    invalid=invalidations(output,[{'note_id':n['note_id'],'plan_id':''} for n in notes])
+    data['notes']=[dict(n,is_latest=n['note_id'] in leaf_ids,
+        plan_creation_allowed=n['note_id'] in leaf_ids and n['intent']=='observe' and n['note_id'] not in invalid['invalid_notes']) for n in notes]
     data['attention_followups']=research_journal.attention_followups(output,data['notes'],data.get('market'))
     review_paths,_=recent(output,'review')
-    data['human_reviews']=[research_journal.read_review(output,p.stem) for p in reversed(review_paths)]
-    data['note_scope']={'shown':len(notes),'total':note_total,'limit':100}
+    data['human_reviews']=[research_journal.review_projection(output,research_journal.read_review(output,p.stem)) for p in reversed(review_paths)]
+    data['seen_market_evidence_file_id']=identity(data['market']) if data.get('market') else None
+    data['note_scope']={'shown':len(notes),'total':note_total,'limit':100,'current_leaves':len(leaves),
+        'coverage':'all_current_leaves_plus_recent_100_history; older_history_requires_read_only_journal_GET'}
     if data.get('market'):
         from datetime import date,timedelta
         from trade_system.review_metrics import period_bounds, judgement_period_summary
@@ -297,6 +303,36 @@ def journal_projection(output,data):
     data['action_queue']=action_queue(data)
     data['report_id']=identity(data)
     return data
+
+
+def journal_navigation(output, *, kind='note', before=None, limit=100, selected=None):
+    """Read-only bounded history and independently addressable immutable details."""
+    import re
+    from .journal_index import history, lookup, related
+    from .research_journal import read_note, read_review, review_projection
+    from .operator_workflow import read_observation_plan, plan_invalidation
+    if kind not in ('note','review','plan') or isinstance(limit,bool) or not 1<=limit<=100:
+        raise ValueError('valid bounded journal history required')
+    for value in (before,selected):
+        if value is not None and not re.fullmatch('[a-f0-9]{64}',value):raise ValueError('invalid journal identity')
+    loaders={'note':read_note,'review':read_review,'plan':read_observation_plan}
+    def present(value,event_kind):
+        value=loaders[event_kind](output,value[event_kind+'_id'])
+        if event_kind=='review':return review_projection(output,value)
+        value=dict(value,is_latest=lookup(output,event_kind,'parent',value[event_kind+'_id']) is None)
+        if event_kind=='plan':value['invalidation_reason']=plan_invalidation(output,value)
+        return value
+    page=history(output,kind,before,limit)
+    page['events']=[present(v,kind) for v in page['events']]
+    page['selected']=present({kind+'_id':selected},kind) if selected else None
+    page['related']={}
+    if selected:
+        value=page['selected'];note_id=selected if kind=='note' else value['note_id']
+        page['parent_note']=present({'note_id':note_id},'note')
+        page['related']={k:[present(v,k) for v in related(output,k,note_id)] for k in ('review','plan')}
+        successor=lookup(output,'note','parent',note_id)
+        page['successor_note_id']=successor['note_id'] if successor else None
+    return page
 
 
 def observe(output,*,capture_quotes=False,quote_receipts=None):

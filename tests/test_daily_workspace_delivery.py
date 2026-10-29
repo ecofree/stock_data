@@ -106,10 +106,14 @@ def test_http_acknowledgement_survives_broken_workspace_renderer(tmp_path,monkey
         assert request('/')[0]==503
         status,_,body=request(location)
         assert status==200 and '判断已保存' in body and 'synthetic thesis' in body
-        assert '/#review-'+prediction()['prediction_id'] in body
+        note_id=location.rsplit('/',1)[1]
+        assert '/journal?kind=note&amp;id='+note_id in body
+        # The main renderer is broken; the bounded read-only detail remains
+        # independently reachable from the acknowledgement.
+        history_status,_,history_body=request('/journal?kind=note&id='+note_id)
+        assert history_status==200 and note_id in history_body and 'synthetic thesis' in history_body
         assert len(list((tmp_path/'notes').glob('*.json')))==1
         assert request('/receipt/../../other')[0]==404
-        note_id=location.rsplit('/',1)[1]
         review_form=dict(csrf=form['csrf'],request_id='b'*32,note_id=note_id,
                          conclusion='pending',reviewer='SYNTHETIC REVIEWER ONLY',evidence='synthetic pending observation')
         status,review_location,_=request('/review',review_form)
