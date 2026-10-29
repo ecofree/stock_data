@@ -138,9 +138,10 @@ Windows反斜线相对成员在校验时规范化并拒绝重复别名，原rece
 
 离线产物的两个直接数据库写点由`tools/v2/closure_readiness.py`逐调用分类：
 `rehearse`只能写新迁移副本，`verify_normalized_definitions`只能写新的元数据scratch。
-原全局allowed清单不增加条目。分类固定审查于b6e37fe的函数AST、模块声明/绑定与关键防护helper契约，
+原全局allowed清单不增加条目。分类固定审查于5ecfadd的完整模块AST（owner自b6e37fe未改）、精确函数与关键防护helper契约，
 包括新目标、无链接路径、原件只读/独立复制、源ATTACH READ_ONLY和scratch只读重开等条件。
 保留原FunctionDef后再赋值/替换duckdb或guard alias不能沿用分类；新增writer也不继承同模块资格。
 AST忽略位置/格式和3.12新增的空type_params，已在真实3.11/3.12解释器核对；未知契约退回未分类。
-维护取舍是这些函数/安全依赖/模块声明改变时必须重新审查并更新固定契约，不能在运行时从当前源码自举expected，
+完整模块摘要包含所有helper函数体，局部Path/duckdb别名属性改写也不能保留分类。
+维护取舍是这些模块的可执行AST改变时必须重新审查并更新固定契约，不能在运行时从当前源码自举expected，
 也不能通过挪到动态调用隐藏写点。这仍是受限静态直接调用门禁，不是全程序或OS权限证明，不能据此恢复运营。

@@ -13,11 +13,11 @@ from trade_system.v2.research_product import read_prediction,saved_projection
 from tools.v2.verify_delivery import source_files
 
 
-# Reviewed at b6e37fe. These constants are deliberately not derived from the
-# audited source at runtime. A changed safety contract requires a new review.
+# Full module bodies reviewed at 5ecfadd (owners unchanged since b6e37fe).
+# Constants never derive from audited source at runtime; changes need review.
 _WRITER_CONTRACTS = {
     'trade_system/v2/market_migration_rehearsal.py': {
-        'namespace':'ed7869f61340a33ced212bb81cb6303ecee574ab574d9390d79a594624d672c9',
+        'namespace':'767667023c32591e88c860bca2e7555cc2b6b31114e4ee3699b229f05e44bb6b',
         'functions': {
             '_sha256':'66933e756d68f1366509835ca15d79a6ecf254ffa084a5ff8b9de02b7bd21946',
             '_literal':'d69fa131e908f0bba728915b491b9e098ff227d306ac4ad4ad0417a74a664dbb',
@@ -28,16 +28,16 @@ _WRITER_CONTRACTS = {
             'rehearse':'1502cad0de3c626fac2f63dec56747c5ec18b4680cceaf01a089dd9522f48571'},
         'symbols':('duckdb','Path','os','stat','re','hashlib','shutil','contextmanager','str','getattr','__file__')},
     'trade_system/v2/offline_binding.py': {
-        'namespace':'ac8d7502e1831ffa4d2e519844f5e2699de34e630cd53f478e5755fcee01241a',
+        'namespace':'6322461530a02667cbc693c40bc7d6dc819e85626409efeb62f681a04a891f1f',
         'functions':{'verify_normalized_definitions':'6dbfa35f314345a079768b7da8ea8db60bd0fa9a0fd82ccbc4caa7c3ed9fdc7d'},
         'symbols':('duckdb','Path','safe_path','migration','normalized_view_names',
                    'build_normalized_views_on_connection','shutil','uuid','str')},
     'trade_system/v2/isolated_workspace.py': {
-        'namespace':'11490a9545759910624408df45efa41744748a0e38db6a36e7e5539f04acb2e4',
+        'namespace':'d2432d9409a935446ce8192027563203c6e716b3087e95e1cdda27da16b3a76a',
         'functions':{'safe_path':'16b5de9c1522c9ce2f2df984dfd806053620d204b69933a5c3eb139730e74d19'},
         'symbols':('Path','stat','getattr')},
     'trade_system/db_utils.py': {
-        'namespace':'ddd84fbe41076ea9dde4f6dacbe7d4a397d2eb6a276c0babfb5ffed6bce962fd',
+        'namespace':'75e01aaf0c5ef86043a9529e56549051f9d8997c4ed0bd869d0e099b1c80b04f',
         'functions':{'_source_distribution_root':'76f300dffbba0510721ebc044d6928b505b5fed4b1703bdc411f5dd8c8397aa7',
                      'primary_checkout':'c8c8ebd1fefbbeede929676ed899ada11c87f11e8671f73039a49b83d0a17ed7'},
         'symbols':('__file__','str','getattr')},
@@ -61,13 +61,9 @@ def _contract_digest(node):
 
 
 def _namespace_digest(tree):
-    declarations=[]
-    for node in tree.body:
-        value=_contract_form(node)
-        if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
-            value[1]=[pair for pair in value[1] if pair[0]!='body']
-        declarations.append(value)
-    return hashlib.sha256(canonical(declarations).encode()).hexdigest()
+    # Every helper body is included: a local alias can mutate a shared safety
+    # dependency even when the exact writer and original guard remain intact.
+    return hashlib.sha256(canonical([_contract_form(node) for node in tree.body]).encode()).hexdigest()
 
 
 def _root_name(node):
@@ -78,8 +74,8 @@ def _root_name(node):
 
 def _guard_contract_matches(tree,relative,functions):
     contract=_WRITER_CONTRACTS[relative]
-    # Imports, constants, all function declarations/defaults/decorators, and
-    # module-level alias assignments are fixed independently of function bodies.
+    # Fixed full modules include imports, bindings, defaults and all bodies;
+    # individual guard/call contracts below remain independently explicit.
     try:
         if _namespace_digest(tree)!=contract['namespace']:return False
         for name in functions:

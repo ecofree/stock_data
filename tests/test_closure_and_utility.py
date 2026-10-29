@@ -263,6 +263,28 @@ def test_writer_gate_isolated_classification_does_not_follow_code_to_other_modul
         writer_gate(tmp_path)
 
 
+@pytest.mark.parametrize('relative,helper,statement',[
+ ('trade_system/v2/offline_binding.py','bound_file','path_type = Path\npath_type.mkdir = lambda *a, **k: None'),
+ ('trade_system/v2/offline_binding.py','bound_file','db_module = duckdb\ndb_module.connect = lambda *a, **k: None'),
+ ('trade_system/v2/offline_binding.py','normalized_members','unused = 7'),
+ ('trade_system/v2/isolated_workspace.py','initialize','path_type = Path\npath_type.mkdir = lambda *a, **k: None'),
+ ('trade_system/v2/market_migration_rehearsal.py','_q','unused = 7'),
+ ('trade_system/db_utils.py','latest_open_session','unused = 7'),
+])
+def test_writer_gate_rejects_unreviewed_helper_bodies_in_complete_module_contract(tmp_path,relative,helper,statement):
+    import ast
+    from tools.v2.closure_readiness import writer_gate
+    _isolated_writer_fixture(tmp_path)
+    target=tmp_path/relative
+    tree=ast.parse(target.read_text('utf-8-sig'))
+    owner=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name==helper)
+    owner.body[0:0]=ast.parse(statement).body
+    # Only parse the altered fixture; no modified helper or alias is executed.
+    target.write_text(ast.unparse(tree),encoding='utf-8')
+    with pytest.raises(ValueError,match='new unclassified direct writer'):
+        writer_gate(tmp_path)
+
+
 def test_delivery_timeout_preserves_real_child_output_and_failure(tmp_path):
     from tools.v2.verify_delivery import _run_check, digest
 
