@@ -599,6 +599,8 @@ def test_small_candidate_build_preserves_legacy_and_emits_pinned_private_transfe
         shutil.copyfile(old/'code'/name,source/name)
     files = {p.relative_to(source).as_posix():file_hash(p) for p in source.rglob('*') if p.is_file()}
     subprocess.run(['git','init','-q',str(source)],check=True,capture_output=True)
+    # The long isolated TEMP root also lengthens Git's internal object paths.
+    subprocess.run(['git','-C',str(source),'config','--local','core.longpaths','true'],check=True,capture_output=True)
     subprocess.run(['git','-C',str(source),'add','.'],check=True,capture_output=True)
     subprocess.run(['git','-C',str(source),'-c','user.name=SYNTHETIC','-c','user.email=synthetic@example.invalid',
                     'commit','-qm','Synthetic source fixture'],check=True,capture_output=True)
