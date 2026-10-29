@@ -38,6 +38,16 @@ _ADDITIONS = {
 }
 _NEW_TABLES = _BOOKKEEPING | {'qlib_shadow_evaluation', 'multi_source_kline'}
 _OLD_INDEXES = {'uq_multi_source_kline', 'ix_multi_source_kline'}
+_PRODUCT_INDEX = 'uq_multi_source_kline_product'
+_INDEX_OWNER = {'schema': 'main', 'table': 'multi_source_kline'}
+_LEGACY_KEYS = ['source_date', 'asset_type', 'asset_code', 'provider']
+# Pre-0016 schema._ensure_business_indexes used this unique business key,
+# falling back to the same four-column non-unique ix_ index on duplicates.
+_INDEX_DEFINITIONS = {
+    'uq_multi_source_kline': {'is_unique': True, 'expressions': _LEGACY_KEYS},
+    'ix_multi_source_kline': {'is_unique': False, 'expressions': _LEGACY_KEYS},
+    _PRODUCT_INDEX: {'is_unique': True, 'expressions': [*_LEGACY_KEYS, 'adjustment']},
+}
 
 
 def _sha256(path):
@@ -51,6 +61,11 @@ def _q(value):
 
 def _literal(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _index_definition(unique, expressions):
+    return {'is_unique': bool(unique),
+            'expressions': [part.strip().strip('"') for part in expressions.strip('[]').split(',')]}
 
 
 def _no_links(path):
@@ -141,7 +156,26 @@ def _snapshot(con):
     constraints = [list(row) for row in con.execute(
         'SELECT table_name,constraint_type,constraint_text,constraint_column_names '
         'FROM duckdb_constraints() WHERE database_name=? ORDER BY table_name,constraint_index', [database]).fetchall()]
-    return {'tables': tables, 'constraints': constraints, **objects}
+    index_owners = {name: {'schema': schema, 'table': table} for name, schema, table in con.execute(
+        'SELECT index_name,schema_name,table_name FROM duckdb_indexes() WHERE database_name=?', [database]).fetchall()}
+    index_definitions = {name: _index_definition(unique, expressions) for name, unique, expressions in con.execute(
+        'SELECT index_name,is_unique,expressions FROM duckdb_indexes() WHERE database_name=?', [database]).fetchall()}
+    return {'tables': tables, 'constraints': constraints, 'index_owners': index_owners,
+            'index_definitions': index_definitions, **objects}
+
+
+def _check_reserved_index_ownership(snapshot):
+    for name, owner in snapshot['index_owners'].items():
+        if name in _OLD_INDEXES | {_PRODUCT_INDEX} and owner != _INDEX_OWNER:
+            raise ValueError('index ownership conflict: reserved migration index belongs to another relation')
+        if name in _INDEX_DEFINITIONS and snapshot['index_definitions'][name] != _INDEX_DEFINITIONS[name]:
+            raise ValueError('index definition conflict: reserved migration index has an unreviewed definition')
+
+
+def _allowed_removed_indexes(snapshot):
+    return {name for name, owner in snapshot['index_owners'].items()
+            if name in _OLD_INDEXES and owner == _INDEX_OWNER
+            and snapshot['index_definitions'][name] == _INDEX_DEFINITIONS[name]}
 
 
 def _duplicate_products(con):
@@ -163,6 +197,7 @@ def _duplicate_products(con):
 
 def _preservation(con, before, *, rebuilt_views):
     after = _snapshot(con)
+    removable_indexes = _allowed_removed_indexes(before)
     if set(before['tables']) - set(after['tables']):
         raise ValueError('preservation: original table missing')
     if set(after['tables']) - set(before['tables']) - _NEW_TABLES:
@@ -221,7 +256,9 @@ def _preservation(con, before, *, rebuilt_views):
                          'added_columns': sorted(extra), 'source_minus_candidate': removed,
                          'candidate_minus_source': added, 'bookkeeping_original_rows_only': table in _BOOKKEEPING})
     for name, sql in before['indexes'].items():
-        if name not in _OLD_INDEXES and after['indexes'].get(name) != sql:
+        if name not in removable_indexes and (after['indexes'].get(name) != sql
+                or after['index_owners'].get(name) != before['index_owners'].get(name)
+                or after['index_definitions'].get(name) != before['index_definitions'].get(name)):
             raise ValueError('preservation: original index changed')
     for name, sql in before['views'].items():
         if name not in rebuilt_views and after['views'].get(name) != sql:
@@ -230,7 +267,10 @@ def _preservation(con, before, *, rebuilt_views):
             'original_base_tables': len(before['tables']), 'candidate_base_tables': len(after['tables']),
             'new_tables': sorted(set(after['tables'])-set(before['tables'])),
             'original_schema': before, 'candidate_schema': after,
-            'allowed_removed_indexes': sorted(set(before['indexes']) & _OLD_INDEXES)}
+            'allowed_removed_indexes': sorted(removable_indexes),
+            'allowed_removed_index_objects': [dict(name=name, **before['index_owners'][name],
+                **before['index_definitions'][name], original_sql=before['indexes'][name])
+                for name in sorted(removable_indexes)]}
 
 
 def _migration_postconditions(con):
@@ -242,13 +282,13 @@ def _migration_postconditions(con):
             actual = {r[0] for r in con.execute('DESCRIBE '+_q(table)).fetchall()}
             if not columns <= actual:
                 raise ValueError('migration postcondition: reviewed columns missing')
-    product_index = con.execute("SELECT is_unique,expressions FROM duckdb_indexes() "
+    product_index = con.execute("SELECT schema_name,table_name,is_unique,expressions FROM duckdb_indexes() "
         "WHERE database_name=current_database() AND index_name='uq_multi_source_kline_product'").fetchall()
-    expected = ['source_date', 'asset_type', 'asset_code', 'provider', 'adjustment']
-    if (len(product_index) != 1 or not product_index[0][0]
-            or [p.strip().strip('"') for p in product_index[0][1].strip('[]').split(',')] != expected):
+    if (len(product_index) != 1 or product_index[0][:2] != ('main', 'multi_source_kline')
+            or _index_definition(product_index[0][2], product_index[0][3]) != _INDEX_DEFINITIONS[_PRODUCT_INDEX]):
         raise ValueError('migration postcondition: exact product unique index missing')
     if con.execute("SELECT count(*) FROM duckdb_indexes() WHERE database_name=current_database() "
+                   "AND schema_name='main' AND table_name='multi_source_kline' "
                    "AND index_name IN ('uq_multi_source_kline','ix_multi_source_kline')").fetchone()[0]:
         raise ValueError('migration postcondition: obsolete product index remains')
 
@@ -360,6 +400,7 @@ def rehearse(source, output, *, source_sha256):
                       'autoload_known_extensions': False}
             con = duckdb.connect(str(candidate), config=config)
             before = _snapshot(con)
+            _check_reserved_index_ownership(before)
             done = sorted(applied_versions(con))
             checksum_exists = 'schema_migration_checksum' in before['tables']
             verified = dict(con.execute('SELECT version,sha256 FROM schema_migration_checksum').fetchall()) if checksum_exists else {}

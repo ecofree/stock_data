@@ -326,3 +326,103 @@ def test_fingerprints_support_installed_migration_data_location(tmp_path, monkey
     migration.write_text('SELECT 1;', encoding='utf-8')
     monkeypatch.setattr(module, 'discover_migrations', lambda: [(17, migration)])
     assert module._fingerprints()['migrations/'+migration.name] == digest(migration)
+
+
+@pytest.mark.parametrize('case', ['product_index_on_other_table', 'old_index_on_other_table',
+                                   'old_secondary_index_on_other_table'])
+def test_reserved_index_names_on_other_tables_fail_without_index_loss(tmp_path, case):
+    """Independent-review counterexamples: name/expressions do not prove owner."""
+    source = source_db(tmp_path)
+    with duckdb.connect(str(source)) as con:
+        if case == 'product_index_on_other_table':
+            con.execute('CREATE TABLE unrelated_product(source_date DATE,asset_type VARCHAR,asset_code VARCHAR,'
+                        'provider VARCHAR,adjustment VARCHAR)')
+            con.execute('CREATE UNIQUE INDEX uq_multi_source_kline_product ON unrelated_product'
+                        '(source_date,asset_type,asset_code,provider,adjustment)')
+        else:
+            name = 'uq_multi_source_kline' if case == 'old_index_on_other_table' else 'ix_multi_source_kline'
+            if name == 'uq_multi_source_kline':
+                con.execute('DROP INDEX uq_multi_source_kline')
+            con.execute(f'CREATE INDEX {name} ON protected_facts(payload)')
+        before = con.execute('SELECT schema_name,index_name,table_name,is_unique,expressions,sql '
+                             'FROM duckdb_indexes() ORDER BY index_name').fetchall()
+    source_hash = digest(source)
+    with pytest.raises(ValueError, match='index ownership'):
+        rehearsal(source, tmp_path/'rejected')
+    assert digest(source) == source_hash
+    receipt = json.loads((tmp_path/'rejected'/'migration-receipt.json').read_text(encoding='utf-8'))
+    assert receipt['status'] == 'failed' and receipt['failure']['stage'] == 'preflight'
+    with duckdb.connect(str(tmp_path/'rejected'/'migrated-market.duckdb'), read_only=True) as con:
+        assert con.execute('SELECT schema_name,index_name,table_name,is_unique,expressions,sql '
+                           'FROM duckdb_indexes() ORDER BY index_name').fetchall() == before
+        assert 'schema_migration' not in {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+
+
+def test_correct_owned_product_index_and_old_secondary_index_remain_supported(tmp_path):
+    source = source_db(tmp_path)
+    with duckdb.connect(str(source)) as con:
+        con.execute('CREATE UNIQUE INDEX uq_multi_source_kline_product ON multi_source_kline'
+                    '(source_date,asset_type,asset_code,provider,adjustment)')
+        con.execute('CREATE INDEX ix_multi_source_kline ON multi_source_kline(source_date,asset_type,asset_code,provider)')
+    receipt = rehearsal(source, tmp_path/'candidate')
+    assert receipt['status'] == 'passed'
+    assert set(receipt['preservation']['allowed_removed_indexes']) == {'uq_multi_source_kline', 'ix_multi_source_kline'}
+    removed = {row['name']: row for row in receipt['preservation']['allowed_removed_index_objects']}
+    for name, row in removed.items():
+        assert row['schema'] == 'main' and row['table'] == 'multi_source_kline'
+        assert row['is_unique'] == (name == 'uq_multi_source_kline')
+        assert row['expressions'] == ['source_date', 'asset_type', 'asset_code', 'provider']
+        assert row['original_sql']
+    with duckdb.connect(str(tmp_path/'candidate'/'migrated-market.duckdb'), read_only=True) as con:
+        assert con.execute('SELECT schema_name,table_name,index_name FROM duckdb_indexes()').fetchall() == [
+            ('main', 'multi_source_kline', 'uq_multi_source_kline_product')]
+
+
+@pytest.mark.parametrize('name,unique,columns', [
+    ('uq_multi_source_kline', True, 'asset_code'),
+    ('uq_multi_source_kline', False, 'source_date,asset_type,asset_code,provider'),
+    ('ix_multi_source_kline', False, 'source_date,asset_code'),
+    ('ix_multi_source_kline', True, 'source_date,asset_type,asset_code,provider'),
+])
+def test_reserved_legacy_name_on_target_with_unknown_definition_is_preserved(tmp_path, name, unique, columns):
+    source = source_db(tmp_path)
+    with duckdb.connect(str(source)) as con:
+        con.execute('DROP INDEX uq_multi_source_kline')
+        con.execute(f'CREATE {"UNIQUE " if unique else ""}INDEX {name} ON multi_source_kline({columns})')
+        before = con.execute('SELECT index_name,sql FROM duckdb_indexes()').fetchall()
+    with pytest.raises(ValueError, match='index definition'):
+        rehearsal(source, tmp_path/'rejected')
+    with duckdb.connect(str(tmp_path/'rejected'/'migrated-market.duckdb'), read_only=True) as con:
+        assert con.execute('SELECT index_name,sql FROM duckdb_indexes()').fetchall() == before
+
+
+def test_quoted_comma_identifier_cannot_impersonate_four_index_expressions(tmp_path):
+    source = source_db(tmp_path)
+    with duckdb.connect(str(source)) as con:
+        con.execute('DROP INDEX uq_multi_source_kline')
+        con.execute('ALTER TABLE multi_source_kline ADD COLUMN "source_date,asset_type" VARCHAR')
+        con.execute('CREATE UNIQUE INDEX uq_multi_source_kline ON multi_source_kline'
+                    '("source_date,asset_type",asset_code,provider)')
+    with pytest.raises(ValueError, match='index definition'):
+        rehearsal(source, tmp_path/'rejected')
+
+
+@pytest.mark.parametrize('wrong_owner', ['table', 'schema'])
+def test_postcondition_itself_rejects_product_index_on_wrong_owner(tmp_path, wrong_owner):
+    source = source_db(tmp_path)
+    from trade_system.migrations import apply_pending_in_transaction
+    from trade_system.v2.market_migration_rehearsal import _migration_postconditions
+    with duckdb.connect(str(source)) as con:
+        con.execute('BEGIN')
+        apply_pending_in_transaction(con, versions=(14, 15, 16, 17))
+        con.execute('DROP INDEX uq_multi_source_kline_product')
+        if wrong_owner == 'schema':
+            con.execute('CREATE SCHEMA unrelated_schema')
+        owner = 'unrelated_product' if wrong_owner == 'table' else 'unrelated_schema.multi_source_kline'
+        con.execute(f'CREATE TABLE {owner}(source_date DATE,asset_type VARCHAR,asset_code VARCHAR,'
+                    'provider VARCHAR,adjustment VARCHAR)')
+        con.execute(f'CREATE UNIQUE INDEX uq_multi_source_kline_product ON {owner}'
+                    '(source_date,asset_type,asset_code,provider,adjustment)')
+        with pytest.raises(ValueError, match='migration postcondition'):
+            _migration_postconditions(con)
+        con.execute('ROLLBACK')
