@@ -93,7 +93,7 @@ def capture(output,installed_python,wheel,*,minimal_runtime=False,data_lane=Fals
         'lint':[sys.executable,'-B','-X','utf8','-m','ruff','check','--select','E9,F63,F7,F82,F401,F841','.'],
         'migrations':[sys.executable,'-B','-X','utf8','scripts/lint_migrations.py'],
         'writer_boundary':[sys.executable,'-B','-X','utf8','tools/v2/closure_readiness.py','--writer-gate'],
-        'tests':[sys.executable,'-B','-X','utf8','-X','pycache_prefix='+str(temporary/'bytecode-cache'),'-m','pytest','-o','addopts=','-v','--durations=25','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml'),'--basetemp='+str(temporary/'pytest-temp')],
+        'tests':[sys.executable,'-B','-X','utf8','-X','pycache_prefix='+str(temporary/'bytecode-cache'),'-m','pytest','-o','addopts=','-o','junit_family=legacy','-v','--durations=25','-o','faulthandler_timeout=60','-p','no:cacheprovider','--junitxml='+str(output/'tests.xml'),'--basetemp='+str(temporary/'pytest-temp')],
         'installed_dependencies':[str(installed_python),'-I','-B','-X','utf8','-m','pip','check'],
         'installed_core':[str(installed_python),'-I','-B','-X','utf8',str(ROOT/'tools/v2/probe_installed.py'),'--wheel',str(wheel)]+(['--minimal-runtime'] if minimal_runtime else [])}
     if data_lane:

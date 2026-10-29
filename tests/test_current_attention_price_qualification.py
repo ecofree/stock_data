@@ -29,7 +29,8 @@ def compare(tmp_path, original, current, *, day='2026-10-12'):
     source=snapshot('2026-10-09',original)
     evidence=seal_evidence(tmp_path,source)
     note={'schema':2,'note_id':'synthetic-attention','instrument':'000001',
-          'evidence_file_id':evidence,'evidence_id':source['snapshot_id']}
+          'evidence_file_id':evidence,'evidence_id':source['snapshot_id'],
+          'received_at':'2026-10-09T19:00:00+08:00'}
     path=tmp_path/'notes/evidence'/f'{evidence}.json'
     before=path.read_bytes()
     rows=attention_followups(tmp_path,[note],snapshot(day,current))
@@ -174,3 +175,26 @@ def test_snapshot_helper_refuses_malformed_contracts(contract):
 def test_known_matching_adjustments_remain_qualified(adjustment):
     row=stock();row['price_contract'][1]=adjustment
     assert price_snapshot_qualified(row)
+
+
+@pytest.mark.parametrize('defect',['note_missing_receipt','note_naive_receipt','original_missing_clock',
+    'original_invalid_clock','current_missing_clock','current_invalid_clock','current_future_clock','current_clock_before_day'])
+def test_original_note_and_current_view_clocks_are_both_required(tmp_path,monkeypatch,defect):
+    from datetime import datetime
+    from trade_system.v2 import domain
+    monkeypatch.setattr(domain,'now_utc',lambda:datetime.fromisoformat('2026-10-13T19:00:00+08:00'))
+    original=snapshot('2026-10-09',stock());current=snapshot('2026-10-12',stock(11))
+    if defect=='original_missing_clock':original.pop('as_of')
+    elif defect=='original_invalid_clock':original['as_of']='not a timestamp'
+    elif defect=='current_missing_clock':current.pop('as_of')
+    elif defect=='current_invalid_clock':current['as_of']='2026-10-12T24:00:00+08:00'
+    elif defect=='current_future_clock':current['as_of']='2026-10-14T18:00:00+08:00'
+    elif defect=='current_clock_before_day':current['as_of']='2026-10-11T18:00:00+08:00'
+    evidence=seal_evidence(tmp_path,original)
+    note={'schema':2,'note_id':'synthetic-clock','instrument':'000001','evidence_file_id':evidence,
+          'received_at':'2026-10-09T19:00:00+08:00'}
+    if defect=='note_missing_receipt':note.pop('received_at')
+    elif defect=='note_naive_receipt':note['received_at']='2026-10-09T19:00:00'
+    row=attention_followups(tmp_path,[note],current)[0]
+    assert row['change_pct'] is None
+    assert row['original_close']==10 and row['current_close']==11

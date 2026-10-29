@@ -231,7 +231,6 @@ def read_review(output,review_id):
 
 def review_projection(output, review):
     """Derived original-to-seen facts; never mutate or backfill old reviews."""
-    from .domain import utc
     result=dict(review)
     snapshot_id=review.get('seen_market_snapshot_id')
     result['market_binding']='historical_unbound' if snapshot_id is None else 'explicit_unbound_no_published_market'
@@ -239,18 +238,9 @@ def review_projection(output, review):
     if snapshot_id not in (None,'unbound'):
         market=read_json(Path(output)/'notes/evidence'/(review['seen_market_evidence_file_id']+'.json'))[0]
         note=read_note(output,review['note_id'])
-        comparison=attention_followups(output,[note],market)[0]
-        try:
-            receipt=utc(review['received_at']);seen_at=utc(market['as_of'])
-            from zoneinfo import ZoneInfo
-            future=seen_at>receipt or market['trade_date']>receipt.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
-            original=read_json(Path(output)/'notes/evidence'/(note['evidence_file_id']+'.json'))[0]
-            future=future or utc(original['as_of'])>receipt or original['trade_date']>receipt.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
-            if any(utc(value['as_of'])<utc(value['trade_date']+'T00:00:00+08:00') for value in (original,market)):
-                comparison.update(change_pct=None,status='evidence_clock_unverified')
-            if future:comparison.update(change_pct=None,status='future_evidence')
-        except (ValueError,KeyError,TypeError):
-            comparison.update(change_pct=None,status='evidence_clock_unverified')
+        # Original chronology belongs to this directly bound note. The seen
+        # side is frozen at this review receipt, never at a later page reload.
+        comparison=attention_followups(output,[note],market,as_of=review['received_at'])[0]
         result.update(market_binding='bound_daily_market_snapshot',seen_comparison=comparison,
             seen_market_as_of=market.get('as_of'),seen_market_trade_date=market.get('trade_date'),
             availability_scope='sealed_at_human_receipt_not_provider_publication_certification')
@@ -299,10 +289,28 @@ def annotate(notes):
     return [dict(n,is_latest=n['note_id'] not in superseded) for n in notes]
 
 
-def attention_followups(output, notes, market):
+def snapshot_clock_state(snapshot, received_at):
+    """Chronology qualification only; does not certify provider publication time."""
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    from .domain import utc
+    try:
+        day=snapshot['trade_date']
+        if not isinstance(day,str) or not re.fullmatch('[0-9]{4}-[0-9]{2}-[0-9]{2}',day):return 'unverified'
+        day=date.fromisoformat(day)
+        seen=utc(snapshot['as_of']);receipt=utc(received_at)
+        if seen.astimezone(ZoneInfo('Asia/Shanghai')).date()<day:return 'unverified'
+        if seen>receipt or day>receipt.astimezone(ZoneInfo('Asia/Shanghai')).date():return 'future'
+    except (KeyError,TypeError,ValueError,OverflowError):return 'unverified'
+    return None
+
+
+def attention_followups(output, notes, market, *, as_of=None):
     """Compare original seen closes, not fills or strategy returns. No database writes."""
     import math
+    from .domain import now_utc
     from .market_workspace import price_snapshot_qualified
+    viewing_at=now_utc().isoformat() if as_of is None else as_of
     results=[]
     for note in notes:
         if note.get('schema')!=2:continue
@@ -325,6 +333,15 @@ def attention_followups(output, notes, market):
                     else:
                         change=None;status='price_unqualified'
                         qualification_reasons['comparison']='nonfinite_price_change'
+        original_clock=snapshot_clock_state(original,note.get('received_at'))
+        current_clock=snapshot_clock_state(market,viewing_at) if market else None
+        if original_clock:
+            change=None
+            status='original_evidence_future_at_judgement' if original_clock=='future' else 'original_evidence_clock_unverified'
+            qualification_reasons['original']='future_at_judgement' if original_clock=='future' else 'clock_unverified_at_judgement'
+        elif current_clock:
+            change=None;status='future_evidence' if current_clock=='future' else 'evidence_clock_unverified'
+            qualification_reasons['current']='future_at_observation' if current_clock=='future' else 'clock_unverified_at_observation'
         results.append({'note_id':note['note_id'],'instrument':note['instrument'],
             'original_price_contract':base.get('price_contract'),'current_price_contract':current.get('price_contract'),
             'original_price_status':base.get('price_status'),'current_price_status':current.get('price_status'),

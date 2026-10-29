@@ -49,6 +49,7 @@ def test_delivery_all_python_children_disable_bytecode(tmp_path, monkeypatch):
             (i for i, value in enumerate(command) if value == '-m' or str(value).endswith('.py')),
             default=len(command)), name
     assert '-I' in commands['installed_core']
+    assert 'junit_family=legacy' in commands['tests']
 
 
 def test_full_suite_has_finite_ci_headroom_without_relaxing_other_checks(tmp_path, monkeypatch):

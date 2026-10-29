@@ -208,3 +208,57 @@ def test_journal_detail_leads_with_readable_fixed_seen_facts(tmp_path):
     assert text.index('<summary>原件身份与完整字段</summary>')<text.index('<pre')
     assert text.count('<article id="review-'+key+'">')==1
     assert 'id="related-reviews"' in text
+
+
+@pytest.mark.parametrize('future_field',['as_of','trade_date'])
+def test_future_original_stays_unqualified_for_its_note_but_explicit_revision_has_own_clock(tmp_path,monkeypatch,future_field):
+    from trade_system.v2 import domain
+    clock=['2026-10-13T18:00:00+08:00']
+    monkeypatch.setattr(domain,'now_utc',lambda:datetime.fromisoformat(clock[0]))
+    original=snapshot('2026-10-12',stock())
+    original.pop('snapshot_id')
+    original['as_of']='2026-10-14T18:00:00+08:00'
+    if future_field=='trade_date':original['trade_date']='2026-10-14'
+    original['snapshot_id']=identity(original)
+    product.publish_desk(tmp_path,market=original)
+    command=dict(instrument='000001',operator='SYNTHETIC ONLY',intent='observe',hypothesis='future original',
+        invalidation='manual',request_id='1'*32,evidence_id=original['snapshot_id'])
+    note=product.save_note(tmp_path,command)
+    original_path=tmp_path/'notes/attention'/f'{note}.json';note_bytes=original_path.read_bytes()
+    seen=snapshot('2026-10-15',stock(11));clock[0]='2026-10-16T18:00:00+08:00'
+    product.publish_desk(tmp_path,market=seen)
+    values=review_values(note,seen);key=journal.save_review(tmp_path,values)
+    old_review=tmp_path/'notes/attention/reviews'/f'{key}.json';review_bytes=old_review.read_bytes()
+    current=journal.attention_followups(tmp_path,[journal.read_note(tmp_path,note)],seen)[0]
+    fixed=journal.review_projection(tmp_path,journal.read_review(tmp_path,key))['seen_comparison']
+    assert current['change_pct'] is None and fixed['change_pct'] is None
+    assert current['status']==fixed['status']=='original_evidence_future_at_judgement'
+    revision=product.save_note(tmp_path,dict(command,supersedes=note,request_id='4'*32))
+    revised_key=journal.save_review(tmp_path,review_values(revision,seen,'5'*32))
+    assert journal.review_projection(tmp_path,journal.read_review(tmp_path,revised_key))['seen_comparison']['change_pct']==pytest.approx(10)
+    clock[0]='2026-10-17T18:00:00+08:00';product.publish_desk(tmp_path,market=snapshot('2026-10-16',stock(12)))
+    assert journal.save_review(tmp_path,values)==key
+    for row in product.saved_projection(tmp_path)['attention_followups']:
+        if row['note_id']==note:assert row['change_pct'] is None
+    assert journal.review_projection(tmp_path,journal.read_review(tmp_path,key))['seen_comparison']['change_pct'] is None
+    assert original_path.read_bytes()==note_bytes and old_review.read_bytes()==review_bytes
+
+
+def test_receipt_and_history_share_readable_fixed_fact_summary(tmp_path):
+    from trade_system.v2.research_product_view import journal_page,review_receipt_page,render
+    from html import unescape
+    note,_=setup_note(tmp_path)
+    market=snapshot('2026-10-13',stock(11));product.publish_desk(tmp_path,market=market)
+    key=journal.save_review(tmp_path,review_values(note,market))
+    review=journal.review_projection(tmp_path,journal.read_review(tmp_path,key))
+    pages=[review_receipt_page(review),journal_page(product.journal_navigation(tmp_path,kind='review',selected=key))]
+    for page in pages:
+        primary=unescape(page.split('<details>')[0])
+        assert '2026-10-13' in primary and '原始价格' in primary and '所见价格' in primary
+        assert '中继' in primary and '不复权' in primary and '成交量：股' in primary
+        assert '10.000000000000009' not in primary and "['xiaodefa'" not in primary
+        assert 'bound_daily_market_snapshot' not in primary
+        assert '10%' in primary
+        assert '<summary>原件身份与完整字段</summary>' in page
+    current=render(product.saved_projection(tmp_path))
+    assert '选两只证券加入对比；模型正向贡献' not in current

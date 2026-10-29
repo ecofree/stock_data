@@ -100,7 +100,7 @@ def render(data, *, include_account=False):
 <p id="session-date" class="small"></p><details class="small"><summary>数据与模型时点</summary><p id="freshness"></p></details><details class="warning"><summary>研究边界：价格目标不是收益或交易资格</summary><p>模型评分是下一交易日开盘至T+2收盘的价格变化估计，不是成交承诺或收益保证。当前历史对照未证明选股优势，以下是研究观察清单，不是买入推荐。缺失记录保留；当前模型预先指定为价格基线，不按测试赢家自动切换。</p></details>
 <div class="toolbar"><label>筛选证券 <input id="search" placeholder="输入代码或名称，点击行查看依据" maxlength="30"></label><label>排序依据 <select id="sort"><option value="code">证券代码（默认，不代表推荐顺序）</option></select></label></div>
 <div class="scroll"><table id="current"><thead><tr><th>证券</th><th>事实日期</th><th>来源</th><th>复权</th><th>价格资格</th><th>收盘 / 元</th><th>涨跌 %</th></tr></thead><tbody></tbody></table></div><p id="empty"></p>
-<p class="small">选两只证券加入对比；模型正向贡献只是数值解释，不是利好事实。</p><div id="compare-panel" aria-live="polite"></div><details id="details"><summary>选中候选的依据与风险</summary><div id="evidence"></div></details></section>
+<p class="small">选两只证券加入对比，核对同日事实、来源、复权与价格资格，再记录你的判断。</p><div id="compare-panel" aria-live="polite"></div><details id="details"><summary>选中候选的依据与风险</summary><div id="evidence"></div></details></section>
 <section id="experiment"><section class="metrics" id="stats"></section><h2 id="research-heading">历史研究：共同样本对照</h2><p id="scope" class="small"></p><div class="scroll"><table><thead><tr><th>模型组</th><th>样本 / 日期</th><th>MSE</th><th>日均Rank IC</th><th>Top5价格目标均值 %</th></tr></thead><tbody id="models"></tbody></table></div>
 <p class="small" id="research-contract">同一组样本、同一目标和预处理规则。资金与Alpha158的对照结果允许为负；Top5统计不是资金曲线。尾段不评分、不调参。历史可用性选择存在偏差，不能外推全市场。</p><div id="comparison"></div></section>
 <section id="price-study" hidden><h2>独立21日价格研究</h2><p id="price-study-status"></p><p class="small">与上方61日Alpha158共同研究分开；新旧价格模型、动量和等权使用相同证券日。不足6只的日期保留，Top5不适用；汇总只在共同合格日期上计算，不是资金曲线。</p><div class="scroll"><table><thead><tr><th>对照</th><th>全期MSE</th><th>合格日Top5 / 等权目标均值 %</th></tr></thead><tbody id="price-study-models"></tbody></table></div><details><summary>全部测试日期与不足记录</summary><div class="scroll"><table><thead><tr><th>日期</th><th>证券数</th><th>Top5资格</th><th>新价格模型 %</th><th>旧模型 %</th><th>动量 %</th><th>等权 %</th></tr></thead><tbody id="price-study-days"></tbody></table></div></details></section>
@@ -339,7 +339,7 @@ function keepView(){try{sessionStorage.setItem(viewKey,JSON.stringify({period:$(
 window.addEventListener('pagehide',keepView);
 try{const saved=JSON.parse(sessionStorage.getItem(viewKey)||'null');if(saved){$('review-period').value=saved.period||'day';drawPeriod();$('search').value=saved.search||'';$('sort').value=saved.sort||'code';$('search').dispatchEvent(new Event('input'));for(const c of saved.compare||[])if(rows.some(r=>r.instrument===c))compared.add(c);drawCompare();draw();const selected=rows.find(r=>r.instrument===saved.selected);if(selected)show(selected);if(saved.focus&&$(saved.focus))$(saved.focus).focus({preventScroll:true});requestAnimationFrame(()=>window.scrollTo(0,saved.scroll||0))}}catch(_){}
 
-const followupLabels={price_unqualified:'原始或当前价格资格未通过，不能计算后续变化',source_conflict:'原始与当前价格口径冲突，不能计算后续变化',source_missing:'缺少原始或当前价格，不能计算后续变化',pending_next_session:'等待后续交易日同口径价格',observed_close_change_not_execution_return:'已观察到同口径收盘变化'};
+const followupLabels={original_evidence_future_at_judgement:'原证据晚于这条判断的接收时点，不计算变化',original_evidence_clock_unverified:'原证据或这条判断的接收时点未认证，不计算变化',future_evidence:'所见事实晚于查看时点，不计算变化',evidence_clock_unverified:'所见事实时点未认证，不计算变化',price_unqualified:'原始或当前价格资格未通过，不能计算后续变化',source_conflict:'原始与当前价格口径冲突，不能计算后续变化',source_missing:'缺少原始或当前价格，不能计算后续变化',pending_next_session:'等待后续交易日同口径价格',observed_close_change_not_execution_return:'已观察到同口径收盘变化'};
 $('reviews').append(el('h3','市场判断：原始到当前事实（随新发布变化）'));
 for(const item of D.attention_followups||[]){const box=el('article','');box.id='review-'+item.note_id;
  const qualifiedChange=item.status==='observed_close_change_not_execution_return'&&typeof item.change_pct==='number'&&Number.isFinite(item.change_pct);
@@ -375,17 +375,55 @@ window.addEventListener('pageshow',()=>{if(online)document.querySelectorAll('.re
 </script></html>'''
 
 
+REVIEW_STATES={'pending':'仍待观察','triggered':'失效条件已触发','not_triggered':'截至记录时未触发','unclear':'证据不足，无法判断'}
+COMPARISON_STATES={'observed_close_change_not_execution_return':'同口径价格变化，仅供观察',
+    'pending_next_session':'同日或等待后续日，不计算变化','price_unqualified':'价格资格未通过，不计算变化',
+    'source_conflict':'价格口径不同，不计算变化','source_missing':'价格缺失，不计算变化',
+    'future_evidence':'所见事实或快照晚于查看 / 复盘接收时点，不计算变化',
+    'evidence_clock_unverified':'所见时点资料不合格，不计算变化',
+    'original_evidence_future_at_judgement':'原证据晚于这条判断的接收时点，不计算变化',
+    'original_evidence_clock_unverified':'原证据或这条判断的接收时点未认证，不计算变化'}
+
+
+def readable_number(value, suffix=''):
+    if value is None:return '未知'
+    if isinstance(value,(int,float)) and not isinstance(value,bool):
+        try:return format(value,'.4f').rstrip('0').rstrip('.')+suffix
+        except (OverflowError,ValueError):pass
+    return str(value)+suffix
+
+
+def readable_price_contract(contract):
+    if not isinstance(contract,(list,tuple)) or len(contract)!=4:return '来源、复权或单位未知'
+    provider,adjustment,volume,amount=map(str,contract)
+    providers={'xiaodefa':'TuShare 中继（xiaodefa）','hithink':'同花顺官方',
+        'baostock':'BaoStock 历史来源','tushare':'历史 TuShare 来源','tushare_daily':'历史 TuShare 日线',
+        'tushare_relay':'历史 TuShare 中继'}
+    adjustments={'none':'不复权','qfq':'前复权','hfq':'后复权'}
+    units={'shares':'股','hands':'手','yuan':'元','thousand_yuan':'千元'}
+    return '来源：'+providers.get(provider,provider+'（原记录）')+' / 复权：'+adjustments.get(adjustment,'未知（'+adjustment+'）')+' / 成交量：'+units.get(volume,volume)+' / 成交额：'+units.get(amount,amount)
+
+
+def fixed_fact_fields(review):
+    """Shared display summary only; raw identities and comparison math stay intact."""
+    comparison=review.get('seen_comparison')
+    if not comparison:
+        return [('所见行情','本次明确未绑定：当时无已发布行情' if review.get('market_binding')=='explicit_unbound_no_published_market' else '历史人工记录，所见行情版本未绑定')]
+    return [('所见行情绑定','已封存所见盘后快照'),
+        ('固定所见行情',str(comparison['original_date'])+' → '+str(comparison['current_date'])),
+        ('原始价格',readable_number(comparison['original_close'],' 元')),
+        ('所见价格',readable_number(comparison['current_close'],' 元')),
+        ('原始来源 / 复权 / 单位',readable_price_contract(comparison.get('original_price_contract'))),
+        ('所见来源 / 复权 / 单位',readable_price_contract(comparison.get('current_price_contract'))),
+        ('比较资格',COMPARISON_STATES.get(comparison['status'],'未核对，不计算变化')),
+        ('同口径变化（不是成交收益）',readable_number(comparison['change_pct'],'%'))]
+
+
 def journal_page(page):
     """Plain GET links, all selected facts inline; no scripts or external reads."""
     from urllib.parse import urlencode
     e=lambda value:escape(str(value),quote=True)
     shown=set()
-    states={'pending':'仍待观察','triggered':'失效条件已触发','not_triggered':'截至记录时未触发',
-        'unclear':'证据不足，无法判断','observed_close_change_not_execution_return':'同口径价格变化，仅供观察',
-        'pending_next_session':'同日或等待后续日，不计算变化','price_unqualified':'价格资格未通过，不计算变化',
-        'source_conflict':'价格口径不同，不计算变化','source_missing':'价格缺失，不计算变化',
-        'future_evidence':'事实或快照时点晚于人工接收，不计算变化',
-        'evidence_clock_unverified':'时点资料不合格，不计算变化'}
     def link(kind,key,label):
         return '<a href="/journal?'+e(urlencode({'kind':kind,'id':key}))+'">'+e(label)+'</a>'
     def event(value,kind):
@@ -396,22 +434,18 @@ def journal_page(page):
         fields=[('接收时间',value.get('received_at'))]
         if kind=='note':fields.extend([('判断版本','当前判断' if value.get('is_latest') else '历史版本，原件保留'),
             ('署名',value['operator']),('人工判断',value['hypothesis']),('失效条件',value['invalidation'])])
-        elif kind=='plan':fields.extend([('计划版本','当前版本' if value.get('is_latest') else '已被替代的历史版本'),
-            ('署名',value['operator']),('条件',value['condition']),('价格阈值',value.get('threshold')),
-            ('有效期',value['valid_until']),('失效条件',value.get('invalidation')),
-            ('永久失效原因',value.get('invalidation_reason') or '无已记录的永久失效；当前到期与报价状态见工作台')])
+        elif kind=='plan':
+            from .operator_workflow import observation_plan_risk
+            reason=value.get('invalidation_reason')
+            invalidation=observation_plan_risk({'state':'invalid','invalidation':reason})['invalidation']['message'] if reason else '无已记录的永久失效；当前到期与报价状态见工作台'
+            fields.extend([('计划版本','当前版本' if value.get('is_latest') else '已被替代的历史版本'),
+                ('署名',value['operator']),('条件',{'manual':'人工核对原判断条件','price_above':'未复权价格达到或高于','price_below':'未复权价格达到或低于'}.get(value['condition'],'条件未知')),
+                ('价格阈值',readable_number(value.get('threshold'))),('有效期',value['valid_until']),
+                ('失效条件',value.get('invalidation')),('永久失效原因',invalidation)])
         else:
-            fields.extend([('复盘署名',value['reviewer']),('人工核对',states.get(value['conclusion'],'待核对')),
+            fields.extend([('复盘署名',value['reviewer']),('人工核对',REVIEW_STATES.get(value['conclusion'],'待核对')),
                 ('人工证据',value['evidence'])])
-            comparison=value.get('seen_comparison')
-            if comparison:
-                fields.extend([('固定所见行情',str(comparison['original_date'])+' → '+str(comparison['current_date'])),
-                    ('原始价格',comparison['original_close']),('所见价格',comparison['current_close']),
-                    ('原始来源 / 复权 / 单位',comparison.get('original_price_contract')),
-                    ('所见来源 / 复权 / 单位',comparison.get('current_price_contract')),
-                    ('比较资格',states.get(comparison['status'],'未核对，不计算变化')),
-                    ('同口径变化 %（不是成交收益）',comparison['change_pct'])])
-            else:fields.append(('所见行情','本次明确未绑定：当时无已发布行情' if value.get('market_binding')=='explicit_unbound_no_published_market' else '历史人工记录，所见行情版本未绑定'))
+            fields.extend(fixed_fact_fields(value))
         text+='<dl>'+''.join('<dt>'+e(label)+'</dt><dd style="white-space:pre-wrap">'+e('未知' if field is None else field)+'</dd>' for label,field in fields)+'</dl>'
         text+='<details><summary>原件身份与完整字段</summary><pre>'+e(json.dumps(value,ensure_ascii=False,indent=2))+'</pre></details>'
         if value.get('note_id') and kind!='note':text+=link('note',value['note_id'],'返回原判断')
@@ -450,12 +484,11 @@ def receipt_page(note):
 
 
 def review_receipt_page(review):
-    labels={'pending':'仍待观察','triggered':'失效条件已触发','not_triggered':'截至记录时未触发','unclear':'证据不足，无法判断'}
     text='<dl>'+''.join('<dt>'+escape(k)+'</dt><dd style="overflow-wrap:anywhere;white-space:pre-wrap">'+escape(str(v))+'</dd>' for k,v in [
         ('复盘回执',review['review_id']),('原判断',review['note_id']),('署名',review['reviewer']),
-        ('记录时间',review['received_at']),('人工核对',labels[review['conclusion']]),('证据',review['evidence']),
-        ('所见行情绑定',review.get('market_binding','historical_unbound')),
-        ('原始到所见事实',json.dumps(review.get('seen_comparison'),ensure_ascii=False))])+'</dl>'
+        ('记录时间',review['received_at']),('人工核对',REVIEW_STATES[review['conclusion']]),('证据',review['evidence']),
+        *fixed_fact_fields(review)])+'</dl>'
+    text+='<details><summary>原件身份与完整字段</summary><pre>'+escape(json.dumps(review,ensure_ascii=False,indent=2))+'</pre></details>'
     key=json.dumps('stock-data-review-draft:'+review['note_id'])
     request=json.dumps(review['request_id'])
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
